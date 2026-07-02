@@ -1,0 +1,62 @@
+"""Core abstraction tests: actions, observations, memory, perception."""
+
+from cognitive_runtime.core import (
+    Action,
+    Memory,
+    NULL_ACTION,
+    Observation,
+    RewardSignal,
+    StructuredPerception,
+)
+
+
+def test_action_key_roundtrip():
+    action = Action.make("SELECT_HOTBAR_SLOT", slot=3)
+    assert action.key() == "SELECT_HOTBAR_SLOT:slot=3"
+    assert Action.from_key(action.key()) == action
+    assert Action.from_key("NULL") == NULL_ACTION
+    assert NULL_ACTION.is_null
+
+
+def test_observation_hash_is_deterministic_and_content_sensitive():
+    a = Observation(timestamp=1.0, tick=5, data={"health": 20, "pos": [1, 2]})
+    b = Observation(timestamp=9.9, tick=5, data={"pos": [1, 2], "health": 20})
+    assert a.hash() == b.hash()  # timestamp excluded, key order irrelevant
+    c = Observation(timestamp=1.0, tick=5, data={"health": 19, "pos": [1, 2]})
+    assert a.hash() != c.hash()
+
+
+def test_reward_signal_from_components():
+    signal = RewardSignal.from_components({"a": 0.5, "b": -0.2, "zero": 0.0})
+    assert abs(signal.value - 0.3) < 1e-9
+    assert "zero" not in signal.components
+
+
+def test_structured_perception_flattens_numeric_leaves():
+    obs = Observation(
+        timestamp=0.0,
+        tick=1,
+        data={"health": 20, "position": {"x": 1.5, "z": 2.5}, "is_night": False,
+              "hotbar": ["berries", None]},
+        frame=[[1, 2], [3, 4]],
+    )
+    state = StructuredPerception().encode(obs)
+    assert state.features["health"] == 20.0
+    assert state.features["position.x"] == 1.5
+    assert state.features["is_night"] == 0.0
+    assert state.features["hotbar.len"] == 2.0
+    assert state.features["frame.mean"] == 2.5
+
+
+def test_memory_repetition_and_novelty():
+    memory = Memory(capacity=16)
+    perception = StructuredPerception()
+    for i in range(3):
+        memory.update(perception.encode(Observation(timestamp=0.0, tick=i, data={"v": i})))
+        memory.record_action(NULL_ACTION)
+    assert memory.repeated_action_streak() == 3
+    memory.record_action(Action("MOVE_FORWARD"))
+    assert memory.repeated_action_streak() == 1
+    assert memory.novelty_rate() == 1.0
+    memory.update(perception.encode(Observation(timestamp=0.0, tick=0, data={"v": 0})))
+    assert not memory.last_observation_was_novel
