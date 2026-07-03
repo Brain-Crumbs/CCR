@@ -53,6 +53,7 @@ about any specific world.
 | Policy | `core/policy.py` | `decide(state, memory, prediction) -> Action` |
 | Learner | `core/learner.py` | Online `(obs, action, reward)` hook; MVP learns offline via behavioral cloning |
 | RewardSignal | `core/reward.py` | Scalar value + named components + semantic events |
+| Streams | `core/streams/` | Time-indexed sensory/motor stream primitives (Phase 0, not yet wired into the loop); see [streams.md](streams.md) |
 
 The runtime machinery lives in `cognitive_runtime/runtime/`:
 

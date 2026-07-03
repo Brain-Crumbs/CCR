@@ -1,0 +1,155 @@
+"""Stream event primitives.
+
+Every sensory or motor input to the runtime is a time-indexed
+:class:`StreamEvent` on a named stream ("body.health", "vision.frame.grid",
+"motor.command").  Programs advertise the streams they publish with
+:class:`StreamSpec`.  Nothing here knows about any specific Program.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+#: The generic sensory/motor taxonomy.  Minecraft health, Linux battery and
+#: robot joint stress are all "body" streams; frames, desktop pixels and
+#: cameras are all "vision" streams.  The brain consumes modalities, not
+#: environment-specific fields.
+MODALITIES = frozenset(
+    {
+        "body",
+        "vision",
+        "spatial",
+        "audio",
+        "event",
+        "reward",
+        "language",
+        "input",
+        "world",
+        "motor",
+    }
+)
+
+_STREAM_ID_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)*$")
+
+
+def validate_stream_identity(stream_id: str, modality: str) -> None:
+    """Validate a stream id / modality pair.
+
+    Stream ids are lowercase dotted paths.  When the first path segment is
+    itself a modality name (the recommended convention, e.g. "body.health"),
+    it must match the declared modality.
+    """
+    if not _STREAM_ID_RE.match(stream_id):
+        raise ValueError(
+            f"invalid stream_id {stream_id!r}: must be a lowercase dotted path"
+        )
+    if modality not in MODALITIES:
+        raise ValueError(
+            f"unknown modality {modality!r} for stream {stream_id!r}; "
+            f"expected one of {sorted(MODALITIES)}"
+        )
+    head = stream_id.split(".", 1)[0]
+    if head in MODALITIES and head != modality:
+        raise ValueError(
+            f"stream {stream_id!r} starts with modality segment {head!r} "
+            f"but declares modality {modality!r}"
+        )
+
+
+@dataclass(frozen=True)
+class StreamEvent:
+    """One time-indexed sample on a named stream.
+
+    Timestamps are SIMULATED time — never wall clock.  Replay verification
+    hashes include the timestamp, so wall-clock leakage would break replay.
+    """
+
+    stream_id: str
+    modality: str
+    timestamp: float
+    sequence_number: int  # per-stream monotonic, assigned by the publishing bus
+    payload: Any  # JSON-serializable
+    confidence: float = 1.0
+    source: str = ""  # publishing program/backend name
+
+    def __post_init__(self) -> None:
+        validate_stream_identity(self.stream_id, self.modality)
+
+    def hash(self) -> str:
+        """Deterministic content hash; the replay-verification unit.
+
+        Mirrors ``Observation.hash()``: canonical JSON with sorted keys over
+        the replay-relevant fields.
+        """
+        payload = json.dumps(
+            {
+                "stream_id": self.stream_id,
+                "sequence_number": self.sequence_number,
+                "timestamp": self.timestamp,
+                "payload": self.payload,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "stream_id": self.stream_id,
+            "modality": self.modality,
+            "timestamp": self.timestamp,
+            "sequence_number": self.sequence_number,
+            "payload": self.payload,
+            "confidence": self.confidence,
+            "source": self.source,
+        }
+
+    @staticmethod
+    def from_dict(raw: Dict[str, Any]) -> "StreamEvent":
+        return StreamEvent(
+            stream_id=raw["stream_id"],
+            modality=raw["modality"],
+            timestamp=raw.get("timestamp", 0.0),
+            sequence_number=raw.get("sequence_number", 0),
+            payload=raw.get("payload"),
+            confidence=raw.get("confidence", 1.0),
+            source=raw.get("source", ""),
+        )
+
+
+@dataclass(frozen=True)
+class StreamSpec:
+    """A Program's advertisement of one stream it publishes."""
+
+    stream_id: str
+    modality: str
+    description: str = ""
+    nominal_rate_hz: Optional[float] = None  # None = irregular / event-driven
+    payload_schema: str = ""  # informal hint, e.g. "float 0..20" or "2-D int grid"
+
+    def __post_init__(self) -> None:
+        validate_stream_identity(self.stream_id, self.modality)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "stream_id": self.stream_id,
+            "modality": self.modality,
+            "description": self.description,
+            "nominal_rate_hz": self.nominal_rate_hz,
+            "payload_schema": self.payload_schema,
+        }
+
+    @staticmethod
+    def from_dict(raw: Dict[str, Any]) -> "StreamSpec":
+        return StreamSpec(
+            stream_id=raw["stream_id"],
+            modality=raw["modality"],
+            description=raw.get("description", ""),
+            nominal_rate_hz=raw.get("nominal_rate_hz"),
+            payload_schema=raw.get("payload_schema", ""),
+        )
