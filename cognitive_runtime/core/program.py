@@ -16,17 +16,34 @@ between worlds without modification:
     snapshot() -> snapshot_id
     restore(snapshot_id)
     metadata() -> ProgramMetadata
+
+Streams-first contract (interface v2, migration in progress):
+
+    stream_catalog() -> list[StreamSpec]
+    attach_buses(sensory, motor)
+    step()                       # replaces act() as the tick driver
+
+Programs publish StreamEvents onto the sensory bus and drain actions from
+the motor bus; `observe()`/`reward()` remain as the legacy pull-style path
+until the migration completes.  See docs/program-interface.md.
 """
 
 from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.observation import Observation
 from cognitive_runtime.core.reward import RewardSignal
+
+if TYPE_CHECKING:  # avoid a runtime cycle: core.streams.shim imports Program
+    from cognitive_runtime.core.streams import (
+        MotorStreamBus,
+        SensoryStreamBus,
+        StreamSpec,
+    )
 
 
 @dataclass
@@ -88,3 +105,47 @@ class Program(abc.ABC):
     def episode_stats(self) -> Dict[str, Any]:
         """Program-specific statistics for the episode summary (optional)."""
         return {}
+
+    # -------------------------------------------------- streams-first contract
+
+    def stream_catalog(self) -> "List[StreamSpec]":
+        """The streams this Program publishes (sensory, event, reward).
+
+        Default: empty — a legacy pull-style Program.  Wrap those in
+        ``ObservationStreamShim`` to get generic streams.
+        """
+        return []
+
+    def attach_buses(
+        self, sensory: "SensoryStreamBus", motor: "MotorStreamBus"
+    ) -> None:
+        """Connect the Program to its buses.
+
+        Stream-native Programs register their catalog on the sensory bus and
+        publish an initial full snapshot per stream so subscribers never
+        start blind.  The default just stores the buses for subclasses.
+        """
+        self._sensory_bus = sensory
+        self._motor_bus = motor
+
+    def step(self) -> None:
+        """Advance one program tick: drain pending motor events, apply them,
+        advance the world, publish sensory/reward/event streams for this tick.
+
+        Contract:
+        - Replaces ``act(action)`` as the tick driver.  Motor events drained
+          this tick are applied in deterministic order; **zero motor events
+          is a NULL tick** — the world still advances (hunger drains, mobs
+          move, time passes).
+        - Every publication uses simulated time and flows through the bus so
+          sequence numbers stay per-stream monotonic.
+        - Invalid motor events are rejected by publishing
+          ``event.action_rejected`` (payload: reason) rather than raising —
+          the world still steps.
+        - ``reset(seed)`` must also reset both buses and republish
+          initial-state events.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} is a legacy pull-style Program; drive it "
+            "through observe()/act() or wrap it in ObservationStreamShim"
+        )

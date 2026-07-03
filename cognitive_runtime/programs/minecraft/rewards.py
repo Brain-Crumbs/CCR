@@ -20,12 +20,15 @@ can emit `new_item:<tool>` / `created_light_source` events.
 
 from __future__ import annotations
 
+import hashlib
+import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, List, Set
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.reward import RewardSignal
+from cognitive_runtime.core.streams.events import StreamEvent
 
 TOOL_ITEMS = {"wooden_pickaxe", "wooden_axe", "wooden_sword", "wooden_shovel"}
 FOOD_ITEM_NAMES = {"berries", "apple", "bread", "cooked_meat"}
@@ -104,6 +107,9 @@ class SurvivalReward:
         self._null_streak = 0
         self._seen_obs_hashes: Set[str] = set()
         self._ticks_since_novel = 0
+        # Stream-path state: latest value per stream + spawn position.
+        self._latest_streams: Dict[str, Any] = {}
+        self._spawn: Optional[Tuple[float, float]] = None
 
     # ------------------------------------------------------------------ eval
 
@@ -113,6 +119,84 @@ class SurvivalReward:
         events: List[str],
         action: Action,
         observation_hash: str,
+    ) -> RewardSignal:
+        """Legacy pull-style entry point: inputs from a whole Observation."""
+        return self._evaluate(
+            health=float(obs_data.get("health", 0.0)),
+            hunger=float(obs_data.get("hunger", 0.0)),
+            nearby_blocks=obs_data.get("nearby_blocks", []),
+            biome=obs_data.get("biome"),
+            distance=float(obs_data.get("distance_from_spawn", 0.0)),
+            mobs_visible=bool(obs_data.get("mobs")),
+            events=events,
+            action=action,
+            novelty_hash=observation_hash,
+        )
+
+    def prime_stream_state(self, stream_events: List[StreamEvent]) -> None:
+        """Absorb state stream values without evaluating a tick.
+
+        Called with the initial post-reset snapshot so the latest-value
+        cache (and the spawn position) is populated before the first tick.
+        """
+        for event in stream_events:
+            if event.modality in ("body", "vision", "spatial", "world"):
+                self._latest_streams[event.stream_id] = event.payload
+                if self._spawn is None and event.stream_id == "spatial.position":
+                    self._spawn = (event.payload["x"], event.payload["z"])
+
+    def evaluate_stream_window(
+        self, stream_events: List[StreamEvent], action: Action
+    ) -> RewardSignal:
+        """Stream-native entry point: same rules, inputs from the tick's
+        sensory stream events.
+
+        On-change publishing means the latest published value of a state
+        stream *is* the current value, so a per-stream latest cache stands
+        in for the whole observation.  Novelty hashes the tick's sensory
+        events instead of the whole-observation hash.
+        """
+        semantic_events: List[str] = []
+        for event in stream_events:
+            self.prime_stream_state([event])
+            translated = _SEMANTIC_EVENTS.get(event.stream_id)
+            if translated is not None:
+                semantic_events.append(translated(event.payload))
+
+        latest = self._latest_streams
+        position = latest.get("spatial.position")
+        distance = 0.0
+        if position is not None and self._spawn is not None:
+            distance = round(
+                math.dist((position["x"], position["z"]), self._spawn), 2
+            )
+        window_digest = hashlib.sha1(
+            "".join(e.hash() for e in stream_events).encode("utf-8")
+        ).hexdigest()
+
+        return self._evaluate(
+            health=float(latest.get("body.health", 0.0)),
+            hunger=float(latest.get("body.hunger", 0.0)),
+            nearby_blocks=latest.get("world.nearby_blocks", []),
+            biome=latest.get("world.biome"),
+            distance=distance,
+            mobs_visible=bool(latest.get("vision.entities")),
+            events=semantic_events,
+            action=action,
+            novelty_hash=window_digest,
+        )
+
+    def _evaluate(
+        self,
+        health: float,
+        hunger: float,
+        nearby_blocks: List[List[str]],
+        biome: Optional[str],
+        distance: float,
+        mobs_visible: bool,
+        events: List[str],
+        action: Action,
+        novelty_hash: str,
     ) -> RewardSignal:
         cfg = self.cfg
         components: Dict[str, float] = {}
@@ -125,8 +209,6 @@ class SurvivalReward:
             components["tick_alive"] = cfg.tick_alive
 
         # ---------------------------------------------------- body state
-        health = float(obs_data.get("health", 0.0))
-        hunger = float(obs_data.get("hunger", 0.0))
         damage_events = sum(1 for e in events if e.startswith("damage:"))
         if damage_events:
             components["damage_taken"] = cfg.damage_taken * damage_events
@@ -155,7 +237,7 @@ class SurvivalReward:
 
         # --------------------------------------------------- exploration
         block_bonus = 0.0
-        for row in obs_data.get("nearby_blocks", []):
+        for row in nearby_blocks:
             for block in row:
                 if block not in self._seen_blocks:
                     self._seen_blocks.add(block)
@@ -165,7 +247,6 @@ class SurvivalReward:
             components["new_block_type"] = block_bonus
             self._block_reward_total += block_bonus
 
-        biome = obs_data.get("biome")
         if biome and biome not in self._seen_biomes:
             self._seen_biomes.add(biome)
             bonus = min(cfg.new_biome, cfg.new_biome_cap - self._biome_reward_total)
@@ -173,7 +254,6 @@ class SurvivalReward:
                 components["new_biome"] = bonus
                 self._biome_reward_total += bonus
 
-        distance = float(obs_data.get("distance_from_spawn", 0.0))
         while (
             distance >= self._max_distance_rewarded + cfg.distance_unit
             and self._distance_reward_total < cfg.distance_cap
@@ -229,7 +309,7 @@ class SurvivalReward:
             self._null_streak += 1
         else:
             self._null_streak = 0
-        threatened = bool(obs_data.get("mobs")) or health < 10.0
+        threatened = mobs_visible or health < 10.0
         if self._null_streak > cfg.idle_threshold and not threatened:
             components["idle"] = cfg.idle
 
@@ -240,13 +320,27 @@ class SurvivalReward:
             components["spinning"] = cfg.spinning
             self._recent_actions.clear()
 
-        if observation_hash in self._seen_obs_hashes:
+        if novelty_hash in self._seen_obs_hashes:
             self._ticks_since_novel += 1
         else:
-            self._seen_obs_hashes.add(observation_hash)
+            self._seen_obs_hashes.add(novelty_hash)
             self._ticks_since_novel = 0
         if self._ticks_since_novel >= cfg.no_novelty_ticks:
             components["no_novelty"] = cfg.no_novelty
             self._ticks_since_novel = 0
 
         return RewardSignal.from_components(components, events=tuple(events))
+
+
+# Stream event → legacy semantic event string, so the reward core keeps
+# reading the exact event vocabulary it always has.
+_SEMANTIC_EVENTS = {
+    "event.damage_taken": lambda p: f"damage:{p['reason']}",
+    "event.item_collected": lambda p: f"new_item:{p['item']}",
+    "event.block_broken": lambda p: f"broke_block:{p['block']}",
+    "event.block_placed": lambda p: "placed_block",
+    "event.food_eaten": lambda p: "ate_food",
+    "event.entered_shelter": lambda p: "entered_shelter",
+    "event.survived_night": lambda p: "survived_night",
+    "event.died": lambda p: "died",
+}

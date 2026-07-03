@@ -23,6 +23,68 @@ episode_stats() -> dict            # optional: program-specific summary stats
 This allows the same runtime to move between Minecraft, ToyOS, a VM, or a
 future AI-native operating system without modification.
 
+## The streams-first contract (interface v2)
+
+The interface is migrating from pull-style observations to **time-indexed
+streams** (see [streams.md](streams.md)): instead of the runtime pulling
+`observe() -> Observation`, Programs publish `StreamEvent`s onto a
+`SensoryStreamBus` and drain actions from a `MotorStreamBus`. Three methods
+carry the new contract:
+
+```python
+stream_catalog() -> list[StreamSpec]     # streams this Program publishes
+attach_buses(sensory, motor)             # register catalog, publish initial snapshot
+step()                                   # advance one program tick
+```
+
+Contract details:
+
+- **`step()` replaces `act(action)` as the tick driver.** It drains pending
+  motor events, applies them in deterministic order, advances the world one
+  tick, and publishes this tick's sensory/reward/event streams. **Zero
+  motor events is a NULL tick** — the world still advances: hunger drains,
+  mobs move, time passes.
+- **Motor events** are `motor.command` events with payload
+  `{"action": <Action.key()>}` (`core/streams/motor.py`). The action space
+  stays program-defined and opaque to the runtime.
+- **Invalid motor events never raise.** Malformed or out-of-space commands
+  are rejected by publishing `event.action_rejected` (payload: reason);
+  the world steps anyway.
+- **Every publication uses simulated time** and flows through the bus so
+  per-stream sequence numbers stay monotonic.
+- **`reset(seed)` also resets both buses** (`bus.reset()`) and republishes
+  an initial full snapshot per stream, so subscribers never start blind.
+- **Reward is a stream too**: publish `reward.scalar`
+  (`{"value", "components"}`) every tick; semantic happenings are
+  irregular `event.*` streams.
+
+### Cadence guidance
+
+Publish each stream at its native rate, not everything every tick:
+vision per tick; body vitals on change plus a heartbeat (so silence is
+distinguishable from a dead sensor); spatial/world state on change;
+events irregularly; reward per tick. `DeltaPublisher`
+(`core/streams/delta.py`) keeps the on-change detection in one place.
+
+### Migrating a legacy Program
+
+1. Wrap it: `ObservationStreamShim(program)` (`core/streams/shim.py`)
+   publishes generic streams by diffing consecutive `observe()` results —
+   one `observation.<key>` stream per top-level data key, the frame as
+   `vision.frame.grid`. This keeps any pull-style Program runnable on the
+   stream substrate with zero changes.
+2. Then migrate for real: define a `StreamSpec` catalog with native
+   cadences and modality-prefixed ids, implement
+   `attach_buses()`/`step()`, and move reward emission onto
+   `reward.scalar`. `programs/minecraft/streams.py` +
+   `MinecraftSurvivalBox.step()` are the reference migration.
+3. The reverse view, `LatestValueView(buffer).to_observation()`,
+   reconstructs an Observation-shaped snapshot from latest stream values
+   for observation-based policies and featurizers.
+
+During the migration `observe()`/`act()`/`reward()` remain the loop's
+path; the sections below describe that legacy contract.
+
 ## Contract details
 
 ### Ticks
