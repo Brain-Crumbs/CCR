@@ -57,7 +57,6 @@ def _scripted_trace(seed, n_ticks):
     actions = []
     for _ in range(n_ticks):
         state = perception.encode(program.observe())
-        memory.update(state)
         action = policy.decide(state, memory, None)
         actions.append(action)
         memory.record_action(action)

@@ -48,10 +48,10 @@ about any specific world.
 | Observation | `core/observation.py` | Timestamped structured data + optional frame; content-hashable for replay/novelty |
 | Action | `core/action.py` | Opaque named action with params; `NULL_ACTION` is first-class |
 | Perception | `core/perception.py` | Encodes observations into runtime state (generic numeric flattening in the MVP) |
-| Memory | `core/memory.py` | Bounded window of states/actions/hashes; novelty, repetition and trend signals |
-| WorldModel | `core/world_model.py` | Predicts future state; MVP ships a trend extrapolator with a generic risk heuristic |
-| Policy | `core/policy.py` | `decide(state, memory, prediction) -> Action` |
-| Learner | `core/learner.py` | Online `(obs, action, reward)` hook; MVP learns offline via behavioral cloning |
+| Memory | `core/memory.py` | Stream-native: a `TemporalBuffer` of recent events + latent tokens + motor emissions; novelty, repetition and per-stream trend signals |
+| WorldModel | `core/world_model.py` | Predicts from per-stream trends in memory; MVP ships a trend extrapolator with a generic vital-risk heuristic |
+| Policy | `core/policy.py` | `emit(state, memory, prediction) -> list[Action]` (`[]` == NULL); `SingleActionPolicy` adapts one-action-per-tick policies |
+| Learner | `core/learner.py` | Online `update(window)` hook reading `reward.scalar`; MVP learns offline via behavioral cloning |
 | RewardSignal | `core/reward.py` | Scalar value + named components + semantic events |
 | Streams | `core/streams/` | Time-indexed sensory/motor stream primitives (Phase 0, not yet wired into the loop); see [streams.md](streams.md) |
 
@@ -59,34 +59,72 @@ The runtime machinery lives in `cognitive_runtime/runtime/`:
 
 | Component | Module | Role |
 |---|---|---|
-| CognitiveRuntime | `runtime/loop.py` | The continuous loop; runs episodes back to back |
+| CognitiveRuntime | `runtime/loop.py` | The continuous loop (v2: cognitive ticks over stream windows); runs episodes back to back |
+| Streams | `core/streams/` | Buses, `TemporalBuffer`, `TickSynchronizer`, encoders — the sensory/motor substrate ([streams.md](streams.md)) |
 | FixedTickScheduler | `runtime/scheduler.py` | Holds a fixed tick rate (realtime) or fast-forwards; tracks missed ticks |
-| Recorder | `runtime/recorder.py` | JSONL tick records + episode summaries per session |
-| Replay | `runtime/replay.py` | Re-simulates recorded actions and verifies observation hashes |
+| Recorder | `runtime/recorder.py` | JSONL tick records + episode summaries (incl. per-stream rates) per session |
+| Replay | `runtime/replay.py` | Re-injects recorded motor emissions through `step()` and verifies observation hashes |
 
-## The loop
+## The loop (v2: cognitive ticks over stream windows)
+
+The runtime no longer asks "what is the current observation?" — it asks
+**"what streams have arrived since the last cognitive tick?"** (see
+[streams.md](streams.md)):
 
 ```python
 while running:
-    observation = program.observe()
-    state       = perception.encode(observation)
-    memory.update(state)
-    prediction  = world_model.predict(state, memory)
-    action      = policy.decide(state, memory, prediction)
-    program.act(action)                  # NULL is a real action
-    reward      = program.reward()
-    learner.update(observation, action, reward)
+    scheduler.wait_for_next_tick()
+    for _ in range(program_ticks_per_cognitive_tick):
+        program.step()                          # drains motor bus, publishes streams
+    window  = synchronizer.collect(sensory_bus) # events since the last cognitive tick
+    tokens  = encoders.encode_window(window)
+    memory.update(window, tokens)               # TemporalBuffer + latent tokens
+    pred    = world_model.predict(state, memory)
+    motor   = policy.emit(state, memory, pred)  # list of motor emissions; [] == NULL
+    for action in motor: motor_bus.publish(...)
+    learner.update(window)                      # reads reward.scalar from the window
     recorder.write_tick(...)
 ```
 
+### One-tick actuation latency
+
+Motor emissions from cognitive tick *t* sit on the motor bus and are applied
+by `program.step()` at the **start of tick *t+1***. This one-tick latency is
+intentional — it is how real sensorimotor loops behave — and it is stable
+and documented because **replay and reward attribution depend on it**.
+Replay mirrors the loop exactly (`step()` + the motor bus in the same
+order), so recorded sessions still reproduce byte-for-byte: reset with the
+recorded seed, re-inject the recorded motor emissions, and every
+compatibility-observation hash must match.
+
+### Cognitive vs program ticks
+
+`program_ticks_per_cognitive_tick` (default 1) decouples the decision rate
+from the world rate: with a ratio of *N* the world advances *N* program
+ticks per decision, and the every-tick streams (vision, `world.time`,
+`reward.scalar`) arrive **batched** *N*-to-a-window. The world still moves
+every program tick; the agent simply decides less often.
+
 Notes:
 
-- The Program advances exactly one tick per `act()` call, including NULL.
-  This makes recorded sessions exactly replayable: reset with the recorded
-  seed, feed back the recorded actions, and every observation hash must match.
-- Decision latency (perception → decision) is measured per tick and recorded.
-- Timestamps inside observations are *simulated* time so that hashing and
-  replay are wall-clock independent.
+- **NULL is a real action.** An empty motor emission is an explicit,
+  recorded decision (`selected_action == "NULL"`), counted in
+  `EpisodeSummary.null_action_ticks`. The world still advances on a NULL
+  tick (hunger drains, mobs move, time passes) and still publishes
+  `reward.scalar`.
+- **Perception is retired from the loop.** A `StreamEncoderRegistry` of
+  passthrough encoders turns the window into latent tokens in place of the
+  old `StructuredPerception` (real modality encoders are Phase 4).
+- **Compatibility bridge.** `program.observe()` remains as the sanctioned
+  Phase-2 shim that feeds observation-based policies and the recorder /
+  featurizer, until Phase 4 moves them onto latent tokens. The *primary*
+  data path — memory, encoders, world model, learner, recording — is
+  stream-based.
+- Decision latency (window collection → motor emission) is measured per
+  cognitive tick and recorded, alongside per-stream event rates and
+  silent-stream gaps.
+- Timestamps inside stream events and observations are *simulated* time so
+  that hashing and replay are wall-clock independent.
 
 ## Determinism and replay
 

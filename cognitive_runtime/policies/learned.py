@@ -13,13 +13,13 @@ from typing import Deque, Optional
 from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.perception import State
-from cognitive_runtime.core.policy import Policy
+from cognitive_runtime.core.policy import SingleActionPolicy
 from cognitive_runtime.core.world_model import Prediction
 from cognitive_runtime.training.features import featurize
 from cognitive_runtime.training.imitation import BCModel
 
 
-class LearnedPolicy(Policy):
+class LearnedPolicy(SingleActionPolicy):
     name = "learned"
 
     def __init__(self, model: BCModel | str, history: int = 8):

@@ -48,6 +48,10 @@ class EpisodeSummary:
     avg_latency_ms: float = 0.0
     ticks_per_second: float = 0.0
     missed_ticks: int = 0
+    program_ticks_per_cognitive_tick: int = 1
+    # Runtime health: events/sec per stream_id, and streams that fell silent.
+    stream_event_rates: Dict[str, float] = field(default_factory=dict)
+    silent_streams: list = field(default_factory=list)
     program_stats: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:

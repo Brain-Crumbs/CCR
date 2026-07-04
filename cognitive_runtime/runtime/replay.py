@@ -3,10 +3,16 @@
 Two capabilities:
 
 1. Load recorded traces for inspection (episode viewer, dataset building).
-2. Re-simulate: feed the recorded actions back into a fresh Program reset
-   with the recorded seed and verify that every observation hash matches.
-   If hashes diverge, determinism is broken and the session cannot be
-   trusted for debugging or training.
+2. Re-simulate: feed the recorded motor emissions back into a fresh Program
+   reset with the recorded seed and verify that every observation hash
+   matches.  If hashes diverge, determinism is broken and the session
+   cannot be trusted for debugging or training.
+
+Replay mirrors the loop v2 exactly — driving the Program through
+`step()` + the motor bus with the same one-tick actuation latency — so the
+recorded trajectory reproduces byte-for-byte.  (Stream-native replay
+verification against recorded stream hashes is Phase 3; this is the Phase-2
+stopgap over the legacy tick records.)
 """
 
 from __future__ import annotations
@@ -17,7 +23,14 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from cognitive_runtime.core.action import Action
+from cognitive_runtime.core.learner import window_reward
 from cognitive_runtime.core.program import Program
+from cognitive_runtime.core.streams import (
+    MotorStreamBus,
+    SensoryStreamBus,
+    TickSynchronizer,
+    publish_motor_command,
+)
 
 
 def load_session_metadata(session_dir: str) -> Dict[str, Any]:
@@ -65,11 +78,23 @@ def replay_episode(
     session_dir: str,
     episode_id: str,
     verify: bool = True,
+    program_ticks_per_cognitive_tick: int = 1,
 ) -> ReplayResult:
-    """Re-run the recorded actions through a fresh Program instance."""
+    """Re-run the recorded motor emissions through a fresh Program instance.
+
+    Mirrors loop v2: each cognitive tick steps the program `ratio` times
+    (draining the motor bus, which carries the previous tick's recorded
+    emission), rebuilds the compatibility observation, verifies its hash,
+    then re-publishes this record's emission for the next step.
+    """
     records, summary = load_episode(session_dir, episode_id)
     seed = int(summary.get("seed", 0))
+    ratio = int(summary.get("program_ticks_per_cognitive_tick",
+                            program_ticks_per_cognitive_tick))
+    sensory_bus, motor_bus = SensoryStreamBus(), MotorStreamBus()
+    program.attach_buses(sensory_bus, motor_bus)
     program.reset(seed=seed)
+    synchronizer = TickSynchronizer(program_ticks_per_cognitive_tick=ratio)
 
     matched = True
     first_divergence: Optional[int] = None
@@ -77,15 +102,19 @@ def replay_episode(
     ticks = 0
 
     for record in records:
+        for _ in range(ratio):
+            program.step()
         observation = program.observe()
+        window = synchronizer.collect(sensory_bus, now=observation.timestamp)
         if verify and observation.hash() != record["observation_hash"]:
             matched = False
             first_divergence = record["tick_id"]
             break
-        action = Action.from_key(record["selected_action"])
-        program.act(action)
-        reward_replayed += program.reward().value
+        reward_replayed += window_reward(window)
         ticks += 1
+        selected = record["selected_action"]
+        if selected != "NULL":
+            publish_motor_command(motor_bus, Action.from_key(selected), observation.timestamp)
         if program.is_complete() and ticks < len(records):
             # Recorded episode continued past completion: divergence.
             matched = False

@@ -11,11 +11,11 @@ from typing import List, Optional
 from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.perception import State
-from cognitive_runtime.core.policy import Policy
+from cognitive_runtime.core.policy import SingleActionPolicy
 from cognitive_runtime.core.world_model import Prediction
 
 
-class RandomPolicy(Policy):
+class RandomPolicy(SingleActionPolicy):
     name = "random"
 
     def __init__(self, action_space: List[Action], seed: int = 0):

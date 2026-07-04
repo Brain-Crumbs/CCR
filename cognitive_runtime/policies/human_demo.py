@@ -19,7 +19,7 @@ from typing import Dict, Optional
 from cognitive_runtime.core.action import NULL_ACTION, Action
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.perception import State
-from cognitive_runtime.core.policy import Policy
+from cognitive_runtime.core.policy import SingleActionPolicy
 from cognitive_runtime.core.world_model import Prediction
 
 _KEYMAP: Dict[str, Action] = {
@@ -44,7 +44,7 @@ for _i in range(1, 10):
 _FRAME_GLYPHS = {1: ".", 2: ",", 3: "~", 4: "≈", 5: "T", 6: "#", 7: "*", 8: "%", 9: "▒", 10: "█", 90: "Z", 99: "@"}
 
 
-class HumanDemoPolicy(Policy):
+class HumanDemoPolicy(SingleActionPolicy):
     """Blocking terminal input each tick.  Use with realtime=False and a
     low tick budget; every tick waits for the human."""
 

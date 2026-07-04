@@ -20,6 +20,9 @@ class RuntimeConfig:
     record_frames: bool = False        # frames are bulky; opt in
     session_id: Optional[str] = None
     memory_capacity: int = 512
+    # Cognitive ticks can run slower than program ticks: the loop steps the
+    # program this many times per cognitive tick (Phase 2, default 1).
+    program_ticks_per_cognitive_tick: int = 1
     program_config: Dict[str, Any] = field(default_factory=dict)
 
     def resolved_session_id(self, policy_name: str) -> str:

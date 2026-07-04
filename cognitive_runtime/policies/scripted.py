@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional
 from cognitive_runtime.core.action import NULL_ACTION, Action
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.perception import State
-from cognitive_runtime.core.policy import Policy
+from cognitive_runtime.core.policy import SingleActionPolicy
 from cognitive_runtime.core.world_model import Prediction
 
 _MOVE = Action("MOVE_FORWARD")
@@ -37,7 +37,7 @@ _HARVESTABLE = {"berry_bush", "tree", "stone", "coal_ore"}
 _IMPASSABLE = {"barrier", "placed_block"}
 
 
-class ScriptedSurvivalPolicy(Policy):
+class ScriptedSurvivalPolicy(SingleActionPolicy):
     name = "scripted"
 
     def __init__(self, seed: int = 0):

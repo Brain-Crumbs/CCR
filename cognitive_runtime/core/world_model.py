@@ -1,17 +1,24 @@
-"""World model: predict future state from current state and memory.
+"""World model: predict where things are heading from memory.
 
-The MVP ships a trivial trend extrapolator.  The interface exists so a
-learned dynamics model can replace it without touching the loop.
+The MVP ships a trivial trend extrapolator.  Loop v2: it reads per-stream
+numeric slopes from the :class:`Memory` `TemporalBuffer` instead of a
+flattened feature dict.  Same semantics: vitals trending down ⇒ risk.  The
+interface exists so a learned dynamics model can replace it without touching
+the loop.
 """
 
 from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, List
 
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.perception import State
+
+#: Streams treated as vitals for the generic risk heuristic.  Generic ids,
+#: not environment fields: any Program publishing these gets risk sensing.
+VITAL_STREAMS: List[str] = ["body.health", "body.hunger", "body.oxygen"]
 
 
 @dataclass
@@ -30,24 +37,24 @@ class WorldModel(abc.ABC):
 
 
 class TrendWorldModel(WorldModel):
-    """Linear extrapolation of each numeric feature over a short horizon."""
+    """Linear extrapolation of each numeric vital stream over a short horizon."""
 
-    def __init__(self, horizon: int = 10, window: int = 16):
+    def __init__(self, horizon: int = 10, window: int = 16,
+                 vitals: List[str] | None = None):
         self.horizon = horizon
         self.window = window
+        self.vitals = list(vitals) if vitals is not None else list(VITAL_STREAMS)
 
     def predict(self, state: State, memory: Memory) -> Prediction:
         expected: Dict[str, float] = {}
         risk = 0.0
-        for name, value in state.features.items():
-            slope = memory.feature_trend(name, self.window)
-            expected[name] = value + slope * self.horizon
-        # Generic risk heuristic: any feature that looks like a vital
-        # ("health", "hunger", "oxygen") and is trending down raises risk.
-        for name, value in state.features.items():
-            leaf = name.rsplit(".", 1)[-1]
-            if leaf in ("health", "hunger", "oxygen"):
-                slope = memory.feature_trend(name, self.window)
-                if slope < 0:
-                    risk = min(1.0, risk + min(1.0, -slope * self.horizon / max(value, 1.0)))
+        for stream_id in self.vitals:
+            latest = memory.buffer.latest(stream_id)
+            if latest is None or not isinstance(latest.payload, (int, float)):
+                continue
+            value = float(latest.payload)
+            slope = memory.stream_trend(stream_id, self.window)
+            expected[stream_id] = value + slope * self.horizon
+            if slope < 0:
+                risk = min(1.0, risk + min(1.0, -slope * self.horizon / max(value, 1.0)))
         return Prediction(expected_features=expected, risk=risk)
