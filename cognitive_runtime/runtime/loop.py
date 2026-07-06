@@ -14,7 +14,7 @@ The runtime no longer asks "what is the current observation?" — it asks
         motor   = policy.emit(state, memory, pred)   # [] == NULL
         for action in motor: motor_bus.publish(...)
         learner.update(window)
-        recorder.write_tick(...)
+        recorder.write_cognitive_tick(window.events, motor, decision)
 
 **One-tick actuation latency.** Motor events emitted at cognitive tick *t*
 sit on the motor bus and are applied by `program.step()` at the start of
@@ -49,10 +49,10 @@ from cognitive_runtime.core.streams import (
 from cognitive_runtime.core.world_model import TrendWorldModel, WorldModel
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.recorder import (
+    DecisionRecord,
     EpisodeSummary,
     NullRecorder,
     Recorder,
-    TickRecord,
 )
 from cognitive_runtime.runtime.scheduler import FixedTickScheduler
 
@@ -102,8 +102,8 @@ class CognitiveRuntime:
             self.recorder = Recorder(
                 record_dir=self.config.record_dir,
                 session_id=self.config.resolved_session_id(policy.name),
-                record_observations=self.config.record_observations,
-                record_frames=self.config.record_frames,
+                record_streams=self.config.record_streams,
+                exclude_streams=self.config.effective_exclude_streams(),
             )
         else:
             self.recorder = NullRecorder()
@@ -184,16 +184,14 @@ class CognitiveRuntime:
                 self._stop_requested = True
                 break
 
-            for action in emissions:
+            motor_events = [
                 publish_motor_command(self.motor_bus, action, observation.timestamp)
+                for action in emissions
+            ]
             self.memory.record_actions(emissions)
             self.learner.update(window)
 
             reward_value = window_reward(window)
-            components = _aggregate_components(window)
-            # window.by_stream only holds streams that fired this window.
-            events = sorted(sid for sid in window.by_stream if sid.startswith("event."))
-            selected = emissions[0].key() if emissions else "NULL"
             total_reward += reward_value
             latency_total_ms += latency_ms
             last_timestamp = observation.timestamp
@@ -201,22 +199,20 @@ class CognitiveRuntime:
                 null_ticks += 1
             ticks += 1
 
-            self.recorder.write_tick(
-                TickRecord(
-                    session_id=self.recorder.session_id,
-                    episode_id=episode_id,
-                    tick_id=observation.tick,
-                    timestamp=observation.timestamp,
-                    observation_hash=observation.hash(),
-                    selected_action=selected,
-                    action_ok=True,
-                    reward=round(reward_value, 6),
-                    reward_components=components,
-                    events=events,
+            self.recorder.write_cognitive_tick(
+                sensory_events=window.events,
+                motor_events=motor_events,
+                decision=DecisionRecord(
+                    tick_index=window.tick_index,
+                    window_span=[round(window.started_at, 3), round(window.ended_at, 3)],
+                    n_events_by_stream={
+                        sid: len(evs) for sid, evs in sorted(window.by_stream.items())
+                    },
+                    motor_emitted=[event.hash() for event in motor_events],
                     policy_name=self.policy.name,
                     latency_ms=round(latency_ms, 3),
-                    observation=observation.to_dict(include_frame=True),
-                )
+                    reward_window_total=round(reward_value, 6),
+                ),
             )
 
         stats = self.program.episode_stats()
@@ -237,6 +233,7 @@ class CognitiveRuntime:
             missed_ticks=self.scheduler.stats.missed_ticks,
             program_ticks_per_cognitive_tick=ratio,
             stream_event_rates=self._stream_rates(last_timestamp),
+            stream_event_counts=dict(sorted(self.synchronizer.arrival_counts().items())),
             silent_streams=self.synchronizer.silent_streams(min_windows=1),
             program_stats=stats,
         )
@@ -250,15 +247,3 @@ class CognitiveRuntime:
         if sim_elapsed <= 0:
             return {sid: 0.0 for sid in sorted(counts)}
         return {sid: round(counts[sid] / sim_elapsed, 3) for sid in sorted(counts)}
-
-
-def _aggregate_components(window) -> dict:
-    """Sum reward.scalar component dicts across a window."""
-    components: dict = {}
-    for event in window.by_stream.get("reward.scalar", []):
-        payload = event.payload
-        if isinstance(payload, dict):
-            for name, value in (payload.get("components") or {}).items():
-                if isinstance(value, (int, float)):
-                    components[name] = round(components.get(name, 0.0) + float(value), 6)
-    return components

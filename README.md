@@ -79,7 +79,7 @@ while running:
     motor      = policy.emit(state, memory, prediction)  # [] == NULL
     for action in motor: motor_bus.publish(...)          # applied next tick
     learner.update(window)
-    recorder.write_tick(...)
+    recorder.write_cognitive_tick(window.events, motor, decision)  # streams-v2 log
 ```
 
 **NULL is a real action.** An empty motor emission is an explicit, recorded
@@ -94,7 +94,7 @@ cognitive_runtime/
   core/        Program interface, Action/Observation/Reward, Policy,
                Perception, Memory, WorldModel, Learner  (environment-agnostic)
   runtime/     continuous loop, fixed-tick scheduler, config,
-               recorder (JSONL ticks + episode summaries), replay/verify
+               recorder (streams-v2: stream log + decisions + summaries), replay/verify
   programs/
     minecraft/ SurvivalBox adapter, simulated backend, observations,
                actions, survival reward, evaluation metrics

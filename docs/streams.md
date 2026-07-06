@@ -99,15 +99,17 @@ carry it forward:
    order out, regardless of publisher interleaving.
 4. **Content hashes.** `StreamEvent.hash()` covers
    `(stream_id, sequence_number, timestamp, payload)` via canonical JSON —
-   the unit of replay verification (Phase 3): re-inject recorded motor
-   streams and every sensory stream hash must match.
+   the unit of replay verification (streams-v2, Phase 3): re-inject the
+   recorded motor stream and every regenerated sensory stream hash must match
+   the log in order.
 5. **Environment-agnostic.** Nothing under `core/streams/` imports from
    `programs/` (enforced by a test).
 
 ## Migration status
 
-Phase 0 (this document) is additive only. Subsequent phases: Program
+Phase 0 (this document) is additive only. Completed phases: Program
 interface v2 (programs publish/consume streams), runtime loop v2 (cognitive
-ticks over stream windows), stream-native recording/replay, real encoders,
-and real-time multi-rate streaming. See the tracking issue for the full
+ticks over stream windows), and stream-native recording/replay + tools
+(streams-v2). Remaining: real modality encoders, and real-time multi-rate
+streaming. See the tracking issue for the full
 plan.

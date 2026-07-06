@@ -9,7 +9,7 @@ and the online LearnedPolicy, and must stay identical between them.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
 
@@ -33,6 +33,48 @@ FEATURE_NAMES: List[str] = (
     ]
     + [f"last_action:{key}" for key in ACTION_KEYS]
 )
+
+
+def observation_data_from_streams(
+    stream_data: Dict[str, Any], spawn: Optional[Tuple[float, float]] = None
+) -> Dict[str, Any]:
+    """Flatten a stream-keyed ``LatestValueView`` snapshot into the flat
+    observation keys :func:`featurize` reads.
+
+    The SurvivalBox publisher maps observation fields onto generic streams
+    (``body.health``, ``world.time``, ...); this is the inverse map so the
+    featurizer runs on the reconstructed stream state exactly as it did on the
+    recorded observation.  ``spawn`` (the tick-0 position) recovers
+    ``distance_from_spawn``, which is not itself a stream.
+    """
+    time = stream_data.get("world.time") or {}
+    rotation = stream_data.get("spatial.rotation") or {}
+    hotbar = stream_data.get("body.hotbar") or {}
+    position = stream_data.get("spatial.position") or {}
+    obs: Dict[str, Any] = {
+        "health": stream_data.get("body.health", 0.0),
+        "hunger": stream_data.get("body.hunger", 0.0),
+        "oxygen": stream_data.get("body.oxygen", 0.0),
+        "time_of_day": time.get("time_of_day", 0),
+        "day_length": time.get("day_length", 1),
+        "is_night": time.get("is_night", False),
+        "yaw": rotation.get("yaw", 0.0),
+        "pitch": rotation.get("pitch", 0.0),
+        "mobs": stream_data.get("vision.entities") or [],
+        "front_block": stream_data.get("world.front_block", "grass"),
+        "nearby_blocks": stream_data.get("world.nearby_blocks") or [],
+        "inventory": stream_data.get("body.inventory") or {},
+        "hotbar": hotbar.get("slots") or [],
+        "selected_slot": hotbar.get("selected", 0),
+        "sheltered": stream_data.get("world.sheltered", False),
+        "biome": stream_data.get("world.biome", ""),
+        "position": position,
+    }
+    if spawn is not None and position:
+        obs["distance_from_spawn"] = math.dist(
+            (position.get("x", 0.0), position.get("z", 0.0)), spawn
+        )
+    return obs
 
 
 def featurize(obs_data: Dict[str, Any], recent_action_keys: Sequence[str]) -> List[float]:
