@@ -64,6 +64,12 @@ def test_cli_end_to_end_flow(tmp_path):
     main(["train", "--sessions", session_dir, "--out", model_path, "--epochs", "3"])
     assert os.path.exists(model_path)
 
+    # The trained latent model drives the runtime end-to-end (inference path).
+    main(["run", "--policy", "learned", "--model", model_path, "--episodes", "1",
+          "--seed", "9", "--episode-ticks", "200", "--world-size", "32",
+          "--record-dir", record_dir, "--session-id", "learned-run"])
+    assert os.path.exists(os.path.join(record_dir, "learned-run", "session.json"))
+
 
 def test_legacy_session_is_rejected(tmp_path):
     session_dir = _record(tmp_path, RandomPolicy(MinecraftSurvivalBox(config=FAST_CONFIG)

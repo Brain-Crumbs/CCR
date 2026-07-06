@@ -18,6 +18,7 @@ from typing import Deque, Dict, List, Optional, Set
 
 from cognitive_runtime.core.action import NULL_ACTION, Action
 from cognitive_runtime.core.streams.encoder_registry import LatentToken
+from cognitive_runtime.core.streams.fusion import LatentState
 from cognitive_runtime.core.streams.shim import LatestValueView
 from cognitive_runtime.core.streams.synchronizer import TickWindow
 from cognitive_runtime.core.streams.temporal_buffer import TemporalBuffer
@@ -57,6 +58,7 @@ class Memory:
         self._seen_hashes: Set[str] = set()
         self._novel_last_update = True
         self._latent_tokens: List[LatentToken] = []
+        self._latent_state: Optional[LatentState] = None
 
     def reset(self) -> None:
         self.buffer.reset()
@@ -65,6 +67,7 @@ class Memory:
         self._seen_hashes.clear()
         self._novel_last_update = True
         self._latent_tokens = []
+        self._latent_state = None
 
     # ------------------------------------------------------------- updates
 
@@ -90,9 +93,17 @@ class Memory:
         """Observation-shaped view over the latest value of each stream."""
         return LatestValueView(self.buffer)
 
-    def latent_state(self) -> List[LatentToken]:
-        """The most recent fused latent tokens (Phase-4 fusion lands here)."""
+    def latent_tokens(self) -> List[LatentToken]:
+        """The most recent per-stream encoded tokens for this window."""
         return self._latent_tokens
+
+    def set_fused_latent(self, state: LatentState) -> None:
+        """Store the fused latent state produced by ``TemporalFusion``."""
+        self._latent_state = state
+
+    def fused_latent(self) -> Optional[LatentState]:
+        """The most recent fused :class:`LatentState`, if the loop computed one."""
+        return self._latent_state
 
     def last_actions(self, n: int) -> List[Action]:
         return list(self.actions)[-n:]

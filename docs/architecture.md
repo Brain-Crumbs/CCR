@@ -48,12 +48,12 @@ about any specific world.
 | Observation | `core/observation.py` | Timestamped structured data + optional frame; content-hashable for replay/novelty |
 | Action | `core/action.py` | Opaque named action with params; `NULL_ACTION` is first-class |
 | Perception | `core/perception.py` | Encodes observations into runtime state (generic numeric flattening in the MVP) |
-| Memory | `core/memory.py` | Stream-native: a `TemporalBuffer` of recent events + latent tokens + motor emissions; novelty, repetition and per-stream trend signals |
+| Memory | `core/memory.py` | Stream-native: a `TemporalBuffer` of recent events + the fused `LatentState` + motor emissions; novelty, repetition and per-stream trend signals |
 | WorldModel | `core/world_model.py` | Predicts from per-stream trends in memory; MVP ships a trend extrapolator with a generic vital-risk heuristic |
 | Policy | `core/policy.py` | `emit(state, memory, prediction) -> list[Action]` (`[]` == NULL); `SingleActionPolicy` adapts one-action-per-tick policies |
 | Learner | `core/learner.py` | Online `update(window)` hook reading `reward.scalar`; MVP learns offline via behavioral cloning |
 | RewardSignal | `core/reward.py` | Scalar value + named components + semantic events |
-| Streams | `core/streams/` | Time-indexed sensory/motor stream primitives (Phase 0, not yet wired into the loop); see [streams.md](streams.md) |
+| Streams | `core/streams/` | Time-indexed sensory/motor primitives, per-modality encoders and `TemporalFusion` producing a fixed-width `LatentState`; see [streams.md](streams.md) |
 
 The runtime machinery lives in `cognitive_runtime/runtime/`:
 

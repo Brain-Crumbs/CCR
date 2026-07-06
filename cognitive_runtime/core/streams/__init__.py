@@ -31,6 +31,18 @@ from cognitive_runtime.core.streams.encoder_registry import (
     StreamEncoder,
     StreamEncoderRegistry,
 )
+from cognitive_runtime.core.streams.encoders import (
+    EntityEncoder,
+    EventEncoder,
+    GridVisionEncoder,
+    ScalarEncoder,
+    SpatialEncoder,
+)
+from cognitive_runtime.core.streams.fusion import (
+    LatentState,
+    TemporalFusion,
+    default_encoder_registry,
+)
 from cognitive_runtime.core.streams.delta import DeltaPublisher
 from cognitive_runtime.core.streams.motor import (
     MOTOR_COMMAND_SPEC,
@@ -61,6 +73,14 @@ __all__ = [
     "StreamEncoder",
     "PassthroughEncoder",
     "StreamEncoderRegistry",
+    "ScalarEncoder",
+    "SpatialEncoder",
+    "GridVisionEncoder",
+    "EventEncoder",
+    "EntityEncoder",
+    "LatentState",
+    "TemporalFusion",
+    "default_encoder_registry",
     "DeltaPublisher",
     "MOTOR_COMMAND_STREAM",
     "MOTOR_COMMAND_SPEC",

@@ -190,6 +190,11 @@ def train_bc(
         action_keys=list(dataset.action_keys),
         weights=weights,
         bias=bias,
-        meta={"metrics": metrics, "sources": dataset.sources},
+        meta={
+            "metrics": metrics,
+            "sources": dataset.sources,
+            "representation": dataset.representation,
+            "layout_hash": dataset.layout_hash,
+        },
     )
     return model, metrics

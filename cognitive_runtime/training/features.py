@@ -15,6 +15,27 @@ from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
 
 ACTION_KEYS: List[str] = [a.key() for a in ACTION_SPACE]
 
+
+def motor_history_features(recent_action_keys: Sequence[str]) -> List[float]:
+    """One-hot of the most recent motor emission over the action space.
+
+    The motor half of the policy input; identical for the handcrafted and
+    latent feature paths so only the sensory representation changes.
+    """
+    last_key = recent_action_keys[-1] if recent_action_keys else None
+    return [1.0 if key == last_key else 0.0 for key in ACTION_KEYS]
+
+
+def latent_features(
+    latent_vector: Sequence[float], recent_action_keys: Sequence[str]
+) -> List[float]:
+    """Policy input on the latent path: fused latent vector + motor history."""
+    return list(latent_vector) + motor_history_features(recent_action_keys)
+
+
+def latent_feature_names(latent_slot_names: Sequence[str]) -> List[str]:
+    return list(latent_slot_names) + [f"last_action:{key}" for key in ACTION_KEYS]
+
 _HARVESTABLE = {"tree", "berry_bush", "stone", "coal_ore"}
 _SOLID = {"tree", "stone", "coal_ore", "berry_bush", "placed_block", "barrier"}
 _FOOD = {"berries"}
