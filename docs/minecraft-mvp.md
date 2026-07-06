@@ -105,11 +105,24 @@ random baseline on survival time and reward (asserted in
 
 ## Recording, replay, metrics
 
-Every tick is recorded (JSONL): tick id, observation hash, structured
-observation, action, reward + components, events, policy, latency. Episode
-summaries add seed, duration, death reason, total reward, distance, items,
-damage, food, blocks broken/placed, success. `replay` re-simulates from the
-seed and verifies every observation hash — if a session cannot be replayed,
+The recorded artifact of a session is the **stream log** (streams-v2), not
+reconstructed observations. Per episode:
+
+- `episode_XXXXX.streams.jsonl` — one line per `StreamEvent`, both directions
+  (`dir: sensory|motor`), in bus-drain order, each with its content `hash`.
+  Streams elided for size (`exclude_streams`) keep a hash-only line so replay
+  stays complete.
+- `episode_XXXXX.decisions.jsonl` — one line per cognitive tick (window span,
+  per-stream event counts, motor emitted, policy, latency, window reward); this
+  is where NULL decisions are visible even though they emit no motor events.
+- `episode_XXXXX.summary.json` — seed, duration, death reason, total reward,
+  distance, items, damage, food, blocks broken/placed, success, and per-stream
+  event counts + rates.
+
+`replay` rebuilds the program from `session.json`, resets with the recorded
+seed, re-injects the recorded **motor** stream tick-aligned, and verifies that
+every re-generated **sensory** event hash matches the log in order (reporting
+the first divergence as stream + seq + tick). If a session cannot be replayed,
 it cannot be debugged or improved seriously.
 
 Metrics (`evaluate` / `dashboard`): survival time, death rate,

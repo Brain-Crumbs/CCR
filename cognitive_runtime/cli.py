@@ -87,6 +87,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         record=not args.no_record,
         record_dir=args.record_dir,
         record_frames=args.record_frames,
+        record_streams=args.record_streams,
+        exclude_streams=args.exclude_streams,
         session_id=args.session_id,
         program_config=program_config,
     )
@@ -117,6 +119,8 @@ def cmd_demo(args: argparse.Namespace) -> None:
     args.realtime = False  # each tick blocks on human input instead
     args.no_record = False
     args.record_frames = True
+    args.record_streams = ["*"]
+    args.exclude_streams = []
     if args.session_id is None:
         import time as _time
         args.session_id = f"{_time.strftime('%Y%m%d-%H%M%S')}-human-demo"
@@ -189,6 +193,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="hold the tick rate in wall-clock time (default: fast-forward)")
     p_run.add_argument("--no-record", action="store_true")
     p_run.add_argument("--record-frames", action="store_true")
+    p_run.add_argument("--record-streams", nargs="+", default=["*"],
+                       help="stream globs to log with full payload (default: all)")
+    p_run.add_argument("--exclude-streams", nargs="+", default=[],
+                       help="stream globs to log hash-only, e.g. vision.*")
     p_run.add_argument("--record-dir", default="sessions")
     p_run.add_argument("--session-id", default=None)
     _add_world_args(p_run)

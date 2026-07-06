@@ -62,8 +62,8 @@ The runtime machinery lives in `cognitive_runtime/runtime/`:
 | CognitiveRuntime | `runtime/loop.py` | The continuous loop (v2: cognitive ticks over stream windows); runs episodes back to back |
 | Streams | `core/streams/` | Buses, `TemporalBuffer`, `TickSynchronizer`, encoders — the sensory/motor substrate ([streams.md](streams.md)) |
 | FixedTickScheduler | `runtime/scheduler.py` | Holds a fixed tick rate (realtime) or fast-forwards; tracks missed ticks |
-| Recorder | `runtime/recorder.py` | JSONL tick records + episode summaries (incl. per-stream rates) per session |
-| Replay | `runtime/replay.py` | Re-injects recorded motor emissions through `step()` and verifies observation hashes |
+| Recorder | `runtime/recorder.py` | Streams-v2 log: `*.streams.jsonl` (every StreamEvent, both directions) + `*.decisions.jsonl` (one cognitive tick each) + episode summaries (per-stream counts/rates) |
+| Replay | `runtime/replay.py` | Re-injects the recorded motor stream tick-aligned through `step()` and verifies every regenerated sensory event hash in order |
 
 ## The loop (v2: cognitive ticks over stream windows)
 
@@ -83,7 +83,7 @@ while running:
     motor   = policy.emit(state, memory, pred)  # list of motor emissions; [] == NULL
     for action in motor: motor_bus.publish(...)
     learner.update(window)                      # reads reward.scalar from the window
-    recorder.write_tick(...)
+    recorder.write_cognitive_tick(window.events, motor, decision)
 ```
 
 ### One-tick actuation latency
@@ -94,8 +94,8 @@ intentional — it is how real sensorimotor loops behave — and it is stable
 and documented because **replay and reward attribution depend on it**.
 Replay mirrors the loop exactly (`step()` + the motor bus in the same
 order), so recorded sessions still reproduce byte-for-byte: reset with the
-recorded seed, re-inject the recorded motor emissions, and every
-compatibility-observation hash must match.
+recorded seed, re-inject the recorded motor stream tick-aligned, and every
+regenerated sensory event hash must match the log in order.
 
 ### Cognitive vs program ticks
 

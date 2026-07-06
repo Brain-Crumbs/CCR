@@ -22,7 +22,7 @@ from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
 from cognitive_runtime.runtime.recorder import EpisodeSummary
-from cognitive_runtime.runtime.replay import load_episode
+from cognitive_runtime.runtime.replay import iter_cognitive_ticks, load_decisions
 from cognitive_runtime.tools.replay_runner import replay_session
 
 FAST_CONFIG = {"episode_ticks": 200, "world_size": 32}
@@ -45,9 +45,16 @@ def _runtime(tmp_path, policy, session_id, config=FAST_CONFIG, seed=0, ratio=1, 
 
 
 def _sequence(session_dir, episode_id="episode_00000"):
-    """Per-tick (sensory hash, motor emission) pairs from a recorded episode."""
-    records, _ = load_episode(session_dir, episode_id)
-    return [(r["observation_hash"], r["selected_action"]) for r in records]
+    """Per-tick (sensory hashes, motor emission hashes) from a recorded episode."""
+    seq = []
+    for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
+        seq.append(
+            (
+                tuple(r["hash"] for r in sensory),
+                tuple(r["hash"] for r in motor),
+            )
+        )
+    return seq
 
 
 # ------------------------------------------------------------ determinism
@@ -77,15 +84,47 @@ def test_replay_detects_tampered_motor_emission(tmp_path):
     runtime = _runtime(tmp_path, RandomPolicy(ACTION_SPACE, seed=3), "tamper", seed=1)
     runtime.run()
     session_dir = os.path.join(str(tmp_path), "tamper")
-    path = os.path.join(session_dir, "episode_00000.jsonl")
+    path = os.path.join(session_dir, "episode_00000.streams.jsonl")
     lines = open(path, encoding="utf-8").read().splitlines()
-    record = json.loads(lines[40])
-    record["selected_action"] = "SPRINT" if record["selected_action"] != "SPRINT" else "ATTACK"
-    lines[40] = json.dumps(record)
+    # Flip one motor payload: the world steps differently, so the regenerated
+    # sensory hashes diverge downstream.
+    for i, line in enumerate(lines):
+        record = json.loads(line)
+        if record["dir"] == "motor":
+            action = record["payload"]["action"]
+            record["payload"]["action"] = "SPRINT" if action != "SPRINT" else "ATTACK"
+            lines[i] = json.dumps(record)
+            break
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
     results = replay_session(session_dir)
     assert not results[0].matched
+
+
+def test_replay_verifies_with_elided_sensory_payloads(tmp_path):
+    """exclude_streams elides vision.* payloads to hash-only lines; replay must
+    still verify tick-for-tick from those hashes."""
+    from cognitive_runtime.runtime.config import RuntimeConfig
+    from cognitive_runtime.runtime.loop import CognitiveRuntime
+
+    config = RuntimeConfig(
+        episodes=1, seed=4, max_ticks_per_episode=200,
+        record_dir=str(tmp_path), session_id="elide",
+        program_config=FAST_CONFIG, exclude_streams=["vision.*"],
+    )
+    CognitiveRuntime(
+        program=MinecraftSurvivalBox(config=FAST_CONFIG),
+        policy=ScriptedSurvivalPolicy(seed=2), config=config,
+    ).run()
+    session_dir = os.path.join(str(tmp_path), "elide")
+    lines = open(
+        os.path.join(session_dir, "episode_00000.streams.jsonl"), encoding="utf-8"
+    ).read().splitlines()
+    elided = [json.loads(l) for l in lines if json.loads(l).get("elided")]
+    assert elided and all("payload" not in r for r in elided)
+    results = replay_session(session_dir)
+    assert results[0].matched
+    assert results[0].ticks_replayed == 200
 
 
 # --------------------------------------------------- NULL-tick accounting
@@ -98,9 +137,10 @@ def test_null_cognitive_ticks_are_counted(tmp_path):
         assert summary.duration_ticks == 200
         assert summary.null_action_ticks == 200  # every emission is []
         assert summary.termination_reason == "episode_ticks"
-    # Every recorded tick is a NULL emission.
-    records, _ = load_episode(os.path.join(str(tmp_path), "nulls"), "episode_00000")
-    assert all(r["selected_action"] == "NULL" for r in records)
+    # Every recorded decision is a NULL emission (no motor events).
+    decisions = load_decisions(os.path.join(str(tmp_path), "nulls"), "episode_00000")
+    assert len(decisions) == 200
+    assert all(d["motor_emitted"] == [] for d in decisions)
 
 
 # --------------------------------------------- cognitive / program ratio

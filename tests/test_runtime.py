@@ -8,7 +8,13 @@ from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
 from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
-from cognitive_runtime.runtime.replay import list_episodes, load_episode
+from cognitive_runtime.runtime.replay import (
+    iter_cognitive_ticks,
+    list_episodes,
+    load_decisions,
+    load_stream_log,
+    load_summary,
+)
 from cognitive_runtime.runtime.scheduler import FixedTickScheduler
 from cognitive_runtime.tools.replay_runner import replay_session
 
@@ -48,22 +54,54 @@ def test_realtime_scheduler_holds_tick_rate():
     assert scheduler.stats.elapsed_seconds >= 20 * (1 / 200.0) * 0.5
 
 
-def test_recorder_writes_ticks_and_summaries(tmp_path):
+def test_recorder_writes_streams_decisions_and_summaries(tmp_path):
     runtime = _make_runtime(tmp_path, RandomPolicy(ACTION_SPACE, seed=1))
     runtime.run()
     session_dir = os.path.join(str(tmp_path), "test-session")
     assert os.path.exists(os.path.join(session_dir, "session.json"))
-    records, summary = load_episode(session_dir, "episode_00000")
-    assert len(records) == 200
-    first = records[0]
-    for key in ("session_id", "episode_id", "tick_id", "timestamp", "observation_hash",
-                "selected_action", "reward", "policy_name", "latency_ms", "observation"):
-        assert key in first, key
+
+    # One decision line per cognitive tick.
+    decisions = load_decisions(session_dir, "episode_00000")
+    assert len(decisions) == 200
+    for key in ("tick_index", "window_span", "n_events_by_stream", "motor_emitted",
+                "policy_name", "latency_ms", "reward_window_total"):
+        assert key in decisions[0], key
+
+    # Every stream line carries the schema fields, both directions present.
+    stream_log = load_stream_log(session_dir, "episode_00000")
+    assert stream_log
+    dirs = {r["dir"] for r in stream_log}
+    assert dirs <= {"sensory", "motor"}
+    for record in stream_log[:5]:
+        for key in ("dir", "stream_id", "modality", "timestamp", "seq", "hash"):
+            assert key in record, key
+
+    summary = load_summary(session_dir, "episode_00000")
     assert summary["seed"] == 0
     assert summary["duration_ticks"] == 200
+    assert summary["stream_event_counts"]  # per-stream counts recorded
+
     with open(os.path.join(session_dir, "session.json"), encoding="utf-8") as fh:
         meta = json.load(fh)
     assert meta["program"] == "MinecraftSurvivalBox"
+    assert meta["format"] == "streams-v2"
+    assert meta["stream_catalog"]  # catalog embedded so tools need no program
+
+
+def test_recorded_lines_round_trip_to_stream_events(tmp_path):
+    from cognitive_runtime.runtime.recorder import stream_event_from_log
+
+    runtime = _make_runtime(tmp_path, RandomPolicy(ACTION_SPACE, seed=1), session_id="rt")
+    runtime.run()
+    session_dir = os.path.join(str(tmp_path), "rt")
+    stream_log = load_stream_log(session_dir, "episode_00000")
+    checked = 0
+    for record in stream_log:
+        if record.get("elided"):
+            continue
+        assert stream_event_from_log(record).hash() == record["hash"]
+        checked += 1
+    assert checked > 0
 
 
 def test_milestone4_replay_verifies_determinism(tmp_path):
@@ -77,19 +115,24 @@ def test_milestone4_replay_verifies_determinism(tmp_path):
         assert results[0].ticks_replayed == 200
 
 
-def test_replay_detects_tampering(tmp_path):
+def test_replay_detects_sensory_tampering(tmp_path):
     runtime = _make_runtime(tmp_path, RandomPolicy(ACTION_SPACE, seed=3), session_id="tamper")
     runtime.run()
     session_dir = os.path.join(str(tmp_path), "tamper")
-    path = os.path.join(session_dir, "episode_00000.jsonl")
+    path = os.path.join(session_dir, "episode_00000.streams.jsonl")
     lines = open(path, encoding="utf-8").read().splitlines()
-    record = json.loads(lines[50])
-    record["selected_action"] = "SPRINT" if record["selected_action"] != "SPRINT" else "ATTACK"
-    lines[50] = json.dumps(record)
+    # Mutate one sensory payload while leaving its recorded hash in place.
+    for i, line in enumerate(lines):
+        record = json.loads(line)
+        if record["dir"] == "sensory" and record.get("stream_id") == "body.hunger":
+            record["payload"] = float(record["payload"]) + 5.0
+            lines[i] = json.dumps(record)
+            break
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
     results = replay_session(session_dir)
     assert not results[0].matched
+    assert results[0].first_divergence_stream == "body.hunger"
 
 
 def test_episodes_use_distinct_seeds(tmp_path):
