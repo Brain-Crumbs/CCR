@@ -16,6 +16,13 @@ from cognitive_runtime.core.action import NULL_ACTION, Action
 from cognitive_runtime.core.observation import Observation
 from cognitive_runtime.core.program import ActionResult, Program, ProgramMetadata
 from cognitive_runtime.core.reward import RewardSignal
+from cognitive_runtime.core.streams.bus import MotorStreamBus, SensoryStreamBus
+from cognitive_runtime.core.streams.events import StreamSpec
+from cognitive_runtime.core.streams.motor import (
+    MOTOR_COMMAND_SPEC,
+    MOTOR_COMMAND_STREAM,
+    action_from_motor_event,
+)
 from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE, HOTBAR_SLOTS
 from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
 from cognitive_runtime.programs.minecraft.observations import (
@@ -23,6 +30,10 @@ from cognitive_runtime.programs.minecraft.observations import (
     build_observation,
 )
 from cognitive_runtime.programs.minecraft.rewards import SurvivalReward, SurvivalRewardConfig
+from cognitive_runtime.programs.minecraft.streams import (
+    SURVIVAL_STREAM_SPECS,
+    SurvivalStreamPublisher,
+)
 from cognitive_runtime.programs.minecraft.world import SimulatedWorld
 
 _VALID_ACTION_NAMES = {a.name for a in ACTION_SPACE}
@@ -129,6 +140,9 @@ class MinecraftSurvivalBox(Program):
         self._last_action: Action = NULL_ACTION
         self._last_reward: RewardSignal = RewardSignal()
         self._seed = 0
+        self._sensory_bus: Optional[SensoryStreamBus] = None
+        self._motor_bus: Optional[MotorStreamBus] = None
+        self._publisher: Optional[SurvivalStreamPublisher] = None
         self.initialize(config)
 
     # ------------------------------------------------------------ interface
@@ -149,20 +163,33 @@ class MinecraftSurvivalBox(Program):
         self._pending_events = []
         self._last_action = NULL_ACTION
         self._last_reward = RewardSignal()
+        if self._sensory_bus is not None:
+            assert self._motor_bus is not None and self._publisher is not None
+            self._sensory_bus.reset()
+            self._motor_bus.reset()
+            self._publisher.reset()
+            self._publish_initial_state()
 
     def observe(self) -> Observation:
         assert self._backend is not None
         timestamp = self._backend.tick() * _SIM_SECONDS_PER_TICK
         return self._backend.observe(timestamp)
 
-    def act(self, action: Action) -> ActionResult:
-        assert self._backend is not None
+    @staticmethod
+    def _validation_error(action: Action) -> Optional[str]:
         if action.name not in _VALID_ACTION_NAMES:
-            return ActionResult(ok=False, info={"error": f"unknown action {action.name}"})
+            return f"unknown action {action.name}"
         if action.name == "SELECT_HOTBAR_SLOT":
             slot = action.param("slot")
             if not isinstance(slot, int) or not 0 <= slot < HOTBAR_SLOTS:
-                return ActionResult(ok=False, info={"error": f"invalid slot {slot!r}"})
+                return f"invalid slot {slot!r}"
+        return None
+
+    def act(self, action: Action) -> ActionResult:
+        assert self._backend is not None
+        error = self._validation_error(action)
+        if error is not None:
+            return ActionResult(ok=False, info={"error": error})
         events = self._backend.step(action)
         self._pending_events = events
         self._last_action = action
@@ -183,6 +210,80 @@ class MinecraftSurvivalBox(Program):
     def is_complete(self) -> bool:
         assert self._backend is not None
         return self._backend.is_dead() or self._backend.tick() >= self._config.episode_ticks
+
+    # ------------------------------------------------- streams-first interface
+
+    def stream_catalog(self) -> List[StreamSpec]:
+        return list(SURVIVAL_STREAM_SPECS)
+
+    def attach_buses(self, sensory: SensoryStreamBus, motor: MotorStreamBus) -> None:
+        self._sensory_bus = sensory
+        self._motor_bus = motor
+        for spec in self.stream_catalog():
+            sensory.register(spec)
+        motor.register(MOTOR_COMMAND_SPEC)
+        self._publisher = SurvivalStreamPublisher(sensory, source=self._backend_name)
+        self._publish_initial_state()
+
+    def step(self) -> None:
+        """Advance one program tick from the motor bus.
+
+        Zero motor events is a NULL tick — the world still advances.  At
+        most one command applies per tick; malformed or surplus commands
+        are rejected via ``event.action_rejected`` and the world steps
+        anyway.
+        """
+        assert self._backend is not None
+        assert self._motor_bus is not None and self._sensory_bus is not None, (
+            "attach_buses() before step()"
+        )
+        assert self._publisher is not None
+        action = NULL_ACTION
+        chosen = False
+        rejections: List[str] = []
+        for event in self._motor_bus.drain():
+            if event.stream_id != MOTOR_COMMAND_STREAM:
+                rejections.append(f"unsupported motor stream {event.stream_id!r}")
+                continue
+            try:
+                candidate = action_from_motor_event(event)
+            except ValueError as exc:
+                rejections.append(str(exc))
+                continue
+            error = self._validation_error(candidate)
+            if error is not None:
+                rejections.append(error)
+                continue
+            if chosen:
+                rejections.append(f"superseded: one command per tick ({candidate.key()})")
+                continue
+            action, chosen = candidate, True
+
+        world_events = self._backend.step(action)
+        timestamp = self._backend.tick() * _SIM_SECONDS_PER_TICK
+        observation = self._backend.observe(timestamp)
+        tick_events = self._publisher.publish_tick(
+            observation, world_events, death_reason=self._backend.death_reason()
+        )
+        for reason in rejections:
+            self._sensory_bus.publish(
+                "event.action_rejected", {"reason": reason}, observation.timestamp
+            )
+        signal = self._reward_fn.evaluate_stream_window(tick_events, action)
+        self._sensory_bus.publish(
+            "reward.scalar",
+            {"value": signal.value, "components": dict(signal.components)},
+            observation.timestamp,
+        )
+        self._last_action = action
+        self._last_reward = signal
+
+    def _publish_initial_state(self) -> None:
+        """Full snapshot per stream so subscribers never start blind."""
+        assert self._backend is not None and self._publisher is not None
+        timestamp = self._backend.tick() * _SIM_SECONDS_PER_TICK
+        snapshot = self._publisher.publish_tick(self._backend.observe(timestamp), [])
+        self._reward_fn.prime_stream_state(snapshot)
 
     def snapshot(self) -> str:
         assert self._backend is not None

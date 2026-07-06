@@ -64,20 +64,28 @@ pytest
 
 ## The loop
 
+The runtime asks **"what streams have arrived since the last cognitive
+tick?"**, not "what is the current observation?" (see
+[docs/streams.md](docs/streams.md)):
+
 ```python
 while running:
-    observation = program.observe()
-    state       = perception.encode(observation)
-    memory.update(state)
-    prediction  = world_model.predict(state, memory)
-    action      = policy.decide(state, memory, prediction)
-    program.act(action)                 # NULL is a real action
-    reward      = program.reward()
-    learner.update(observation, action, reward)
+    for _ in range(program_ticks_per_cognitive_tick):
+        program.step()                          # drains motor bus, publishes streams
+    window  = synchronizer.collect(sensory_bus) # events since the last cognitive tick
+    tokens  = encoders.encode_window(window)
+    memory.update(window, tokens)
+    prediction = world_model.predict(state, memory)
+    motor      = policy.emit(state, memory, prediction)  # [] == NULL
+    for action in motor: motor_bus.publish(...)          # applied next tick
+    learner.update(window)
     recorder.write_tick(...)
 ```
 
-**NULL is a real action.** The agent must learn when *not* to act.
+**NULL is a real action.** An empty motor emission is an explicit, recorded
+decision — the agent must learn when *not* to act. Motor emissions are
+applied one tick later (a deliberate, replay-stable actuation latency); see
+[docs/architecture.md](docs/architecture.md).
 
 ## Project structure
 

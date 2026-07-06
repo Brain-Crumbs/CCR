@@ -7,7 +7,7 @@ from cognitive_runtime.core.action import NULL_ACTION, Action
 from cognitive_runtime.core.observation import Observation
 from cognitive_runtime.core.reward import RewardSignal
 from cognitive_runtime.core.program import ActionResult, Program, ProgramMetadata
-from cognitive_runtime.core.policy import Policy
+from cognitive_runtime.core.policy import Policy, SingleActionPolicy
 from cognitive_runtime.core.perception import Perception, State, StructuredPerception
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.world_model import Prediction, TrendWorldModel, WorldModel
@@ -22,6 +22,7 @@ __all__ = [
     "ProgramMetadata",
     "ActionResult",
     "Policy",
+    "SingleActionPolicy",
     "Perception",
     "StructuredPerception",
     "State",

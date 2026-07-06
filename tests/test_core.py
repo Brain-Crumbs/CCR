@@ -8,6 +8,7 @@ from cognitive_runtime.core import (
     RewardSignal,
     StructuredPerception,
 )
+from cognitive_runtime.core.streams import SensoryStreamBus, TickSynchronizer
 
 
 def test_action_key_roundtrip():
@@ -48,15 +49,23 @@ def test_structured_perception_flattens_numeric_leaves():
     assert state.features["frame.mean"] == 2.5
 
 
+def _window(bus, sync, stream_id, payload, timestamp):
+    bus.publish(stream_id, payload, timestamp)
+    return sync.collect(bus, now=timestamp)
+
+
 def test_memory_repetition_and_novelty():
     memory = Memory(capacity=16)
-    perception = StructuredPerception()
+    bus, sync = SensoryStreamBus(), TickSynchronizer()
     for i in range(3):
-        memory.update(perception.encode(Observation(timestamp=0.0, tick=i, data={"v": i})))
-        memory.record_action(NULL_ACTION)
+        memory.update(_window(bus, sync, "body.health", float(i), timestamp=float(i)))
+        memory.record_actions([])  # empty emission == NULL tick
     assert memory.repeated_action_streak() == 3
-    memory.record_action(Action("MOVE_FORWARD"))
+    memory.record_actions([Action("MOVE_FORWARD")])
     assert memory.repeated_action_streak() == 1
     assert memory.novelty_rate() == 1.0
-    memory.update(perception.encode(Observation(timestamp=0.0, tick=0, data={"v": 0})))
+    # Trends read numeric stream payloads straight from the buffer (0,1,2).
+    assert memory.stream_trend("body.health", window=8) == 1.0
+    # Re-publishing an already-seen window payload is not novel.
+    memory.update(_window(bus, sync, "body.health", 0.0, timestamp=0.0))
     assert not memory.last_observation_was_novel

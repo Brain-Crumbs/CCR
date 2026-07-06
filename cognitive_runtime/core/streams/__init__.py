@@ -31,6 +31,18 @@ from cognitive_runtime.core.streams.encoder_registry import (
     StreamEncoder,
     StreamEncoderRegistry,
 )
+from cognitive_runtime.core.streams.delta import DeltaPublisher
+from cognitive_runtime.core.streams.motor import (
+    MOTOR_COMMAND_SPEC,
+    MOTOR_COMMAND_STREAM,
+    action_from_motor_event,
+    motor_command_payload,
+    publish_motor_command,
+)
+from cognitive_runtime.core.streams.shim import (
+    LatestValueView,
+    ObservationStreamShim,
+)
 
 __all__ = [
     "MODALITIES",
@@ -49,4 +61,12 @@ __all__ = [
     "StreamEncoder",
     "PassthroughEncoder",
     "StreamEncoderRegistry",
+    "DeltaPublisher",
+    "MOTOR_COMMAND_STREAM",
+    "MOTOR_COMMAND_SPEC",
+    "motor_command_payload",
+    "publish_motor_command",
+    "action_from_motor_event",
+    "ObservationStreamShim",
+    "LatestValueView",
 ]

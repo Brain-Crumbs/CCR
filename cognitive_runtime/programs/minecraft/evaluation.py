@@ -68,6 +68,11 @@ def summarize_episodes(summaries: List[EpisodeSummary]) -> Dict[str, Any]:
         "avg_decision_latency_ms": round(_mean([s.avg_latency_ms for s in summaries]), 3),
         "avg_ticks_per_second": round(_mean([s.ticks_per_second for s in summaries]), 1),
         "missed_ticks": sum(s.missed_ticks for s in summaries),
+        "cognitive_tick_ratio": summaries[0].program_ticks_per_cognitive_tick,
+        # Stream throughput: total events/sec across all streams, averaged.
+        "stream_events_per_sec": round(
+            _mean([sum(s.stream_event_rates.values()) for s in summaries]), 1
+        ),
     }
 
 
@@ -79,7 +84,7 @@ def comparison_table(rows: List[Dict[str, Any]], columns: List[str] | None = Non
         "policy", "episodes", "avg_survival_ticks", "death_rate", "success_rate",
         "avg_total_reward", "reward_per_minute", "avg_food_consumed",
         "avg_unique_items", "avg_blocks_placed", "null_action_rate",
-        "avg_max_distance", "avg_decision_latency_ms",
+        "avg_max_distance", "avg_decision_latency_ms", "stream_events_per_sec",
     ]
     widths = {
         c: max(len(c), *(len(str(r.get(c, ""))) for r in rows)) for c in columns
