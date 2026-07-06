@@ -31,8 +31,8 @@ from cognitive_runtime.programs.minecraft.observations import (
 )
 from cognitive_runtime.programs.minecraft.rewards import SurvivalReward, SurvivalRewardConfig
 from cognitive_runtime.programs.minecraft.streams import (
-    SURVIVAL_STREAM_SPECS,
     SurvivalStreamPublisher,
+    build_survival_stream_specs,
 )
 from cognitive_runtime.programs.minecraft.world import SimulatedWorld
 
@@ -214,7 +214,7 @@ class MinecraftSurvivalBox(Program):
     # ------------------------------------------------- streams-first interface
 
     def stream_catalog(self) -> List[StreamSpec]:
-        return list(SURVIVAL_STREAM_SPECS)
+        return build_survival_stream_specs(self._config.world_size)
 
     def attach_buses(self, sensory: SensoryStreamBus, motor: MotorStreamBus) -> None:
         self._sensory_bus = sensory

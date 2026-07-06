@@ -8,8 +8,8 @@ The runtime no longer asks "what is the current observation?" — it asks
         for _ in range(program_ticks_per_cognitive_tick):
             program.step()                       # drains motor bus, publishes streams
         window  = synchronizer.collect(sensory_bus)
-        tokens  = encoders.encode_window(window)
-        memory.update(window, tokens)
+        memory.update(window)
+        latent  = fusion.fuse(window, memory.buffer)   # fixed-width LatentState
         pred    = world_model.predict(state, memory)
         motor   = policy.emit(state, memory, pred)   # [] == NULL
         for action in motor: motor_bus.publish(...)
@@ -40,10 +40,11 @@ from cognitive_runtime.core.policy import Policy
 from cognitive_runtime.core.program import Program
 from cognitive_runtime.core.streams import (
     MotorStreamBus,
-    PassthroughEncoder,
     SensoryStreamBus,
     StreamEncoderRegistry,
+    TemporalFusion,
     TickSynchronizer,
+    default_encoder_registry,
     publish_motor_command,
 )
 from cognitive_runtime.core.world_model import TrendWorldModel, WorldModel
@@ -55,19 +56,6 @@ from cognitive_runtime.runtime.recorder import (
     Recorder,
 )
 from cognitive_runtime.runtime.scheduler import FixedTickScheduler
-
-
-def default_encoder_registry() -> StreamEncoderRegistry:
-    """Phase-2 registry: passthrough encoders for the numeric streams.
-
-    Real modality encoders arrive in Phase 4; until then this stands in for
-    the retired StructuredPerception so the loop has latent tokens to fuse.
-    """
-    registry = StreamEncoderRegistry()
-    registry.register("body.*", PassthroughEncoder())
-    registry.register("spatial.*", PassthroughEncoder())
-    registry.register("reward.*", PassthroughEncoder())
-    return registry
 
 
 class CognitiveRuntime:
@@ -87,6 +75,7 @@ class CognitiveRuntime:
         self.world_model = world_model or TrendWorldModel()
         self.learner = learner or NullLearner()
         self.encoders = encoders or default_encoder_registry()
+        self.fusion = TemporalFusion(self.program.stream_catalog(), self.encoders)
         self.memory = Memory(capacity=self.config.memory_capacity)
         self.sensory_bus = SensoryStreamBus()
         self.motor_bus = MotorStreamBus()
@@ -174,8 +163,8 @@ class CognitiveRuntime:
             decide_start = time.perf_counter()
             observation = self.program.observe()  # Phase-2 compatibility bridge
             window = self.synchronizer.collect(self.sensory_bus, now=observation.timestamp)
-            tokens = self.encoders.encode_window(window)
-            self.memory.update(window, tokens)
+            self.memory.update(window)
+            self.memory.set_fused_latent(self.fusion.fuse(None, self.memory.buffer))
             state = State(observation=observation)
             prediction = self.world_model.predict(state, self.memory)
             emissions = self.policy.emit(state, self.memory, prediction)

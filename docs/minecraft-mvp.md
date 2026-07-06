@@ -103,6 +103,13 @@ episode replays (`--min-reward` filter). Success target: outperform the
 random baseline on survival time and reward (asserted in
 `tests/test_training.py`).
 
+By default the policy input is the **fused latent state** (`--features
+latent`): per-modality stream encoders → `TemporalFusion` → a fixed-width
+vector, produced by the same code online and offline. The hand-written
+Minecraft featurizer stays available (`--features handcrafted`) for A/B
+comparison; on the night scenario both survive full episodes and beat random,
+with the latent path within a comparable share of the handcrafted reward.
+
 ## Recording, replay, metrics
 
 The recorded artifact of a session is the **stream log** (streams-v2), not

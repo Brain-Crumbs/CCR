@@ -62,11 +62,27 @@ generic: Minecraft health, a Linux battery and robot joint stress are all
 | Type | Module | Role |
 |---|---|---|
 | `StreamEvent` | `events.py` | One time-indexed sample: id, modality, simulated timestamp, per-stream sequence number, JSON payload, confidence, source. Content-hashable (`.hash()`) — the replay-verification unit. |
-| `StreamSpec` | `events.py` | A Program's advertisement of one stream it publishes (description, nominal rate, informal payload schema). |
+| `StreamSpec` | `events.py` | A Program's advertisement of one stream it publishes (description, nominal rate, informal payload schema, plus optional encoder metadata: `range`, `legend`, `categories`, `neutral`). |
 | `SensoryStreamBus` / `MotorStreamBus` | `bus.py` | Deterministic in-process pub/sub. `publish()` assigns per-stream monotonic sequence numbers; `drain()` returns pending events in deterministic order; `subscribe(pattern)` gives a glob-filtered view (`"body.*"`, `"*"`). Same mechanism both directions. |
 | `TemporalBuffer` | `temporal_buffer.py` | Bounded per-stream history with per-modality capacities (vision short, events long). `latest`, `window(n)`, `events_since(t)`. |
 | `TickSynchronizer` | `synchronizer.py` | Defines cognitive tick boundaries; `collect(bus)` drains into a `TickWindow` (events grouped by stream). Supports a `program_ticks_per_cognitive_tick` ratio and tracks per-stream arrival counts and silences for runtime health. |
-| `StreamEncoderRegistry` | `encoder_registry.py` | Maps stream patterns to `StreamEncoder`s producing `LatentToken`s. Phase 0 ships only a numeric `PassthroughEncoder`; real modality encoders are Phase 4. |
+| `StreamEncoderRegistry` | `encoder_registry.py` | Maps stream patterns to `StreamEncoder`s producing `LatentToken`s. |
+| Modality encoders | `encoders/` | Fixed-width, spec-driven, environment-agnostic: `ScalarEncoder` (body/reward), `SpatialEncoder`, `GridVisionEncoder`, `EntityEncoder`, `EventEncoder`, `CategoryEncoder`. |
+| `TemporalFusion` | `fusion.py` | Assembles per-stream tokens + recent history into one fixed-width `LatentState` (flat vector + named per-stream slices) with a deterministic, versioned `layout_hash`. |
+
+## Encoders & fusion (Phase 4)
+
+The neural-architecture shape is `stream event → modality encoder → latent
+token → temporal fusion → latent state → policy`. Each encoder turns one
+stream's recent window into a **fixed-width** vector using only generic
+`StreamSpec` metadata (normalization `range`, grid `legend`, categorical
+`categories`, `neutral` fill) — never world constants — so the same encoder
+serves any Program. `TemporalFusion` lays the tokens out in a stable,
+`stream_id`-ordered vector, filling silent streams with their neutral value so
+the width is fixed, and hashes the layout so a model trained on one layout
+fails loudly against an incompatible one. The dataset builder replays the
+**same** fusion offline over recorded streams, so train-time and inference-time
+features come from identical code (an online/offline parity test enforces it).
 
 ## Cadence guidance
 
@@ -109,7 +125,9 @@ carry it forward:
 
 Phase 0 (this document) is additive only. Completed phases: Program
 interface v2 (programs publish/consume streams), runtime loop v2 (cognitive
-ticks over stream windows), and stream-native recording/replay + tools
-(streams-v2). Remaining: real modality encoders, and real-time multi-rate
-streaming. See the tracking issue for the full
+ticks over stream windows), stream-native recording/replay + tools
+(streams-v2), and modality encoders + temporal fusion with behavioral cloning
+on the latent state (Phase 4). Remaining: real neural encoders/fusion, learned
+world models, and real-time multi-rate streaming. See the tracking issue for
+the full
 plan.

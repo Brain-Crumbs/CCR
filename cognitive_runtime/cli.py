@@ -149,10 +149,12 @@ def cmd_train(args: argparse.Namespace) -> None:
         history=args.history,
         max_samples=args.max_samples,
         min_episode_reward=args.min_reward,
+        representation=args.features,
     )
     if len(dataset) == 0:
-        sys.exit("no training samples found (were sessions recorded with observations?)")
-    print(f"dataset: {len(dataset)} samples from {len(dataset.sources)} episodes")
+        sys.exit("no training samples found (were the sessions recorded as streams-v2?)")
+    print(f"dataset: {len(dataset)} samples from {len(dataset.sources)} episodes "
+          f"({dataset.representation} features, dim={len(dataset.feature_names)})")
     model, metrics = train_bc(
         dataset, epochs=args.epochs, lr=args.lr, batch_size=args.batch_size, seed=args.seed
     )
@@ -224,6 +226,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--lr", type=float, default=0.5)
     p_train.add_argument("--batch-size", type=int, default=32)
     p_train.add_argument("--history", type=int, default=8)
+    p_train.add_argument("--features", choices=["latent", "handcrafted"], default="latent",
+                         help="policy input: fused latent state (default) or hand featurizer")
     p_train.add_argument("--max-samples", type=int, default=None)
     p_train.add_argument("--min-reward", type=float, default=None,
                          help="skip episodes below this total reward")

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
 from cognitive_runtime.core.streams.bus import stream_matches
-from cognitive_runtime.core.streams.events import StreamEvent
+from cognitive_runtime.core.streams.events import StreamEvent, StreamSpec
 from cognitive_runtime.core.streams.synchronizer import TickWindow
 
 
@@ -27,11 +27,28 @@ class LatentToken:
 
 
 class StreamEncoder(abc.ABC):
-    """Encodes the events one stream produced during a tick window."""
+    """Encodes the recent events of one stream into a fixed-width latent token.
+
+    Fixed width is what lets a fusion layout reserve a stable slice per stream
+    and fill it with :meth:`neutral` when the stream is silent.  Modality
+    encoders (Phase 4) implement :meth:`width` and :meth:`neutral`; the
+    Phase-0 passthrough encoder leaves them unimplemented (variable width) and
+    is only used outside a fusion layout.
+    """
 
     @abc.abstractmethod
-    def encode(self, events: List[StreamEvent]) -> Optional[LatentToken]:
+    def encode(
+        self, events: List[StreamEvent], spec: Optional[StreamSpec] = None
+    ) -> Optional[LatentToken]:
         """Return a latent token for the window, or None if nothing usable."""
+
+    def width(self, spec: Optional[StreamSpec] = None) -> int:
+        """Fixed length of this encoder's vector for `spec`."""
+        raise NotImplementedError(f"{type(self).__name__} has no fixed width")
+
+    def neutral(self, spec: Optional[StreamSpec] = None) -> List[float]:
+        """The vector used when the stream is silent (default: zeros)."""
+        return [0.0] * self.width(spec)
 
 
 def _numeric_leaves(payload: Any) -> List[float]:
@@ -57,7 +74,9 @@ def _numeric_leaves(payload: Any) -> List[float]:
 class PassthroughEncoder(StreamEncoder):
     """Flattens the latest event's numeric payload into the vector as-is."""
 
-    def encode(self, events: List[StreamEvent]) -> Optional[LatentToken]:
+    def encode(
+        self, events: List[StreamEvent], spec: Optional[StreamSpec] = None
+    ) -> Optional[LatentToken]:
         if not events:
             return None
         latest = events[-1]

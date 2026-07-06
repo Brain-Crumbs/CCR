@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 #: The generic sensory/motor taxonomy.  Minecraft health, Linux battery and
 #: robot joint stress are all "body" streams; frames, desktop pixels and
@@ -124,13 +124,27 @@ class StreamEvent:
 
 @dataclass(frozen=True)
 class StreamSpec:
-    """A Program's advertisement of one stream it publishes."""
+    """A Program's advertisement of one stream it publishes.
+
+    The optional encoder-facing metadata keeps the modality encoders
+    (Phase 4) environment-agnostic: normalization ranges, grid class legends
+    and neutral fill values arrive here from the Program instead of being
+    hardcoded per world.
+    """
 
     stream_id: str
     modality: str
     description: str = ""
     nominal_rate_hz: Optional[float] = None  # None = irregular / event-driven
     payload_schema: str = ""  # informal hint, e.g. "float 0..20" or "2-D int grid"
+    #: (lo, hi) normalization range for scalar/coordinate payloads.
+    range: Optional[Tuple[float, float]] = None
+    #: grid cell-class id -> generic class name, for vision grid encoders.
+    legend: Optional[Dict[int, str]] = None
+    #: closed vocabulary for a categorical (string) payload, for one-hot encoders.
+    categories: Optional[Tuple[str, ...]] = None
+    #: value a fusion layout fills in when this stream is silent/missing.
+    neutral: float = 0.0
 
     def __post_init__(self) -> None:
         validate_stream_identity(self.stream_id, self.modality)
@@ -142,14 +156,31 @@ class StreamSpec:
             "description": self.description,
             "nominal_rate_hz": self.nominal_rate_hz,
             "payload_schema": self.payload_schema,
+            "range": list(self.range) if self.range is not None else None,
+            "legend": (
+                {str(k): v for k, v in self.legend.items()}
+                if self.legend is not None
+                else None
+            ),
+            "categories": list(self.categories) if self.categories is not None else None,
+            "neutral": self.neutral,
         }
 
     @staticmethod
     def from_dict(raw: Dict[str, Any]) -> "StreamSpec":
+        rng = raw.get("range")
+        legend = raw.get("legend")
+        categories = raw.get("categories")
         return StreamSpec(
             stream_id=raw["stream_id"],
             modality=raw["modality"],
             description=raw.get("description", ""),
             nominal_rate_hz=raw.get("nominal_rate_hz"),
             payload_schema=raw.get("payload_schema", ""),
+            range=tuple(rng) if rng is not None else None,
+            legend=(
+                {int(k): v for k, v in legend.items()} if legend is not None else None
+            ),
+            categories=tuple(categories) if categories is not None else None,
+            neutral=raw.get("neutral", 0.0),
         )
