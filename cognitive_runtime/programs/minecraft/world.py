@@ -43,6 +43,29 @@ BLOCK_IDS = {
 MOB_FRAME_ID = 90
 AGENT_FRAME_ID = 99
 
+#: Deterministic RGB palette for the pixel render -- a stand-in for "what the
+#: player sees".  Pure function of world state, so ``render_pixels`` stays
+#: replay-safe (a real backend would swap in a rendered/captured frame here).
+BLOCK_COLORS = {
+    "grass": (86, 168, 74),
+    "dirt": (134, 96, 67),
+    "sand": (219, 209, 145),
+    "water": (54, 108, 209),
+    "tree": (37, 92, 38),
+    "stone": (128, 128, 128),
+    "coal_ore": (54, 54, 60),
+    "berry_bush": (150, 40, 70),
+    "placed_block": (170, 140, 100),
+    "barrier": (20, 20, 20),
+}
+AGENT_COLOR = (240, 220, 40)
+MOB_COLOR = (200, 40, 40)
+
+#: Pixel-render geometry: a (2*radius+1) cell local view, each cell upscaled to
+#: ``scale``x``scale`` pixels -> an 11*3 = 33 px square RGB image at the default.
+PIXEL_RADIUS = 5
+PIXEL_SCALE = 3
+
 WALK_SPEED = 0.25
 SPRINT_SPEED = 0.45
 SNEAK_SPEED = 0.10
@@ -514,6 +537,40 @@ class SimulatedWorld:
                     row.append(BLOCK_IDS[self.terrain[x][z]])
             frame.append(row)
         return frame
+
+    def render_pixels(
+        self, radius: int = PIXEL_RADIUS, scale: int = PIXEL_SCALE
+    ) -> List[List[List[int]]]:
+        """Deterministic RGB pixel render of the local view (H x W x 3, 0..255).
+
+        The pixel counterpart to :meth:`render_frame`: each local cell is
+        colorized (terrain/agent/mob) and upscaled to ``scale``x``scale``
+        pixels, so a small CNN gets real pixels while the result stays a pure
+        function of world state -- byte-identical under replay.  A real backend
+        renders/captures a frame here instead; the stream contract is the same.
+        """
+        ix, iz = int(self.x), int(self.z)
+        mob_cells = {(int(m["x"]), int(m["z"])) for m in self.mobs}
+        cell_colors: List[List[Tuple[int, int, int]]] = []
+        for dx in range(-radius, radius + 1):
+            row: List[Tuple[int, int, int]] = []
+            for dz in range(-radius, radius + 1):
+                x = min(max(ix + dx, 0), self.size - 1)
+                z = min(max(iz + dz, 0), self.size - 1)
+                if dx == 0 and dz == 0:
+                    rgb = AGENT_COLOR
+                elif (x, z) in mob_cells:
+                    rgb = MOB_COLOR
+                else:
+                    rgb = BLOCK_COLORS[self.terrain[x][z]]
+                row.append(rgb)
+            cell_colors.append(row)
+        image: List[List[List[int]]] = []
+        for cell_row in cell_colors:
+            pixel_row = [list(rgb) for rgb in cell_row for _ in range(scale)]
+            for _ in range(scale):
+                image.append([list(px) for px in pixel_row])
+        return image
 
     def mob_summary(self, limit: int = 4) -> List[Dict[str, float]]:
         fx, fz = self._facing_vector()

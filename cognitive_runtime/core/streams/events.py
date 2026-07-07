@@ -167,6 +167,9 @@ class StreamSpec:
     #: bounded-queue overflow behavior in realtime mode (see OVERFLOW_POLICIES).
     #: ``None`` = fall back to the bus's per-modality default.
     overflow: Optional[str] = None
+    #: fixed tensor dimensions of the payload (e.g. an RGB frame's (H, W, C)),
+    #: for neural encoders that consume raw arrays rather than fused scalars.
+    shape: Optional[Tuple[int, ...]] = None
 
     def __post_init__(self) -> None:
         validate_stream_identity(self.stream_id, self.modality)
@@ -192,6 +195,7 @@ class StreamSpec:
             "categories": list(self.categories) if self.categories is not None else None,
             "neutral": self.neutral,
             "overflow": self.overflow,
+            "shape": list(self.shape) if self.shape is not None else None,
         }
 
     @staticmethod
@@ -212,4 +216,5 @@ class StreamSpec:
             categories=tuple(categories) if categories is not None else None,
             neutral=raw.get("neutral", 0.0),
             overflow=raw.get("overflow"),
+            shape=tuple(raw["shape"]) if raw.get("shape") is not None else None,
         )

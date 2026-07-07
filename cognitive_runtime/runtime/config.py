@@ -30,11 +30,16 @@ class RuntimeConfig:
     record_streams: List[str] = field(default_factory=lambda: ["*"])
     exclude_streams: List[str] = field(default_factory=list)
 
+    #: Bulky frame streams elided from the log unless ``record_frames`` is set.
+    FRAME_STREAMS = ("vision.frame.grid", "vision.frame.pixels")
+
     def effective_exclude_streams(self) -> List[str]:
-        """exclude_streams plus the frame stream when frames are opted out."""
+        """exclude_streams plus the frame streams when frames are opted out."""
         excluded = list(self.exclude_streams)
-        if not self.record_frames and "vision.frame.grid" not in excluded:
-            excluded.append("vision.frame.grid")
+        if not self.record_frames:
+            for stream_id in self.FRAME_STREAMS:
+                if stream_id not in excluded:
+                    excluded.append(stream_id)
         return excluded
 
     def resolved_session_id(self, policy_name: str) -> str:
