@@ -66,6 +66,34 @@ MOB_COLOR = (200, 40, 40)
 PIXEL_RADIUS = 5
 PIXEL_SCALE = 3
 
+#: Frame-code -> RGB, so a semantic grid frame (the same one every backend
+#: emits, including the mineflayer bridge) colorizes to pixels the same way.
+FRAME_CODE_COLORS: Dict[int, Tuple[int, int, int]] = {
+    **{BLOCK_IDS[name]: rgb for name, rgb in BLOCK_COLORS.items()},
+    MOB_FRAME_ID: MOB_COLOR,
+    AGENT_FRAME_ID: AGENT_COLOR,
+}
+_UNKNOWN_CELL_COLOR = (255, 0, 255)  # magenta: an out-of-vocab frame code
+
+
+def pixels_from_frame(
+    frame: List[List[int]], scale: int = PIXEL_SCALE
+) -> List[List[List[int]]]:
+    """Colorize a semantic grid frame (frame codes) into an H*scale x W*scale x 3
+    RGB image.  Backend-agnostic: any world that emits the shared grid frame
+    gets identical pixel vision, and the mapping is a pure function of the grid
+    (so it stays deterministic / replay-safe)."""
+    image: List[List[List[int]]] = []
+    for grid_row in frame:
+        pixel_row = [
+            list(FRAME_CODE_COLORS.get(code, _UNKNOWN_CELL_COLOR))
+            for code in grid_row
+            for _ in range(scale)
+        ]
+        for _ in range(scale):
+            image.append([list(px) for px in pixel_row])
+    return image
+
 WALK_SPEED = 0.25
 SPRINT_SPEED = 0.45
 SNEAK_SPEED = 0.10
@@ -543,34 +571,13 @@ class SimulatedWorld:
     ) -> List[List[List[int]]]:
         """Deterministic RGB pixel render of the local view (H x W x 3, 0..255).
 
-        The pixel counterpart to :meth:`render_frame`: each local cell is
-        colorized (terrain/agent/mob) and upscaled to ``scale``x``scale``
-        pixels, so a small CNN gets real pixels while the result stays a pure
-        function of world state -- byte-identical under replay.  A real backend
-        renders/captures a frame here instead; the stream contract is the same.
+        The pixel counterpart to :meth:`render_frame`: the same semantic grid,
+        colorized and upscaled so a small CNN gets real pixels while the result
+        stays a pure function of world state -- byte-identical under replay.  A
+        real backend renders/captures a frame here instead; the stream contract
+        is the same.
         """
-        ix, iz = int(self.x), int(self.z)
-        mob_cells = {(int(m["x"]), int(m["z"])) for m in self.mobs}
-        cell_colors: List[List[Tuple[int, int, int]]] = []
-        for dx in range(-radius, radius + 1):
-            row: List[Tuple[int, int, int]] = []
-            for dz in range(-radius, radius + 1):
-                x = min(max(ix + dx, 0), self.size - 1)
-                z = min(max(iz + dz, 0), self.size - 1)
-                if dx == 0 and dz == 0:
-                    rgb = AGENT_COLOR
-                elif (x, z) in mob_cells:
-                    rgb = MOB_COLOR
-                else:
-                    rgb = BLOCK_COLORS[self.terrain[x][z]]
-                row.append(rgb)
-            cell_colors.append(row)
-        image: List[List[List[int]]] = []
-        for cell_row in cell_colors:
-            pixel_row = [list(rgb) for rgb in cell_row for _ in range(scale)]
-            for _ in range(scale):
-                image.append([list(px) for px in pixel_row])
-        return image
+        return pixels_from_frame(self.render_frame(radius), scale)
 
     def mob_summary(self, limit: int = 4) -> List[Dict[str, float]]:
         fx, fz = self._facing_vector()
