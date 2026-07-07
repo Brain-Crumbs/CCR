@@ -12,17 +12,20 @@ see docs/streams.md and the migration tracking issue.
 
 from cognitive_runtime.core.streams.events import (
     MODALITIES,
+    OVERFLOW_POLICIES,
     StreamEvent,
     StreamSpec,
     validate_stream_identity,
 )
 from cognitive_runtime.core.streams.bus import (
+    DEFAULT_QUEUE_CAPACITY,
     MotorStreamBus,
     SensoryStreamBus,
     StreamBus,
     StreamSubscription,
     stream_matches,
 )
+from cognitive_runtime.core.streams.pacer import RatePacer
 from cognitive_runtime.core.streams.temporal_buffer import TemporalBuffer
 from cognitive_runtime.core.streams.synchronizer import TickSynchronizer, TickWindow
 from cognitive_runtime.core.streams.encoder_registry import (
@@ -58,6 +61,7 @@ from cognitive_runtime.core.streams.shim import (
 
 __all__ = [
     "MODALITIES",
+    "OVERFLOW_POLICIES",
     "StreamEvent",
     "StreamSpec",
     "validate_stream_identity",
@@ -66,6 +70,8 @@ __all__ = [
     "MotorStreamBus",
     "StreamSubscription",
     "stream_matches",
+    "DEFAULT_QUEUE_CAPACITY",
+    "RatePacer",
     "TemporalBuffer",
     "TickSynchronizer",
     "TickWindow",

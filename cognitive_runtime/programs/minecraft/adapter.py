@@ -10,7 +10,8 @@ to change, and the runtime itself never changes.
 from __future__ import annotations
 
 import abc
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 from cognitive_runtime.core.action import NULL_ACTION, Action
 from cognitive_runtime.core.observation import Observation
@@ -23,6 +24,7 @@ from cognitive_runtime.core.streams.motor import (
     MOTOR_COMMAND_STREAM,
     action_from_motor_event,
 )
+from cognitive_runtime.core.streams.pacer import RatePacer
 from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE, HOTBAR_SLOTS
 from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
 from cognitive_runtime.programs.minecraft.observations import (
@@ -31,6 +33,8 @@ from cognitive_runtime.programs.minecraft.observations import (
 )
 from cognitive_runtime.programs.minecraft.rewards import SurvivalReward, SurvivalRewardConfig
 from cognitive_runtime.programs.minecraft.streams import (
+    BODY_HEARTBEAT_KEY,
+    VISION_STREAM,
     SurvivalStreamPublisher,
     build_survival_stream_specs,
 )
@@ -143,6 +147,9 @@ class MinecraftSurvivalBox(Program):
         self._sensory_bus: Optional[SensoryStreamBus] = None
         self._motor_bus: Optional[MotorStreamBus] = None
         self._publisher: Optional[SurvivalStreamPublisher] = None
+        #: Off until set_realtime() enables it; shared with the publisher so
+        #: the runtime can flip realtime mode after attach_buses().
+        self._pacer = RatePacer(enabled=False)
         self.initialize(config)
 
     # ------------------------------------------------------------ interface
@@ -222,8 +229,31 @@ class MinecraftSurvivalBox(Program):
         for spec in self.stream_catalog():
             sensory.register(spec)
         motor.register(MOTOR_COMMAND_SPEC)
-        self._publisher = SurvivalStreamPublisher(sensory, source=self._backend_name)
+        self._publisher = SurvivalStreamPublisher(
+            sensory, source=self._backend_name, pacer=self._pacer
+        )
         self._publish_initial_state()
+
+    def set_realtime(
+        self, enabled: bool, clock: Optional[Callable[[], float]] = None
+    ) -> None:
+        """Enable wall-clock pacing of vision + body heartbeat in realtime mode.
+
+        Rates come from the world config (``realtime_vision_hz``,
+        ``realtime_body_heartbeat_hz``); irregular streams (events) and the
+        per-tick world/reward streams are left unthrottled.  In fast-forward
+        (``enabled=False``) the pacer is inert and cadence follows ticks.
+        """
+        self._realtime = enabled
+        self._wall_clock = clock
+        self._pacer.enabled = enabled
+        if clock is not None:
+            self._pacer._clock = clock
+        self._pacer.set_rate(VISION_STREAM, self._config.realtime_vision_hz)
+        self._pacer.set_rate(
+            BODY_HEARTBEAT_KEY, self._config.realtime_body_heartbeat_hz
+        )
+        self._pacer.reset()
 
     def step(self) -> None:
         """Advance one program tick from the motor bus.
@@ -279,10 +309,16 @@ class MinecraftSurvivalBox(Program):
         self._last_reward = signal
 
     def _publish_initial_state(self) -> None:
-        """Full snapshot per stream so subscribers never start blind."""
+        """Full snapshot per stream so subscribers never start blind.
+
+        ``paced=False`` bypasses the realtime pacer so every stream appears in
+        the snapshot even when a stream's wall-clock token would not yet be due.
+        """
         assert self._backend is not None and self._publisher is not None
         timestamp = self._backend.tick() * _SIM_SECONDS_PER_TICK
-        snapshot = self._publisher.publish_tick(self._backend.observe(timestamp), [])
+        snapshot = self._publisher.publish_tick(
+            self._backend.observe(timestamp), [], paced=False
+        )
         self._reward_fn.prime_stream_state(snapshot)
 
     def snapshot(self) -> str:

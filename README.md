@@ -36,6 +36,10 @@ python -m cognitive_runtime run --policy null --episodes 1
 # Baselines with recording (sessions/ by default)
 python -m cognitive_runtime run --policy scripted --episodes 3
 
+# Real-time multi-rate streaming: hold 20 Hz in wall-clock time, vision paced
+# to 10 Hz and a 2 Hz body heartbeat (see docs/streams.md). Still replayable.
+python -m cognitive_runtime run --policy scripted --realtime --episode-ticks 200
+
 # Compare baseline policies on identical episode seeds
 python -m cognitive_runtime evaluate --policies null,random,scripted --episodes 3
 

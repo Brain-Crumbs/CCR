@@ -55,7 +55,7 @@ def _make_policy(name: str, args: argparse.Namespace) -> Policy:
     if name == "scripted":
         return ScriptedSurvivalPolicy(seed=args.seed)
     if name == "human":
-        return HumanDemoPolicy()
+        return HumanDemoPolicy(realtime=getattr(args, "realtime", False))
     if name == "learned":
         if not args.model:
             sys.exit("--model is required for the learned policy")

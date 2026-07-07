@@ -19,6 +19,7 @@ from cognitive_runtime.core.observation import Observation
 from cognitive_runtime.core.streams.bus import SensoryStreamBus
 from cognitive_runtime.core.streams.delta import DeltaPublisher
 from cognitive_runtime.core.streams.events import StreamEvent, StreamSpec
+from cognitive_runtime.core.streams.pacer import RatePacer
 from cognitive_runtime.programs.minecraft.world import (
     AGENT_FRAME_ID,
     BLOCK_IDS,
@@ -29,8 +30,15 @@ from cognitive_runtime.programs.minecraft.world import (
 
 #: Body vitals republish unchanged values every this many ticks, so
 #: subscribers can distinguish "silent because unchanged" from "silent
-#: because dead sensor".
+#: because dead sensor".  At 20 tps this is a 1 Hz heartbeat, which is also
+#: the vitals' nominal rate for stale-stream detection.
 BODY_HEARTBEAT_TICKS = 20
+BODY_HEARTBEAT_HZ = 1.0
+
+#: Pacer keys: the vision frame is rate-paced in realtime, and body vitals
+#: share one heartbeat token (they beat together).
+VISION_STREAM = "vision.frame.grid"
+BODY_HEARTBEAT_KEY = "body.heartbeat"
 
 VITAL_RANGE = (0.0, 20.0)  # health/hunger/oxygen scale
 
@@ -78,10 +86,13 @@ def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
                    "Visible mobs (distance/angle), every tick while any are visible.",
                    payload_schema="[{distance, angle}]", range=(0.0, 16.0)),
         StreamSpec("body.health", "body", "Health, on change + heartbeat.",
+                   nominal_rate_hz=BODY_HEARTBEAT_HZ,
                    payload_schema="float 0..20", range=VITAL_RANGE, neutral=20.0),
         StreamSpec("body.hunger", "body", "Hunger, on change + heartbeat.",
+                   nominal_rate_hz=BODY_HEARTBEAT_HZ,
                    payload_schema="float 0..20", range=VITAL_RANGE, neutral=20.0),
         StreamSpec("body.oxygen", "body", "Oxygen, on change + heartbeat.",
+                   nominal_rate_hz=BODY_HEARTBEAT_HZ,
                    payload_schema="float 0..20", range=VITAL_RANGE, neutral=20.0),
         StreamSpec("body.inventory", "body", "Inventory summary, on change.",
                    payload_schema="{item: count}"),
@@ -123,22 +134,38 @@ SURVIVAL_STREAM_SPECS: List[StreamSpec] = build_survival_stream_specs()
 
 
 class SurvivalStreamPublisher:
-    def __init__(self, bus: SensoryStreamBus, source: str = ""):
+    def __init__(
+        self,
+        bus: SensoryStreamBus,
+        source: str = "",
+        pacer: Optional[RatePacer] = None,
+    ):
         self._bus = bus
         self._delta = DeltaPublisher(bus)
         self._source = source
+        #: Disabled by default (fast-forward): every-tick/heartbeat cadence.
+        self._pacer = pacer if pacer is not None else RatePacer(enabled=False)
 
     def reset(self) -> None:
         self._delta.reset()
+        self._pacer.reset()
 
     def publish_tick(
         self,
         observation: Observation,
         world_events: List[str],
         death_reason: Optional[str] = None,
+        paced: bool = True,
     ) -> List[StreamEvent]:
         """Publish this tick's streams from the post-step observation and the
-        world's semantic event strings.  Returns everything published."""
+        world's semantic event strings.  Returns everything published.
+
+        With ``paced`` the realtime pacer gates vision frames and the body
+        heartbeat to their wall-clock rates; ``paced=False`` bypasses it so
+        the initial post-reset snapshot always publishes every stream (no
+        subscriber starts blind).  In fast-forward mode the pacer is inert and
+        ``paced`` has no effect.
+        """
         data = observation.data
         timestamp = observation.timestamp
         published: List[StreamEvent] = []
@@ -150,8 +177,21 @@ class SurvivalStreamPublisher:
             if event is not None:
                 published.append(event)
 
-        heartbeat = observation.tick % BODY_HEARTBEAT_TICKS == 0
-        pub("vision.frame.grid", observation.frame, force=True)
+        if paced and self._pacer.enabled:
+            # Realtime: throttle vision + heartbeat to their target rates.  We
+            # pace off *simulated* time (which the realtime scheduler holds
+            # locked to wall clock) so pacing is deterministic and a realtime
+            # recording replays bit-for-bit in fast-forward.
+            show_frame = self._pacer.should_publish(VISION_STREAM, now=timestamp)
+            heartbeat = self._pacer.should_publish(BODY_HEARTBEAT_KEY, now=timestamp)
+        else:
+            # Fast-forward, or the forced snapshot: every-tick vision, a
+            # 20-tick (1 Hz) vitals heartbeat — the established Phase-1 cadence.
+            show_frame = True
+            heartbeat = observation.tick % BODY_HEARTBEAT_TICKS == 0
+
+        if show_frame:
+            pub("vision.frame.grid", observation.frame, force=True)
         mobs = data["mobs"]
         pub("vision.entities", mobs, force=bool(mobs))
         pub("body.health", data["health"], force=heartbeat)

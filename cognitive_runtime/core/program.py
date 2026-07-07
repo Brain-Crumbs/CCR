@@ -128,6 +128,19 @@ class Program(abc.ABC):
         self._sensory_bus = sensory
         self._motor_bus = motor
 
+    def set_realtime(self, enabled: bool, clock: Optional[Any] = None) -> None:
+        """Tell the Program whether the runtime is running in realtime mode.
+
+        Realtime-aware Programs pace per-stream publication to wall-clock
+        rates (vision 10–30 Hz, a body heartbeat 1–10 Hz) while irregular
+        streams stay event-driven; in fast-forward the same code publishes at
+        tick cadence so tests stay fast and deterministic.  The default
+        just records the flag — a Program that has no rate machinery ignores
+        it.  ``clock`` is a ``() -> float`` wall-clock source (monotonic).
+        """
+        self._realtime = enabled
+        self._wall_clock = clock
+
     def step(self) -> None:
         """Advance one program tick: drain pending motor events, apply them,
         advance the world, publish sensory/reward/event streams for this tick.

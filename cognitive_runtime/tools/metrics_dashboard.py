@@ -38,6 +38,45 @@ def _per_stream_rate_table(summaries: List[EpisodeSummary]) -> str:
     return "\n".join(lines)
 
 
+def _realtime_health(summaries: List[EpisodeSummary]) -> str:
+    """Realtime multi-rate health, aggregated over realtime episodes only."""
+    realtime = [s for s in summaries if getattr(s, "realtime", False)]
+    if not realtime:
+        return ""
+    n = len(realtime)
+    empty = sum(int(s.empty_windows) for s in realtime)
+    late = sum(int(s.late_windows) for s in realtime)
+    overflows = sum(
+        sum(sum(policy.values()) for policy in (s.stream_overflow_counts or {}).values())
+        for s in realtime
+    )
+    motor_rate = sum(float(s.motor_emission_rate) for s in realtime) / n
+    stale = sorted({sid for s in realtime for sid in (s.stale_streams or [])})
+
+    # Average measured wall-clock rate per stream across realtime episodes.
+    wall_totals: Dict[str, float] = {}
+    wall_counts: Dict[str, int] = {}
+    for s in realtime:
+        for sid, rate in (s.stream_wallclock_rates or {}).items():
+            wall_totals[sid] = wall_totals.get(sid, 0.0) + float(rate)
+            wall_counts[sid] = wall_counts.get(sid, 0) + 1
+
+    lines = [
+        "",
+        f"realtime health ({n} realtime episode(s)):",
+        f"  empty windows: {empty}   late windows: {late}   "
+        f"queue overflows: {overflows}",
+        f"  avg motor emission rate: {round(motor_rate, 3)}/s",
+    ]
+    if stale:
+        lines.append(f"  stale streams: {', '.join(stale)}")
+    if wall_totals:
+        lines.append("  measured wall-clock rates (events/sec):")
+        for sid in sorted(wall_totals, key=lambda s: -wall_totals[s] / wall_counts[s]):
+            lines.append(f"    {sid}: {round(wall_totals[sid] / wall_counts[sid], 3)}")
+    return "\n".join(lines)
+
+
 def dashboard(record_dir: str) -> str:
     """One row per policy, aggregated over every session under record_dir."""
     if not os.path.isdir(record_dir):
@@ -58,4 +97,9 @@ def dashboard(record_dir: str) -> str:
         row = summarize_episodes(by_policy[policy_name])
         row["policy"] = policy_name
         rows.append(row)
-    return comparison_table(rows) + "\n" + _per_stream_rate_table(all_summaries)
+    return (
+        comparison_table(rows)
+        + "\n"
+        + _per_stream_rate_table(all_summaries)
+        + _realtime_health(all_summaries)
+    )

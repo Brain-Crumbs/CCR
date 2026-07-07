@@ -167,6 +167,11 @@ def replay_episode(
 
     sensory_bus, motor_bus = SensoryStreamBus(), MotorStreamBus()
     program.attach_buses(sensory_bus, motor_bus)
+    # A realtime recording paced publication off simulated time; reproduce that
+    # same pacing here (still fast-forward — no sleeping) so the paced sensory
+    # subset regenerates bit-for-bit.  Fast-forward recordings leave it off.
+    if metadata.get("realtime"):
+        program.set_realtime(True)
     program.reset(seed=seed)
 
     matched = True

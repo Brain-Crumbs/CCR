@@ -21,6 +21,10 @@ class SurvivalBoxConfig:
     max_mobs: int = 3
     start_near_resources: bool = True
     rare_events_disabled: bool = True  # reserved: no weather / raids in the sim
+    # Realtime (--realtime) per-stream wall-clock pacing targets.  Ignored in
+    # fast-forward mode, where publication maps onto tick cadence instead.
+    realtime_vision_hz: float = 10.0          # vision frames paced to this rate
+    realtime_body_heartbeat_hz: float = 2.0   # body vitals heartbeat rate
 
     @staticmethod
     def from_dict(raw: Dict[str, Any]) -> "SurvivalBoxConfig":
