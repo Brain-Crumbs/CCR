@@ -22,8 +22,10 @@ survival world. See [docs/minecraft-mvp.md](docs/minecraft-mvp.md).
 > The MVP ships with a deterministic *simulated* survival backend so the
 > entire stack — continuous loop, rewards, recording, replay, baselines,
 > behavioral cloning — runs end to end with zero dependencies and no
-> Minecraft server. A real-Minecraft backend plugs in behind the same
-> adapter seam (`SurvivalBackend`) without touching the runtime.
+> Minecraft server. A **real-Minecraft backend** (`--backend remote`) plugs in
+> behind the same adapter seam (`SurvivalBackend`) via a mineflayer bridge,
+> without touching the runtime — see
+> [bridge/mineflayer/README.md](bridge/mineflayer/README.md).
 
 ## Quick start
 
@@ -60,6 +62,11 @@ python -m cognitive_runtime replay --session sessions/<session-id>
 # Inspect an episode / aggregate metrics across sessions
 python -m cognitive_runtime view --session sessions/<session-id> --episode episode_00000
 python -m cognitive_runtime dashboard
+
+# Inhabit a real Minecraft server via the mineflayer bridge (see
+# bridge/mineflayer/README.md): npm install once, point at your server, then:
+CCR_MINECRAFT_HOST=localhost python -m cognitive_runtime run \
+    --backend remote --realtime --policy scripted --episode-ticks 400 --record-frames
 ```
 
 Run the tests:
@@ -103,13 +110,16 @@ cognitive_runtime/
   runtime/     continuous loop, fixed-tick scheduler, config,
                recorder (streams-v2: stream log + decisions + summaries), replay/verify
   programs/
-    minecraft/ SurvivalBox adapter, simulated backend, observations,
-               actions, survival reward, evaluation metrics
+    minecraft/ SurvivalBox adapter, simulated backend, remote (mineflayer)
+               backend, observations, actions, survival reward, metrics
   policies/    null, random, scripted survival, human-demo, learned (BC)
   training/    features, dataset builder, imitation trainer, policy comparison
   tools/       episode viewer, metrics dashboard, replay runner
+bridge/
+  mineflayer/  Node bridge to a live Minecraft server (real backend)
+  fake/        SimulatedWorld over the same protocol (tests / reference)
 docs/          architecture, program interface, Minecraft MVP, future AI-OS
-tests/         determinism, rewards, replay fidelity, training milestones
+tests/         determinism, rewards, replay fidelity, training, remote backend
 ```
 
 ## Key architectural rule

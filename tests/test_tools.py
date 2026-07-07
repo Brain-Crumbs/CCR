@@ -104,7 +104,16 @@ def test_non_deterministic_session_is_not_replay_verified(tmp_path):
         main(["replay", "--session", session_dir])
 
 
-def test_cli_backend_flag_selects_the_backend(tmp_path, capsys):
-    with pytest.raises(NotImplementedError, match="mineflayer"):
-        main(["run", "--policy", "null", "--episodes", "1", "--episode-ticks", "5",
-              "--no-record", "--backend", "remote"])
+def test_cli_backend_flag_runs_over_the_remote_backend(tmp_path, monkeypatch):
+    """`--backend remote` selects the remote backend and runs against it; here
+    it is pointed at the Python fake bridge so no Minecraft/Node is needed."""
+    import sys
+    from pathlib import Path
+
+    fake_bridge = Path(__file__).resolve().parents[1] / "bridge" / "fake" / "sim_bridge.py"
+    monkeypatch.setenv("CCR_MINECRAFT_BRIDGE_CMD", f"{sys.executable} {fake_bridge}")
+    main(["run", "--policy", "scripted", "--episodes", "1", "--episode-ticks", "20",
+          "--backend", "remote", "--record-dir", str(tmp_path), "--session-id", "cli-remote"])
+    metadata = json.loads((tmp_path / "cli-remote" / "session.json").read_text())
+    assert metadata["deterministic"] is False
+    assert "remote" in metadata["program_tags"]

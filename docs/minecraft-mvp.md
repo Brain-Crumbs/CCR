@@ -28,9 +28,11 @@ The adapter (`programs/minecraft/adapter.py`) talks to a pluggable
   spawn at night and burn at dawn, block breaking/placing, and an
   inventory + hotbar. Same seed + same actions ⇒ byte-identical
   observations, which is what makes replay verification possible.
-- **`RemoteMinecraftBackend` (stub):** the seam for real Minecraft
-  (mineflayer / Malmo / RCON driving a fixed-seed, world-bordered server).
-  Implementing it requires no changes above the adapter.
+- **`RemoteMinecraftBackend` (shipped):** drives a **live Minecraft server**
+  through a small mineflayer bridge over a line-delimited JSON protocol
+  (`programs/minecraft/remote.py` + `bridge/mineflayer/`). It declares itself
+  non-deterministic and snapshot-less, so everything above the adapter —
+  streams, rewards, recording, training, realtime pacing — works unchanged.
 
 The backend is selected with `--backend {simulated,remote}` on
 `run`/`demo`/`evaluate` (default: `simulated`).
@@ -40,38 +42,47 @@ Starting conditions follow the plan: fixed seed, limited world boundary
 episodes, optional spawn-near-resources. The goal is not to make Minecraft
 hard yet — the goal is to make learning measurable.
 
-### Real-backend integration (mineflayer / Malmo / RCON)
+### Real Minecraft via the mineflayer bridge
 
-A real backend implements `SurvivalBackend` and everything above the
-adapter — streams, rewards, recording, training, realtime pacing — works
-unchanged. What the implementation owes the seam:
+Full setup is in [`bridge/mineflayer/README.md`](../bridge/mineflayer/README.md).
+The short version:
 
-- **Capability flags.** `SurvivalBackend.deterministic` and
-  `SurvivalBackend.supports_snapshots` are class attributes; a live server
-  sets both `False`. The adapter then refuses `snapshot()`/`restore()` with
-  a clear error, the session records `"deterministic": false`, and
-  `replay` skips re-simulation with an explanation instead of reporting
-  spurious divergence (the recording stays fully usable for `view` and
-  `train`).
-- **Semantic events.** `step()` returns the event-string vocabulary the
-  stream publisher and reward function consume: `damage:<reason>`,
-  `new_item:<item>`, `broke_block:<block>`, `placed_block`, `ate_food`,
-  `entered_shelter`, `survived_night`, `died`. A mineflayer bridge
-  synthesizes them from client events (health delta → `damage:`, inventory
-  delta → `new_item:`, …). The dormant reward rules (`first_tool`,
-  `created_light_source`) activate as soon as the backend emits those
-  events.
-- **Cheap `observe()`.** The runtime loop derives policy state from
-  streams and never calls `observe()`, but the adapter still builds each
-  tick's stream publication from the backend's `observe(timestamp)` — keep
-  it a cached-state read, never a network round-trip.
-- **Realtime mode is the natural fit.** Run with `--realtime`: the bridge
-  publishes from its own thread onto the thread-safe sensory bus, vision
-  and the body heartbeat are paced to wall-clock rates, and bounded queues
-  with declared overflow policies absorb a bursty client.
+```bash
+cd bridge/mineflayer && npm install          # Node ≥ 18
+export CCR_MINECRAFT_HOST=localhost CCR_MINECRAFT_PORT=25565
+python -m cognitive_runtime run --backend remote --realtime \
+    --policy scripted --episodes 1 --episode-ticks 400 --record-frames
+```
 
-The remaining integration checklist lives in the tracking issue for the
-real backend.
+The runtime launches `node bridge/mineflayer/index.js` (override with
+`CCR_MINECRAFT_BRIDGE_CMD`) and talks to it over stdio. The bridge maps the
+action space onto mineflayer controls, builds the observation shape (mapping
+Minecraft block/biome/item names into the SurvivalBox vocabulary), and
+synthesizes the semantic event vocabulary — `damage:<reason>`,
+`new_item:<item>`, `broke_block:<block>`, `placed_block`, `ate_food`,
+`entered_shelter`, `survived_night`, `died` — that the stream publisher and
+reward function already consume. The dormant reward rules (`first_tool`,
+`created_light_source`) activate as soon as the bridge emits those events.
+
+How the seam behaves for a live, non-deterministic world:
+
+- **Capability flags.** `SurvivalBackend.deterministic` /
+  `supports_snapshots` are both `False` for the remote backend. The adapter
+  refuses `snapshot()`/`restore()` with a clear error, the session records
+  `"deterministic": false`, and `replay` skips re-simulation with an
+  explanation instead of reporting spurious divergence — the recording stays
+  fully usable for `view` and `train`.
+- **Realtime is the natural fit.** With `--realtime` the bridge advances one
+  server tick per step while the runtime paces vision/body streams to
+  wall-clock rates over bounded, overflow-counted queues; `dashboard` then
+  reports realtime health for the session.
+
+Testing without a server: the Python **fake bridge**
+(`bridge/fake/sim_bridge.py`) speaks the same protocol backed by the
+simulated world, so `tests/test_remote_backend.py` drives the entire remote
+path and asserts it reproduces the in-process backend byte-for-byte. The
+bridge's JavaScript is syntax-checked in CI; its live behaviour (block-mapping
+fidelity, action timing) is what you tune against your server.
 
 ## Observations (MVP)
 
