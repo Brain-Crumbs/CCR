@@ -29,7 +29,9 @@ survival world. See [docs/minecraft-mvp.md](docs/minecraft-mvp.md).
 
 ## Quick start
 
-Requires Python ≥ 3.10. No dependencies (pytest for tests).
+Requires Python ≥ 3.10. No dependencies for the core stack (pytest for tests).
+Pixel-vision neural training/inference is opt-in: `pip install -e .[neural]`
+pulls PyTorch; everything else runs without it.
 
 ```bash
 # Milestone 0: the continuous loop with the null policy
@@ -55,6 +57,13 @@ python -m cognitive_runtime train --sessions sessions/<session-id> --out models/
 
 # Evaluate the learned policy against the baselines
 python -m cognitive_runtime evaluate --policies random,scripted,learned --model models/bc.json
+
+# Train a pixel-vision CNN end to end: it learns its own vision from the RGB
+# vision.frame.pixels stream (needs frames in the log + the optional neural extra)
+#   pip install -e .[neural]
+python -m cognitive_runtime train --model-type neural \
+    --sessions sessions/<session-id> --out models/vision_bc.pt
+python -m cognitive_runtime evaluate --policies scripted,neural --model models/vision_bc.pt
 
 # Replay a recorded session and verify tick-for-tick determinism
 python -m cognitive_runtime replay --session sessions/<session-id>
@@ -112,8 +121,11 @@ cognitive_runtime/
   programs/
     minecraft/ SurvivalBox adapter, simulated backend, remote (mineflayer)
                backend, observations, actions, survival reward, metrics
-  policies/    null, random, scripted survival, human-demo, learned (BC)
-  training/    features, dataset builder, imitation trainer, policy comparison
+  policies/    null, random, scripted survival, human-demo, learned (linear BC),
+               neural (end-to-end pixel-vision CNN)
+  training/    features, dataset builders (linear + neural), imitation trainer,
+               neural trainer (end-to-end BC), policy comparison
+  models/      neural models (pixel-vision CNN); optional, torch-only
   tools/       episode viewer, metrics dashboard, replay runner
 bridge/
   mineflayer/  Node bridge to a live Minecraft server (real backend)
