@@ -32,10 +32,46 @@ The adapter (`programs/minecraft/adapter.py`) talks to a pluggable
   (mineflayer / Malmo / RCON driving a fixed-seed, world-bordered server).
   Implementing it requires no changes above the adapter.
 
+The backend is selected with `--backend {simulated,remote}` on
+`run`/`demo`/`evaluate` (default: `simulated`).
+
 Starting conditions follow the plan: fixed seed, limited world boundary
 (walled), survival mode, daytime start, controlled difficulty, short
 episodes, optional spawn-near-resources. The goal is not to make Minecraft
 hard yet — the goal is to make learning measurable.
+
+### Real-backend integration (mineflayer / Malmo / RCON)
+
+A real backend implements `SurvivalBackend` and everything above the
+adapter — streams, rewards, recording, training, realtime pacing — works
+unchanged. What the implementation owes the seam:
+
+- **Capability flags.** `SurvivalBackend.deterministic` and
+  `SurvivalBackend.supports_snapshots` are class attributes; a live server
+  sets both `False`. The adapter then refuses `snapshot()`/`restore()` with
+  a clear error, the session records `"deterministic": false`, and
+  `replay` skips re-simulation with an explanation instead of reporting
+  spurious divergence (the recording stays fully usable for `view` and
+  `train`).
+- **Semantic events.** `step()` returns the event-string vocabulary the
+  stream publisher and reward function consume: `damage:<reason>`,
+  `new_item:<item>`, `broke_block:<block>`, `placed_block`, `ate_food`,
+  `entered_shelter`, `survived_night`, `died`. A mineflayer bridge
+  synthesizes them from client events (health delta → `damage:`, inventory
+  delta → `new_item:`, …). The dormant reward rules (`first_tool`,
+  `created_light_source`) activate as soon as the backend emits those
+  events.
+- **Cheap `observe()`.** The runtime loop derives policy state from
+  streams and never calls `observe()`, but the adapter still builds each
+  tick's stream publication from the backend's `observe(timestamp)` — keep
+  it a cached-state read, never a network round-trip.
+- **Realtime mode is the natural fit.** Run with `--realtime`: the bridge
+  publishes from its own thread onto the thread-safe sensory bus, vision
+  and the body heartbeat are paced to wall-clock rates, and bounded queues
+  with declared overflow policies absorb a bursty client.
+
+The remaining integration checklist lives in the tracking issue for the
+real backend.
 
 ## Observations (MVP)
 

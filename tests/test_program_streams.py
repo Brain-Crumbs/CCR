@@ -4,12 +4,12 @@ Covers the SurvivalBox migration (catalog, act/step parity, determinism,
 native cadences, NULL ticks, rejected motor events) and the legacy shim.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from cognitive_runtime.core.action import NULL_ACTION, Action
+from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.observation import Observation
-from cognitive_runtime.core.perception import StructuredPerception
+from cognitive_runtime.core.perception import State
 from cognitive_runtime.core.program import ActionResult, Program, ProgramMetadata
 from cognitive_runtime.core.reward import RewardSignal
 from cognitive_runtime.core.streams import (
@@ -49,19 +49,22 @@ def _drive(seed, actions):
 
 
 def _scripted_trace(seed, n_ticks):
-    """Action sequence the scripted policy produces on the legacy path."""
-    program = MinecraftSurvivalBox(config=FAST_CONFIG)
-    program.reset(seed=seed)
+    """Action sequence the scripted policy produces over stream-derived state."""
+    program, sensory, motor = _stream_program(seed)
     policy = ScriptedSurvivalPolicy(seed=0)
-    perception, memory = StructuredPerception(), Memory()
+    memory = Memory()
+    buffer = TemporalBuffer()
+    buffer.extend(sensory.drain())  # initial post-reset snapshot
     actions = []
     for _ in range(n_ticks):
-        state = perception.encode(program.observe())
+        state = State(observation=LatestValueView(buffer).to_observation())
         action = policy.decide(state, memory, None)
         actions.append(action)
         memory.record_action(action)
-        program.act(action)
-        program.reward()
+        if not action.is_null:
+            publish_motor_command(motor, action, timestamp=0.0)
+        program.step()
+        buffer.extend(sensory.drain())
     return actions
 
 
@@ -74,8 +77,8 @@ def test_stream_catalog_covers_the_survival_taxonomy():
     expected = {
         "vision.frame.grid", "vision.entities",
         "body.health", "body.hunger", "body.oxygen",
-        "body.inventory", "body.hotbar",
-        "spatial.position", "spatial.rotation",
+        "body.inventory", "body.hotbar", "body.in_water", "body.alive",
+        "spatial.position", "spatial.rotation", "spatial.distance_from_spawn",
         "world.time", "world.biome", "world.nearby_blocks",
         "world.front_block", "world.sheltered",
         "event.damage_taken", "event.item_collected", "event.block_broken",

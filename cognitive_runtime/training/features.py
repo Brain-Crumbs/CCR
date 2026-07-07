@@ -66,12 +66,25 @@ def observation_data_from_streams(
     (``body.health``, ``world.time``, ...); this is the inverse map so the
     featurizer runs on the reconstructed stream state exactly as it did on the
     recorded observation.  ``spawn`` (the tick-0 position) recovers
-    ``distance_from_spawn``, which is not itself a stream.
+    ``distance_from_spawn`` for recordings that predate the
+    ``spatial.distance_from_spawn`` stream.
     """
     time = stream_data.get("world.time") or {}
     rotation = stream_data.get("spatial.rotation") or {}
     hotbar = stream_data.get("body.hotbar") or {}
     position = stream_data.get("spatial.position") or {}
+    nearby = stream_data.get("world.nearby_blocks") or []
+    # body.in_water is published as a stream; for recordings that predate it,
+    # the centre cell of the world.nearby_blocks patch is the agent's own cell
+    # — the same cell the backend's in_water flag reads — so it reconstructs
+    # exactly.
+    in_water = stream_data.get("body.in_water")
+    if in_water is None:
+        in_water = False
+        if nearby:
+            center_row = nearby[len(nearby) // 2]
+            if center_row:
+                in_water = center_row[len(center_row) // 2] == "water"
     obs: Dict[str, Any] = {
         "health": stream_data.get("body.health", 0.0),
         "hunger": stream_data.get("body.hunger", 0.0),
@@ -83,7 +96,8 @@ def observation_data_from_streams(
         "pitch": rotation.get("pitch", 0.0),
         "mobs": stream_data.get("vision.entities") or [],
         "front_block": stream_data.get("world.front_block", "grass"),
-        "nearby_blocks": stream_data.get("world.nearby_blocks") or [],
+        "nearby_blocks": nearby,
+        "in_water": in_water,
         "inventory": stream_data.get("body.inventory") or {},
         "hotbar": hotbar.get("slots") or [],
         "selected_slot": hotbar.get("selected", 0),
@@ -91,7 +105,12 @@ def observation_data_from_streams(
         "biome": stream_data.get("world.biome", ""),
         "position": position,
     }
-    if spawn is not None and position:
+    # spatial.distance_from_spawn is published as a stream; the tick-0
+    # ``spawn`` position remains the fallback for recordings that predate it.
+    distance = stream_data.get("spatial.distance_from_spawn")
+    if distance is not None:
+        obs["distance_from_spawn"] = distance
+    elif spawn is not None and position:
         obs["distance_from_spawn"] = math.dist(
             (position.get("x", 0.0), position.get("z", 0.0)), spawn
         )

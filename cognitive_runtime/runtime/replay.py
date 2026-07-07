@@ -48,6 +48,16 @@ class LegacyFormatError(RuntimeError):
     """Raised when a session predates the streams-v2 recording format."""
 
 
+class NonDeterministicSessionError(RuntimeError):
+    """Raised when a session was recorded by a non-deterministic backend.
+
+    Replay verification re-simulates the world from the recorded seed and
+    motor stream; that only proves anything for a deterministic backend.  A
+    live-server recording is still fully usable for viewing and training —
+    it just cannot be verified by re-simulation.
+    """
+
+
 # --------------------------------------------------------------------- loading
 
 
@@ -62,6 +72,22 @@ def require_streams_v2(metadata: Dict[str, Any]) -> None:
         raise LegacyFormatError(
             f"session is not {RECORDING_FORMAT!r} (format={fmt!r}); "
             "re-record it with the current runtime to replay it"
+        )
+
+
+def require_deterministic(metadata: Dict[str, Any]) -> None:
+    """Reject re-simulation of sessions from non-deterministic backends.
+
+    Sessions that predate the ``deterministic`` metadata field are treated as
+    deterministic (they could only have come from the simulated backend).
+    """
+    if not metadata.get("deterministic", True):
+        raise NonDeterministicSessionError(
+            f"session {metadata.get('session_id', '?')!r} was recorded by a "
+            "non-deterministic backend "
+            f"(program_tags={metadata.get('program_tags')}); replay "
+            "verification by re-simulation only applies to deterministic "
+            "backends — the recording remains usable for view/train"
         )
 
 

@@ -77,8 +77,9 @@ while running:
     for _ in range(program_ticks_per_cognitive_tick):
         program.step()                          # drains motor bus, publishes streams
     window  = synchronizer.collect(sensory_bus) # events since the last cognitive tick
-    tokens  = encoders.encode_window(window)
-    memory.update(window, tokens)               # TemporalBuffer + latent tokens
+    memory.update(window)                       # TemporalBuffer of recent events
+    latent  = fusion.fuse(window, memory.buffer)   # fixed-width LatentState
+    state   = memory.latest_values().to_observation()  # stream-derived, no observe()
     pred    = world_model.predict(state, memory)
     motor   = policy.emit(state, memory, pred)  # list of motor emissions; [] == NULL
     for action in motor: motor_bus.publish(...)
@@ -112,14 +113,16 @@ Notes:
   `EpisodeSummary.null_action_ticks`. The world still advances on a NULL
   tick (hunger drains, mobs move, time passes) and still publishes
   `reward.scalar`.
-- **Perception is retired from the loop.** A `StreamEncoderRegistry` of
-  passthrough encoders turns the window into latent tokens in place of the
-  old `StructuredPerception` (real modality encoders are Phase 4).
-- **Compatibility bridge.** `program.observe()` remains as the sanctioned
-  Phase-2 shim that feeds observation-based policies and the recorder /
-  featurizer, until Phase 4 moves them onto latent tokens. The *primary*
-  data path — memory, encoders, world model, learner, recording — is
-  stream-based.
+- **Perception is retired from the loop.** The per-modality stream encoders
+  plus `TemporalFusion` produce the fixed-width `LatentState` in place of the
+  old `StructuredPerception`; the default learned policy consumes that fused
+  latent state.
+- **Stream-derived policy state.** The `State` handed to policies is
+  reconstructed from the latest value of each stream
+  (`Memory.latest_values().to_observation()`); the loop never calls
+  `program.observe()` (a test enforces it). Observation-based policies
+  (scripted, human demo, the handcrafted A/B featurizer) read stream-keyed
+  data — the latest value each stream has published.
 - Decision latency (window collection → motor emission) is measured per
   cognitive tick and recorded, alongside per-stream event rates and
   silent-stream gaps.

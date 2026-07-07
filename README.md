@@ -33,8 +33,10 @@ Requires Python ≥ 3.10. No dependencies (pytest for tests).
 # Milestone 0: the continuous loop with the null policy
 python -m cognitive_runtime run --policy null --episodes 1
 
-# Baselines with recording (sessions/ by default)
-python -m cognitive_runtime run --policy scripted --episodes 3
+# Baselines with recording (sessions/ by default).  Add --record-frames when
+# the session is destined for training: frames are logged hash-only otherwise,
+# so the latent policy's vision features would train blind.
+python -m cognitive_runtime run --policy scripted --episodes 3 --record-frames
 
 # Real-time multi-rate streaming: hold 20 Hz in wall-clock time, vision paced
 # to 10 Hz and a 2 Hz body heartbeat (see docs/streams.md). Still replayable.
@@ -77,8 +79,9 @@ while running:
     for _ in range(program_ticks_per_cognitive_tick):
         program.step()                          # drains motor bus, publishes streams
     window  = synchronizer.collect(sensory_bus) # events since the last cognitive tick
-    tokens  = encoders.encode_window(window)
-    memory.update(window, tokens)
+    memory.update(window)                       # TemporalBuffer of recent events
+    latent  = fusion.fuse(window, memory.buffer)   # fixed-width LatentState
+    state   = memory.latest_values().to_observation()   # stream-derived, no observe()
     prediction = world_model.predict(state, memory)
     motor      = policy.emit(state, memory, prediction)  # [] == NULL
     for action in motor: motor_bus.publish(...)          # applied next tick
@@ -112,10 +115,12 @@ tests/         determinism, rewards, replay fidelity, training milestones
 ## Key architectural rule
 
 Minecraft-specific code must never leak into the runtime. The core runtime
-only ever calls `program.observe()`, `program.act(action)`,
-`program.reward()` — Minecraft knowledge lives in the Minecraft Program,
-its reward module, and optional Minecraft-specific policy experiments.
-Adding a second Program requires no runtime changes; that is the point.
+only ever talks to the generic `Program` interface — `program.step()` plus
+the sensory/motor stream buses; even the `State` handed to policies is
+derived from stream state, never pulled from the Program. Minecraft
+knowledge lives in the Minecraft Program, its reward module, and optional
+Minecraft-specific policy experiments. Adding a second Program requires no
+runtime changes; that is the point.
 
 ## Documentation
 

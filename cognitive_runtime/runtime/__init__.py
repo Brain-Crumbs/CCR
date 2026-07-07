@@ -11,6 +11,7 @@ from cognitive_runtime.runtime.recorder import (
 from cognitive_runtime.runtime.loop import CognitiveRuntime
 from cognitive_runtime.runtime.replay import (
     LegacyFormatError,
+    NonDeterministicSessionError,
     ReplayResult,
     list_episodes,
     replay_episode,
@@ -25,6 +26,7 @@ __all__ = [
     "EpisodeSummary",
     "CognitiveRuntime",
     "LegacyFormatError",
+    "NonDeterministicSessionError",
     "list_episodes",
     "replay_episode",
     "ReplayResult",

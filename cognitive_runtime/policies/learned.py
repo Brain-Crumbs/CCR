@@ -22,7 +22,11 @@ from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.perception import State
 from cognitive_runtime.core.world_model import Prediction
 from cognitive_runtime.core.policy import SingleActionPolicy
-from cognitive_runtime.training.features import featurize, latent_features
+from cognitive_runtime.training.features import (
+    featurize,
+    latent_features,
+    observation_data_from_streams,
+)
 from cognitive_runtime.training.imitation import BCModel
 
 
@@ -43,7 +47,11 @@ class LearnedPolicy(SingleActionPolicy):
         if self.representation == "latent":
             features = self._latent_features(memory)
         else:
-            features = featurize(state.observation.data, list(self._recent))
+            # The loop's observation is stream-keyed; run it through the same
+            # inverse map the offline dataset builder uses, so train-time and
+            # inference-time features come from identical code.
+            obs = observation_data_from_streams(state.observation.data)
+            features = featurize(obs, list(self._recent))
         key = self.model.predict_key(features)
         self._recent.append(key)
         return Action.from_key(key)

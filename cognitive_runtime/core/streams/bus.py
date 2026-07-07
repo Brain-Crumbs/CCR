@@ -233,11 +233,6 @@ class StreamBus:
         with self._guard():
             return {sid: dict(c) for sid, c in self._overflow_counts.items()}
 
-    def total_overflows(self) -> int:
-        return sum(
-            sum(c.values()) for c in self.overflow_counts().values()
-        )
-
     # -- consuming ----------------------------------------------------------
 
     def drain(self) -> List[StreamEvent]:

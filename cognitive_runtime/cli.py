@@ -25,10 +25,11 @@ from cognitive_runtime.policies import (
     ScriptedSurvivalPolicy,
 )
 from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
-from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+from cognitive_runtime.programs.minecraft.adapter import BACKENDS, MinecraftSurvivalBox
 from cognitive_runtime.programs.minecraft.evaluation import comparison_table, summarize_episodes
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
+from cognitive_runtime.runtime.replay import NonDeterministicSessionError
 from cognitive_runtime.tools.episode_viewer import view_episode
 from cognitive_runtime.tools.metrics_dashboard import dashboard
 from cognitive_runtime.tools.replay_runner import format_results, replay_session
@@ -73,6 +74,9 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
                         help="full day/night cycle in ticks; night is the second half")
     parser.add_argument("--start-time", type=int, default=0, help="time of day at spawn")
     parser.add_argument("--model", default=None, help="path to a trained BC model (learned policy)")
+    parser.add_argument("--backend", default="simulated", choices=sorted(BACKENDS),
+                        help="survival backend: the deterministic simulated world, or "
+                             "a real-Minecraft client (remote; not yet implemented)")
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -93,7 +97,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         program_config=program_config,
     )
     runtime = CognitiveRuntime(
-        program=MinecraftSurvivalBox(config=program_config),
+        program=MinecraftSurvivalBox(config=program_config, backend=args.backend),
         policy=policy,
         config=config,
     )
@@ -134,7 +138,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     for name in names:
         factories[name] = (lambda n: (lambda: _make_policy(n, args)))(name)
     rows = compare_policies(
-        program_factory=lambda: MinecraftSurvivalBox(config=program_config),
+        program_factory=lambda: MinecraftSurvivalBox(config=program_config, backend=args.backend),
         policy_factories=factories,
         episodes=args.episodes,
         seed=args.seed,
@@ -166,7 +170,10 @@ def cmd_train(args: argparse.Namespace) -> None:
 
 
 def cmd_replay(args: argparse.Namespace) -> None:
-    results = replay_session(args.session, episode_id=args.episode, verify=not args.no_verify)
+    try:
+        results = replay_session(args.session, episode_id=args.episode, verify=not args.no_verify)
+    except NonDeterministicSessionError as exc:
+        sys.exit(f"replay skipped: {exc}")
     print(format_results(results))
     if any(not r.matched for r in results):
         sys.exit(1)

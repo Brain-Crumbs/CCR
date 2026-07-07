@@ -41,6 +41,28 @@ def test_featurizer_is_fixed_width():
     assert all(isinstance(v, float) for v in features)
 
 
+def test_stream_reconstruction_derives_in_water():
+    """in_water is not a stream; it must reconstruct from the centre cell of
+    the world.nearby_blocks patch so offline handcrafted features match the
+    online observation (train/inference parity)."""
+    from cognitive_runtime.training.features import observation_data_from_streams
+
+    dry_patch = [["grass"] * 5 for _ in range(5)]
+    wet_patch = [row[:] for row in dry_patch]
+    wet_patch[2][2] = "water"  # the agent's own cell
+
+    dry = observation_data_from_streams({"world.nearby_blocks": dry_patch})
+    wet = observation_data_from_streams({"world.nearby_blocks": wet_patch})
+    empty = observation_data_from_streams({})
+    assert dry["in_water"] is False
+    assert wet["in_water"] is True
+    assert empty["in_water"] is False
+
+    in_water_index = FEATURE_NAMES.index("in_water")
+    assert featurize(wet, [])[in_water_index] == 1.0
+    assert featurize(dry, [])[in_water_index] == 0.0
+
+
 def test_dataset_built_from_recorded_traces(tmp_path):
     _, session_dir = _record_session(
         tmp_path, ScriptedSurvivalPolicy(seed=1), "scripted-data", FAST_CONFIG

@@ -1,12 +1,11 @@
 # Sensory & Motor Streams
 
-The runtime is migrating from static observations to **time-indexed sensory
-streams**: instead of asking "what is the current observation?", the runtime
-asks **"what streams have arrived since the last cognitive tick?"**. This
-document covers the Phase-0 stream substrate in
-`cognitive_runtime/core/streams/` — the primitives everything later builds
-on. The primitives are purely additive today: the legacy loop is unchanged
-until Phase 2 of the migration.
+The runtime consumes **time-indexed sensory streams**, not static
+observations: instead of asking "what is the current observation?", it asks
+**"what streams have arrived since the last cognitive tick?"**. This
+document covers the stream substrate in `cognitive_runtime/core/streams/` —
+the primitives the loop, recorder, replay and training are all built on
+(see the migration status at the end of this document).
 
 ## Architecture
 
@@ -39,22 +38,22 @@ Design rules:
 
 Every event lives on a named stream. Stream ids are **lowercase dotted
 paths** whose first segment is, by convention, the modality
-(`body.health`, `vision.frame.grid`, `event.damage`). Modalities are
+(`body.health`, `vision.frame.grid`, `event.damage_taken`). Modalities are
 generic: Minecraft health, a Linux battery and robot joint stress are all
 `body.*` streams; Minecraft frames, desktop pixels and robot cameras are all
 `vision.*` streams. The brain consumes modalities, never environment fields.
 
 | Modality | What flows on it | Example streams |
 |---|---|---|
-| `body` | Internal/self state | `body.health`, `body.hunger`, `body.position` |
-| `vision` | Frames, pixels, grids | `vision.frame.grid` |
-| `spatial` | Maps, locality, geometry | `spatial.nearby_blocks` |
+| `body` | Internal/self state | `body.health`, `body.hunger`, `body.oxygen` |
+| `vision` | Frames, pixels, grids | `vision.frame.grid`, `vision.entities` |
+| `spatial` | Position, orientation, geometry | `spatial.position`, `spatial.rotation` |
 | `audio` | Sound events/levels | `audio.ambient` |
-| `event` | Discrete world happenings | `event.damage`, `event.item_collected` |
-| `reward` | Reward components | `reward.survival` |
+| `event` | Discrete world happenings | `event.damage_taken`, `event.item_collected` |
+| `reward` | Reward components | `reward.scalar` |
 | `language` | Text in/out of the world | `language.chat` |
-| `input` | Raw human input (demos) | `input.keyboard` |
-| `world` | Global world state | `world.time_of_day`, `world.weather` |
+| `input` | Raw human input (demos) | `input.keypress` |
+| `world` | Global world state | `world.time`, `world.nearby_blocks` |
 | `motor` | Actions, the other direction | `motor.command` |
 
 ## The primitives
@@ -207,12 +206,18 @@ carry it forward:
 
 ## Migration status
 
-Phase 0 (this document) is additive only. Completed phases: Program
-interface v2 (programs publish/consume streams), runtime loop v2 (cognitive
-ticks over stream windows), stream-native recording/replay + tools
-(streams-v2), modality encoders + temporal fusion with behavioral cloning on
-the latent state (Phase 4), and **real-time multi-rate streaming (Phase 5)** —
-the two-clock design, rate pacing, asynchronous ingestion, bounded-queue
-backpressure and realtime health metrics described above. Remaining: real
-neural encoders/fusion and learned world models. See the tracking issue for the
-full plan.
+Completed phases: stream primitives (Phase 0), Program interface v2
+(programs publish/consume streams), runtime loop v2 (cognitive ticks over
+stream windows), stream-native recording/replay + tools (streams-v2),
+modality encoders + temporal fusion with behavioral cloning on the latent
+state (Phase 4), and **real-time multi-rate streaming (Phase 5)** — the
+two-clock design, rate pacing, asynchronous ingestion, bounded-queue
+backpressure and realtime health metrics described above.
+
+The loop's policy `State` is now **derived from stream state**
+(`Memory.latest_values().to_observation()`), not pulled from the Program:
+`program.observe()` is no longer called by the loop (a test enforces it),
+and the formerly observation-only fields are streams
+(`body.in_water`, `body.alive`, `spatial.distance_from_spawn`). Remaining:
+real neural encoders/fusion and learned world models. See the tracking
+issue for the full plan.

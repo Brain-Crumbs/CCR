@@ -51,13 +51,17 @@ class ScriptedSurvivalPolicy(SingleActionPolicy):
         self._turn_bias = _RIGHT
 
     def decide(self, state: State, memory: Memory, prediction: Optional[Prediction]) -> Action:
+        # The loop derives the observation from stream state, so data is keyed
+        # by the SurvivalBox stream ids (see programs/minecraft/streams.py).
         obs: Dict[str, Any] = state.observation.data
-        health = obs.get("health", 20.0)
-        hunger = obs.get("hunger", 20.0)
-        hotbar = obs.get("hotbar", [])
-        mobs = obs.get("mobs", [])
-        front = obs.get("front_block", "grass")
-        pos = obs.get("position", {})
+        health = obs.get("body.health", 20.0)
+        hunger = obs.get("body.hunger", 20.0)
+        hotbar_state = obs.get("body.hotbar") or {}
+        hotbar = hotbar_state.get("slots") or []
+        selected_slot = hotbar_state.get("selected", 0)
+        mobs = obs.get("vision.entities") or []
+        front = obs.get("world.front_block", "grass")
+        pos = obs.get("spatial.position") or {}
         here = (round(pos.get("x", 0.0), 2), round(pos.get("z", 0.0), 2))
 
         self._track_stuck(here, memory)
@@ -81,13 +85,13 @@ class ScriptedSurvivalPolicy(SingleActionPolicy):
                 return _MOVE  # close the gap while facing the mob
 
         # --- water escape -----------------------------------------------------
-        if obs.get("in_water"):
+        if obs.get("body.in_water"):
             return _BACK
 
         # --- eating -----------------------------------------------------------
         if hunger <= 12.0 and _FOOD in hotbar:
             slot = hotbar.index(_FOOD)
-            if obs.get("selected_slot") != slot:
+            if selected_slot != slot:
                 return Action.make("SELECT_HOTBAR_SLOT", slot=slot)
             return _USE
 

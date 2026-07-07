@@ -10,6 +10,7 @@ The runtime no longer asks "what is the current observation?" — it asks
         window  = synchronizer.collect(sensory_bus)
         memory.update(window)
         latent  = fusion.fuse(window, memory.buffer)   # fixed-width LatentState
+        state   = memory.latest_values().to_observation()  # stream-derived
         pred    = world_model.predict(state, memory)
         motor   = policy.emit(state, memory, pred)   # [] == NULL
         for action in motor: motor_bus.publish(...)
@@ -22,10 +23,10 @@ tick *t+1*.  This is how real sensorimotor loops behave; it is stable and
 documented because replay and reward attribution depend on it.
 
 The loop stays environment-agnostic: it only talks to the stream buses and
-the Program interface.  `program.observe()` is used solely as the sanctioned
-Phase-2 compatibility bridge that lets observation-based policies (and the
-recorder/featurizer) keep working until Phase 4 moves them onto latent
-tokens.
+the Program interface.  The `State` handed to policies is **derived from
+stream state** (`Memory.latest_values().to_observation()`), never pulled
+from the Program: observation-based policies read the latest value each
+stream has published.  `program.observe()` is no longer called by the loop.
 """
 
 from __future__ import annotations
@@ -124,6 +125,8 @@ class CognitiveRuntime:
                 "session_id": self.recorder.session_id,
                 "program": meta.name,
                 "program_version": meta.version,
+                "program_tags": list(meta.tags),
+                "deterministic": meta.deterministic,
                 "policy": self.policy.name,
                 "tick_rate": self.config.tick_rate,
                 "realtime": self.config.realtime,
@@ -176,10 +179,15 @@ class CognitiveRuntime:
             # "What streams arrived since the last cognitive tick?"  Decision
             # latency is measured from here (window collection) to emission.
             decide_start = time.perf_counter()
-            observation = self.program.observe()  # Phase-2 compatibility bridge
-            window = self.synchronizer.collect(self.sensory_bus, now=observation.timestamp)
+            window = self.synchronizer.collect(self.sensory_bus)
             self.memory.update(window)
             self.memory.set_fused_latent(self.fusion.fuse(None, self.memory.buffer))
+            # The policy's State is derived from stream state, not pulled from
+            # the Program: the latest value each stream has published, shaped
+            # like an Observation for observation-based policies.
+            observation = self.memory.latest_values().to_observation(
+                tick=(window.tick_index + 1) * ratio
+            )
             state = State(observation=observation)
             prediction = self.world_model.predict(state, self.memory)
             emissions = self.policy.emit(state, self.memory, prediction)
@@ -189,7 +197,7 @@ class CognitiveRuntime:
                 break
 
             motor_events = [
-                publish_motor_command(self.motor_bus, action, observation.timestamp)
+                publish_motor_command(self.motor_bus, action, window.ended_at)
                 for action in emissions
             ]
             motor_emissions += len(motor_events)
@@ -199,7 +207,7 @@ class CognitiveRuntime:
             reward_value = window_reward(window)
             total_reward += reward_value
             latency_total_ms += latency_ms
-            last_timestamp = observation.timestamp
+            last_timestamp = window.ended_at
             if not emissions:
                 null_ticks += 1
             ticks += 1

@@ -10,7 +10,6 @@ import os
 import subprocess
 import sys
 
-from cognitive_runtime.core.action import NULL_ACTION, Action
 from cognitive_runtime.core.streams import (
     MotorStreamBus,
     SensoryStreamBus,
@@ -21,7 +20,6 @@ from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
 from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
-from cognitive_runtime.runtime.recorder import EpisodeSummary
 from cognitive_runtime.runtime.replay import iter_cognitive_ticks, load_decisions
 from cognitive_runtime.tools.replay_runner import replay_session
 
@@ -222,3 +220,77 @@ def test_core_and_runtime_do_not_import_programs():
         "assert not bad, bad"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+# ------------------------------------- stream-derived policy state (issue #13)
+
+
+def test_loop_never_calls_program_observe(tmp_path):
+    """The loop's policy State is derived from stream state; program.observe()
+    is a compatibility API for shims/tests, never the loop's data path."""
+
+    class ObserveForbidden(MinecraftSurvivalBox):
+        def observe(self):
+            raise AssertionError("the loop must not call program.observe()")
+
+    runtime_config = RuntimeConfig(
+        episodes=1, seed=3, max_ticks_per_episode=100,
+        record_dir=str(tmp_path), session_id="no-observe", program_config=FAST_CONFIG,
+    )
+    runtime = CognitiveRuntime(
+        program=ObserveForbidden(config=FAST_CONFIG),
+        policy=ScriptedSurvivalPolicy(seed=1),
+        config=runtime_config,
+    )
+    summaries = runtime.run()
+    assert summaries[0].duration_ticks == 100
+
+
+def test_stream_derived_state_matches_program_observation(tmp_path):
+    """Every value the featurizer/policies read from the stream-derived State
+    must equal the program's own post-step observation, tick for tick."""
+    from cognitive_runtime.core.policy import SingleActionPolicy
+    from cognitive_runtime.training.features import observation_data_from_streams
+
+    program = MinecraftSurvivalBox(config=NIGHT_CONFIG)
+    mismatches = []
+    keys = [
+        "health", "hunger", "oxygen", "time_of_day", "day_length", "is_night",
+        "yaw", "pitch", "mobs", "front_block", "nearby_blocks", "inventory",
+        "hotbar", "selected_slot", "sheltered", "biome", "position",
+        "in_water", "distance_from_spawn",
+    ]
+
+    class ComparePolicy(SingleActionPolicy):
+        name = "scripted"
+
+        def __init__(self):
+            self.base = ScriptedSurvivalPolicy(seed=1)
+
+        def reset(self):
+            self.base.reset()
+
+        def decide(self, state, memory, prediction):
+            derived = observation_data_from_streams(state.observation.data)
+            legacy = program.observe()  # the test pulls it; the loop does not
+            for key in keys:
+                if derived.get(key) != legacy.data.get(key):
+                    mismatches.append((legacy.tick, key, derived.get(key),
+                                       legacy.data.get(key)))
+            if state.observation.frame != legacy.frame:
+                mismatches.append((legacy.tick, "frame", "...", "..."))
+            if state.observation.timestamp != legacy.timestamp:
+                mismatches.append((legacy.tick, "timestamp",
+                                   state.observation.timestamp, legacy.timestamp))
+            return self.base.decide(state, memory, prediction)
+
+    runtime_config = RuntimeConfig(
+        episodes=1, seed=100, max_ticks_per_episode=NIGHT_CONFIG["episode_ticks"],
+        record_dir=str(tmp_path), session_id="derived-parity",
+        program_config=NIGHT_CONFIG,
+    )
+    summaries = CognitiveRuntime(
+        program=program, policy=ComparePolicy(), config=runtime_config
+    ).run()
+    assert summaries[0].duration_ticks > 0
+    assert not mismatches, mismatches[:5]

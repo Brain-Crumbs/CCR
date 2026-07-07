@@ -142,6 +142,28 @@ def test_layout_hash_changes_with_catalog():
     assert trimmed.width < base.width
 
 
+def test_layout_hash_changes_with_categorical_vocabulary():
+    """A renamed categorical vocabulary of the same size changes the one-hot
+    semantics, so it must change the layout hash (loud failure, not silent
+    mis-prediction)."""
+
+    def rename(spec):
+        if spec.categories is None:
+            return spec
+        renamed = tuple(f"other_{c}" for c in spec.categories)
+        return StreamSpec(
+            stream_id=spec.stream_id, modality=spec.modality,
+            description=spec.description, nominal_rate_hz=spec.nominal_rate_hz,
+            payload_schema=spec.payload_schema, range=spec.range,
+            legend=spec.legend, categories=renamed, neutral=spec.neutral,
+        )
+
+    base = TemporalFusion(_catalog())
+    renamed = TemporalFusion([rename(s) for s in _catalog()])
+    assert renamed.width == base.width  # same size vocabulary, same layout width
+    assert renamed.layout_hash != base.layout_hash
+
+
 # ---------------------------------------------------- layout-hash guard on load
 
 
