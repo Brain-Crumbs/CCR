@@ -101,13 +101,97 @@ Streams are multi-rate by design; publish at the rate that matches the sense:
 (`silent_streams()`) so missing heartbeats surface as runtime-health
 signals rather than silent staleness.
 
+## Realtime multi-rate streaming (Phase 5)
+
+Fast-forward runs everything on one deterministic clock as fast as the CPU
+allows. **Realtime mode** (`--realtime`) instead lets each sense update at its
+own rate in wall-clock time — vision at 10–30 Hz, a body heartbeat at 1–10 Hz,
+events whenever they happen — while keeping determinism exactly where it is
+promised.
+
+### Two clocks, one deterministic
+
+Every `StreamEvent` carries two timestamps:
+
+- **`timestamp` — simulated time.** The deterministic replay clock. Windowing,
+  hashing, replay and reward all use it. The realtime scheduler holds simulated
+  time locked to the wall clock (it sleeps to keep the tick rate), so "10 Hz of
+  simulated time" *is* "10 Hz of wall time" during a live run.
+- **`arrived_at` — wall-clock arrival (metadata only).** The monotonic instant
+  an event reached the bus, stamped only in realtime mode. It is **excluded
+  from `hash()`**, so replay and hashing never depend on it. It exists purely so
+  health metrics can measure the *actually delivered* cadence. Fast-forward logs
+  omit it entirely and stay byte-identical.
+
+### Rate-driven publication (the pacer)
+
+`RatePacer` (in the Program's publisher) throttles a stream to a target rate.
+Crucially it paces off **simulated** time, so pacing is deterministic:
+
+- In **realtime** the scheduler keeps simulated ≈ wall, so vision paces to its
+  target Hz in real time; irregular streams (`event.*`) carry no target rate
+  and are never throttled; the per-tick world/reward streams run at the
+  cognitive rate.
+- In **fast-forward** the pacer is disabled and publication maps straight onto
+  tick cadence — the established Phase-1 behavior, so tests stay fast and
+  deterministic.
+
+Because pacing is a pure function of simulated time, a realtime recording
+**replays bit-for-bit in fast-forward**: replay re-enables the pacer off the
+recorded simulated clock and regenerates the very same paced subset of frames.
+
+### Asynchronous ingestion
+
+`SensoryStreamBus(thread_safe=True)` adds a lock + condition variable so a real
+backend (a mineflayer bridge, a screen-capture thread, the human-demo terminal
+reader) can `publish()` from its own thread while the cognitive loop drains on
+the main thread. The single-threaded simulated path is the default and stays
+**lock-free and deterministic** — it pays nothing for machinery it does not use.
+
+### Backpressure (bounded queues)
+
+Realtime queues are bounded per stream; when one overflows, the policy declared
+in its `StreamSpec.overflow` (or a per-modality default) decides what happens —
+and every drop is **counted, never silent**:
+
+| policy | behavior | default for |
+|---|---|---|
+| `coalesce` | collapse to the freshest event (a stale frame is worthless) | `vision`, `body` |
+| `block` | never drop — the publisher waits for the consumer | `event` |
+| `drop_oldest` | bounded ring: keep the most-recent `capacity` | everything else |
+
+In the deterministic single-threaded path the queues are drained every tick, so
+their bounds are never reached and ordering is unchanged.
+
+### Missed-window & staleness health
+
+`TickSynchronizer` and the `EpisodeSummary` account for realtime health:
+**empty windows** (nothing arrived), **late windows** (a tick that started past
+its deadline — the scheduler's missed ticks), **stale streams** (a rate-bearing
+stream quiet for more than 2× its nominal period — a stopped publisher),
+**motor emission rate**, **queue overflow counts**, and measured **wall-clock
+rates** per stream. `dashboard` renders a realtime-health block for realtime
+sessions.
+
+### What determinism means in realtime mode
+
+The motor log and every sensory-stream hash are still recorded. Replay re-runs
+in fast-forward and verifies the simulated-time behavior tick-for-tick: the
+recorded motor stream reproduces the same world trajectory, the same paced
+sensory hashes (pacing reproduced off simulated time), and the same reward.
+Wall-clock arrival times, being metadata, are free to differ between the live
+run and its replay — that is the one thing that legitimately cannot be
+reproduced, and nothing depends on it.
+
 ## The determinism contract
 
 Determinism is infrastructure ([architecture.md](architecture.md)); streams
 carry it forward:
 
-1. **Simulated time only.** `StreamEvent.timestamp` is simulated time,
-   never wall clock. Replay depends on it.
+1. **Simulated time drives everything deterministic.** `StreamEvent.timestamp`
+   is simulated time; replay, hashing and pacing depend on it. Wall-clock
+   arrival lives in `arrived_at` as metadata only (realtime mode) and is
+   excluded from `hash()`.
 2. **Per-stream monotonic sequence numbers**, assigned by the publishing
    bus, starting at 0 per episode (`bus.reset()`).
 3. **Deterministic delivery order.** `drain()` sorts by
@@ -126,8 +210,9 @@ carry it forward:
 Phase 0 (this document) is additive only. Completed phases: Program
 interface v2 (programs publish/consume streams), runtime loop v2 (cognitive
 ticks over stream windows), stream-native recording/replay + tools
-(streams-v2), and modality encoders + temporal fusion with behavioral cloning
-on the latent state (Phase 4). Remaining: real neural encoders/fusion, learned
-world models, and real-time multi-rate streaming. See the tracking issue for
-the full
-plan.
+(streams-v2), modality encoders + temporal fusion with behavioral cloning on
+the latent state (Phase 4), and **real-time multi-rate streaming (Phase 5)** —
+the two-clock design, rate pacing, asynchronous ingestion, bounded-queue
+backpressure and realtime health metrics described above. Remaining: real
+neural encoders/fusion and learned world models. See the tracking issue for the
+full plan.

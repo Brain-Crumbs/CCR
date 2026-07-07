@@ -35,6 +35,12 @@ MODALITIES = frozenset(
 
 _STREAM_ID_RE = re.compile(r"^[a-z0-9_]+(\.[a-z0-9_]+)*$")
 
+#: Backpressure behaviors a bounded bus queue applies when a stream overflows.
+#:  - ``drop_oldest``  ring buffer: keep the most-recent ``capacity`` events.
+#:  - ``coalesce``     keep only the latest event (frames — the fresh one wins).
+#:  - ``block``        never drop; the publisher waits for the consumer to drain.
+OVERFLOW_POLICIES = frozenset({"drop_oldest", "coalesce", "block"})
+
 
 def validate_stream_identity(stream_id: str, modality: str) -> None:
     """Validate a stream id / modality pair.
@@ -64,8 +70,16 @@ def validate_stream_identity(stream_id: str, modality: str) -> None:
 class StreamEvent:
     """One time-indexed sample on a named stream.
 
-    Timestamps are SIMULATED time — never wall clock.  Replay verification
-    hashes include the timestamp, so wall-clock leakage would break replay.
+    Two clocks live here, and only one of them is deterministic:
+
+    - ``timestamp`` is SIMULATED time — the deterministic replay clock.
+      Replay verification hashes include it, so wall-clock leakage would
+      break replay.
+    - ``arrived_at`` is the WALL-CLOCK instant the event reached the bus, in
+      realtime mode (``None`` in fast-forward).  It is **metadata only**:
+      excluded from :meth:`hash`, so replay and hashing never depend on it.
+      It exists so runtime-health metrics can measure real-time cadence
+      without contaminating determinism.
     """
 
     stream_id: str
@@ -75,6 +89,9 @@ class StreamEvent:
     payload: Any  # JSON-serializable
     confidence: float = 1.0
     source: str = ""  # publishing program/backend name
+    #: Wall-clock arrival instant (monotonic seconds), realtime mode only.
+    #: Metadata only — never part of hash(), replay, or fast-forward logs.
+    arrived_at: Optional[float] = None
 
     def __post_init__(self) -> None:
         validate_stream_identity(self.stream_id, self.modality)
@@ -107,6 +124,7 @@ class StreamEvent:
             "payload": self.payload,
             "confidence": self.confidence,
             "source": self.source,
+            "arrived_at": self.arrived_at,
         }
 
     @staticmethod
@@ -119,6 +137,7 @@ class StreamEvent:
             payload=raw.get("payload"),
             confidence=raw.get("confidence", 1.0),
             source=raw.get("source", ""),
+            arrived_at=raw.get("arrived_at"),
         )
 
 
@@ -145,9 +164,17 @@ class StreamSpec:
     categories: Optional[Tuple[str, ...]] = None
     #: value a fusion layout fills in when this stream is silent/missing.
     neutral: float = 0.0
+    #: bounded-queue overflow behavior in realtime mode (see OVERFLOW_POLICIES).
+    #: ``None`` = fall back to the bus's per-modality default.
+    overflow: Optional[str] = None
 
     def __post_init__(self) -> None:
         validate_stream_identity(self.stream_id, self.modality)
+        if self.overflow is not None and self.overflow not in OVERFLOW_POLICIES:
+            raise ValueError(
+                f"invalid overflow {self.overflow!r} for stream {self.stream_id!r}; "
+                f"expected one of {sorted(OVERFLOW_POLICIES)}"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -164,6 +191,7 @@ class StreamSpec:
             ),
             "categories": list(self.categories) if self.categories is not None else None,
             "neutral": self.neutral,
+            "overflow": self.overflow,
         }
 
     @staticmethod
@@ -183,4 +211,5 @@ class StreamSpec:
             ),
             categories=tuple(categories) if categories is not None else None,
             neutral=raw.get("neutral", 0.0),
+            overflow=raw.get("overflow"),
         )

@@ -70,11 +70,22 @@ class EpisodeSummary:
     ticks_per_second: float = 0.0
     missed_ticks: int = 0
     program_ticks_per_cognitive_tick: int = 1
+    realtime: bool = False
     # Runtime health: events/sec per stream_id, total counts, and streams that
     # fell silent.
     stream_event_rates: Dict[str, float] = field(default_factory=dict)
     stream_event_counts: Dict[str, int] = field(default_factory=dict)
     silent_streams: list = field(default_factory=list)
+    # Realtime multi-rate health (Phase 5): missed-window accounting, stale
+    # (stopped-publisher) streams, motor cadence, bounded-queue overflows, and
+    # measured wall-clock rates (populated in realtime mode only).
+    empty_windows: int = 0
+    late_windows: int = 0
+    stale_streams: list = field(default_factory=list)
+    motor_emissions: int = 0
+    motor_emission_rate: float = 0.0
+    stream_overflow_counts: Dict[str, Any] = field(default_factory=dict)
+    stream_wallclock_rates: Dict[str, float] = field(default_factory=dict)
     program_stats: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -99,6 +110,10 @@ def stream_event_to_log(
         "source": event.source,
         "hash": event.hash(),
     }
+    # Wall-clock arrival is metadata only (realtime mode) and never part of the
+    # hash; it is omitted in fast-forward so those logs stay byte-identical.
+    if event.arrived_at is not None:
+        record["arrived_at"] = event.arrived_at
     if elide_payload:
         record["elided"] = True
     else:

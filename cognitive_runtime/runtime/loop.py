@@ -77,10 +77,22 @@ class CognitiveRuntime:
         self.encoders = encoders or default_encoder_registry()
         self.fusion = TemporalFusion(self.program.stream_catalog(), self.encoders)
         self.memory = Memory(capacity=self.config.memory_capacity)
-        self.sensory_bus = SensoryStreamBus()
+        # Two clocks: the simulated timestamp drives windowing/hashing/replay;
+        # in realtime a monotonic wall clock stamps StreamEvent.arrived_at
+        # metadata and paces asynchronous publication.  Fast-forward keeps the
+        # bus lock-free and wall-clock-free so it stays byte-identical.
+        realtime = self.config.realtime
+        wall_clock = time.monotonic if realtime else None
+        self.sensory_bus = SensoryStreamBus(thread_safe=realtime, wall_clock=wall_clock)
         self.motor_bus = MotorStreamBus()
+        nominal_rates = {
+            spec.stream_id: spec.nominal_rate_hz
+            for spec in self.program.stream_catalog()
+            if spec.nominal_rate_hz
+        }
         self.synchronizer = TickSynchronizer(
-            program_ticks_per_cognitive_tick=self.config.program_ticks_per_cognitive_tick
+            program_ticks_per_cognitive_tick=self.config.program_ticks_per_cognitive_tick,
+            nominal_rates=nominal_rates,
         )
         self.scheduler = FixedTickScheduler(
             tick_rate=self.config.tick_rate, realtime=self.config.realtime
@@ -97,6 +109,8 @@ class CognitiveRuntime:
         else:
             self.recorder = NullRecorder()
         self.program.attach_buses(self.sensory_bus, self.motor_bus)
+        # Let realtime-aware Programs pace publication to wall-clock rates.
+        self.program.set_realtime(realtime, clock=wall_clock)
         self._stop_requested = False
 
     def stop(self) -> None:
@@ -147,6 +161,7 @@ class CognitiveRuntime:
         total_reward = 0.0
         null_ticks = 0
         latency_total_ms = 0.0
+        motor_emissions = 0
         ticks = 0
         last_timestamp = 0.0
 
@@ -177,6 +192,7 @@ class CognitiveRuntime:
                 publish_motor_command(self.motor_bus, action, observation.timestamp)
                 for action in emissions
             ]
+            motor_emissions += len(motor_events)
             self.memory.record_actions(emissions)
             self.learner.update(window)
 
@@ -221,9 +237,21 @@ class CognitiveRuntime:
             ticks_per_second=round(self.scheduler.stats.ticks_per_second, 2),
             missed_ticks=self.scheduler.stats.missed_ticks,
             program_ticks_per_cognitive_tick=ratio,
+            realtime=self.config.realtime,
             stream_event_rates=self._stream_rates(last_timestamp),
             stream_event_counts=dict(sorted(self.synchronizer.arrival_counts().items())),
             silent_streams=self.synchronizer.silent_streams(min_windows=1),
+            empty_windows=self.synchronizer.empty_windows(),
+            # A late window is a cognitive tick that started past its deadline;
+            # the scheduler already counts these as missed ticks.
+            late_windows=self.scheduler.stats.missed_ticks,
+            stale_streams=self.synchronizer.stale_streams(now=last_timestamp),
+            motor_emissions=motor_emissions,
+            motor_emission_rate=(
+                round(motor_emissions / last_timestamp, 3) if last_timestamp > 0 else 0.0
+            ),
+            stream_overflow_counts=self.sensory_bus.overflow_counts(),
+            stream_wallclock_rates=self.synchronizer.wall_clock_rates(),
             program_stats=stats,
         )
         self.recorder.write_summary(summary)
