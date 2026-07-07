@@ -97,11 +97,16 @@ def test_simulated_backend_is_deterministic_and_snapshottable():
     assert "simulated" in meta.tags
 
 
-def test_remote_backend_is_a_clear_stub():
-    import pytest
+def test_remote_backend_is_registered_and_non_deterministic():
+    # The remote backend is implemented (see tests/test_remote_backend.py for
+    # the wire-protocol coverage); here we only assert it is registered and
+    # advertises live-world semantics without spawning a bridge.
+    from cognitive_runtime.programs.minecraft.adapter import BACKENDS
+    from cognitive_runtime.programs.minecraft.remote import RemoteMinecraftBackend
 
-    with pytest.raises(NotImplementedError, match="mineflayer"):
-        MinecraftSurvivalBox(config=FAST_CONFIG, backend="remote")
+    assert BACKENDS["remote"] is RemoteMinecraftBackend
+    assert RemoteMinecraftBackend.deterministic is False
+    assert RemoteMinecraftBackend.supports_snapshots is False
 
 
 def test_snapshot_guard_for_backends_without_snapshot_support():

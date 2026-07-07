@@ -9,7 +9,6 @@ to change, and the runtime itself never changes.
 
 from __future__ import annotations
 
-import abc
 from typing import Any, Callable, Dict, List, Optional
 
 from cognitive_runtime.core.action import NULL_ACTION, Action
@@ -25,11 +24,10 @@ from cognitive_runtime.core.streams.motor import (
 )
 from cognitive_runtime.core.streams.pacer import RatePacer
 from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE, HOTBAR_SLOTS
+from cognitive_runtime.programs.minecraft.backend import SimulatedBackend, SurvivalBackend
 from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
-from cognitive_runtime.programs.minecraft.observations import (
-    OBSERVATION_KEYS,
-    build_observation,
-)
+from cognitive_runtime.programs.minecraft.observations import OBSERVATION_KEYS
+from cognitive_runtime.programs.minecraft.remote import RemoteMinecraftBackend
 from cognitive_runtime.programs.minecraft.rewards import SurvivalReward, SurvivalRewardConfig
 from cognitive_runtime.programs.minecraft.streams import (
     BODY_HEARTBEAT_KEY,
@@ -37,114 +35,14 @@ from cognitive_runtime.programs.minecraft.streams import (
     SurvivalStreamPublisher,
     build_survival_stream_specs,
 )
-from cognitive_runtime.programs.minecraft.world import SimulatedWorld
 
 _VALID_ACTION_NAMES = {a.name for a in ACTION_SPACE}
 _SIM_SECONDS_PER_TICK = 0.05  # simulated time; deterministic for replay
 
 
-class SurvivalBackend(abc.ABC):
-    """The seam between the SurvivalBox Program and an actual world.
-
-    Capability flags (class attributes, overridden per backend):
-
-    - ``deterministic`` — reset(seed) + the same action sequence reproduces
-      the world byte-for-byte.  True for the simulated backend; False for a
-      live server, whose recordings cannot be replay-verified by
-      re-simulation.
-    - ``supports_snapshots`` — ``snapshot()``/``restore()`` actually capture
-      and restore full world state.  A live server cannot honor this; the
-      adapter raises a clear error instead of pretending.
-    """
-
-    deterministic: bool = True
-    supports_snapshots: bool = True
-
-    @abc.abstractmethod
-    def reset(self, seed: int) -> None: ...
-
-    @abc.abstractmethod
-    def step(self, action: Action) -> List[str]:
-        """Advance one tick; returns semantic events."""
-
-    @abc.abstractmethod
-    def observe(self, timestamp: float) -> Observation: ...
-
-    @abc.abstractmethod
-    def tick(self) -> int: ...
-
-    @abc.abstractmethod
-    def is_dead(self) -> bool: ...
-
-    @abc.abstractmethod
-    def death_reason(self) -> Optional[str]: ...
-
-    @abc.abstractmethod
-    def stats(self) -> Dict[str, Any]: ...
-
-    @abc.abstractmethod
-    def snapshot(self) -> str: ...
-
-    @abc.abstractmethod
-    def restore(self, snapshot_id: str) -> None: ...
-
-
-class SimulatedBackend(SurvivalBackend):
-    def __init__(self, config: SurvivalBoxConfig):
-        self.world = SimulatedWorld(config, seed=0)
-
-    def reset(self, seed: int) -> None:
-        self.world.reset(seed)
-
-    def step(self, action: Action) -> List[str]:
-        return self.world.step(action)
-
-    def observe(self, timestamp: float) -> Observation:
-        return build_observation(self.world, timestamp)
-
-    def tick(self) -> int:
-        return self.world.tick
-
-    def is_dead(self) -> bool:
-        return self.world.dead
-
-    def death_reason(self) -> Optional[str]:
-        return self.world.death_reason
-
-    def stats(self) -> Dict[str, Any]:
-        return dict(self.world.stats)
-
-    def snapshot(self) -> str:
-        return self.world.snapshot()
-
-    def restore(self, snapshot_id: str) -> None:
-        self.world.restore(snapshot_id)
-
-
-class RemoteMinecraftBackend(SurvivalBackend):
-    """Placeholder for a real-Minecraft backend.
-
-    Implementation sketch: run a headless client (mineflayer) or Malmo mod
-    alongside a Java server with a fixed seed and world border; translate
-    the MVP action space to client inputs; build Observations from the
-    client's entity/health/inventory state and (optionally) frames; emit the
-    semantic event vocabulary the reward function consumes (see
-    docs/minecraft-mvp.md, "Real-backend integration").
-    """
-
-    deterministic = False       # a live server cannot be re-simulated
-    supports_snapshots = False  # a live server cannot capture/restore state
-
-    def __init__(self, *args: Any, **kwargs: Any):
-        raise NotImplementedError(
-            "Real-Minecraft backend not implemented in the MVP. "
-            "Implement SurvivalBackend against mineflayer/Malmo/RCON "
-            "(integration checklist: GitHub issue #14)."
-        )
-
-    reset = step = observe = tick = is_dead = death_reason = stats = snapshot = restore = None  # type: ignore[assignment]
-
-
+#: Backend registry; ``--backend`` selects one.  ``SurvivalBackend`` and
+#: ``SimulatedBackend`` live in ``backend.py`` and ``RemoteMinecraftBackend``
+#: in ``remote.py``; they are re-exported here so existing imports keep working.
 BACKENDS = {"simulated": SimulatedBackend, "remote": RemoteMinecraftBackend}
 
 
@@ -200,6 +98,17 @@ class MinecraftSurvivalBox(Program):
         assert self._backend is not None
         timestamp = self._backend.tick() * _SIM_SECONDS_PER_TICK
         return self._backend.observe(timestamp)
+
+    def close(self) -> None:
+        """Release backend resources (e.g. the remote bridge subprocess).
+
+        The simulated backend holds nothing; a remote backend closes its
+        bridge.  The runtime does not require this — the remote bridge also
+        cleans up at interpreter exit — but it is the tidy way to stop a live
+        client when you are done with a Program instance.
+        """
+        if self._backend is not None:
+            self._backend.close()
 
     @staticmethod
     def _validation_error(action: Action) -> Optional[str]:
