@@ -1,0 +1,242 @@
+'use strict';
+
+// One live-Minecraft episode session: owns the mineflayer bot, applies actions
+// one server tick at a time, and synthesizes the SurvivalBox semantic-event
+// vocabulary by diffing state across ticks.  The event strings and stats keys
+// match the simulated world so the runtime's streams/reward are unchanged.
+
+const mineflayer = require('mineflayer');
+const Vec3 = require('vec3');
+const { itemToVocab, FOOD_ITEMS } = require('./blocks');
+const { applyAction, clearControls } = require('./actions');
+const { buildObservation, isSheltered, timeState } = require('./observation');
+
+function log(...args) {
+  process.stderr.write('[mc-bridge] ' + args.join(' ') + '\n');
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+class WorldSession {
+  constructor() {
+    this.bot = null;
+    this.config = {};
+    this.connection = {};
+    this.tick = 0;
+    this.spawn = null;
+    this.dead = false;
+    this.deathReason = null;
+    this._pending = [];
+    this._seenItems = new Set();
+    this._prevHealth = 20;
+    this._prevInventory = {};
+    this._prevSheltered = false;
+    this._prevNight = false;
+    this._lastDamageCause = 'unknown';
+    this._stats = freshStats();
+  }
+
+  // -- connection ----------------------------------------------------------
+
+  async _connect() {
+    if (this.bot) return;
+    const opts = {
+      host: this.connection.host || 'localhost',
+      port: this.connection.port || 25565,
+      username: this.connection.username || 'CCRAgent',
+      auth: this.connection.auth || 'offline',
+    };
+    if (this.connection.version) opts.version = this.connection.version;
+    log('connecting to', opts.host + ':' + opts.port, 'as', opts.username);
+    this.bot = mineflayer.createBot(opts);
+    this.bot.vec3 = (x, y, z) => new Vec3(x, y, z);
+    this._wireEvents();
+    await new Promise((resolve, reject) => {
+      const onSpawn = () => { cleanup(); resolve(); };
+      const onError = (err) => { cleanup(); reject(err); };
+      const cleanup = () => {
+        this.bot.removeListener('spawn', onSpawn);
+        this.bot.removeListener('error', onError);
+      };
+      this.bot.once('spawn', onSpawn);
+      this.bot.once('error', onError);
+    });
+    log('spawned');
+  }
+
+  _wireEvents() {
+    const bot = this.bot;
+    bot.on('death', () => { this._pending.push('died'); this.dead = true; this.deathReason = this._lastDamageCause; });
+    bot.on('entityHurt', (entity) => {
+      if (entity === bot.entity) this._lastDamageCause = 'hit';
+    });
+    bot.on('kicked', (reason) => log('kicked:', typeof reason === 'string' ? reason : JSON.stringify(reason)));
+    bot.on('error', (err) => log('error:', err && err.message ? err.message : String(err)));
+    bot.on('end', () => log('connection ended'));
+  }
+
+  // -- protocol handlers ---------------------------------------------------
+
+  async reset(seed, config, connection) {
+    this.config = config || {};
+    this.connection = connection || {};
+    await this._connect();
+    // Best-effort world reset via op commands; harmless if the server refuses.
+    try {
+      this.bot.chat('/gamemode survival');
+      this.bot.chat(`/effect clear ${this.bot.username}`);
+      this.bot.chat(`/time set ${this.config.start_time || 0}`);
+    } catch (e) { /* not op / commands disabled: fall through */ }
+    await sleep(250);
+    this.tick = 0;
+    this.dead = (this.bot.health != null && this.bot.health <= 0);
+    this.deathReason = null;
+    this._pending = [];
+    this._seenItems = new Set();
+    this._prevHealth = this.bot.health == null ? 20 : this.bot.health;
+    this._prevInventory = this._inventoryVocabCounts();
+    this._prevSheltered = isSheltered(this.bot);
+    this._prevNight = timeState(0, this.config).is_night;
+    this._stats = freshStats();
+    this.spawn = { x: this.bot.entity.position.x, z: this.bot.entity.position.z };
+    return this._status();
+  }
+
+  async step(action) {
+    if (!this.bot) throw new Error('step before reset');
+    const events = [];
+    const hooks = {
+      onBroke: (vocab) => { this._pending.push(`broke_block:${vocab}`); this._stats.blocks_broken += 1; },
+      onPlaced: () => { this._pending.push('placed_block'); this._stats.blocks_placed += 1; },
+      onAte: () => { this._pending.push('ate_food'); this._stats.food_consumed += 1; },
+      onKilled: () => { this._pending.push('killed_mob'); this._stats.mobs_killed += 1; },
+    };
+
+    clearControls(this.bot);
+    try {
+      applyAction(this.bot, action, hooks);
+    } catch (e) {
+      log('action error:', e && e.message ? e.message : String(e));
+    }
+    await this._awaitTick();
+    clearControls(this.bot);
+    this.tick += 1;
+
+    // Diff-based events.
+    const health = this.bot.health == null ? 0 : this.bot.health;
+    if (health < this._prevHealth - 1e-6) {
+      const drop = this._prevHealth - health;
+      this._stats.damage_taken = round(this._stats.damage_taken + drop, 2);
+      events.push(`damage:${this._lastDamageCause}`);
+    }
+    this._prevHealth = health;
+    this._lastDamageCause = 'unknown';
+
+    // New inventory item types.
+    const inv = this._inventoryVocabCounts();
+    for (const name of Object.keys(inv)) {
+      if (!this._seenItems.has(name)) {
+        this._seenItems.add(name);
+        this._stats.unique_items_collected += 1;
+        events.push(`new_item:${name}`);
+        if (FOOD_ITEMS.has(name)) events.push('acquired_food');
+      }
+    }
+    this._prevInventory = inv;
+
+    // Shelter / night transitions.
+    const sheltered = isSheltered(this.bot);
+    if (sheltered && !this._prevSheltered) events.push('entered_shelter');
+    this._prevSheltered = sheltered;
+
+    const night = timeState(this.tick, this.config).is_night;
+    if (this._prevNight && !night && !this.dead) {
+      if (!this._stats.survived_night) { this._stats.survived_night = true; events.push('survived_night'); }
+    }
+    this._prevNight = night;
+
+    // Distance stat.
+    const dist = this.spawn
+      ? Math.hypot(this.bot.entity.position.x - this.spawn.x, this.bot.entity.position.z - this.spawn.z)
+      : 0;
+    if (dist > this._stats.max_distance_from_spawn) this._stats.max_distance_from_spawn = round(dist, 2);
+
+    // Death from vitals (in case the 'death' event did not fire).
+    if (health <= 0 && !this.dead) { this.dead = true; this.deathReason = this._lastDamageCause; this._pending.push('died'); }
+
+    // Drain async completions captured during the tick.
+    const drained = this._pending;
+    this._pending = [];
+    const all = events.concat(drained);
+    return { ok: true, events: all, ...this._status() };
+  }
+
+  observe(timestamp) {
+    if (!this.bot) throw new Error('observe before reset');
+    const obs = buildObservation(this.bot, this.tick, this.config, this.spawn);
+    return { ok: true, observation: obs };
+  }
+
+  close() {
+    if (this.bot) {
+      try { this.bot.quit(); } catch (e) { /* ignore */ }
+      this.bot = null;
+    }
+  }
+
+  // -- helpers -------------------------------------------------------------
+
+  _awaitTick() {
+    // Advance ~one server tick.  Prefer the bot's physics clock; fall back to
+    // a 50 ms sleep (20 tps) if physicsTick is unavailable.
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      try {
+        this.bot.once('physicsTick', finish);
+      } catch (e) { /* older mineflayer: physicTick */ }
+      setTimeout(finish, 100);
+    });
+  }
+
+  _inventoryVocabCounts() {
+    const counts = {};
+    for (const item of this.bot.inventory.items()) {
+      const name = itemToVocab(item.name);
+      counts[name] = (counts[name] || 0) + item.count;
+    }
+    return counts;
+  }
+
+  _status() {
+    return {
+      ok: true,
+      tick: this.tick,
+      dead: this.dead,
+      death_reason: this.deathReason,
+      stats: { ...this._stats },
+    };
+  }
+}
+
+function freshStats() {
+  return {
+    damage_taken: 0.0,
+    food_consumed: 0,
+    blocks_broken: 0,
+    blocks_placed: 0,
+    mobs_killed: 0,
+    max_distance_from_spawn: 0.0,
+    unique_items_collected: 0,
+    survived_night: false,
+  };
+}
+
+function round(value, digits) {
+  const f = Math.pow(10, digits);
+  return Math.round(value * f) / f;
+}
+
+module.exports = { WorldSession };
