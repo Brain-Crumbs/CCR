@@ -37,6 +37,8 @@ from cognitive_runtime.training.datasets import build_dataset
 from cognitive_runtime.training.evaluation import compare_policies
 from cognitive_runtime.training.imitation import train_bc
 
+DEFAULT_MODEL_OUT = "models/bc.json"
+
 
 def _program_config(args: argparse.Namespace) -> Dict[str, Any]:
     return {
@@ -61,6 +63,14 @@ def _make_policy(name: str, args: argparse.Namespace) -> Policy:
         if not args.model:
             sys.exit("--model is required for the learned policy")
         return LearnedPolicy(args.model)
+    if name == "neural":
+        if not args.model:
+            sys.exit("--model is required for the neural policy (a .pt bundle)")
+        try:
+            from cognitive_runtime.policies.neural_policy import NeuralPolicy
+        except ImportError as exc:  # torch not installed
+            sys.exit(f"the neural policy needs PyTorch ({exc}); install '.[neural]'.")
+        return NeuralPolicy(args.model)
     sys.exit(f"unknown policy: {name}")
 
 
@@ -148,6 +158,9 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
 
 
 def cmd_train(args: argparse.Namespace) -> None:
+    if args.model_type == "neural":
+        _train_neural(args)
+        return
     dataset = build_dataset(
         args.sessions,
         history=args.history,
@@ -167,6 +180,38 @@ def cmd_train(args: argparse.Namespace) -> None:
     for key, value in metrics.items():
         print(f"  {key}: {value}")
     print(f"model saved to {args.out}")
+
+
+def _train_neural(args: argparse.Namespace) -> None:
+    """Pixel-vision end-to-end BC.  torch is imported here so the default
+    (linear) training path never requires it."""
+    try:
+        from cognitive_runtime.training.datasets import build_neural_dataset
+        from cognitive_runtime.training.neural import train_neural_bc
+    except ImportError as exc:  # torch not installed
+        sys.exit(
+            f"neural training needs PyTorch ({exc}). Install it with "
+            "'pip install -e .[neural]'."
+        )
+    dataset = build_neural_dataset(
+        args.sessions,
+        history=args.history,
+        max_samples=args.max_samples,
+        min_episode_reward=args.min_reward,
+    )
+    if len(dataset) == 0:
+        sys.exit("no pixel training samples found (record sessions with --record-frames)")
+    print(f"dataset: {len(dataset)} pixel samples from {len(dataset.sources)} episodes "
+          f"(frame={dataset.pixel_shape}, non-vision dim={len(dataset.non_vision_names)})")
+    model, metrics = train_neural_bc(
+        dataset, epochs=args.epochs, lr=args.neural_lr, batch_size=args.batch_size, seed=args.seed
+    )
+    out = args.out if args.out != DEFAULT_MODEL_OUT else "models/vision_bc.pt"
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    model.save(out)
+    for key, value in metrics.items():
+        print(f"  {key}: {value}")
+    print(f"model saved to {out}")
 
 
 def cmd_replay(args: argparse.Namespace) -> None:
@@ -195,7 +240,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = sub.add_parser("run", help="run the runtime with a policy")
     p_run.add_argument("--policy", default="scripted",
-                       choices=["null", "random", "scripted", "learned", "human"])
+                       choices=["null", "random", "scripted", "learned", "neural", "human"])
     p_run.add_argument("--episodes", type=int, default=1)
     p_run.add_argument("--tick-rate", type=float, default=20.0)
     p_run.add_argument("--realtime", action="store_true",
@@ -228,13 +273,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_train = sub.add_parser("train", help="train a behavioral-cloning policy from sessions")
     p_train.add_argument("--sessions", nargs="+", required=True,
                          help="session directories (e.g. sessions/20260101-...-scripted)")
-    p_train.add_argument("--out", default="models/bc.json")
+    p_train.add_argument("--out", default=DEFAULT_MODEL_OUT,
+                         help="output path; neural models default to models/vision_bc.pt")
+    p_train.add_argument("--model-type", choices=["linear", "neural"], default="linear",
+                         help="linear softmax head (default) or the end-to-end pixel CNN")
     p_train.add_argument("--epochs", type=int, default=10)
-    p_train.add_argument("--lr", type=float, default=0.5)
+    p_train.add_argument("--lr", type=float, default=0.5, help="linear-model learning rate")
+    p_train.add_argument("--neural-lr", type=float, default=1e-3, help="neural-model learning rate")
     p_train.add_argument("--batch-size", type=int, default=32)
     p_train.add_argument("--history", type=int, default=8)
     p_train.add_argument("--features", choices=["latent", "handcrafted"], default="latent",
-                         help="policy input: fused latent state (default) or hand featurizer")
+                         help="linear policy input: fused latent state (default) or hand featurizer")
     p_train.add_argument("--max-samples", type=int, default=None)
     p_train.add_argument("--min-reward", type=float, default=None,
                          help="skip episodes below this total reward")

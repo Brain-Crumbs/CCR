@@ -13,6 +13,11 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+# Neural pixel vision (end-to-end behavioral cloning). Optional: the whole
+# pure-Python stack (loop, streams, simulated/remote backends, the linear BC
+# trainer and every heuristic encoder) runs without it. Only the pixel CNN,
+# its trainer and the neural policy import torch, always lazily.
+neural = ["torch>=2", "numpy>=1.23"]
 
 [project.scripts]
 ccr = "cognitive_runtime.cli:main"
