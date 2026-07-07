@@ -17,15 +17,17 @@ between worlds without modification:
     restore(snapshot_id)
     metadata() -> ProgramMetadata
 
-Streams-first contract (interface v2, migration in progress):
+Streams-first contract (interface v2 — the loop's primary path):
 
     stream_catalog() -> list[StreamSpec]
     attach_buses(sensory, motor)
-    step()                       # replaces act() as the tick driver
+    step()                       # the tick driver; replaces act()
 
 Programs publish StreamEvents onto the sensory bus and drain actions from
-the motor bus; `observe()`/`reward()` remain as the legacy pull-style path
-until the migration completes.  See docs/program-interface.md.
+the motor bus.  ``observe()``/``act()``/``reward()`` remain as the legacy
+pull-style contract: ``observe()`` is the loop's compatibility bridge for
+observation-based policies, and the shim keeps pull-style Programs runnable
+on the stream substrate.  See docs/program-interface.md.
 """
 
 from __future__ import annotations

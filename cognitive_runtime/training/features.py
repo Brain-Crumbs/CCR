@@ -72,6 +72,15 @@ def observation_data_from_streams(
     rotation = stream_data.get("spatial.rotation") or {}
     hotbar = stream_data.get("body.hotbar") or {}
     position = stream_data.get("spatial.position") or {}
+    nearby = stream_data.get("world.nearby_blocks") or []
+    # in_water is not itself a stream, but the centre cell of the
+    # world.nearby_blocks patch is the agent's own cell — the same cell the
+    # backend's in_water flag reads — so it reconstructs exactly.
+    in_water = False
+    if nearby:
+        center_row = nearby[len(nearby) // 2]
+        if center_row:
+            in_water = center_row[len(center_row) // 2] == "water"
     obs: Dict[str, Any] = {
         "health": stream_data.get("body.health", 0.0),
         "hunger": stream_data.get("body.hunger", 0.0),
@@ -83,7 +92,8 @@ def observation_data_from_streams(
         "pitch": rotation.get("pitch", 0.0),
         "mobs": stream_data.get("vision.entities") or [],
         "front_block": stream_data.get("world.front_block", "grass"),
-        "nearby_blocks": stream_data.get("world.nearby_blocks") or [],
+        "nearby_blocks": nearby,
+        "in_water": in_water,
         "inventory": stream_data.get("body.inventory") or {},
         "hotbar": hotbar.get("slots") or [],
         "selected_slot": hotbar.get("selected", 0),

@@ -1,13 +1,14 @@
-"""Time-indexed sensory/motor stream primitives (Phase 0).
+"""Time-indexed sensory/motor stream primitives.
 
-The stream substrate the sensory-stream architecture builds on: Programs
+The stream substrate the sensory-stream architecture is built on: Programs
 publish :class:`StreamEvent`s onto buses, the runtime collects them into
-cognitive tick windows, buffers recent history per stream, and encodes
-windows into latent tokens.
+cognitive tick windows, buffers recent history per stream, encodes streams
+with per-modality encoders and fuses them into a fixed-width
+:class:`LatentState`.  This is the primary data path of the runtime loop
+(``runtime/loop.py``); see docs/streams.md.
 
 Environment-agnostic by construction: nothing in this package may import
-from ``cognitive_runtime.programs``.  Not yet wired into the legacy loop —
-see docs/streams.md and the migration tracking issue.
+from ``cognitive_runtime.programs`` (enforced by a test).
 """
 
 from cognitive_runtime.core.streams.events import (
@@ -35,6 +36,7 @@ from cognitive_runtime.core.streams.encoder_registry import (
     StreamEncoderRegistry,
 )
 from cognitive_runtime.core.streams.encoders import (
+    CategoryEncoder,
     EntityEncoder,
     EventEncoder,
     GridVisionEncoder,
@@ -84,6 +86,7 @@ __all__ = [
     "GridVisionEncoder",
     "EventEncoder",
     "EntityEncoder",
+    "CategoryEncoder",
     "LatentState",
     "TemporalFusion",
     "default_encoder_registry",

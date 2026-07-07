@@ -119,6 +119,7 @@ class TemporalFusion:
                 list(e.spec.range) if e.spec.range is not None else None,
                 e.spec.neutral,
                 sorted(set(e.spec.legend.values())) if e.spec.legend else None,
+                list(e.spec.categories) if e.spec.categories else None,
             ]
             for e in self.layout
         ]

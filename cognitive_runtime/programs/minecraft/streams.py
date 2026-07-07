@@ -129,10 +129,6 @@ def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
     ]
 
 
-#: Default catalog (world_size 64); adapters rebuild per config for ranges.
-SURVIVAL_STREAM_SPECS: List[StreamSpec] = build_survival_stream_specs()
-
-
 class SurvivalStreamPublisher:
     def __init__(
         self,

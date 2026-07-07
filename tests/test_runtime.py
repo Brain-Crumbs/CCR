@@ -9,7 +9,6 @@ from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
 from cognitive_runtime.runtime.replay import (
-    iter_cognitive_ticks,
     list_episodes,
     load_decisions,
     load_stream_log,

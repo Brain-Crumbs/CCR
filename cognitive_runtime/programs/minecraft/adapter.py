@@ -10,7 +10,6 @@ to change, and the runtime itself never changes.
 from __future__ import annotations
 
 import abc
-import time
 from typing import Any, Callable, Dict, List, Optional
 
 from cognitive_runtime.core.action import NULL_ACTION, Action

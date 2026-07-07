@@ -82,8 +82,11 @@ events irregularly; reward per tick. `DeltaPublisher`
    reconstructs an Observation-shaped snapshot from latest stream values
    for observation-based policies and featurizers.
 
-During the migration `observe()`/`act()`/`reward()` remain the loop's
-path; the sections below describe that legacy contract.
+The loop drives Programs through `step()` and the buses. Of the legacy
+contract, `observe()` is still called each cognitive tick as the
+compatibility bridge for observation-based policies (scripted, human demo,
+the handcrafted featurizer); `act()`/`reward()` are exercised only through
+the shim and parity tests. The sections below describe that legacy contract.
 
 ## Contract details
 

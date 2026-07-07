@@ -14,6 +14,7 @@ window) and ``min_episode_reward`` filters on summed ``reward.scalar``.
 from __future__ import annotations
 
 import os
+import sys
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -105,16 +106,27 @@ def build_dataset(
     dataset = Dataset(representation=representation)
     key_to_label = {key: i for i, key in enumerate(ACTION_KEYS)}
     fusion: Optional[TemporalFusion] = None
+    elided_layout_streams: set = set()
 
     for session_dir in session_dirs:
         if not os.path.isdir(session_dir):
             raise FileNotFoundError(f"session directory not found: {session_dir}")
         metadata = load_session_metadata(session_dir)
         require_streams_v2(metadata)
-        if representation == LATENT and fusion is None:
-            fusion = TemporalFusion(_catalog(metadata))
-            dataset.feature_names = latent_feature_names(fusion.feature_names())
-            dataset.layout_hash = fusion.layout_hash
+        if representation == LATENT:
+            if fusion is None:
+                fusion = TemporalFusion(_catalog(metadata))
+                dataset.feature_names = latent_feature_names(fusion.feature_names())
+                dataset.layout_hash = fusion.layout_hash
+            else:
+                session_fusion = TemporalFusion(_catalog(metadata))
+                if session_fusion.layout_hash != fusion.layout_hash:
+                    raise ValueError(
+                        f"session {session_dir} has an incompatible stream catalog "
+                        f"(fusion layout {session_fusion.layout_hash} vs "
+                        f"{fusion.layout_hash}); train on sessions recorded with "
+                        "the same program config"
+                    )
 
         for episode_id in list_episodes(session_dir):
             spawn = _spawn(session_dir, episode_id) if representation == HANDCRAFTED else None
@@ -127,6 +139,11 @@ def build_dataset(
                 reward_total += float(decision.get("reward_window_total", 0.0))
                 for record in sensory:
                     if record.get("elided"):
+                        stream_id = record.get("stream_id", "")
+                        if fusion is not None and any(
+                            e.stream_id == stream_id for e in fusion.layout
+                        ):
+                            elided_layout_streams.add(stream_id)
                         continue
                     buffer.append(stream_event_from_log(record))
                 label_key = _motor_label(motor)
@@ -150,4 +167,13 @@ def build_dataset(
                     dataset.sources.append(f"{session_dir}/{episode_id} (truncated)")
                     return dataset
             dataset.sources.append(f"{session_dir}/{episode_id}")
+    if elided_layout_streams:
+        print(
+            "warning: these streams were recorded hash-only (payload elided) and "
+            "contribute nothing to the latent features: "
+            + ", ".join(sorted(elided_layout_streams))
+            + " — record training sessions with --record-frames / --record-streams "
+            "to include them",
+            file=sys.stderr,
+        )
     return dataset
