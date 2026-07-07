@@ -13,16 +13,33 @@ def _state(data):
     return _PERCEPTION.encode(Observation(timestamp=0.0, tick=1, data=data))
 
 
+# Stream-keyed observation data, as the loop's stream-derived view produces.
 BASE = {
-    "health": 20.0, "hunger": 20.0, "position": {"x": 10.0, "z": 10.0},
-    "front_block": "grass", "hotbar": [None] * 9, "selected_slot": 0,
-    "mobs": [], "in_water": False,
+    "body.health": 20.0, "body.hunger": 20.0,
+    "spatial.position": {"x": 10.0, "z": 10.0},
+    "world.front_block": "grass",
+    "body.hotbar": {"slots": [None] * 9, "selected": 0},
+    "vision.entities": [], "body.in_water": False,
 }
 
 
 def _obs(**overrides):
+    """Build stream-keyed data; flat aliases map onto their stream ids."""
     data = dict(BASE)
-    data.update(overrides)
+    aliases = {
+        "health": "body.health", "hunger": "body.hunger",
+        "front_block": "world.front_block", "mobs": "vision.entities",
+        "in_water": "body.in_water", "position": "spatial.position",
+    }
+    hotbar = dict(data["body.hotbar"])
+    for key, value in overrides.items():
+        if key == "hotbar":
+            hotbar["slots"] = value
+        elif key == "selected_slot":
+            hotbar["selected"] = value
+        else:
+            data[aliases.get(key, key)] = value
+    data["body.hotbar"] = hotbar
     return data
 
 

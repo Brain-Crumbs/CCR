@@ -46,6 +46,9 @@ def default_encoder_registry() -> StreamEncoderRegistry:
     registry = StreamEncoderRegistry()
     registry.register("body.*", ScalarEncoder())
     registry.register("reward.*", ScalarEncoder())
+    # Scalar spatial streams (a distance is one number, not a pose) must match
+    # before the generic pose encoder; first registered match wins.
+    registry.register("spatial.distance_from_spawn", ScalarEncoder())
     registry.register("spatial.*", SpatialEncoder())
     registry.register("vision.frame.grid", GridVisionEncoder())
     registry.register("vision.entities", EntityEncoder())

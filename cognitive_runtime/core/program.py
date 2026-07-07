@@ -62,6 +62,11 @@ class ProgramMetadata:
     action_space: List[Action] = field(default_factory=list)
     observation_keys: List[str] = field(default_factory=list)
     tags: List[str] = field(default_factory=list)
+    #: Whether reset(seed) + the same action sequence reproduces the world
+    #: byte-for-byte.  Simulated backends are; a live server (e.g. real
+    #: Minecraft) is not — its recordings cannot be replay-verified by
+    #: re-simulation.
+    deterministic: bool = True
 
 
 class Program(abc.ABC):

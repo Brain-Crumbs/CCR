@@ -214,10 +214,10 @@ state (Phase 4), and **real-time multi-rate streaming (Phase 5)** — the
 two-clock design, rate pacing, asynchronous ingestion, bounded-queue
 backpressure and realtime health metrics described above.
 
-Remaining follow-ups: the loop still calls `program.observe()` each
-cognitive tick as the compatibility bridge for observation-based policies —
-the endgame is deriving that snapshot from stream state
-(`LatestValueView.to_observation()`), which needs the few observation-only
-fields (`in_water`, `dead`, `distance_from_spawn`) to become streams or
-derivations first — plus real neural encoders/fusion and learned world
-models. See the tracking issue for the full plan.
+The loop's policy `State` is now **derived from stream state**
+(`Memory.latest_values().to_observation()`), not pulled from the Program:
+`program.observe()` is no longer called by the loop (a test enforces it),
+and the formerly observation-only fields are streams
+(`body.in_water`, `body.alive`, `spatial.distance_from_spawn`). Remaining:
+real neural encoders/fusion and learned world models. See the tracking
+issue for the full plan.

@@ -81,3 +81,30 @@ def test_legacy_session_is_rejected(tmp_path):
     json.dump(meta, open(meta_path, "w", encoding="utf-8"))
     with pytest.raises(LegacyFormatError):
         replay_session(session_dir)
+
+
+def test_non_deterministic_session_is_not_replay_verified(tmp_path):
+    """A live-backend recording (deterministic=false) must be skipped with a
+    clear message instead of reporting spurious divergence (issue #14)."""
+    from cognitive_runtime.runtime.replay import NonDeterministicSessionError
+
+    session_dir = _record(tmp_path, ScriptedSurvivalPolicy(seed=0), "live-session")
+    meta_path = os.path.join(session_dir, "session.json")
+    with open(meta_path) as fh:
+        metadata = json.load(fh)
+    assert metadata["deterministic"] is True  # recorded by the loop
+    metadata["deterministic"] = False
+    with open(meta_path, "w") as fh:
+        json.dump(metadata, fh)
+
+    with pytest.raises(NonDeterministicSessionError, match="non-deterministic"):
+        replay_session(session_dir)
+    # The CLI reports it as a skip, not a divergence.
+    with pytest.raises(SystemExit, match="replay skipped"):
+        main(["replay", "--session", session_dir])
+
+
+def test_cli_backend_flag_selects_the_backend(tmp_path, capsys):
+    with pytest.raises(NotImplementedError, match="mineflayer"):
+        main(["run", "--policy", "null", "--episodes", "1", "--episode-ticks", "5",
+              "--no-record", "--backend", "remote"])

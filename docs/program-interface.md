@@ -82,11 +82,11 @@ events irregularly; reward per tick. `DeltaPublisher`
    reconstructs an Observation-shaped snapshot from latest stream values
    for observation-based policies and featurizers.
 
-The loop drives Programs through `step()` and the buses. Of the legacy
-contract, `observe()` is still called each cognitive tick as the
-compatibility bridge for observation-based policies (scripted, human demo,
-the handcrafted featurizer); `act()`/`reward()` are exercised only through
-the shim and parity tests. The sections below describe that legacy contract.
+The loop drives Programs through `step()` and the buses, and the `State` it
+hands policies is derived from stream state (`LatestValueView`), so the loop
+never calls `observe()` (a test enforces it). The legacy
+`observe()`/`act()`/`reward()` contract remains for shim-wrapped pull-style
+Programs and parity tests; the sections below describe it.
 
 ## Contract details
 
@@ -129,6 +129,13 @@ side, never the runtime.
 `reset(seed)` must produce identical worlds for identical seeds, and all
 in-world randomness must flow through seeded RNG state captured by
 `snapshot()`/`restore()`. The replay runner enforces this.
+
+Determinism and snapshots are **capabilities**, not universal guarantees: a
+Program backed by a live external world (a real Minecraft server, a real
+browser) declares `metadata().deterministic = False` and may raise
+`NotImplementedError` from `snapshot()`/`restore()`. Its sessions are still
+recorded and trainable, but `replay` skips re-simulation for them with a
+clear message.
 
 ## Adding a new Program
 

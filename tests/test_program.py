@@ -85,3 +85,31 @@ def test_episode_completes_at_tick_limit():
     stats = program.episode_stats()
     assert stats["final_tick"] == 50
     assert stats["success"] is True
+
+
+# --------------------------------------------- backend capabilities (issue #14)
+
+
+def test_simulated_backend_is_deterministic_and_snapshottable():
+    program = MinecraftSurvivalBox(config=FAST_CONFIG)
+    meta = program.metadata()
+    assert meta.deterministic is True
+    assert "simulated" in meta.tags
+
+
+def test_remote_backend_is_a_clear_stub():
+    import pytest
+
+    with pytest.raises(NotImplementedError, match="mineflayer"):
+        MinecraftSurvivalBox(config=FAST_CONFIG, backend="remote")
+
+
+def test_snapshot_guard_for_backends_without_snapshot_support():
+    import pytest
+
+    program = MinecraftSurvivalBox(config=FAST_CONFIG)
+    program._backend.supports_snapshots = False  # e.g. a live-server backend
+    with pytest.raises(NotImplementedError, match="does not support snapshots"):
+        program.snapshot()
+    with pytest.raises(NotImplementedError, match="does not support snapshots"):
+        program.restore("snap-0-0")

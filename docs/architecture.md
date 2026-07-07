@@ -79,6 +79,7 @@ while running:
     window  = synchronizer.collect(sensory_bus) # events since the last cognitive tick
     memory.update(window)                       # TemporalBuffer of recent events
     latent  = fusion.fuse(window, memory.buffer)   # fixed-width LatentState
+    state   = memory.latest_values().to_observation()  # stream-derived, no observe()
     pred    = world_model.predict(state, memory)
     motor   = policy.emit(state, memory, pred)  # list of motor emissions; [] == NULL
     for action in motor: motor_bus.publish(...)
@@ -116,11 +117,12 @@ Notes:
   plus `TemporalFusion` produce the fixed-width `LatentState` in place of the
   old `StructuredPerception`; the default learned policy consumes that fused
   latent state.
-- **Compatibility bridge.** `program.observe()` remains as the sanctioned
-  shim that feeds observation-based policies (scripted, human demo, the
-  handcrafted A/B featurizer). The *primary* data path — memory, encoders,
-  fusion, world model, learner, recording, latent BC training — is
-  stream-based.
+- **Stream-derived policy state.** The `State` handed to policies is
+  reconstructed from the latest value of each stream
+  (`Memory.latest_values().to_observation()`); the loop never calls
+  `program.observe()` (a test enforces it). Observation-based policies
+  (scripted, human demo, the handcrafted A/B featurizer) read stream-keyed
+  data — the latest value each stream has published.
 - Decision latency (window collection → motor emission) is measured per
   cognitive tick and recorded, alongside per-stream event rates and
   silent-stream gaps.

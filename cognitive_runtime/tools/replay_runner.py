@@ -10,6 +10,7 @@ from cognitive_runtime.runtime.replay import (
     list_episodes,
     load_session_metadata,
     replay_episode,
+    require_deterministic,
     require_streams_v2,
 )
 
@@ -17,6 +18,7 @@ from cognitive_runtime.runtime.replay import (
 def replay_session(session_dir: str, episode_id: str | None = None, verify: bool = True) -> List[ReplayResult]:
     metadata = load_session_metadata(session_dir)
     require_streams_v2(metadata)
+    require_deterministic(metadata)
     if metadata.get("program") != "MinecraftSurvivalBox":
         raise ValueError(f"unsupported program for replay: {metadata.get('program')}")
     episodes = [episode_id] if episode_id else list_episodes(session_dir)

@@ -164,14 +164,18 @@ class HumanDemoPolicy(SingleActionPolicy):
         print(__doc__)
 
     def decide(self, state: State, memory: Memory, prediction: Optional[Prediction]) -> Action:
+        # Stream-derived observation: data is keyed by SurvivalBox stream ids.
         obs = state.observation.data
         if self.show_frame and state.observation.frame:
             for row in state.observation.frame:
                 print("".join(_FRAME_GLYPHS.get(c, "?") for c in row))
+        time_state = obs.get("world.time") or {}
+        hotbar_state = obs.get("body.hotbar") or {}
         print(
-            f"tick={state.observation.tick} hp={obs.get('health')} food={obs.get('hunger')} "
-            f"night={obs.get('is_night')} front={obs.get('front_block')} "
-            f"hotbar={obs.get('hotbar')} mobs={obs.get('mobs')}"
+            f"tick={state.observation.tick} hp={obs.get('body.health')} "
+            f"food={obs.get('body.hunger')} night={time_state.get('is_night')} "
+            f"front={obs.get('world.front_block')} "
+            f"hotbar={hotbar_state.get('slots')} mobs={obs.get('vision.entities')}"
         )
         # Blocking mode feeds exactly one line onto the stream this tick;
         # realtime mode lets the reader thread feed it whenever the human types.

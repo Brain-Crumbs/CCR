@@ -98,10 +98,17 @@ def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
                    payload_schema="{item: count}"),
         StreamSpec("body.hotbar", "body", "Hotbar slots + selected, on change.",
                    payload_schema='{"slots": [item|null], "selected": int}'),
+        StreamSpec("body.in_water", "body", "In-water flag, on change.",
+                   payload_schema="bool"),
+        StreamSpec("body.alive", "body", "Alive flag; flips once on death.",
+                   payload_schema="bool", neutral=1.0),
         StreamSpec("spatial.position", "spatial", "Agent position, on change.",
                    payload_schema="{x, y, z}", range=pos_range, neutral=world_size / 2.0),
         StreamSpec("spatial.rotation", "spatial", "Agent view direction, on change.",
                    payload_schema="{yaw, pitch}"),
+        StreamSpec("spatial.distance_from_spawn", "spatial",
+                   "Distance from the spawn point, on change.",
+                   payload_schema="float", range=(0.0, float(world_size))),
         StreamSpec("world.time", "world", "Day/night clock, every tick.",
                    nominal_rate_hz=20.0,
                    payload_schema="{time_of_day, day_length, is_night}"),
@@ -195,8 +202,11 @@ class SurvivalStreamPublisher:
         pub("body.oxygen", data["oxygen"], force=heartbeat)
         pub("body.inventory", data["inventory"])
         pub("body.hotbar", {"slots": data["hotbar"], "selected": data["selected_slot"]})
+        pub("body.in_water", data["in_water"])
+        pub("body.alive", not data["dead"])
         pub("spatial.position", data["position"])
         pub("spatial.rotation", {"yaw": data["yaw"], "pitch": data["pitch"]})
+        pub("spatial.distance_from_spawn", data["distance_from_spawn"])
         pub("world.time", {
             "time_of_day": data["time_of_day"],
             "day_length": data["day_length"],
