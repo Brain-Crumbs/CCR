@@ -46,7 +46,7 @@ generic: Minecraft health, a Linux battery and robot joint stress are all
 | Modality | What flows on it | Example streams |
 |---|---|---|
 | `body` | Internal/self state | `body.health`, `body.hunger`, `body.oxygen` |
-| `vision` | Frames, pixels, grids | `vision.frame.grid`, `vision.entities` |
+| `vision` | Frames, pixels, grids | `vision.frame.grid`, `vision.frame.pixels`, `vision.entities` |
 | `spatial` | Position, orientation, geometry | `spatial.position`, `spatial.rotation` |
 | `audio` | Sound events/levels | `audio.ambient` |
 | `event` | Discrete world happenings | `event.damage_taken`, `event.item_collected` |
@@ -82,6 +82,25 @@ the width is fixed, and hashes the layout so a model trained on one layout
 fails loudly against an incompatible one. The dataset builder replays the
 **same** fusion offline over recorded streams, so train-time and inference-time
 features come from identical code (an online/offline parity test enforces it).
+
+### Neural pixel vision
+
+Fusion produces a *frozen, fixed-width* vector, which is the right shape for the
+heuristic encoders but not for a **trainable** network.  So the pixel pathway
+sits outside fusion: the `vision.frame.pixels` stream (a deterministic RGB frame
+— colorized from the same semantic grid every backend emits, so the simulated
+and mineflayer backends share it, and a real screenshot can later fill
+`Observation.pixels` directly) is fed **raw** to a small CNN
+(`models/vision.py`).  The CNN is trained **end to end** with the policy head by
+behavioral cloning (`training/neural.py`), so the agent learns its own visual
+features from the stream instead of a hand-written grid encoder.  Its companion
+scalar input is the fused latent with every `vision.*` slice dropped
+(`datasets.build_neural_dataset`), so the CNN is the sole visual pathway; the
+`NeuralPolicy` reconstructs that same non-vision vector from the runtime's
+`LatentState` at inference.  Because replay re-injects the recorded motor stream
+(it never re-runs the policy), a neural encoder cannot affect the determinism
+contract — only the deterministic renderer that produces the pixel stream
+matters, and that is pure Python.
 
 ## Cadence guidance
 

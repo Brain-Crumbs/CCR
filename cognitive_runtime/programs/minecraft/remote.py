@@ -54,6 +54,7 @@ from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.observation import Observation
 from cognitive_runtime.programs.minecraft.backend import SurvivalBackend
 from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
+from cognitive_runtime.programs.minecraft.world import pixels_from_frame
 
 #: Environment overrides.  The bridge command is shell-split; the rest are
 #: forwarded to the bridge in every ``reset`` so a live client knows where to
@@ -279,11 +280,19 @@ class RemoteMinecraftBackend(SurvivalBackend):
         bridge = self._require_bridge()
         response = bridge.request({"cmd": "observe", "timestamp": timestamp})
         obs = response.get("observation") or {}
+        frame = obs.get("frame")
+        # Prefer a bridge-supplied RGB frame (e.g. a future prismarine-viewer
+        # screenshot); otherwise colorize the semantic grid the same way the
+        # simulated backend does, so the neural pixel stream works either way.
+        pixels = obs.get("pixels")
+        if pixels is None and frame is not None:
+            pixels = pixels_from_frame(frame)
         return Observation(
             timestamp=timestamp,
             tick=obs.get("tick", self._tick),
             data=obs.get("data", {}),
-            frame=obs.get("frame"),
+            frame=frame,
+            pixels=pixels,
         )
 
     # -- cached status ------------------------------------------------------

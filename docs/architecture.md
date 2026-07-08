@@ -51,6 +51,7 @@ about any specific world.
 | Memory | `core/memory.py` | Stream-native: a `TemporalBuffer` of recent events + the fused `LatentState` + motor emissions; novelty, repetition and per-stream trend signals |
 | WorldModel | `core/world_model.py` | Predicts from per-stream trends in memory; MVP ships a trend extrapolator with a generic vital-risk heuristic |
 | Policy | `core/policy.py` | `emit(state, memory, prediction) -> list[Action]` (`[]` == NULL); `SingleActionPolicy` adapts one-action-per-tick policies |
+| Learned policies | `policies/learned.py`, `policies/neural_policy.py` | `learned` — linear softmax BC over the fused latent (dependency-free); `neural` — an end-to-end **pixel-vision CNN** (`models/vision.py`) that learns its own vision from the `vision.frame.pixels` stream (optional, torch) |
 | Learner | `core/learner.py` | Online `update(window)` hook reading `reward.scalar`; MVP learns offline via behavioral cloning |
 | RewardSignal | `core/reward.py` | Scalar value + named components + semantic events |
 | Streams | `core/streams/` | Time-indexed sensory/motor primitives, per-modality encoders and `TemporalFusion` producing a fixed-width `LatentState`; see [streams.md](streams.md) |

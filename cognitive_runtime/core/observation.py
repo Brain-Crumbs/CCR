@@ -20,11 +20,16 @@ class Observation:
     tick: int
     data: Dict[str, Any] = field(default_factory=dict)
     frame: Optional[List[List[int]]] = None
+    #: Optional true RGB pixel frame (H x W x 3, 0..255) -- the neural-vision
+    #: counterpart to the coarse ``frame`` grid.  ``None`` when a Program does
+    #: not render pixels.
+    pixels: Optional[List[List[List[int]]]] = None
 
     def hash(self) -> str:
         """Deterministic content hash used for replay verification and novelty."""
         payload = json.dumps(
-            {"tick": self.tick, "data": self.data, "frame": self.frame},
+            {"tick": self.tick, "data": self.data, "frame": self.frame,
+             "pixels": self.pixels},
             sort_keys=True,
             separators=(",", ":"),
             default=str,
@@ -39,6 +44,7 @@ class Observation:
         }
         if include_frame:
             out["frame"] = self.frame
+            out["pixels"] = self.pixels
         return out
 
     @staticmethod
@@ -48,4 +54,5 @@ class Observation:
             tick=raw.get("tick", 0),
             data=raw.get("data", {}),
             frame=raw.get("frame"),
+            pixels=raw.get("pixels"),
         )

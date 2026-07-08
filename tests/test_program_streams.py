@@ -75,7 +75,7 @@ def test_stream_catalog_covers_the_survival_taxonomy():
     program = MinecraftSurvivalBox(config=FAST_CONFIG)
     specs = {spec.stream_id: spec for spec in program.stream_catalog()}
     expected = {
-        "vision.frame.grid", "vision.entities",
+        "vision.frame.grid", "vision.frame.pixels", "vision.entities",
         "body.health", "body.hunger", "body.oxygen",
         "body.inventory", "body.hotbar", "body.in_water", "body.alive",
         "spatial.position", "spatial.rotation", "spatial.distance_from_spawn",

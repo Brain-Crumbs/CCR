@@ -25,6 +25,8 @@ from cognitive_runtime.programs.minecraft.world import (
     BLOCK_IDS,
     BREAK_YIELD,
     MOB_FRAME_ID,
+    PIXEL_RADIUS,
+    PIXEL_SCALE,
     SOLID,
 )
 
@@ -36,9 +38,14 @@ BODY_HEARTBEAT_TICKS = 20
 BODY_HEARTBEAT_HZ = 1.0
 
 #: Pacer keys: the vision frame is rate-paced in realtime, and body vitals
-#: share one heartbeat token (they beat together).
+#: share one heartbeat token (they beat together).  The RGB pixel frame beats
+#: with the grid frame (same vision cadence).
 VISION_STREAM = "vision.frame.grid"
+PIXEL_STREAM = "vision.frame.pixels"
 BODY_HEARTBEAT_KEY = "body.heartbeat"
+
+#: RGB pixel-frame dimensions (H, W, C), derived from the world's render geometry.
+PIXEL_SHAPE = ((2 * PIXEL_RADIUS + 1) * PIXEL_SCALE, (2 * PIXEL_RADIUS + 1) * PIXEL_SCALE, 3)
 
 VITAL_RANGE = (0.0, 20.0)  # health/hunger/oxygen scale
 
@@ -82,6 +89,10 @@ def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
         StreamSpec("vision.frame.grid", "vision", "Coarse top-down frame.",
                    nominal_rate_hz=20.0, payload_schema="11x11 int grid",
                    legend=FRAME_LEGEND),
+        StreamSpec(PIXEL_STREAM, "vision", "Top-down RGB pixel frame.",
+                   nominal_rate_hz=20.0,
+                   payload_schema=f"{PIXEL_SHAPE[0]}x{PIXEL_SHAPE[1]}x3 uint8 image",
+                   range=(0.0, 255.0), shape=PIXEL_SHAPE, overflow="coalesce"),
         StreamSpec("vision.entities", "vision",
                    "Visible mobs (distance/angle), every tick while any are visible.",
                    payload_schema="[{distance, angle}]", range=(0.0, 16.0)),
@@ -195,6 +206,8 @@ class SurvivalStreamPublisher:
 
         if show_frame:
             pub("vision.frame.grid", observation.frame, force=True)
+            if observation.pixels is not None:
+                pub(PIXEL_STREAM, observation.pixels, force=True)
         mobs = data["mobs"]
         pub("vision.entities", mobs, force=bool(mobs))
         pub("body.health", data["health"], force=heartbeat)

@@ -52,4 +52,5 @@ def build_observation(world: SimulatedWorld, timestamp: float) -> Observation:
         tick=world.tick,
         data=data,
         frame=world.render_frame(radius=5),
+        pixels=world.render_pixels(),
     )
