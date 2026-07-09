@@ -8,40 +8,23 @@ linear BC paths never import it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
-import numpy as np
 import torch
 from torch import nn
 
+from cognitive_runtime.neural.pixel_stream_encoder import (
+    PixelStreamEncoder,
+    pixels_to_chw,
+)
+
 REPRESENTATION = "neural_pixels"
-
-
-def pixels_to_chw(frame: Any) -> torch.Tensor:
-    """Convert an H x W x C RGB frame into a normalized C x H x W tensor.
-
-    ``frame`` is normally an ndarray (the live/recorded pixel stream); a
-    nested list is also accepted for legacy sessions.  The ndarray path goes
-    through ``torch.from_numpy`` (a view, not a per-element Python conversion).
-    """
-    array = frame if isinstance(frame, np.ndarray) else np.asarray(frame, dtype=np.uint8)
-    if array.size == 0:
-        raise ValueError("pixel frame must be a non-empty H x W x C array")
-    if array.ndim != 3:
-        raise ValueError(f"pixel frame must be 3-dimensional, got shape {tuple(array.shape)}")
-    if array.shape[2] != 3:
-        raise ValueError(f"pixel frame must have 3 RGB channels, got {array.shape[2]}")
-    contiguous = np.ascontiguousarray(array)
-    if not contiguous.flags.writeable:
-        # A zero-copy mmap view (read-only) from the frame store; torch.from_numpy
-        # requires a writable buffer, and we're about to cast to float anyway.
-        contiguous = contiguous.copy()
-    tensor = torch.from_numpy(contiguous).float()
-    return tensor.permute(2, 0, 1).contiguous() / 255.0
+VISION_BC_FORMAT = "vision-bc-v2"
+LEGACY_VISION_BC_FORMAT = "vision-bc-v1"
 
 
 class VisionPolicyNet(nn.Module):
-    """Small CNN over pixels plus an MLP over non-vision and motor features."""
+    """Pixel stream encoder plus an MLP action head."""
 
     def __init__(
         self,
@@ -65,30 +48,26 @@ class VisionPolicyNet(nn.Module):
         self.embed_dim = int(embed_dim)
         self.hidden_dim = int(hidden_dim)
 
-        self.cnn = nn.Sequential(
-            nn.Conv2d(c, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(32, embed_dim),
-            nn.ReLU(),
-        )
+        self.encoder = PixelStreamEncoder(self.pixel_shape, latent_width=self.embed_dim)
         self.head = nn.Sequential(
             nn.Linear(embed_dim + self.n_non_vision + self.n_motor, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, n_actions),
         )
 
+    @property
+    def cnn(self) -> nn.Sequential:
+        """Backward-compatible access to the visual trunk."""
+        return self.encoder.cnn
+
+    def visual_latent(self, pixels: torch.Tensor) -> torch.Tensor:
+        return self.encoder(pixels)
+
     def forward(self, pixels: torch.Tensor, aux: torch.Tensor) -> torch.Tensor:
-        if pixels.ndim != 4:
-            raise ValueError(f"pixels must be N x C x H x W, got {tuple(pixels.shape)}")
         expected_aux = self.n_non_vision + self.n_motor
         if aux.ndim != 2 or aux.shape[1] != expected_aux:
             raise ValueError(f"aux must be N x {expected_aux}, got {tuple(aux.shape)}")
-        visual = self.cnn(pixels)
+        visual = self.visual_latent(pixels)
         return self.head(torch.cat([visual, aux], dim=1))
 
     def config(self) -> Dict[str, Any]:
@@ -155,6 +134,7 @@ class VisionBCModel:
     def save(self, path: str) -> None:
         torch.save(
             {
+                "format": VISION_BC_FORMAT,
                 "config": self.net.config(),
                 "state_dict": self.net.state_dict(),
                 "action_keys": list(self.action_keys),
@@ -166,12 +146,29 @@ class VisionBCModel:
     @staticmethod
     def load(path: str) -> "VisionBCModel":
         raw = torch.load(path, map_location="cpu")
+        bundle_format = raw.get("format", LEGACY_VISION_BC_FORMAT)
+        if bundle_format not in {LEGACY_VISION_BC_FORMAT, VISION_BC_FORMAT}:
+            raise ValueError(
+                f"unsupported VisionBCModel bundle format {bundle_format!r}; "
+                f"expected {VISION_BC_FORMAT!r}"
+            )
         net = VisionPolicyNet(**raw["config"])
-        net.load_state_dict(raw["state_dict"])
+        net.load_state_dict(_migrate_state_dict(raw["state_dict"]))
         net.eval()
         return VisionBCModel(
             net=net,
             action_keys=list(raw["action_keys"]),
             meta=dict(raw.get("meta", {})),
         )
+
+
+def _migrate_state_dict(state_dict: Mapping[str, Any]) -> Dict[str, Any]:
+    """Map pre-Phase-B ``cnn.*`` keys onto the composed encoder module."""
+    migrated: Dict[str, Any] = {}
+    for key, value in state_dict.items():
+        if key.startswith("cnn."):
+            migrated[f"encoder.{key}"] = value
+        else:
+            migrated[key] = value
+    return migrated
 
