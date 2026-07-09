@@ -253,7 +253,7 @@ class OnlineQModel:
     ) -> str:
         eps = self.current_epsilon() if epsilon is None else epsilon
         chooser = rng or self._rng
-        if chooser.random() < eps:
+        if eps > 0.0 and chooser.random() < eps:
             return self.action_keys[chooser.randrange(len(self.action_keys))]
         scores = self.q_values(latent_vector, recent_action_keys)
         return self.action_keys[max(range(len(scores)), key=scores.__getitem__)]
@@ -429,4 +429,3 @@ class OnlineQModel:
             latent_width=expected_latent_width,
         )
         return model
-
