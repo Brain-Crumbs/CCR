@@ -225,6 +225,9 @@ def cmd_train(args: argparse.Namespace) -> None:
     if args.model_type == "neural":
         _train_neural(args)
         return
+    if args.model_type == "pixel-encoder":
+        _train_pixel_encoder(args)
+        return
     dataset = build_dataset(
         args.sessions,
         history=args.history,
@@ -268,7 +271,13 @@ def _train_neural(args: argparse.Namespace) -> None:
     print(f"dataset: {len(dataset)} pixel samples from {len(dataset.sources)} episodes "
           f"(frame={dataset.pixel_shape}, non-vision dim={len(dataset.non_vision_names)})")
     model, metrics = train_neural_bc(
-        dataset, epochs=args.epochs, lr=args.neural_lr, batch_size=args.batch_size, seed=args.seed
+        dataset,
+        epochs=args.epochs,
+        lr=args.neural_lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        embed_dim=args.latent_width,
+        encoder_init_path=args.encoder_init,
     )
     out = args.out if args.out != DEFAULT_MODEL_OUT else "models/vision_bc.pt"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
@@ -276,6 +285,58 @@ def _train_neural(args: argparse.Namespace) -> None:
     for key, value in metrics.items():
         print(f"  {key}: {value}")
     print(f"model saved to {out}")
+
+
+def _train_pixel_encoder(args: argparse.Namespace) -> None:
+    """Offline visual representation pretraining for PixelStreamEncoder."""
+    try:
+        from cognitive_runtime.training.datasets import build_pixel_sequence_dataset
+        from cognitive_runtime.training.visual_representation import (
+            VisualPretrainingConfig,
+            save_pixel_encoder_pretraining_checkpoint,
+            train_pixel_encoder_pretraining,
+        )
+    except ImportError as exc:  # torch not installed
+        sys.exit(
+            f"pixel-encoder pretraining needs PyTorch ({exc}). Install it with "
+            "'pip install -e .[neural]'."
+        )
+    dataset = build_pixel_sequence_dataset(
+        args.sessions,
+        max_samples=args.max_samples,
+        min_episode_reward=args.min_reward,
+    )
+    if len(dataset) == 0:
+        sys.exit("no adjacent pixel samples found (record sessions with --record-frames)")
+    print(
+        f"dataset: {len(dataset)} adjacent pixel pairs from {len(dataset.sources)} episodes "
+        f"(frame={dataset.pixel_shape})"
+    )
+    config = VisualPretrainingConfig(
+        epochs=args.epochs,
+        lr=args.neural_lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        latent_width=args.latent_width,
+        hidden_dim=args.hidden_dim,
+        reconstruction_size=args.reconstruction_size,
+        reconstruction_weight=args.reconstruction_weight,
+        next_latent_weight=args.next_latent_weight,
+        contrastive_weight=args.contrastive_weight,
+        contrastive_temperature=args.contrastive_temperature,
+    )
+    model, stats = train_pixel_encoder_pretraining(dataset, config)
+    out = args.out if args.out != DEFAULT_MODEL_OUT else "models/pixel_encoder.pt"
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    save_pixel_encoder_pretraining_checkpoint(out, model, dataset, stats)
+    for key in (
+        "final_total_loss",
+        "final_reconstruction_loss",
+        "final_next_latent_loss",
+        "final_contrastive_loss",
+    ):
+        print(f"  {key}: {stats[key]}")
+    print(f"checkpoint bundle saved to {out}")
 
 
 def cmd_replay(args: argparse.Namespace) -> None:
@@ -360,13 +421,26 @@ def build_parser() -> argparse.ArgumentParser:
                          help="session directories (e.g. sessions/20260101-...-scripted)")
     p_train.add_argument("--out", default=DEFAULT_MODEL_OUT,
                          help="output path; neural models default to models/vision_bc.pt")
-    p_train.add_argument("--model-type", choices=["linear", "neural"], default="linear",
-                         help="linear softmax head (default) or the end-to-end pixel CNN")
+    p_train.add_argument("--model-type", choices=["linear", "neural", "pixel-encoder"],
+                         default="linear",
+                         help="linear softmax head (default), pixel BC, or pixel encoder pretrain")
     p_train.add_argument("--epochs", type=int, default=10)
     p_train.add_argument("--lr", type=float, default=0.5, help="linear-model learning rate")
     p_train.add_argument("--neural-lr", type=float, default=1e-3, help="neural-model learning rate")
     p_train.add_argument("--batch-size", type=int, default=32)
     p_train.add_argument("--history", type=int, default=8)
+    p_train.add_argument("--encoder-init", default=None,
+                         help="pixel-encoder checkpoint bundle used to initialize neural BC")
+    p_train.add_argument("--latent-width", type=int, default=64,
+                         help="pixel-encoder latent width for pretraining")
+    p_train.add_argument("--hidden-dim", type=int, default=128,
+                         help="hidden width for pixel-encoder pretraining heads")
+    p_train.add_argument("--reconstruction-size", type=int, default=16,
+                         help="max side length for downsampled reconstruction targets")
+    p_train.add_argument("--reconstruction-weight", type=float, default=1.0)
+    p_train.add_argument("--next-latent-weight", type=float, default=1.0)
+    p_train.add_argument("--contrastive-weight", type=float, default=1.0)
+    p_train.add_argument("--contrastive-temperature", type=float, default=0.2)
     p_train.add_argument("--features", choices=["latent", "handcrafted"], default="latent",
                          help="linear policy input: fused latent state (default) or hand featurizer")
     p_train.add_argument("--max-samples", type=int, default=None)
