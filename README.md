@@ -126,6 +126,8 @@ cognitive_runtime/
   training/    features, dataset builders (linear + neural), imitation trainer,
                neural trainer (end-to-end BC), policy comparison
   models/      neural models (pixel-vision CNN); optional, torch-only
+  neural/      trainable stream/fusion/world-model/policy/value module
+               contracts for the neural stream agent target; optional, torch-only
   tools/       episode viewer, metrics dashboard, replay runner
 bridge/
   mineflayer/  Node bridge to a live Minecraft server (real backend)
