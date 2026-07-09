@@ -27,56 +27,27 @@ from cognitive_runtime.core.streams.encoder_registry import (
     StreamEncoder,
     StreamEncoderRegistry,
 )
-from cognitive_runtime.core.streams.encoders import (
-    CategoryEncoder,
-    EntityEncoder,
-    EventEncoder,
-    GridVisionEncoder,
-    ScalarEncoder,
-    SpatialEncoder,
-)
 from cognitive_runtime.core.streams.events import StreamSpec
+from cognitive_runtime.core.streams.registry import DEFAULT_STREAM_REGISTRY
 from cognitive_runtime.core.streams.temporal_buffer import TemporalBuffer
 
 FUSION_VERSION = "fusion-v1"
 
 
 def default_encoder_registry() -> StreamEncoderRegistry:
-    """Generic modality -> encoder mapping (first match wins)."""
-    registry = StreamEncoderRegistry()
-    for stream_id in (
-        "body.alive",
-        "body.health",
-        "body.hotbar",
-        "body.hunger",
-        "body.in_water",
-        "body.inventory",
-        "body.oxygen",
-    ):
-        registry.register(stream_id, ScalarEncoder())
-    registry.register("reward.*", ScalarEncoder())
-    # Scalar spatial streams (a distance is one number, not a pose) must match
-    # before the generic pose encoder; first registered match wins.
-    registry.register("spatial.distance_from_spawn", ScalarEncoder())
-    registry.register("spatial.*", SpatialEncoder())
-    registry.register("vision.frame.grid", GridVisionEncoder())
-    registry.register("vision.entities", EntityEncoder())
-    for stream_id in (
-        "event.action_rejected",
-        "event.block_broken",
-        "event.block_placed",
-        "event.damage_taken",
-        "event.died",
-        "event.entered_shelter",
-        "event.food_eaten",
-        "event.item_collected",
-        "event.survived_night",
-    ):
-        registry.register(stream_id, EventEncoder())
-    # Generic categorical/scalar world state (vocab/range from the spec).
-    registry.register("world.front_block", CategoryEncoder())
-    registry.register("world.sheltered", ScalarEncoder())
-    return registry
+    """Generic modality -> encoder mapping (first match wins).
+
+    Built from :data:`DEFAULT_STREAM_REGISTRY` (`registry.py`), the per-stream
+    schema declarations (shape, rate, encoder binding, latent width,
+    checkpoint key, train/eval behavior -- issue #21) that are now the single
+    source of truth for which encoder a stream pattern binds to. Kept as a
+    separate function -- rather than inlining `StreamRegistry` everywhere --
+    so existing callers (`cli.py`, `runtime/loop.py`,
+    `training/online_q_acceptance.py`) are unaffected, and so the resulting
+    fusion layout, width and `layout_hash` are unchanged (byte-compatible
+    with saved online-Q checkpoints).
+    """
+    return DEFAULT_STREAM_REGISTRY.to_encoder_registry()
 
 
 @dataclass(frozen=True)
