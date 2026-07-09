@@ -1,5 +1,8 @@
 """Runtime-facing online Q policy and learner.
 
+Status: baseline only — kept until the neural actor/critic policy
+(docs/neural-stream-agent.md, Phase E) beats it on identical seeds.
+
 The policy chooses from a dependency-free :class:`OnlineQModel`; the learner
 uses the current reward window to update the *previous* decision, preserving
 the runtime's one-tick motor latency.

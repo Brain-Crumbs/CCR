@@ -1,5 +1,8 @@
 """Learned policy: behavioral-cloning model over the latent state.
 
+Status: offline baseline only — linear BC is not the target learned policy
+(docs/neural-stream-agent.md); it stays for offline comparison runs.
+
 The model declares which representation it was trained on:
 
 - ``latent`` (default) reads the fused :class:`LatentState` the runtime already

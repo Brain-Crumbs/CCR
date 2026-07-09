@@ -146,8 +146,10 @@ runtime changes; that is the point.
 
 ## Documentation
 
+- [docs/neural-stream-agent.md](docs/neural-stream-agent.md) — **the target architecture and roadmap**: a neural, stream-native agent with learned encoders, fusion, world model, and actor/critic online learning
 - [docs/architecture.md](docs/architecture.md) — runtime design and components
 - [docs/streams.md](docs/streams.md) — sensory/motor stream primitives and the determinism contract
+- [docs/online-learning.md](docs/online-learning.md) — trainable stream modules and the online Q baseline
 - [docs/program-interface.md](docs/program-interface.md) — the universal Program contract
 - [docs/minecraft-mvp.md](docs/minecraft-mvp.md) — SurvivalBox: scope, rewards, milestones
 - [docs/future-ai-os.md](docs/future-ai-os.md) — the long-term AI-native OS direction

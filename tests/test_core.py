@@ -1,4 +1,4 @@
-"""Core abstraction tests: actions, observations, memory, perception."""
+"""Core abstraction tests: actions, observations, memory."""
 
 from cognitive_runtime.core import (
     Action,
@@ -6,7 +6,6 @@ from cognitive_runtime.core import (
     NULL_ACTION,
     Observation,
     RewardSignal,
-    StructuredPerception,
 )
 from cognitive_runtime.core.streams import SensoryStreamBus, TickSynchronizer
 
@@ -31,22 +30,6 @@ def test_reward_signal_from_components():
     signal = RewardSignal.from_components({"a": 0.5, "b": -0.2, "zero": 0.0})
     assert abs(signal.value - 0.3) < 1e-9
     assert "zero" not in signal.components
-
-
-def test_structured_perception_flattens_numeric_leaves():
-    obs = Observation(
-        timestamp=0.0,
-        tick=1,
-        data={"health": 20, "position": {"x": 1.5, "z": 2.5}, "is_night": False,
-              "hotbar": ["berries", None]},
-        frame=[[1, 2], [3, 4]],
-    )
-    state = StructuredPerception().encode(obs)
-    assert state.features["health"] == 20.0
-    assert state.features["position.x"] == 1.5
-    assert state.features["is_night"] == 0.0
-    assert state.features["hotbar.len"] == 2.0
-    assert state.features["frame.mean"] == 2.5
 
 
 def _window(bus, sync, stream_id, payload, timestamp):

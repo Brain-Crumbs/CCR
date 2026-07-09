@@ -1,5 +1,9 @@
 """Dependency-free linear Q model for the first online-learning core.
 
+Status: baseline only.  The target online learner is a neural actor/critic
+(see docs/neural-stream-agent.md); this model stays as the comparison
+baseline until the actor/critic reliably beats it, then gets deprecated.
+
 The runtime loop does not use this model yet.  It is the pure model layer:
 fixed layout checks, feature construction from fused latent state plus recent
 motor history, epsilon-greedy action selection, TD updates, and atomic JSON

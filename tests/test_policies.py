@@ -2,15 +2,15 @@
 
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.observation import Observation
-from cognitive_runtime.core.perception import StructuredPerception
+from cognitive_runtime.core.perception import State
 from cognitive_runtime.policies import NullPolicy, RandomPolicy, ScriptedSurvivalPolicy
 from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
 
-_PERCEPTION = StructuredPerception()
-
 
 def _state(data):
-    return _PERCEPTION.encode(Observation(timestamp=0.0, tick=1, data=data))
+    # Policies read state.observation.data (the stream-derived view the loop
+    # builds); State.features stays empty, exactly as in the runtime loop.
+    return State(observation=Observation(timestamp=0.0, tick=1, data=data))
 
 
 # Stream-keyed observation data, as the loop's stream-derived view produces.

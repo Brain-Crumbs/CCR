@@ -4,6 +4,11 @@ CCR's first online learner is still intentionally small: a dependency-free
 linear Q model over the existing fused latent vector.  The neural modular path
 is now represented as an interface, not as a behavior change.
 
+The linear Q learner is a **baseline**, not the target.  The end-state — a
+neural, stream-native agent with trainable encoders, learned fusion, a world
+model, and an actor/critic policy — is specified in
+[neural-stream-agent.md](neural-stream-agent.md).
+
 ## Trainable Stream Modules
 
 `TrainableStreamModule` extends the existing fixed `StreamEncoder` contract with
