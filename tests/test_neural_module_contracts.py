@@ -42,8 +42,8 @@ def test_core_runtime_and_scripted_cli_never_import_torch(tmp_path):
 
 def test_neural_package_import_error_is_actionable_without_torch():
     code = (
-        "import sys; "
-        "sys.modules['torch'] = None; "  # forces `import torch` to raise ImportError
+        "import sys\n"
+        "sys.modules['torch'] = None\n"  # forces `import torch` to raise ImportError
         "try:\n"
         "    import cognitive_runtime.neural\n"
         "except ImportError as exc:\n"

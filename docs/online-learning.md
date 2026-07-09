@@ -2,7 +2,8 @@
 
 CCR's first online learner is still intentionally small: a dependency-free
 linear Q model over the existing fused latent vector.  The neural modular path
-is now represented as an interface, not as a behavior change.
+is represented by module interfaces plus a checkpoint bundle format, not yet
+as a behavior change.
 
 The linear Q learner is a **baseline**, not the target.  The end-state — a
 neural, stream-native agent with trainable encoders, learned fusion, a world
@@ -22,6 +23,12 @@ future learning hooks:
 
 `FixedStreamModule` wraps today's fixed encoders and returns no trainable state.
 That means `TemporalFusion` and the v1 online Q feature layout remain unchanged.
+
+`cognitive_runtime.neural.checkpoint.NeuralAgentCheckpoint` is the Phase A
+bundle format for future neural learners: it saves encoders, learned fusion,
+world model, actor, critic, optimizer state, training counters, RNG state and
+replay-buffer metadata with torch, while writing a JSON sidecar so tooling can
+inspect checkpoint provenance without deserializing tensors.
 
 ## Future Neural Path
 

@@ -41,8 +41,8 @@ class PolicyModel(nn.Module, abc.ABC):
     (parameters and buffers). A loader additionally needs the ordered
     ``action_keys`` this model was trained against, so it can refuse to load
     a bundle trained on an incompatible action space the way
-    ``OnlineQModel.check_compatible`` does today; the checkpoint bundle
-    format itself is a separate issue.
+    ``OnlineQModel.check_compatible`` does today; the unified checkpoint
+    bundle stores this in ``NeuralAgentCheckpoint`` metadata.
     """
 
     def __init__(self) -> None:
