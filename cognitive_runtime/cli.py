@@ -160,6 +160,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         record_frames=args.record_frames,
         record_streams=args.record_streams,
         exclude_streams=args.exclude_streams,
+        frame_disk_budget_mb=args.frame_disk_budget_mb,
+        pin_on_streams=args.pin_on_streams,
         session_id=args.session_id,
         program_config=program_config,
     )
@@ -193,6 +195,8 @@ def cmd_demo(args: argparse.Namespace) -> None:
     args.record_frames = True
     args.record_streams = ["*"]
     args.exclude_streams = []
+    args.frame_disk_budget_mb = 512.0
+    args.pin_on_streams = ["event.died", "event.damage_taken"]
     if args.session_id is None:
         import time as _time
         args.session_id = f"{_time.strftime('%Y%m%d-%H%M%S')}-human-demo"
@@ -310,6 +314,13 @@ def build_parser() -> argparse.ArgumentParser:
                        help="stream globs to log with full payload (default: all)")
     p_run.add_argument("--exclude-streams", nargs="+", default=[],
                        help="stream globs to log hash-only, e.g. vision.*")
+    p_run.add_argument("--frame-disk-budget-mb", type=float, default=512.0,
+                       help="rolling binary frame store budget; oldest unpinned "
+                            "segments are dropped once exceeded")
+    p_run.add_argument("--pin-on-streams", nargs="+",
+                       default=["event.died", "event.damage_taken"],
+                       help="stream globs that pin the frame store's current "
+                            "segment when they fire, e.g. event.died")
     p_run.add_argument("--record-dir", default="sessions")
     p_run.add_argument("--session-id", default=None)
     p_run.add_argument("--online-model", default=DEFAULT_ONLINE_MODEL_OUT,

@@ -30,6 +30,21 @@ class RuntimeConfig:
     record_streams: List[str] = field(default_factory=lambda: ["*"])
     exclude_streams: List[str] = field(default_factory=list)
 
+    # Rolling-window binary frame store (only used when a frame stream is
+    # actually being recorded, i.e. record_frames=True or it's named in
+    # record_streams).  A segment rotates on whichever threshold hits first;
+    # rotation then reclaims disk by dropping the oldest *unpinned* segment
+    # until the store is back under budget.
+    frame_segment_max_mb: float = 32.0
+    frame_segment_max_seconds: float = 60.0
+    frame_disk_budget_mb: float = 512.0
+    #: Streams that pin the frame store's current segment when they fire this
+    #: tick, so the surrounding frames survive rotation (high-value moments:
+    #: deaths, damage).  Glob patterns, e.g. ["event.died", "event.damage_taken"].
+    pin_on_streams: List[str] = field(
+        default_factory=lambda: ["event.died", "event.damage_taken"]
+    )
+
     #: Bulky frame streams elided from the log unless ``record_frames`` is set.
     FRAME_STREAMS = ("vision.frame.grid", "vision.frame.pixels")
 

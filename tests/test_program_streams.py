@@ -6,6 +6,8 @@ native cadences, NULL ticks, rejected motor events) and the legacy shim.
 
 from typing import Any, Dict, Optional
 
+import numpy as np
+
 from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.observation import Observation
@@ -123,13 +125,23 @@ def test_step_path_matches_legacy_act_path():
 # --------------------------------------------------------- determinism
 
 
+def _comparable_dict(event) -> Dict[str, Any]:
+    """``to_dict()`` with an ndarray payload (a pixel frame) made list-based,
+    so two ticks' dicts can be compared with plain ``==`` (an elementwise
+    ndarray comparison isn't a bool)."""
+    out = event.to_dict()
+    if isinstance(out.get("payload"), np.ndarray):
+        out["payload"] = out["payload"].tolist()
+    return out
+
+
 def test_same_seed_same_motor_events_give_identical_sensory_streams():
     actions = _scripted_trace(seed=11, n_ticks=120)
 
     def run():
         _, ticks = _drive(11, actions)
         return [
-            [(e.stream_id, e.sequence_number, e.hash(), e.to_dict()) for e in tick]
+            [(e.stream_id, e.sequence_number, e.hash(), _comparable_dict(e)) for e in tick]
             for tick in ticks
         ]
 

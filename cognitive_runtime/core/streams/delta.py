@@ -10,8 +10,23 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+import numpy as np
+
 from cognitive_runtime.core.streams.bus import StreamBus
 from cognitive_runtime.core.streams.events import StreamEvent
+
+
+def _payload_equal(a: Any, b: Any) -> bool:
+    """Payload equality that doesn't choke on ndarrays (an elementwise ``==``
+    is ambiguous as a bool)."""
+    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+        return (
+            isinstance(a, np.ndarray)
+            and isinstance(b, np.ndarray)
+            and a.shape == b.shape
+            and bool(np.array_equal(a, b))
+        )
+    return a == b
 
 
 class DeltaPublisher:
@@ -37,7 +52,7 @@ class DeltaPublisher:
         if (
             not force
             and stream_id in self._last_payload
-            and self._last_payload[stream_id] == payload
+            and _payload_equal(self._last_payload[stream_id], payload)
         ):
             return None
         self._last_payload[stream_id] = payload

@@ -15,8 +15,9 @@ only when neural training is requested, so torch stays optional.
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -140,7 +141,9 @@ def train_neural_bc(
     return model, metrics
 
 
-def _infer_shape(frame) -> Tuple[int, int, int]:
+def _infer_shape(frame: Any) -> Tuple[int, int, int]:
+    if isinstance(frame, np.ndarray):
+        return tuple(frame.shape)  # type: ignore[return-value]
     h = len(frame)
     w = len(frame[0]) if h else 0
     c = len(frame[0][0]) if w else 0
