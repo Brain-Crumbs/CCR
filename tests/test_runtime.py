@@ -140,3 +140,165 @@ def test_episodes_use_distinct_seeds(tmp_path):
     assert [s.seed for s in summaries] == [0, 1]
     session_dir = os.path.join(str(tmp_path), "seeds")
     assert list_episodes(session_dir) == ["episode_00000", "episode_00001"]
+
+
+# ------------------------------------------------- binary frame store (#38)
+
+
+def test_record_frames_writes_frame_ref_not_inline_payload(tmp_path):
+    """With record_frames=True, a frame stream's line references the binary
+    store (frame_ref/shape/dtype) instead of embedding the pixel payload."""
+    from cognitive_runtime.runtime.frame_store import open_frame_store
+    from cognitive_runtime.runtime.recorder import stream_event_from_log
+
+    config = RuntimeConfig(
+        episodes=1, seed=0, max_ticks_per_episode=50,
+        record_dir=str(tmp_path), session_id="frames",
+        program_config=FAST_CONFIG, record_frames=True,
+    )
+    CognitiveRuntime(
+        program=MinecraftSurvivalBox(config=FAST_CONFIG),
+        policy=RandomPolicy(ACTION_SPACE, seed=1), config=config,
+    ).run()
+    session_dir = os.path.join(str(tmp_path), "frames")
+    assert os.path.isdir(os.path.join(session_dir, "frames"))
+
+    stream_log = load_stream_log(session_dir, "episode_00000")
+    pixel_lines = [r for r in stream_log if r.get("stream_id") == "vision.frame.pixels"]
+    assert pixel_lines
+    for record in pixel_lines:
+        assert "payload" not in record
+        assert not record.get("elided")
+        assert "frame_ref" in record and "shape" in record and "dtype" in record
+
+    frame_store = open_frame_store(session_dir)
+    assert frame_store is not None
+    for record in pixel_lines[:5]:
+        event = stream_event_from_log(record, frame_store=frame_store)
+        assert event.hash() == record["hash"]
+    frame_store.close()
+
+
+def test_default_config_still_elides_frames_hash_only(tmp_path):
+    """record_frames defaults to False: frame streams stay hash-only and the
+    binary store is never created (unchanged from before this store existed)."""
+    runtime = _make_runtime(tmp_path, RandomPolicy(ACTION_SPACE, seed=1), session_id="noframes")
+    runtime.run()
+    session_dir = os.path.join(str(tmp_path), "noframes")
+    assert not os.path.isdir(os.path.join(session_dir, "frames"))
+    stream_log = load_stream_log(session_dir, "episode_00000")
+    pixel_lines = [r for r in stream_log if r.get("stream_id") == "vision.frame.pixels"]
+    assert pixel_lines and all(r.get("elided") for r in pixel_lines)
+
+
+def test_pin_on_streams_pins_current_segment_on_trigger(tmp_path):
+    """A configured pin-trigger stream firing this tick pins the frame
+    store's current segment so it survives rotation."""
+    import numpy as np
+
+    from cognitive_runtime.core.streams.events import StreamEvent
+    from cognitive_runtime.runtime.recorder import DecisionRecord, Recorder
+
+    recorder = Recorder(
+        record_dir=str(tmp_path), session_id="pin-test",
+        record_streams=["vision.frame.pixels"],
+        pin_on_streams=["event.damage_taken"],
+    )
+    recorder.write_session_metadata({})
+    recorder.start_episode(0)
+    assert recorder.frame_store.pinned_segments == []
+
+    frame_event = StreamEvent(
+        stream_id="vision.frame.pixels", modality="vision",
+        timestamp=1.0, sequence_number=0, payload=np.zeros((4, 4, 3), dtype=np.uint8),
+    )
+    damage_event = StreamEvent(
+        stream_id="event.damage_taken", modality="event",
+        timestamp=1.0, sequence_number=0, payload={"reason": "zombie"},
+    )
+    recorder.write_cognitive_tick(
+        sensory_events=[frame_event, damage_event], motor_events=[],
+        decision=DecisionRecord(
+            tick_index=0, window_span=[0.0, 1.0],
+            n_events_by_stream={"vision.frame.pixels": 1, "event.damage_taken": 1},
+            motor_emitted=[], policy_name="test", latency_ms=0.0, reward_window_total=0.0,
+        ),
+    )
+    assert len(recorder.frame_store.pinned_segments) == 1
+    recorder.close()
+
+
+def test_legacy_session_without_frame_store_still_loads_and_replays(tmp_path):
+    """A session recorded before this format (inline pixel payload, no
+    frame_hash_algorithm metadata, no frames/ dir) still loads for
+    training/viewing, and replay skips only the now-incomparable pixel-frame
+    hash check instead of falsely reporting tampering."""
+    from cognitive_runtime.runtime.recorder import stream_event_from_log
+
+    config = RuntimeConfig(
+        episodes=1, seed=0, max_ticks_per_episode=50,
+        record_dir=str(tmp_path), session_id="legacy",
+        program_config=FAST_CONFIG, record_frames=True,
+    )
+    CognitiveRuntime(
+        program=MinecraftSurvivalBox(config=FAST_CONFIG),
+        policy=RandomPolicy(ACTION_SPACE, seed=1), config=config,
+    ).run()
+    session_dir = os.path.join(str(tmp_path), "legacy")
+
+    # Rewrite the log the way a pre-migration recorder would have: pixel
+    # frames inline as nested lists, hashed via the old JSON algorithm; drop
+    # the frame_hash_algorithm marker and the binary frame store entirely.
+    import shutil
+
+    from cognitive_runtime.core.hashing import canonical_json
+    import hashlib
+    from cognitive_runtime.runtime.frame_store import open_frame_store
+
+    frame_store = open_frame_store(session_dir)
+    path = os.path.join(session_dir, "episode_00000.streams.jsonl")
+    lines = open(path, encoding="utf-8").read().splitlines()
+    rewritten = []
+    for line in lines:
+        record = json.loads(line)
+        if record.get("stream_id") == "vision.frame.pixels" and "frame_ref" in record:
+            array = frame_store.read_frame(record.pop("frame_ref")).copy()
+            record.pop("shape", None)
+            record.pop("dtype", None)
+            payload = array.tolist()
+            record["payload"] = payload
+            legacy_hash = hashlib.sha1(
+                canonical_json(
+                    {
+                        "stream_id": record["stream_id"],
+                        "sequence_number": record["seq"],
+                        "timestamp": record["timestamp"],
+                        "payload": payload,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+            record["hash"] = legacy_hash
+        rewritten.append(json.dumps(record))
+    frame_store.close()
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(rewritten) + "\n")
+    shutil.rmtree(os.path.join(session_dir, "frames"))
+
+    with open(os.path.join(session_dir, "session.json"), encoding="utf-8") as fh:
+        meta = json.load(fh)
+    meta.pop("frame_hash_algorithm", None)
+    with open(os.path.join(session_dir, "session.json"), "w", encoding="utf-8") as fh:
+        json.dump(meta, fh)
+
+    # Loading still works: stream_event_from_log needs no frame_store at all.
+    stream_log = load_stream_log(session_dir, "episode_00000")
+    pixel_lines = [r for r in stream_log if r.get("stream_id") == "vision.frame.pixels"]
+    assert pixel_lines and all("payload" in r for r in pixel_lines)
+    for record in pixel_lines[:3]:
+        assert stream_event_from_log(record).hash() == record["hash"]
+
+    # Replay: every other stream still verifies; the pixel stream's hash
+    # algorithm changed, so it's skipped rather than reported as tampering.
+    results = replay_session(session_dir)
+    assert len(results) == 1
+    assert results[0].matched, results[0]

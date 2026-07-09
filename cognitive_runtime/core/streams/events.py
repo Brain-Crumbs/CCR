@@ -9,10 +9,13 @@ Every sensory or motor input to the runtime is a time-indexed
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
+
+import numpy as np
+
+from cognitive_runtime.core.hashing import canonical_json
 
 #: The generic sensory/motor taxonomy.  Minecraft health, Linux battery and
 #: robot joint stress are all "body" streams; frames, desktop pixels and
@@ -100,18 +103,32 @@ class StreamEvent:
         """Deterministic content hash; the replay-verification unit.
 
         Mirrors ``Observation.hash()``: canonical JSON with sorted keys over
-        the replay-relevant fields.
+        the replay-relevant fields.  An ndarray payload (a pixel frame) hashes
+        its raw bytes instead -- json.dumps-ing tens of thousands of ints per
+        frame, every tick, is exactly the cost this format avoids.
         """
-        payload = json.dumps(
+        if isinstance(self.payload, np.ndarray):
+            h = hashlib.sha1()
+            h.update(
+                canonical_json(
+                    {
+                        "stream_id": self.stream_id,
+                        "sequence_number": self.sequence_number,
+                        "timestamp": self.timestamp,
+                    }
+                ).encode("utf-8")
+            )
+            contiguous = np.ascontiguousarray(self.payload)
+            h.update(f"|ndarray|{contiguous.dtype}|{contiguous.shape}|".encode("utf-8"))
+            h.update(contiguous.tobytes())
+            return h.hexdigest()
+        payload = canonical_json(
             {
                 "stream_id": self.stream_id,
                 "sequence_number": self.sequence_number,
                 "timestamp": self.timestamp,
                 "payload": self.payload,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
+            }
         )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 

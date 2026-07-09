@@ -22,6 +22,14 @@ Layout on disk (per session directory):
 Streams excluded from the log for size control keep a **hash-only** line
 (``payload`` elided, ``"elided": true``) so replay verification stays complete.
 
+A sensory event whose payload is an ndarray (a pixel frame) is a third case:
+its bytes go to the binary :class:`~cognitive_runtime.runtime.frame_store.FrameStore`
+under ``<session_dir>/frames/`` instead of either embedding or eliding, and
+the line carries a small ``"frame_ref"`` (content hash) plus ``shape``/
+``dtype`` instead of ``"payload"``.  This is purely additive to the streams-v2
+schema -- a legacy line with an inline list payload, or an elided line, reads
+back exactly as before.
+
 `episode_XXXXX.decisions.jsonl` lines carry one cognitive tick each — this is
 where NULL decisions are visible even though they emit no motor events.
 """
@@ -33,8 +41,16 @@ import os
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, IO, List, Optional
 
+import numpy as np
+
 from cognitive_runtime.core.streams.bus import stream_matches
 from cognitive_runtime.core.streams.events import StreamEvent
+from cognitive_runtime.runtime.frame_store import (
+    DEFAULT_DISK_BUDGET_BYTES,
+    DEFAULT_SEGMENT_MAX_BYTES,
+    DEFAULT_SEGMENT_MAX_SECONDS,
+    FrameStore,
+)
 
 RECORDING_FORMAT = "streams-v2"
 
@@ -93,12 +109,20 @@ class EpisodeSummary:
 
 
 def stream_event_to_log(
-    event: StreamEvent, direction: str, elide_payload: bool = False
+    event: StreamEvent,
+    direction: str,
+    elide_payload: bool = False,
+    frame_store: Optional[FrameStore] = None,
 ) -> Dict[str, Any]:
     """Serialize a StreamEvent to one streams.jsonl record.
 
     ``elide_payload`` drops the (bulky) payload but keeps the hash, so replay
-    can still verify the event even though its content is not stored.
+    can still verify the event even though its content is not stored.  An
+    ndarray payload that isn't elided goes to ``frame_store`` instead of being
+    embedded inline: the line carries a small ``frame_ref`` (content hash)
+    rather than the raw pixels.  If the store can't persist it (disk full even
+    after evicting unpinned segments), the event degrades to hash-only rather
+    than raising -- the hash was already computed either way.
     """
     record: Dict[str, Any] = {
         "dir": direction,
@@ -116,25 +140,45 @@ def stream_event_to_log(
         record["arrived_at"] = event.arrived_at
     if elide_payload:
         record["elided"] = True
+    elif isinstance(event.payload, np.ndarray) and frame_store is not None:
+        frame_ref = frame_store.write_frame(event.payload)
+        if frame_ref is None:
+            record["elided"] = True
+        else:
+            record["frame_ref"] = frame_ref
+            record["shape"] = list(event.payload.shape)
+            record["dtype"] = str(event.payload.dtype)
     else:
         record["payload"] = event.payload
     return record
 
 
-def stream_event_from_log(record: Dict[str, Any]) -> StreamEvent:
+def stream_event_from_log(
+    record: Dict[str, Any], frame_store: Optional[FrameStore] = None
+) -> StreamEvent:
     """Rebuild a StreamEvent from a full streams.jsonl record.
 
-    Raises ``KeyError`` on hash-only (elided) lines — they carry no payload and
-    cannot round-trip; callers use their stored ``hash`` directly instead.
+    Raises ``KeyError`` on hash-only (elided) lines, and on ``frame_ref``
+    lines when no ``frame_store`` is given — neither carries enough to
+    round-trip without one; callers use the stored ``hash`` directly instead.
     """
     if record.get("elided"):
         raise KeyError("elided stream record has no payload to reconstruct")
+    if "frame_ref" in record:
+        if frame_store is None:
+            raise KeyError(
+                "frame-referenced stream record requires a FrameStore to "
+                "reconstruct; open one with frame_store.open_frame_store(session_dir)"
+            )
+        payload: Any = frame_store.read_frame(record["frame_ref"])
+    else:
+        payload = record["payload"]
     return StreamEvent(
         stream_id=record["stream_id"],
         modality=record["modality"],
         timestamp=record.get("timestamp", 0.0),
         sequence_number=record.get("seq", 0),
-        payload=record["payload"],
+        payload=payload,
         confidence=record.get("confidence", 1.0),
         source=record.get("source", ""),
     )
@@ -147,12 +191,26 @@ class Recorder:
         session_id: str,
         record_streams: Optional[List[str]] = None,
         exclude_streams: Optional[List[str]] = None,
+        pin_on_streams: Optional[List[str]] = None,
+        frame_segment_max_bytes: int = DEFAULT_SEGMENT_MAX_BYTES,
+        frame_segment_max_seconds: float = DEFAULT_SEGMENT_MAX_SECONDS,
+        frame_disk_budget_bytes: Optional[int] = DEFAULT_DISK_BUDGET_BYTES,
     ):
         self.session_id = session_id
         self.session_dir = os.path.join(record_dir, session_id)
         self.record_streams = list(record_streams) if record_streams else ["*"]
         self.exclude_streams = list(exclude_streams or [])
+        #: Glob patterns; a sensory event on a matching stream this tick pins
+        #: the frame store's current rolling segment (deaths, damage, ...) so
+        #: it survives rotation.
+        self.pin_on_streams = list(pin_on_streams or [])
         os.makedirs(self.session_dir, exist_ok=True)
+        self.frame_store = FrameStore(
+            os.path.join(self.session_dir, "frames"),
+            segment_max_bytes=frame_segment_max_bytes,
+            segment_max_seconds=frame_segment_max_seconds,
+            disk_budget_bytes=frame_disk_budget_bytes,
+        )
         self._streams_file: Optional[IO[str]] = None
         self._decisions_file: Optional[IO[str]] = None
         self._episode_index = 0
@@ -164,6 +222,16 @@ class Recorder:
         if any(stream_matches(p, stream_id) for p in self.exclude_streams):
             return True
         return not any(stream_matches(p, stream_id) for p in self.record_streams)
+
+    def _maybe_pin(self, sensory_events: List[StreamEvent]) -> None:
+        """Pin the frame store's current segment when a high-value event
+        (death, damage, ...) arrives this tick, so it survives rotation."""
+        if not self.pin_on_streams:
+            return
+        for event in sensory_events:
+            if any(stream_matches(p, event.stream_id) for p in self.pin_on_streams):
+                self.frame_store.pin_current()
+                return
 
     # -- session / episode lifecycle ---------------------------------------
 
@@ -194,11 +262,14 @@ class Recorder:
             raise RuntimeError("start_episode() must precede write_cognitive_tick()")
         for event in sensory_events:
             record = stream_event_to_log(
-                event, "sensory", elide_payload=self._elide(event.stream_id)
+                event, "sensory",
+                elide_payload=self._elide(event.stream_id),
+                frame_store=self.frame_store,
             )
             self._streams_file.write(
                 json.dumps(record, separators=(",", ":"), default=str) + "\n"
             )
+        self._maybe_pin(sensory_events)
         for event in motor_events:
             record = stream_event_to_log(event, "motor")
             self._streams_file.write(
@@ -224,6 +295,8 @@ class Recorder:
 
     def close(self) -> None:
         self.end_episode_file()
+        if self.frame_store is not None:
+            self.frame_store.close()
 
 
 class NullRecorder(Recorder):
@@ -234,6 +307,8 @@ class NullRecorder(Recorder):
         self.session_dir = ""
         self.record_streams = ["*"]
         self.exclude_streams = []
+        self.pin_on_streams = []
+        self.frame_store = None
         self._streams_file = None
         self._decisions_file = None
         self._episode_index = 0

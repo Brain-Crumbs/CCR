@@ -17,6 +17,8 @@ from __future__ import annotations
 from collections import deque
 from typing import Deque, List, Optional, Tuple
 
+import numpy as np
+
 from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.perception import State
@@ -85,8 +87,11 @@ class NeuralPolicy(SingleActionPolicy):
                 "Is the program publishing pixel frames?"
             )
         frame = latest_pixels.payload
-        shape = (len(frame), len(frame[0]) if frame else 0,
-                 len(frame[0][0]) if frame and frame[0] else 0)
+        if isinstance(frame, np.ndarray):
+            shape = tuple(frame.shape)
+        else:
+            shape = (len(frame), len(frame[0]) if frame else 0,
+                     len(frame[0][0]) if frame and frame[0] else 0)
         if shape != self.model.pixel_shape:
             raise ValueError(
                 f"pixel-frame shape {shape} != model's {self.model.pixel_shape}; "

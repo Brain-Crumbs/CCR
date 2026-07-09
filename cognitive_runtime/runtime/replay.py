@@ -32,12 +32,15 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+import numpy as np
+
 from cognitive_runtime.core.program import Program
 from cognitive_runtime.core.streams import (
     MOTOR_COMMAND_STREAM,
     MotorStreamBus,
     SensoryStreamBus,
 )
+from cognitive_runtime.runtime.frame_store import FRAME_HASH_ALGORITHM, FrameStore, open_frame_store
 from cognitive_runtime.runtime.recorder import (
     RECORDING_FORMAT,
     stream_event_from_log,
@@ -190,6 +193,12 @@ def replay_episode(
     summary = load_summary(session_dir, episode_id)
     seed = int(summary.get("seed", 0))
     ratio = int(metadata.get("program_ticks_per_cognitive_tick", 1))
+    # Sessions recorded before frame payloads hashed raw bytes stored their
+    # hash via JSON; a freshly re-simulated ndarray frame can never match that
+    # digest even when nothing is wrong, so those streams are skipped rather
+    # than flagged as tampering (see _verify_window).
+    legacy_frame_hash = metadata.get("frame_hash_algorithm") != FRAME_HASH_ALGORITHM
+    frame_store = open_frame_store(session_dir)
 
     sensory_bus, motor_bus = SensoryStreamBus(), MotorStreamBus()
     program.attach_buses(sensory_bus, motor_bus)
@@ -214,7 +223,10 @@ def replay_episode(
         tick_index = decision.get("tick_index", ticks)
 
         if verify:
-            divergence = _verify_window(regenerated, sensory_records)
+            divergence = _verify_window(
+                regenerated, sensory_records,
+                frame_store=frame_store, legacy_frame_hash=legacy_frame_hash,
+            )
             if divergence is not None:
                 stream_id, seq, note = divergence
                 result.matched = False
@@ -255,11 +267,16 @@ def replay_episode(
     result.reward_replayed = round(reward_replayed, 4)
     if not verify:
         result.matched = True
+    if frame_store is not None:
+        frame_store.close()
     return result
 
 
 def _verify_window(
-    regenerated: List[Any], recorded: List[Dict[str, Any]]
+    regenerated: List[Any],
+    recorded: List[Dict[str, Any]],
+    frame_store: Optional[FrameStore] = None,
+    legacy_frame_hash: bool = False,
 ) -> Optional[Tuple[str, int, str]]:
     """Compare regenerated sensory events against the recorded lines in order.
 
@@ -277,7 +294,7 @@ def _verify_window(
         # hash — catches a tampered payload even if the world is unaffected.
         if not record.get("elided"):
             try:
-                if stream_event_from_log(record).hash() != stored_hash:
+                if stream_event_from_log(record, frame_store=frame_store).hash() != stored_hash:
                     return (
                         record.get("stream_id", "?"),
                         record.get("seq", -1),
@@ -286,6 +303,11 @@ def _verify_window(
             except KeyError:
                 pass
         if event.hash() != stored_hash:
+            if legacy_frame_hash and isinstance(event.payload, np.ndarray):
+                # Pre-migration session: this stream's stored hash was JSON-based
+                # and can never match a freshly re-simulated array's byte hash.
+                # Not a divergence -- re-record to verify frame content again.
+                continue
             return (
                 event.stream_id,
                 event.sequence_number,

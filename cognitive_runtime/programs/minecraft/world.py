@@ -20,6 +20,8 @@ import math
 import random
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+
 from cognitive_runtime.core.action import Action
 from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
 
@@ -117,23 +119,27 @@ FRAME_CODE_COLORS: Dict[int, Tuple[int, int, int]] = {
 _UNKNOWN_CELL_COLOR = (255, 0, 255)  # magenta: an out-of-vocab frame code
 
 
-def pixels_from_frame(
-    frame: List[List[int]], scale: int = PIXEL_SCALE
-) -> List[List[List[int]]]:
+#: Frame-code -> RGB lookup table, built once and indexed vectorized (a code
+#: past the known vocabulary clips to the last row, then gets overwritten by
+#: the unknown-cell color below).
+_MAX_FRAME_CODE = max(FRAME_CODE_COLORS) if FRAME_CODE_COLORS else 0
+_FRAME_COLOR_LUT = np.full((_MAX_FRAME_CODE + 1, 3), _UNKNOWN_CELL_COLOR, dtype=np.uint8)
+for _code, _rgb in FRAME_CODE_COLORS.items():
+    _FRAME_COLOR_LUT[_code] = _rgb
+
+
+def pixels_from_frame(frame: List[List[int]], scale: int = PIXEL_SCALE) -> np.ndarray:
     """Colorize a semantic grid frame (frame codes) into an H*scale x W*scale x 3
-    RGB image.  Backend-agnostic: any world that emits the shared grid frame
-    gets identical pixel vision, and the mapping is a pure function of the grid
-    (so it stays deterministic / replay-safe)."""
-    image: List[List[List[int]]] = []
-    for grid_row in frame:
-        pixel_row = [
-            list(FRAME_CODE_COLORS.get(code, _UNKNOWN_CELL_COLOR))
-            for code in grid_row
-            for _ in range(scale)
-        ]
-        for _ in range(scale):
-            image.append([list(px) for px in pixel_row])
-    return image
+    RGB image (uint8 ndarray).  Backend-agnostic: any world that emits the
+    shared grid frame gets identical pixel vision, and the mapping is a pure
+    function of the grid (so it stays deterministic / replay-safe)."""
+    grid = np.asarray(frame, dtype=np.int64)
+    unknown = grid > _MAX_FRAME_CODE
+    codes = np.where(unknown, 0, grid)
+    colored = _FRAME_COLOR_LUT[codes]
+    if unknown.any():
+        colored[unknown] = _UNKNOWN_CELL_COLOR
+    return np.repeat(np.repeat(colored, scale, axis=0), scale, axis=1)
 
 WALK_SPEED = 0.25
 SPRINT_SPEED = 0.45
@@ -721,7 +727,7 @@ class SimulatedWorld:
 
     def render_pixels(
         self, radius: int = PIXEL_RADIUS, scale: int = PIXEL_SCALE
-    ) -> List[List[List[int]]]:
+    ) -> np.ndarray:
         """Deterministic RGB pixel render of the local view (H x W x 3, 0..255).
 
         The pixel counterpart to :meth:`render_frame`: the same semantic grid,

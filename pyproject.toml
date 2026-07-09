@@ -9,7 +9,10 @@ description = "Continuous Cognitive Runtime: an always-running cognitive system 
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = []
+# numpy is core: pixel frames flow as arrays from the backend/bridge boundary
+# through fusion, the binary frame store and the recorder, whether or not
+# torch (the neural extra) is installed.
+dependencies = ["numpy>=1.23"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
@@ -17,7 +20,7 @@ dev = ["pytest>=7"]
 # pure-Python stack (loop, streams, simulated/remote backends, the linear BC
 # trainer and every heuristic encoder) runs without it. Only the pixel CNN,
 # its trainer and the neural policy import torch, always lazily.
-neural = ["torch>=2", "numpy>=1.23"]
+neural = ["torch>=2"]
 
 [project.scripts]
 ccr = "cognitive_runtime.cli:main"

@@ -26,6 +26,7 @@ from cognitive_runtime.core.streams import (
 )
 from cognitive_runtime.core.streams.events import StreamSpec
 from cognitive_runtime.core.streams.motor import MOTOR_COMMAND_STREAM
+from cognitive_runtime.runtime.frame_store import open_frame_store
 from cognitive_runtime.runtime.recorder import stream_event_from_log
 from cognitive_runtime.runtime.replay import (
     iter_cognitive_ticks,
@@ -130,6 +131,7 @@ def build_dataset(
                         "the same program config"
                     )
 
+        frame_store = open_frame_store(session_dir)
         for episode_id in list_episodes(session_dir):
             spawn = _spawn(session_dir, episode_id) if representation == HANDCRAFTED else None
             buffer = TemporalBuffer()
@@ -147,7 +149,7 @@ def build_dataset(
                         ):
                             elided_layout_streams.add(stream_id)
                         continue
-                    buffer.append(stream_event_from_log(record))
+                    buffer.append(stream_event_from_log(record, frame_store=frame_store))
                 label_key = _motor_label(motor)
                 if label_key in key_to_label:
                     if representation == LATENT:
@@ -169,6 +171,8 @@ def build_dataset(
                     dataset.sources.append(f"{session_dir}/{episode_id} (truncated)")
                     return dataset
             dataset.sources.append(f"{session_dir}/{episode_id}")
+        if frame_store is not None:
+            frame_store.close()
     if elided_layout_streams:
         print(
             "warning: these streams were recorded hash-only (payload elided) and "
@@ -202,7 +206,7 @@ def _non_vision_fusion(metadata: Dict[str, Any]) -> TemporalFusion:
 class NeuralDataset:
     """Pixel frames + fused non-vision vectors + motor history + action labels."""
 
-    pixels: List[List[List[List[int]]]] = field(default_factory=list)  # per sample H x W x C
+    pixels: List[Any] = field(default_factory=list)  # per sample, H x W x C ndarray
     non_vision: List[List[float]] = field(default_factory=list)
     motor: List[List[float]] = field(default_factory=list)
     labels: List[int] = field(default_factory=list)
@@ -267,6 +271,7 @@ def build_neural_dataset(
                 "sessions recorded with the same program config"
             )
 
+        frame_store = open_frame_store(session_dir)
         for episode_id in list_episodes(session_dir):
             buffer = TemporalBuffer()
             recent: deque = deque(maxlen=history)
@@ -279,7 +284,7 @@ def build_neural_dataset(
                         if record.get("stream_id") == PIXEL_STREAM:
                             pixels_were_elided = True
                         continue
-                    buffer.append(stream_event_from_log(record))
+                    buffer.append(stream_event_from_log(record, frame_store=frame_store))
                 label_key = _motor_label(motor)
                 latest_pixels = buffer.latest(PIXEL_STREAM)
                 if label_key in key_to_label and latest_pixels is not None:
@@ -300,6 +305,8 @@ def build_neural_dataset(
                     dataset.sources.append(f"{session_dir}/{episode_id} (truncated)")
                     return dataset
             dataset.sources.append(f"{session_dir}/{episode_id}")
+        if frame_store is not None:
+            frame_store.close()
 
     if len(dataset) == 0 and pixels_were_elided:
         raise ValueError(

@@ -7,6 +7,7 @@ are skipped when it is not installed, so the suite stays green either way.
 import os
 from collections import deque
 
+import numpy as np
 import pytest
 
 from cognitive_runtime.core.streams import TemporalBuffer, TemporalFusion
@@ -17,6 +18,7 @@ from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
 from cognitive_runtime.programs.minecraft.streams import PIXEL_SHAPE, PIXEL_STREAM
 from cognitive_runtime.programs.minecraft.world import SimulatedWorld, pixels_from_frame
 from cognitive_runtime.runtime.config import RuntimeConfig
+from cognitive_runtime.runtime.frame_store import open_frame_store
 from cognitive_runtime.runtime.loop import CognitiveRuntime
 from cognitive_runtime.runtime.recorder import stream_event_from_log
 from cognitive_runtime.runtime.replay import (
@@ -54,32 +56,34 @@ def test_pixel_render_is_deterministic_and_correct_shape():
     a = SimulatedWorld(SurvivalBoxConfig.from_dict(FAST_CONFIG), seed=7)
     b = SimulatedWorld(SurvivalBoxConfig.from_dict(FAST_CONFIG), seed=7)
     pa, pb = a.render_pixels(), b.render_pixels()
-    assert pa == pb, "same seed must render byte-identical pixels (replay-safe)"
-    h, w, c = PIXEL_SHAPE
-    assert len(pa) == h and len(pa[0]) == w and len(pa[0][0]) == c == 3
-    assert all(0 <= channel <= 255 for row in pa for px in row for channel in px)
+    assert isinstance(pa, np.ndarray)
+    assert np.array_equal(pa, pb), "same seed must render byte-identical pixels (replay-safe)"
+    assert tuple(pa.shape) == PIXEL_SHAPE
+    assert pa.dtype == np.uint8
+    assert bool(((pa >= 0) & (pa <= 255)).all())
 
 
 def test_pixels_from_frame_upscales_and_colors_generically():
     # A 1x2 grid frame of two frame codes -> scale*2 wide, scale tall, RGB.
     frame = [[1, 4]]  # grass, water
     img = pixels_from_frame(frame, scale=3)
-    assert len(img) == 3 and len(img[0]) == 6 and len(img[0][0]) == 3
-    assert img[0][0] != img[0][-1], "different frame codes get different colors"
+    assert isinstance(img, np.ndarray)
+    assert img.shape == (3, 6, 3)
+    assert not np.array_equal(img[0][0], img[0][-1]), "different frame codes get different colors"
 
 
 def test_pixel_stream_present_and_replayable(tmp_path):
     session_dir = _record(tmp_path, "pixels")
     episode = list_episodes(session_dir)[0]
+    frame_store = open_frame_store(session_dir)
     frames = [
-        stream_event_from_log(rec).payload
+        stream_event_from_log(rec, frame_store=frame_store).payload
         for _d, sensory, _m in iter_cognitive_ticks(session_dir, episode)
         for rec in sensory
         if rec.get("stream_id") == PIXEL_STREAM and not rec.get("elided")
     ]
     assert frames, "pixel frames must be recorded under record_frames"
-    h, w, c = PIXEL_SHAPE
-    assert all(len(f) == h and len(f[0]) == w and len(f[0][0]) == c for f in frames)
+    assert all(isinstance(f, np.ndarray) and tuple(f.shape) == PIXEL_SHAPE for f in frames)
 
 
 # ----------------------------------------------------- online/offline parity
@@ -106,20 +110,21 @@ def test_online_offline_pixel_and_feature_parity(tmp_path):
     # and confirm every sample matches the dataset built by the offline path.
     metadata_catalog = _catalog(load_session_metadata(session_dir))
     episode = list_episodes(session_dir)[0]
+    frame_store = open_frame_store(session_dir)
     buffer = TemporalBuffer()
     key_to_label = {k: i for i, k in enumerate(dataset.action_keys)}
     i = 0
     for _decision, sensory, motor in iter_cognitive_ticks(session_dir, episode):
         for rec in sensory:
             if not rec.get("elided"):
-                buffer.append(stream_event_from_log(rec))
+                buffer.append(stream_event_from_log(rec, frame_store=frame_store))
         label = _motor_label(motor)
         latest = buffer.latest(PIXEL_STREAM)
         if label in key_to_label and latest is not None:
             online_vec, online_names = _non_vision_from_full_fusion(metadata_catalog, buffer)
             assert online_names == dataset.non_vision_names
             assert online_vec == dataset.non_vision[i], f"non-vision mismatch at sample {i}"
-            assert latest.payload == dataset.pixels[i], f"pixel mismatch at sample {i}"
+            assert np.array_equal(latest.payload, dataset.pixels[i]), f"pixel mismatch at sample {i}"
             i += 1
     assert i > 0
 

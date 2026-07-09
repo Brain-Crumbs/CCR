@@ -9,9 +9,12 @@ policies do.
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+import numpy as np
+
+from cognitive_runtime.core.hashing import canonical_json
 
 
 @dataclass
@@ -23,16 +26,28 @@ class Observation:
     #: Optional true RGB pixel frame (H x W x 3, 0..255) -- the neural-vision
     #: counterpart to the coarse ``frame`` grid.  ``None`` when a Program does
     #: not render pixels.
-    pixels: Optional[List[List[List[int]]]] = None
+    pixels: Optional[np.ndarray] = None
 
     def hash(self) -> str:
-        """Deterministic content hash used for replay verification and novelty."""
-        payload = json.dumps(
+        """Deterministic content hash used for replay verification and novelty.
+
+        ``pixels`` hashes its raw bytes when it's an ndarray, so a real frame
+        never gets serialized element-by-element to JSON just to be hashed.
+        """
+        if isinstance(self.pixels, np.ndarray):
+            h = hashlib.sha1()
+            h.update(
+                canonical_json(
+                    {"tick": self.tick, "data": self.data, "frame": self.frame}
+                ).encode("utf-8")
+            )
+            contiguous = np.ascontiguousarray(self.pixels)
+            h.update(f"|pixels|{contiguous.dtype}|{contiguous.shape}|".encode("utf-8"))
+            h.update(contiguous.tobytes())
+            return h.hexdigest()
+        payload = canonical_json(
             {"tick": self.tick, "data": self.data, "frame": self.frame,
-             "pixels": self.pixels},
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
+             "pixels": self.pixels}
         )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 

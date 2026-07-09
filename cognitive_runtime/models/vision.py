@@ -10,21 +10,33 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence, Tuple
 
+import numpy as np
 import torch
 from torch import nn
 
 REPRESENTATION = "neural_pixels"
 
 
-def pixels_to_chw(frame: Sequence[Sequence[Sequence[int]]]) -> torch.Tensor:
-    """Convert an H x W x C RGB frame into a normalized C x H x W tensor."""
-    if not frame or not frame[0] or not frame[0][0]:
+def pixels_to_chw(frame: Any) -> torch.Tensor:
+    """Convert an H x W x C RGB frame into a normalized C x H x W tensor.
+
+    ``frame`` is normally an ndarray (the live/recorded pixel stream); a
+    nested list is also accepted for legacy sessions.  The ndarray path goes
+    through ``torch.from_numpy`` (a view, not a per-element Python conversion).
+    """
+    array = frame if isinstance(frame, np.ndarray) else np.asarray(frame, dtype=np.uint8)
+    if array.size == 0:
         raise ValueError("pixel frame must be a non-empty H x W x C array")
-    tensor = torch.tensor(frame, dtype=torch.float32)
-    if tensor.ndim != 3:
-        raise ValueError(f"pixel frame must be 3-dimensional, got shape {tuple(tensor.shape)}")
-    if tensor.shape[2] != 3:
-        raise ValueError(f"pixel frame must have 3 RGB channels, got {tensor.shape[2]}")
+    if array.ndim != 3:
+        raise ValueError(f"pixel frame must be 3-dimensional, got shape {tuple(array.shape)}")
+    if array.shape[2] != 3:
+        raise ValueError(f"pixel frame must have 3 RGB channels, got {array.shape[2]}")
+    contiguous = np.ascontiguousarray(array)
+    if not contiguous.flags.writeable:
+        # A zero-copy mmap view (read-only) from the frame store; torch.from_numpy
+        # requires a writable buffer, and we're about to cast to float anyway.
+        contiguous = contiguous.copy()
+    tensor = torch.from_numpy(contiguous).float()
     return tensor.permute(2, 0, 1).contiguous() / 255.0
 
 
@@ -104,7 +116,7 @@ class VisionBCModel:
 
     def logits(
         self,
-        pixels: Sequence[Sequence[Sequence[int]]],
+        pixels: Any,
         non_vision: Sequence[float],
         motor: Sequence[float],
     ) -> List[float]:
@@ -125,7 +137,7 @@ class VisionBCModel:
 
     def predict_index(
         self,
-        pixels: Sequence[Sequence[Sequence[int]]],
+        pixels: Any,
         non_vision: Sequence[float],
         motor: Sequence[float],
     ) -> int:
@@ -134,7 +146,7 @@ class VisionBCModel:
 
     def predict_key(
         self,
-        pixels: Sequence[Sequence[Sequence[int]]],
+        pixels: Any,
         non_vision: Sequence[float],
         motor: Sequence[float],
     ) -> str:

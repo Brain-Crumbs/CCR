@@ -8,11 +8,14 @@ def test_simulated_online_q_beats_random_reproducibly():
     result = run_simulated_online_acceptance()
 
     assert result.accepted
-    assert result.acceptance_metric == "ticks"
+    assert result.acceptance_metric == "reward"
+    assert result.online_eval.total_reward == 15.75
+    assert result.random_eval.total_reward == 11.76
     assert result.online_eval.total_ticks == 2400
     assert result.random_eval.total_ticks == 2337
+    assert result.online_eval.total_reward > result.random_eval.total_reward
     assert result.online_eval.total_ticks > result.random_eval.total_ticks
-    assert result.training_ticks == 13987
+    assert result.training_ticks == 13438
 
 
 def test_dashboard_and_view_work_with_online_sessions(tmp_path):

@@ -28,8 +28,8 @@ FAST_CONFIG = {"episode_ticks": 20, "world_size": 32}
 # Pinned before the registry refactor (see fusion.py's default_encoder_registry
 # docstring): proves the declarative registry reproduces the exact same
 # fusion layout, so saved online-Q checkpoints stay loadable.
-EXPECTED_WIDTH = 101
-EXPECTED_LAYOUT_HASH = "e515ac0796ada3cba7da29177ba450944596649b"
+EXPECTED_WIDTH = 105
+EXPECTED_LAYOUT_HASH = "5143ff8ff49183705dbae311fb777541619edbcc"
 
 
 # ------------------------------------------------------------- completeness

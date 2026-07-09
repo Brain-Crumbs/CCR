@@ -12,11 +12,11 @@ environment-specific logic.
 from __future__ import annotations
 
 import hashlib
-import json
 from collections import deque
 from typing import Deque, Dict, List, Optional, Set
 
 from cognitive_runtime.core.action import NULL_ACTION, Action
+from cognitive_runtime.core.hashing import canonical_json, hash_payload
 from cognitive_runtime.core.streams.encoder_registry import LatentToken
 from cognitive_runtime.core.streams.fusion import LatentState
 from cognitive_runtime.core.streams.shim import LatestValueView
@@ -29,18 +29,16 @@ def window_hash(window: TickWindow) -> str:
 
     Hashes stream ids + payloads only (never sequence numbers or timestamps,
     which are unique every tick) so that a recurring *sensory situation*
-    hashes the same — mirroring the intent of ``Observation.hash()``.
+    hashes the same — mirroring the intent of ``Observation.hash()``.  An
+    ndarray payload (a pixel frame) contributes its content hash rather than
+    a JSON dump, so a repeated frame is still recognized as the same
+    situation without re-serializing it.
     """
     items = sorted(
-        (
-            event.stream_id,
-            json.dumps(event.payload, sort_keys=True, separators=(",", ":"), default=str),
-        )
+        (event.stream_id, hash_payload(event.payload))
         for event in window.events
     )
-    return hashlib.sha1(
-        json.dumps(items, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha1(canonical_json(items).encode("utf-8")).hexdigest()
 
 
 class Memory:

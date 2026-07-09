@@ -52,6 +52,7 @@ from cognitive_runtime.core.streams import (
 )
 from cognitive_runtime.core.world_model import TrendWorldModel, WorldModel
 from cognitive_runtime.runtime.config import RuntimeConfig
+from cognitive_runtime.runtime.frame_store import FRAME_HASH_ALGORITHM
 from cognitive_runtime.runtime.recorder import (
     DecisionRecord,
     EpisodeSummary,
@@ -117,6 +118,10 @@ class CognitiveRuntime:
                 session_id=self.config.resolved_session_id(policy.name),
                 record_streams=self.config.record_streams,
                 exclude_streams=self.config.effective_exclude_streams(),
+                pin_on_streams=self.config.pin_on_streams,
+                frame_segment_max_bytes=int(self.config.frame_segment_max_mb * 1024 * 1024),
+                frame_segment_max_seconds=self.config.frame_segment_max_seconds,
+                frame_disk_budget_bytes=int(self.config.frame_disk_budget_mb * 1024 * 1024),
             )
         else:
             self.recorder = NullRecorder()
@@ -147,6 +152,12 @@ class CognitiveRuntime:
             "program_config": self.config.program_config,
             "action_space": [a.key() for a in meta.action_space],
             "stream_catalog": [s.to_dict() for s in self.program.stream_catalog()],
+            # Marks sessions whose ndarray-payload (frame) stream events hash
+            # raw bytes rather than JSON -- see StreamEvent.hash() and
+            # runtime.replay's legacy_frame_hash handling.  Absent on sessions
+            # recorded before this format, so replay knows not to fault a
+            # frame-hash mismatch there as tampering.
+            "frame_hash_algorithm": FRAME_HASH_ALGORITHM,
             "stream_registry": self.stream_registry.describe(self.program.stream_catalog()),
         }
         online_metadata = self._online_metadata()
