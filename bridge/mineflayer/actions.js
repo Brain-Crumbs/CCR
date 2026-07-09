@@ -9,6 +9,7 @@
 const Vec3 = require('vec3');
 const {
   FOOD_ITEMS, PLACEABLE_ITEMS, LIGHT_ITEMS, itemToVocab, blockToVocab, HOSTILE,
+  containerType, mcDataFor,
 } = require('./blocks');
 
 const LOOK_STEP_RAD = (15 * Math.PI) / 180;
@@ -54,8 +55,9 @@ function frontBlockObj(bot) {
 }
 
 // Apply the action.  `hooks` collects async completions:
-//   hooks.onBroke(vocabName), hooks.onPlaced(vocabName, exactName),
-//   hooks.onAte(), hooks.onKilled()
+//   hooks.onBroke(vocabName, position), hooks.onPlaced(vocabName, exactName, position),
+//   hooks.onAte(), hooks.onKilled(),
+//   hooks.onContainer(kind, position), hooks.onCrafted(recipe, inputs, outputs)
 function applyAction(bot, action, hooks) {
   const name = action.name;
   const params = action.params || {};
@@ -112,11 +114,20 @@ function attack(bot, hooks) {
   const block = frontBlockObj(bot);
   if (block && block.boundingBox === 'block' && block.name !== 'bedrock' && block.name !== 'barrier') {
     const vocab = blockToVocab(block);
-    bot.dig(block, true).then(() => hooks.onBroke(vocab)).catch(() => {});
+    const pos = block.position;
+    bot.dig(block, true).then(() => hooks.onBroke(vocab, pos)).catch(() => {});
   }
 }
 
 function use(bot, hooks) {
+  const front = frontBlockObj(bot);
+  const kind = front ? containerType(front.name) : null;
+  if (kind) {
+    hooks.onContainer(kind, front.position);
+    tryCraft(bot, kind, front, hooks);
+    return;
+  }
+
   const held = bot.heldItem;
   if (!held) return;
   const vocab = itemToVocab(held.name);
@@ -127,11 +138,59 @@ function use(bot, hooks) {
   if (PLACEABLE_ITEMS.has(vocab) || LIGHT_ITEMS.has(held.name)) {
     const ref = frontBlockObj(bot);
     if (ref && ref.boundingBox === 'block') {
+      const placedPos = ref.position.offset(0, 1, 0);
       bot.placeBlock(ref, new Vec3(0, 1, 0))
-        .then(() => hooks.onPlaced(vocab, held.name))
+        .then(() => hooks.onPlaced(vocab, held.name, placedPos))
         .catch(() => {});
     }
   }
+}
+
+// Best-effort real-Minecraft crafting/smelting, mirroring the sim's two
+// fixed recipes (RECIPES in world.py) so `event.crafted` is exercisable live.
+// mcData/recipe shape varies by mineflayer & server version -- failures are
+// swallowed, matching the rest of this file's dig/place/consume calls; verify
+// against your server per the mineflayer bridge README's smoke checklist.
+function tryCraft(bot, kind, block, hooks) {
+  try {
+    if (kind === 'crafting_table') {
+      const log = bot.inventory.items().find((i) => /_log$/.test(i.name));
+      if (!log) return;
+      const mcData = mcDataFor(bot.version);
+      const planksName = log.name.replace(/_log$/, '_planks');
+      const planksItem = mcData && mcData.itemsByName[planksName];
+      if (!planksItem) return;
+      const recipes = bot.recipesFor(planksItem.id, null, 1, block);
+      if (!recipes || !recipes.length) return;
+      bot.craft(recipes[0], 1, block)
+        .then(() => hooks.onCrafted('log_to_planks', { log: 1 }, { [planksName]: 4 }))
+        .catch(() => {});
+    } else if (kind === 'furnace') {
+      const cobble = bot.inventory.items().find((i) => i.name === 'cobblestone');
+      const coal = bot.inventory.items().find((i) => i.name === 'coal');
+      if (!cobble || !coal) return;
+      bot.openFurnace(block).then((furnace) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          furnace.removeListener('update', onUpdate);
+          try { furnace.close(); } catch (e) { /* ignore */ }
+        };
+        const onUpdate = () => {
+          const output = furnace.outputItem && furnace.outputItem();
+          if (output && output.count > 0) {
+            finish();
+            hooks.onCrafted('smelt_cobblestone', { cobblestone: 1, coal: 1 }, { stone: 1 });
+          }
+        };
+        furnace.on('update', onUpdate);
+        furnace.putInput(cobble.type, null, 1).catch(() => {});
+        furnace.putFuel(coal.type, null, 1).catch(() => {});
+        setTimeout(finish, 15000); // vanilla smelting is ~10s; give it headroom
+      }).catch(() => {});
+    }
+  } catch (e) { /* best-effort: never let a bad recipe/version crash the tick */ }
 }
 
 module.exports = { applyAction, clearControls, MOVE_CONTROLS };

@@ -7,7 +7,9 @@
 
 const mineflayer = require('mineflayer');
 const Vec3 = require('vec3');
-const { itemToVocab, FOOD_ITEMS, LIGHT_ITEMS } = require('./blocks');
+const {
+  itemToVocab, FOOD_ITEMS, LIGHT_ITEMS, biomeToVocab, structureMarker,
+} = require('./blocks');
 const { applyAction, clearControls } = require('./actions');
 const { buildObservation, isSheltered, timeState } = require('./observation');
 
@@ -36,6 +38,12 @@ class WorldSession {
     this._prevNight = false;
     this._lastDamageCause = 'unknown';
     this._stats = freshStats();
+    // issue #40: richer event streams.
+    this._prevBiome = null;
+    this._prevDimension = null;
+    this._seenAdvancements = new Set();
+    this._discoveredStructures = new Set();
+    this._advancementsWired = false;
   }
 
   // -- connection ----------------------------------------------------------
@@ -75,6 +83,36 @@ class WorldSession {
     bot.on('kicked', (reason) => log('kicked:', typeof reason === 'string' ? reason : JSON.stringify(reason)));
     bot.on('error', (err) => log('error:', err && err.message ? err.message : String(err)));
     bot.on('end', () => log('connection ended'));
+
+    // Dimension changes fire as a respawn packet (issue #40).
+    bot.on('respawn', () => {
+      const dim = bot.game ? bot.game.dimension : 'overworld';
+      if (this._prevDimension !== null && dim !== this._prevDimension) {
+        this._pending.push(`dimension_changed:${this._prevDimension}:${dim}`);
+      }
+      this._prevDimension = dim;
+    });
+
+    // Vanilla advancements (issue #40): forward newly-completed ones by their
+    // vanilla id.  The raw protocol packet's shape is version-sensitive, so
+    // this is best-effort and never throws -- verify per the bridge README.
+    if (bot._client && !this._advancementsWired) {
+      this._advancementsWired = true;
+      bot._client.on('advancements', (packet) => {
+        try {
+          const entries = (packet && (packet.advancementMapping || packet.advancements)) || [];
+          for (const entry of entries) {
+            const id = entry && (entry.key || entry.id || entry.name);
+            const progress = entry && (entry.value || entry.advancement || entry);
+            const done = Boolean(progress && (progress.done || progress.isDone));
+            if (id && done && !this._seenAdvancements.has(id)) {
+              this._seenAdvancements.add(id);
+              this._pending.push(`advancement:${id}`);
+            }
+          }
+        } catch (e) { /* best-effort: packet shape varies by version */ }
+      });
+    }
   }
 
   // -- protocol handlers ---------------------------------------------------
@@ -101,6 +139,10 @@ class WorldSession {
     this._prevNight = timeState(0, this.config).is_night;
     this._stats = freshStats();
     this.spawn = { x: this.bot.entity.position.x, z: this.bot.entity.position.z };
+    const biomeBlock = this.bot.blockAt(this.bot.entity.position);
+    this._prevBiome = biomeToVocab(biomeBlock && biomeBlock.biome ? biomeBlock.biome.name : null);
+    this._prevDimension = this.bot.game ? this.bot.game.dimension : 'overworld';
+    this._discoveredStructures = new Set();
     return this._status();
   }
 
@@ -112,9 +154,14 @@ class WorldSession {
       z: this.bot.entity.position.z,
     };
     const hooks = {
-      onBroke: (vocab) => { this._pending.push(`broke_block:${vocab}`); this._stats.blocks_broken += 1; },
-      onPlaced: (vocab, exact) => {
+      onBroke: (vocab, pos) => {
+        this._pending.push(`broke_block:${vocab}`);
+        this._pending.push(`block_broken_exact:${JSON.stringify({ block: vocab, position: posDict(pos) })}`);
+        this._stats.blocks_broken += 1;
+      },
+      onPlaced: (vocab, exact, pos) => {
         this._pending.push('placed_block');
+        this._pending.push(`block_placed_exact:${JSON.stringify({ block: exact || vocab, position: posDict(pos) })}`);
         if (LIGHT_ITEMS.has(String(exact || vocab || '').toLowerCase())) {
           this._pending.push('created_light_source');
         }
@@ -122,6 +169,12 @@ class WorldSession {
       },
       onAte: () => { this._pending.push('ate_food'); this._stats.food_consumed += 1; },
       onKilled: () => { this._pending.push('killed_mob'); this._stats.mobs_killed += 1; },
+      onContainer: (kind, pos) => {
+        this._pending.push(`container_interact:${JSON.stringify({ container: kind, position: posDict(pos) })}`);
+      },
+      onCrafted: (recipe, inputs, outputs) => {
+        this._pending.push(`crafted:${JSON.stringify({ recipe, inputs, outputs })}`);
+      },
     };
 
     clearControls(this.bot);
@@ -149,9 +202,13 @@ class WorldSession {
     this._prevHealth = health;
     this._lastDamageCause = 'unknown';
 
-    // New inventory item types.
+    // Inventory: exact gain (any count increase) + first-time novelty.
     const inv = this._inventoryVocabCounts();
     for (const name of Object.keys(inv)) {
+      const gained = inv[name] - (this._prevInventory[name] || 0);
+      if (gained > 0) {
+        events.push(`item_collected_exact:${JSON.stringify({ item: name, count: gained })}`);
+      }
       if (!this._seenItems.has(name)) {
         this._seenItems.add(name);
         this._stats.unique_items_collected += 1;
@@ -171,6 +228,33 @@ class WorldSession {
       if (!this._stats.survived_night) { this._stats.survived_night = true; events.push('survived_night'); }
     }
     this._prevNight = night;
+
+    // Biome underfoot (issue #40: event.biome_entered).
+    const biomeBlock = this.bot.blockAt(this.bot.entity.position);
+    const biome = biomeToVocab(biomeBlock && biomeBlock.biome ? biomeBlock.biome.name : null);
+    if (biome !== this._prevBiome) {
+      events.push(`biome_entered:${biome}`);
+      this._prevBiome = biome;
+    }
+
+    // Structure discovery: best-effort marker-block heuristic (issue #40).
+    // mineflayer has no direct "structure generated here" signal, so this
+    // scans nearby blocks for a small curated set of structure-typical
+    // blocks (see STRUCTURE_MARKERS in blocks.js) -- verify live per the
+    // bridge README; false negatives are expected, false positives are rare.
+    try {
+      const marker = this.bot.findBlock({
+        matching: (block) => Boolean(block && structureMarker(block.name)),
+        maxDistance: 16,
+      });
+      if (marker) {
+        const name = structureMarker(marker.name);
+        if (name && !this._discoveredStructures.has(name)) {
+          this._discoveredStructures.add(name);
+          events.push(`structure_discovered:${name}`);
+        }
+      }
+    } catch (e) { /* best-effort scan; never fail the tick over it */ }
 
     // Distance stat.
     const dist = this.spawn
@@ -252,6 +336,13 @@ function freshStats() {
 function round(value, digits) {
   const f = Math.pow(10, digits);
   return Math.round(value * f) / f;
+}
+
+// A mineflayer/vec3 position -> the plain {x,y,z} dict the Python side
+// expects in block_broken_exact/block_placed_exact/container_interact payloads.
+function posDict(pos) {
+  if (!pos) return { x: 0, y: 0, z: 0 };
+  return { x: pos.x, y: pos.y, z: pos.z };
 }
 
 function isMovementAction(name) {

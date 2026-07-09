@@ -24,6 +24,21 @@ runtime  ──JSON over stdio──►  bridge (this)  ──mineflayer──�
   consumes (`damage:<reason>`, `new_item:<item>`, `broke_block:<block>`,
   `placed_block`, `ate_food`, `entered_shelter`, `survived_night`, `died`) by
   diffing state across ticks and watching mineflayer activity callbacks.
+- **Richer event streams.** Also emits the exact-identity / progression event
+  vocabulary from issue #40: `item_collected_exact:<item>:<count>` (JSON),
+  `block_broken_exact` / `block_placed_exact` (block id + position, JSON),
+  `container_interact` (crafting table / furnace / chest, JSON),
+  `crafted:<recipe>` (JSON inputs/outputs) from USE-ing a crafting table or
+  furnace, `advancement:<vanilla id>` forwarded from the server's advancement
+  packets, `dimension_changed:<from>:<to>` on respawn, `biome_entered:<biome>`,
+  and a best-effort `structure_discovered:<name>` heuristic (nearby
+  structure-typical marker blocks — see `STRUCTURE_MARKERS` in `blocks.js`).
+  These map onto the runtime's `event.*` streams in
+  `cognitive_runtime/programs/minecraft/streams.py`; see that module for the
+  full schema. The simulated backend exercises the same streams with its own
+  minimal, deterministic mechanics (a fixed crafting table/furnace/chest/
+  portal and three structure markers placed at fixed world coordinates, and
+  `sim.*` advancement ids) so they are covered by tests with no server.
 
 Day/night (`time_of_day`, `is_night`) is **synthesized from the tick and
 `--day-length`/`--start-time`**, exactly like the simulated world, so those
@@ -77,6 +92,48 @@ Run with `--realtime`: the bridge advances roughly one server tick per `step`,
 and the runtime paces vision/body streams to wall-clock rates with bounded,
 overflow-counted queues. `dashboard` then reports realtime health (rates,
 staleness, overflows) for the session.
+
+## Live smoke checklist (richer event streams, issue #40)
+
+The exact-identity/progression streams above are the parts of #40 that only
+a live server can really exercise (crafting, advancements, dimensions,
+structures — the simulated backend approximates them for tests, not for
+fidelity). After connecting the bridge to a real server, drive the bot
+through this checklist and watch `dashboard` / the recorded session for the
+corresponding `event.*` streams:
+
+1. **Mine a log.** Face a tree and `ATTACK` until it breaks.
+   Expect: `event.block_broken_exact` (block id + position) and
+   `event.item_collected_exact` (`{"item": "oak_log", "count": 1}` or similar).
+2. **Place a block.** Select a placeable item and `USE` facing an empty
+   space. Expect: `event.block_placed_exact` alongside the existing
+   `event.block_placed`.
+3. **Craft a table / craft planks.** Give the bot logs, stand facing a
+   crafting table, and `USE`. Expect: `event.container_interaction`
+   (`"container": "crafting_table"`) and, if the bot holds a log,
+   `event.crafted` with the resulting recipe/inputs/outputs. `event.advancement`
+   should follow if the server awards a crafting-related advancement.
+4. **Smelt something.** Give the bot cobblestone + coal, face a furnace,
+   `USE`. Expect `event.container_interaction` (`"furnace"`) immediately, and
+   `event.crafted` (`smelt_cobblestone`) after the ~10s smelt completes —
+   this is the one interaction that is not instantaneous, so give it time.
+5. **Open a chest.** Face a chest and `USE`. Expect `event.container_interaction`
+   (`"chest"`) with no accompanying `event.crafted` (chests don't craft).
+6. **Cross a portal.** Walk the bot through a nether portal. Expect
+   `event.dimension_changed` (`"from": "overworld", "to": "the_nether"` or
+   similar, from `bot.game.dimension`) on the following `respawn`.
+7. **Change biome.** Walk across a biome boundary. Expect `event.biome_entered`
+   with the new biome's SurvivalBox vocab name.
+8. **Find a structure.** Get within ~16 blocks of a village/stronghold/nether
+   fortress/ocean monument. Expect a best-effort `event.structure_discovered`
+   — this is a marker-block heuristic (`STRUCTURE_MARKERS` in `blocks.js`),
+   not a real "structure generated here" signal, so misses are expected;
+   extend the marker list for structures your world/version features.
+9. **Earn any vanilla advancement.** Expect `event.advancement` with the
+   server's real advancement id (e.g. `minecraft:story/mine_wood`). The raw
+   `advancements` packet shape is version-sensitive (see `world.js`); if this
+   never fires on your server/mineflayer version, that parsing is the first
+   thing to check.
 
 ## Verifying without a server
 

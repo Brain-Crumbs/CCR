@@ -117,6 +117,40 @@ def test_backend_capability_flags():
     assert RemoteMinecraftBackend.supports_snapshots is False
 
 
+# ---------------------------------------- richer event streams over the wire (#40)
+
+
+def test_fake_bridge_emits_the_new_rich_event_streams_over_the_wire():
+    """``SimBridge.handle`` is the exact code the subprocess entrypoint runs;
+    driving it in-process proves the new event strings (issue #40) survive a
+    real JSON round-trip, so the streams are testable with no server and no
+    subprocess."""
+    import json
+
+    from bridge.fake.sim_bridge import SimBridge
+
+    bridge = SimBridge()
+    reset_resp = json.loads(json.dumps(bridge.handle(
+        {"cmd": "reset", "seed": 0, "config": {"world_size": 32}}
+    )))
+    assert reset_resp["ok"]
+
+    world = bridge._world
+    bx, bz = world._front_cell()
+    world.terrain[bx][bz] = "crafting_table"
+    world.inventory["log"] = 1
+
+    step_resp = json.loads(json.dumps(bridge.handle(
+        {"cmd": "step", "action": {"name": "USE"}}
+    )))
+    assert step_resp["ok"]
+    events = step_resp["events"]
+    assert any(e.startswith("container_interact:") for e in events)
+    assert any(e.startswith("crafted:") for e in events)
+    assert any(e.startswith("item_collected_exact:") for e in events)
+    assert any(e == "advancement:sim.craft_item" for e in events)
+
+
 # --------------------------------------------------------- error handling
 
 
@@ -230,9 +264,11 @@ def test_node_semantic_mapper_common_minecraft_names():
         "lava": "barrier",
         "oak_door": "placed_block",
         "glass": "placed_block",
-        "chest": "placed_block",
-        "crafting_table": "placed_block",
+        "chest": "chest",
+        "furnace": "furnace",
+        "crafting_table": "crafting_table",
         "torch": "placed_block",
+        "nether_portal": "portal",
     }
     script = (
         "const b=require('./blocks');"
