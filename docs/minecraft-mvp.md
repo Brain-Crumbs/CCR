@@ -157,6 +157,11 @@ Minecraft featurizer stays available (`--features handcrafted`) for A/B
 comparison; on the night scenario both survive full episodes and beat random,
 with the latent path within a comparable share of the handcrafted reward.
 
+Current learning behavior remains offline behavioral cloning: record sessions,
+then train a model from those recordings. Phase 1 introduces the pure
+`OnlineQModel` checkpoint/update layer, but online updates are not wired into
+the runtime loop until the online policy/learner phase.
+
 ## Recording, replay, metrics
 
 The recorded artifact of a session is the **stream log** (streams-v2), not

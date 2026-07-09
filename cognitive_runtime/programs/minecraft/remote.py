@@ -74,7 +74,13 @@ def default_bridge_command() -> List[str]:
     mineflayer bridge."""
     override = os.environ.get(ENV_BRIDGE_CMD)
     if override:
-        return shlex.split(override)
+        parts = shlex.split(override, posix=(os.name != "nt"))
+        if os.name == "nt":
+            # POSIX shlex treats backslashes as escapes, corrupting Windows
+            # paths such as C:\Python314\python.exe. Non-POSIX shlex keeps the
+            # paths intact but preserves wrapping quotes, so trim those here.
+            parts = [p[1:-1] if len(p) >= 2 and p[0] == p[-1] == '"' else p for p in parts]
+        return parts
     repo_root = Path(__file__).resolve().parents[3]
     return ["node", str(repo_root / "bridge" / "mineflayer" / "index.js")]
 

@@ -51,7 +51,7 @@ class WorldSession {
     if (this.connection.version) opts.version = this.connection.version;
     log('connecting to', opts.host + ':' + opts.port, 'as', opts.username);
     this.bot = mineflayer.createBot(opts);
-    this.bot.vec3 = (x, y, z) => new Vec3(x, y, z);
+    this.bot.vec3 = Vec3;
     this._wireEvents();
     await new Promise((resolve, reject) => {
       const onSpawn = () => { cleanup(); resolve(); };
