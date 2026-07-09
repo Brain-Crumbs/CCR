@@ -142,6 +142,22 @@ def test_layout_hash_changes_with_catalog():
     assert trimmed.width < base.width
 
 
+def test_exact_streams_and_new_events_do_not_change_default_fusion_layout():
+    catalog = _catalog()
+    legacy_catalog = [
+        spec for spec in catalog
+        if spec.stream_id not in {
+            "body.inventory_exact",
+            "world.front_block_exact",
+            "world.nearby_blocks_exact",
+            "event.created_light_source",
+            "event.mob_killed",
+            "event.bumped",
+        }
+    ]
+    assert TemporalFusion(catalog).layout_hash == TemporalFusion(legacy_catalog).layout_hash
+
+
 def test_layout_hash_changes_with_categorical_vocabulary():
     """A renamed categorical vocabulary of the same size changes the one-hot
     semantics, so it must change the layout hash (loud failure, not silent

@@ -1,6 +1,7 @@
 """Survival reward function tests."""
 
 from cognitive_runtime.core.action import Action, NULL_ACTION
+from cognitive_runtime.core.streams.events import StreamEvent
 from cognitive_runtime.programs.minecraft.rewards import SurvivalReward, SurvivalRewardConfig
 
 BASE_OBS = {
@@ -67,6 +68,23 @@ def test_item_and_firsts_rewards():
     assert signal.components["first_block_placed"] == 1.0
     signal = _eval(reward, _obs(), events=["placed_block"])
     assert "first_block_placed" not in signal.components
+
+
+def test_stream_rewards_activate_first_tool_and_light_source():
+    reward = SurvivalReward()
+    reward.prime_stream_state([
+        StreamEvent("body.health", "body", 0.0, 0, 20.0),
+        StreamEvent("body.hunger", "body", 0.0, 0, 20.0),
+        StreamEvent("world.nearby_blocks", "world", 0.0, 0, [["grass"]]),
+        StreamEvent("world.biome", "world", 0.0, 0, "plains"),
+        StreamEvent("spatial.position", "spatial", 0.0, 0, {"x": 0.0, "y": 64.0, "z": 0.0}),
+    ])
+    signal = reward.evaluate_stream_window([
+        StreamEvent("event.item_collected", "event", 1.0, 0, {"item": "stone_pickaxe"}),
+        StreamEvent("event.created_light_source", "event", 1.0, 0, {}),
+    ], NULL_ACTION)
+    assert signal.components["first_tool"] == 1.0
+    assert signal.components["light_source"] == 1.0
 
 
 def test_shelter_and_night_once_per_episode():

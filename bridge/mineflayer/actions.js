@@ -7,7 +7,9 @@
 // callbacks in `hooks`.
 
 const Vec3 = require('vec3');
-const { FOOD_ITEMS, PLACEABLE_ITEMS, itemToVocab, blockToVocab, HOSTILE } = require('./blocks');
+const {
+  FOOD_ITEMS, PLACEABLE_ITEMS, LIGHT_ITEMS, itemToVocab, blockToVocab, HOSTILE,
+} = require('./blocks');
 
 const LOOK_STEP_RAD = (15 * Math.PI) / 180;
 const PITCH_STEP_RAD = (10 * Math.PI) / 180;
@@ -52,7 +54,8 @@ function frontBlockObj(bot) {
 }
 
 // Apply the action.  `hooks` collects async completions:
-//   hooks.onBroke(vocabName), hooks.onPlaced(), hooks.onAte(), hooks.onKilled()
+//   hooks.onBroke(vocabName), hooks.onPlaced(vocabName, exactName),
+//   hooks.onAte(), hooks.onKilled()
 function applyAction(bot, action, hooks) {
   const name = action.name;
   const params = action.params || {};
@@ -121,10 +124,12 @@ function use(bot, hooks) {
     bot.consume().then(() => hooks.onAte()).catch(() => {});
     return;
   }
-  if (PLACEABLE_ITEMS.has(vocab)) {
+  if (PLACEABLE_ITEMS.has(vocab) || LIGHT_ITEMS.has(held.name)) {
     const ref = frontBlockObj(bot);
     if (ref && ref.boundingBox === 'block') {
-      bot.placeBlock(ref, new Vec3(0, 1, 0)).then(() => hooks.onPlaced()).catch(() => {});
+      bot.placeBlock(ref, new Vec3(0, 1, 0))
+        .then(() => hooks.onPlaced(vocab, held.name))
+        .catch(() => {});
     }
   }
 }

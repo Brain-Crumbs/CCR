@@ -30,8 +30,16 @@ from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.reward import RewardSignal
 from cognitive_runtime.core.streams.events import StreamEvent
 
-TOOL_ITEMS = {"wooden_pickaxe", "wooden_axe", "wooden_sword", "wooden_shovel"}
+_TOOL_SUFFIXES = ("_pickaxe", "_axe", "_shovel", "_hoe", "_sword")
+TOOL_ITEMS = {
+    "shears", "fishing_rod", "flint_and_steel", "bucket",
+    "bow", "crossbow", "trident", "shield",
+}
 FOOD_ITEM_NAMES = {"berries", "apple", "bread", "cooked_meat"}
+
+
+def _is_tool_or_weapon(item: str) -> bool:
+    return item in TOOL_ITEMS or item.endswith(_TOOL_SUFFIXES)
 
 
 @dataclass
@@ -273,7 +281,7 @@ class SurvivalReward:
                     if bonus > 0:
                         components["new_item"] = components.get("new_item", 0.0) + bonus
                         self._item_reward_total += bonus
-                    if item in TOOL_ITEMS and not self._first_tool:
+                    if _is_tool_or_weapon(item) and not self._first_tool:
                         self._first_tool = True
                         components["first_tool"] = cfg.first_tool
                     if item in FOOD_ITEM_NAMES and not self._first_food:
@@ -339,6 +347,9 @@ _SEMANTIC_EVENTS = {
     "event.item_collected": lambda p: f"new_item:{p['item']}",
     "event.block_broken": lambda p: f"broke_block:{p['block']}",
     "event.block_placed": lambda p: "placed_block",
+    "event.created_light_source": lambda p: "created_light_source",
+    "event.mob_killed": lambda p: "killed_mob",
+    "event.bumped": lambda p: "bumped",
     "event.food_eaten": lambda p: "ate_food",
     "event.entered_shelter": lambda p: "entered_shelter",
     "event.survived_night": lambda p: "survived_night",

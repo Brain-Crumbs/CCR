@@ -77,13 +77,17 @@ def test_stream_catalog_covers_the_survival_taxonomy():
     expected = {
         "vision.frame.grid", "vision.frame.pixels", "vision.entities",
         "body.health", "body.hunger", "body.oxygen",
-        "body.inventory", "body.hotbar", "body.in_water", "body.alive",
+        "body.inventory", "body.inventory_exact", "body.hotbar",
+        "body.in_water", "body.alive",
         "spatial.position", "spatial.rotation", "spatial.distance_from_spawn",
         "world.time", "world.biome", "world.nearby_blocks",
-        "world.front_block", "world.sheltered",
+        "world.nearby_blocks_exact", "world.front_block",
+        "world.front_block_exact", "world.sheltered",
         "event.damage_taken", "event.item_collected", "event.block_broken",
-        "event.block_placed", "event.food_eaten", "event.entered_shelter",
-        "event.survived_night", "event.died", "event.action_rejected",
+        "event.block_placed", "event.created_light_source",
+        "event.mob_killed", "event.bumped", "event.food_eaten",
+        "event.entered_shelter", "event.survived_night", "event.died",
+        "event.action_rejected",
         "reward.scalar",
     }
     assert set(specs) == expected
@@ -163,6 +167,15 @@ def test_native_cadences_on_a_stationary_null_run():
     assert count("reward.scalar") == n_ticks  # per tick, none in the snapshot
 
 
+def test_exact_streams_publish_but_do_not_replace_compact_streams():
+    program, sensory, _ = _stream_program(0)
+    snapshot = {e.stream_id: e.payload for e in sensory.drain()}
+    assert snapshot["world.front_block_exact"] == snapshot["world.front_block"]
+    assert snapshot["world.nearby_blocks_exact"] == snapshot["world.nearby_blocks"]
+    assert snapshot["body.inventory_exact"] == snapshot["body.inventory"]
+    assert program is not None
+
+
 def test_zero_motor_tick_advances_the_world():
     program, ticks = _drive(0, [None] * 5)
     assert program.episode_stats()["final_tick"] == 5
@@ -207,6 +220,26 @@ def test_malformed_motor_events_reject_but_the_world_still_steps():
     assert len(rejected) == 1 and "superseded" in rejected[0].payload["reason"]
     rotation = [e for e in events if e.stream_id == "spatial.rotation"]
     assert rotation and rotation[0].payload["yaw"] == 15.0  # LOOK_RIGHT applied
+
+
+def test_bumped_and_mob_killed_events_are_published_in_sim_sessions():
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    world = program._backend.world
+    world.z = int(world.z) + 0.9
+    bx, bz = world._front_cell()
+    world.terrain[bx][bz] = "stone"
+    publish_motor_command(motor, Action("MOVE_FORWARD"), timestamp=0.0)
+    program.step()
+    bumped = [e for e in sensory.drain() if e.stream_id == "event.bumped"]
+    assert bumped
+
+    world.terrain[bx][bz] = "dirt"
+    world.mobs = [{"id": 1, "x": world.x, "z": world.z + 1.0, "hp": 1, "cooldown": 0}]
+    publish_motor_command(motor, Action("ATTACK"), timestamp=0.0)
+    program.step()
+    killed = [e for e in sensory.drain() if e.stream_id == "event.mob_killed"]
+    assert killed
 
 
 # ------------------------------------------------------------ legacy shim
