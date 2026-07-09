@@ -83,6 +83,18 @@ class OnlineQPolicy(Policy):
     def latest_decision(self) -> Optional[OnlineQDecision]:
         return self._latest_decision
 
+    def model_metadata(self) -> Dict[str, Any]:
+        return {
+            "format": "online-q-v1",
+            "action_keys": list(self.model.action_keys),
+            "latent_width": self.model.latent_width,
+            "layout_hash": self.model.layout_hash,
+            "feature_width": self.model.feature_width,
+            "training_ticks": self.model.training_ticks,
+            "epsilon": self.model.current_epsilon(),
+            "training": self.training,
+        }
+
     def emit(self, state: State, memory: Memory, prediction: Optional[Prediction]) -> List[Action]:
         latent = memory.fused_latent()
         if latent is None:
@@ -143,6 +155,7 @@ class OnlineQLearner(Learner):
         self.update_count = 0
         self.skipped_updates = 0
         self._previous_decision: Optional[OnlineQDecision] = None
+        self._last_checkpoint_reason: Optional[str] = None
 
     def reset(self) -> None:
         self.episode_reward = 0.0
@@ -179,7 +192,7 @@ class OnlineQLearner(Learner):
                     done=False,
                 )
                 self.update_count += 1
-                self._save_if_due()
+                self._save_if_due(reason="interval")
             else:
                 self.skipped_updates += 1
         self._previous_decision = current
@@ -193,22 +206,37 @@ class OnlineQLearner(Learner):
             "observed_ticks": self.observed_ticks,
             "td_updates": self.update_count,
             "skipped_updates": self.skipped_updates,
+            "last_checkpoint_reason": self._last_checkpoint_reason,
             "epsilon_state": self.model.to_dict()["epsilon_state"],
         }
 
-    def save(self, path: Optional[str] = None) -> None:
+    def checkpoint_metadata(self) -> Dict[str, Any]:
+        return {
+            "checkpoint_path": self.checkpoint_path,
+            "save_every_updates": self.save_every_updates,
+            "stats": self.stats(),
+        }
+
+    def save(self, path: Optional[str] = None, *, reason: str = "manual") -> None:
         out = path or self.checkpoint_path
         if out is None:
             raise ValueError("no checkpoint path provided")
+        self._last_checkpoint_reason = reason
         self.model.meta["learner_stats"] = self.stats()
         self.model.save(out)
 
-    def _save_if_due(self) -> None:
+    def checkpoint(self, reason: str = "manual") -> None:
+        if self.checkpoint_path is not None:
+            self.save(self.checkpoint_path, reason=reason)
+
+    def end_episode(self) -> None:
+        self.checkpoint(reason="episode_end")
+
+    def _save_if_due(self, *, reason: str) -> None:
         if (
             self.checkpoint_path is not None
             and self.save_every_updates is not None
             and self.save_every_updates > 0
             and self.update_count % self.save_every_updates == 0
         ):
-            self.save(self.checkpoint_path)
-
+            self.save(self.checkpoint_path, reason=reason)

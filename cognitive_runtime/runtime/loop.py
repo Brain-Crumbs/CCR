@@ -32,7 +32,7 @@ stream has published.  `program.observe()` is no longer called by the loop.
 from __future__ import annotations
 
 import time
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from cognitive_runtime.core.learner import Learner, NullLearner, window_reward
 from cognitive_runtime.core.memory import Memory
@@ -120,33 +120,43 @@ class CognitiveRuntime:
     def run(self) -> List[EpisodeSummary]:
         """Run the configured number of episodes back to back."""
         meta = self.program.metadata()
-        self.recorder.write_session_metadata(
-            {
-                "session_id": self.recorder.session_id,
-                "program": meta.name,
-                "program_version": meta.version,
-                "program_tags": list(meta.tags),
-                "deterministic": meta.deterministic,
-                "policy": self.policy.name,
-                "tick_rate": self.config.tick_rate,
-                "realtime": self.config.realtime,
-                "max_ticks_per_episode": self.config.max_ticks_per_episode,
-                "program_ticks_per_cognitive_tick": self.config.program_ticks_per_cognitive_tick,
-                "episodes": self.config.episodes,
-                "base_seed": self.config.seed,
-                "program_config": self.config.program_config,
-                "action_space": [a.key() for a in meta.action_space],
-                "stream_catalog": [s.to_dict() for s in self.program.stream_catalog()],
-            }
-        )
+        session_metadata = {
+            "session_id": self.recorder.session_id,
+            "program": meta.name,
+            "program_version": meta.version,
+            "program_tags": list(meta.tags),
+            "deterministic": meta.deterministic,
+            "policy": self.policy.name,
+            "tick_rate": self.config.tick_rate,
+            "realtime": self.config.realtime,
+            "max_ticks_per_episode": self.config.max_ticks_per_episode,
+            "program_ticks_per_cognitive_tick": self.config.program_ticks_per_cognitive_tick,
+            "episodes": self.config.episodes,
+            "base_seed": self.config.seed,
+            "program_config": self.config.program_config,
+            "action_space": [a.key() for a in meta.action_space],
+            "stream_catalog": [s.to_dict() for s in self.program.stream_catalog()],
+        }
+        online_metadata = self._online_metadata()
+        if online_metadata:
+            session_metadata["online_model"] = online_metadata
+        self.recorder.write_session_metadata(session_metadata)
         summaries: List[EpisodeSummary] = []
+        checkpoint_reason = "shutdown"
         try:
             for episode_index in range(self.config.episodes):
                 if self._stop_requested:
                     break
                 seed = self.config.seed + episode_index
                 summaries.append(self._run_episode(episode_index, seed))
+        except KeyboardInterrupt:
+            checkpoint_reason = "keyboard_interrupt"
+            raise
+        except Exception:
+            checkpoint_reason = "exception"
+            raise
         finally:
+            self._checkpoint_online(checkpoint_reason)
             self.recorder.close()
         return summaries
 
@@ -264,6 +274,7 @@ class CognitiveRuntime:
         )
         self.recorder.write_summary(summary)
         self.recorder.end_episode_file()
+        self._end_online_episode()
         return summary
 
     def _stream_rates(self, sim_elapsed: float) -> dict:
@@ -272,3 +283,23 @@ class CognitiveRuntime:
         if sim_elapsed <= 0:
             return {sid: 0.0 for sid in sorted(counts)}
         return {sid: round(counts[sid] / sim_elapsed, 3) for sid in sorted(counts)}
+
+    def _online_metadata(self) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {}
+        policy_meta = getattr(self.policy, "model_metadata", None)
+        if callable(policy_meta):
+            metadata["policy"] = policy_meta()
+        learner_meta = getattr(self.learner, "checkpoint_metadata", None)
+        if callable(learner_meta):
+            metadata["learner"] = learner_meta()
+        return metadata
+
+    def _checkpoint_online(self, reason: str) -> None:
+        checkpoint = getattr(self.learner, "checkpoint", None)
+        if callable(checkpoint):
+            checkpoint(reason=reason)
+
+    def _end_online_episode(self) -> None:
+        end_episode = getattr(self.learner, "end_episode", None)
+        if callable(end_episode):
+            end_episode()

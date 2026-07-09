@@ -17,10 +17,14 @@ import sys
 from typing import Any, Callable, Dict
 
 from cognitive_runtime.core.policy import Policy
+from cognitive_runtime.core.streams import TemporalFusion, default_encoder_registry
+from cognitive_runtime.models.online_q import OnlineQModel
 from cognitive_runtime.policies import (
     HumanDemoPolicy,
     LearnedPolicy,
     NullPolicy,
+    OnlineQLearner,
+    OnlineQPolicy,
     RandomPolicy,
     ScriptedSurvivalPolicy,
 )
@@ -38,6 +42,7 @@ from cognitive_runtime.training.evaluation import compare_policies
 from cognitive_runtime.training.imitation import train_bc
 
 DEFAULT_MODEL_OUT = "models/bc.json"
+DEFAULT_ONLINE_MODEL_OUT = "models/online-q.json"
 
 
 def _program_config(args: argparse.Namespace) -> Dict[str, Any]:
@@ -74,6 +79,53 @@ def _make_policy(name: str, args: argparse.Namespace) -> Policy:
     sys.exit(f"unknown policy: {name}")
 
 
+def _make_online_policy_and_learner(
+    args: argparse.Namespace, program: MinecraftSurvivalBox
+) -> tuple[OnlineQPolicy, OnlineQLearner]:
+    action_space = list(program.metadata().action_space)
+    action_keys = [action.key() for action in action_space]
+    fusion = TemporalFusion(program.stream_catalog(), default_encoder_registry())
+    model_path = args.online_model
+    try:
+        if os.path.exists(model_path):
+            model = OnlineQModel.load(
+                model_path,
+                expected_action_keys=action_keys,
+                expected_layout_hash=fusion.layout_hash,
+                expected_latent_width=fusion.width,
+            )
+        else:
+            model = OnlineQModel.initialize(
+                action_keys,
+                latent_width=fusion.width,
+                layout_hash=fusion.layout_hash,
+                latent_feature_names=fusion.feature_names(),
+                lr=args.online_lr,
+                gamma=args.online_gamma,
+                epsilon_start=args.epsilon_start,
+                epsilon_min=args.epsilon_min,
+                epsilon_decay_ticks=args.epsilon_decay_ticks,
+                seed=args.seed,
+                meta={
+                    "source": "cli",
+                    "policy": "online",
+                    "program": program.metadata().name,
+                    "program_version": program.metadata().version,
+                },
+            )
+    except ValueError as exc:
+        sys.exit(str(exc))
+    policy = OnlineQPolicy(model, action_space=action_space, training=args.online_train)
+    learner = OnlineQLearner(
+        model,
+        policy,
+        training=args.online_train,
+        checkpoint_path=model_path,
+        save_every_updates=args.online_save_every,
+    )
+    return policy, learner
+
+
 def _add_world_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seed", type=int, default=0, help="base episode seed")
     parser.add_argument("--episode-ticks", type=int, default=6000,
@@ -91,7 +143,12 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
 
 def cmd_run(args: argparse.Namespace) -> None:
     program_config = _program_config(args)
-    policy = _make_policy(args.policy, args)
+    program = MinecraftSurvivalBox(config=program_config, backend=args.backend)
+    learner = None
+    if args.policy == "online":
+        policy, learner = _make_online_policy_and_learner(args, program)
+    else:
+        policy = _make_policy(args.policy, args)
     config = RuntimeConfig(
         tick_rate=args.tick_rate,
         realtime=args.realtime,
@@ -107,9 +164,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         program_config=program_config,
     )
     runtime = CognitiveRuntime(
-        program=MinecraftSurvivalBox(config=program_config, backend=args.backend),
+        program=program,
         policy=policy,
         config=config,
+        learner=learner,
     )
     summaries = runtime.run()
     for summary in summaries:
@@ -240,7 +298,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = sub.add_parser("run", help="run the runtime with a policy")
     p_run.add_argument("--policy", default="scripted",
-                       choices=["null", "random", "scripted", "learned", "neural", "human"])
+                       choices=["null", "random", "scripted", "learned", "neural", "online",
+                                "human"])
     p_run.add_argument("--episodes", type=int, default=1)
     p_run.add_argument("--tick-rate", type=float, default=20.0)
     p_run.add_argument("--realtime", action="store_true",
@@ -253,6 +312,19 @@ def build_parser() -> argparse.ArgumentParser:
                        help="stream globs to log hash-only, e.g. vision.*")
     p_run.add_argument("--record-dir", default="sessions")
     p_run.add_argument("--session-id", default=None)
+    p_run.add_argument("--online-model", default=DEFAULT_ONLINE_MODEL_OUT,
+                       help="online Q checkpoint path")
+    p_run.add_argument("--online-save-every", type=int, default=1000,
+                       help="save online Q checkpoint every N TD updates")
+    p_run.add_argument("--epsilon-start", type=float, default=0.2)
+    p_run.add_argument("--epsilon-min", type=float, default=0.05)
+    p_run.add_argument("--epsilon-decay-ticks", type=int, default=50000)
+    p_run.add_argument("--online-lr", type=float, default=0.02)
+    p_run.add_argument("--online-gamma", type=float, default=0.99)
+    p_run.add_argument("--online-train", dest="online_train", action="store_true",
+                       default=True, help="train the online Q model while running")
+    p_run.add_argument("--no-online-train", dest="online_train", action="store_false",
+                       help="run online Q in eval mode without mutating the model")
     _add_world_args(p_run)
     p_run.set_defaults(func=cmd_run)
 
