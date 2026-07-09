@@ -107,6 +107,9 @@ def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
                    payload_schema="float 0..20", range=VITAL_RANGE, neutral=20.0),
         StreamSpec("body.inventory", "body", "Inventory summary, on change.",
                    payload_schema="{item: count}"),
+        StreamSpec("body.inventory_exact", "body",
+                   "Exact Minecraft inventory names, on change.",
+                   payload_schema="{minecraft_item_name: count}"),
         StreamSpec("body.hotbar", "body", "Hotbar slots + selected, on change.",
                    payload_schema='{"slots": [item|null], "selected": int}'),
         StreamSpec("body.in_water", "body", "In-water flag, on change.",
@@ -127,14 +130,23 @@ def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
                    payload_schema="str"),
         StreamSpec("world.nearby_blocks", "world", "5x5 block patch, on cell change.",
                    payload_schema="5x5 str grid"),
+        StreamSpec("world.nearby_blocks_exact", "world",
+                   "5x5 exact Minecraft block-name patch, on cell change.",
+                   payload_schema="5x5 str grid"),
         StreamSpec("world.front_block", "world", "Block faced, on change.",
                    payload_schema="str", categories=FRONT_BLOCK_CATEGORIES),
+        StreamSpec("world.front_block_exact", "world",
+                   "Exact Minecraft block faced, on change.",
+                   payload_schema="str"),
         StreamSpec("world.sheltered", "world", "Shelter state, on change.",
                    payload_schema="bool"),
         StreamSpec("event.damage_taken", "event", payload_schema='{"reason": str}'),
         StreamSpec("event.item_collected", "event", payload_schema='{"item": str}'),
         StreamSpec("event.block_broken", "event", payload_schema='{"block": str}'),
         StreamSpec("event.block_placed", "event"),
+        StreamSpec("event.created_light_source", "event"),
+        StreamSpec("event.mob_killed", "event"),
+        StreamSpec("event.bumped", "event"),
         StreamSpec("event.food_eaten", "event"),
         StreamSpec("event.entered_shelter", "event"),
         StreamSpec("event.survived_night", "event"),
@@ -214,6 +226,8 @@ class SurvivalStreamPublisher:
         pub("body.hunger", data["hunger"], force=heartbeat)
         pub("body.oxygen", data["oxygen"], force=heartbeat)
         pub("body.inventory", data["inventory"])
+        if "inventory_exact" in data:
+            pub("body.inventory_exact", data["inventory_exact"])
         pub("body.hotbar", {"slots": data["hotbar"], "selected": data["selected_slot"]})
         pub("body.in_water", data["in_water"])
         pub("body.alive", not data["dead"])
@@ -227,7 +241,11 @@ class SurvivalStreamPublisher:
         }, force=True)
         pub("world.biome", data["biome"])
         pub("world.nearby_blocks", data["nearby_blocks"])
+        if "nearby_blocks_exact" in data:
+            pub("world.nearby_blocks_exact", data["nearby_blocks_exact"])
         pub("world.front_block", data["front_block"])
+        if "front_block_exact" in data:
+            pub("world.front_block_exact", data["front_block_exact"])
         pub("world.sheltered", data["sheltered"])
 
         for event_string in world_events:
@@ -249,6 +267,12 @@ class SurvivalStreamPublisher:
             return "event.block_broken", {"block": event_string.split(":", 1)[1]}
         if event_string == "placed_block":
             return "event.block_placed", {}
+        if event_string == "created_light_source":
+            return "event.created_light_source", {}
+        if event_string == "killed_mob":
+            return "event.mob_killed", {}
+        if event_string == "bumped":
+            return "event.bumped", {}
         if event_string == "ate_food":
             return "event.food_eaten", {}
         if event_string == "entered_shelter":
@@ -257,4 +281,4 @@ class SurvivalStreamPublisher:
             return "event.survived_night", {}
         if event_string == "died":
             return "event.died", {"reason": death_reason}
-        return None  # bumped / hit_mob / killed_mob / acquired_food: no stream yet
+        return None  # hit_mob / acquired_food: semantic-only reward hints for now

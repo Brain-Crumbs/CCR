@@ -6,7 +6,7 @@
 
 const {
   MOB_FRAME_ID, AGENT_FRAME_ID,
-  blockToVocab, blockToFrameCode, biomeToVocab, itemToVocab, HOSTILE,
+  blockToVocab, blockToFrameCode, blockExactName, biomeToVocab, itemToVocab, HOSTILE,
 } = require('./blocks');
 
 const RAD2DEG = 180 / Math.PI;
@@ -54,11 +54,32 @@ function nearbyBlocks(bot, radius) {
   return patch;
 }
 
+function nearbyBlocksExact(bot, radius) {
+  const ix = Math.floor(bot.entity.position.x);
+  const iz = Math.floor(bot.entity.position.z);
+  const patch = [];
+  for (let dx = -radius; dx <= radius; dx++) {
+    const row = [];
+    for (let dz = -radius; dz <= radius; dz++) {
+      row.push(blockExactName(blockAtColumn(bot, ix + dx, iz + dz)));
+    }
+    patch.push(row);
+  }
+  return patch;
+}
+
 function frontBlock(bot) {
   const { dx, dz } = facingVector(bot);
   const x = Math.floor(bot.entity.position.x + dx);
   const z = Math.floor(bot.entity.position.z + dz);
   return blockToVocab(blockAtColumn(bot, x, z));
+}
+
+function frontBlockExact(bot) {
+  const { dx, dz } = facingVector(bot);
+  const x = Math.floor(bot.entity.position.x + dx);
+  const z = Math.floor(bot.entity.position.z + dz);
+  return blockExactName(blockAtColumn(bot, x, z));
 }
 
 function isSheltered(bot) {
@@ -108,6 +129,17 @@ function inventorySummary(bot) {
     counts[name] = (counts[name] || 0) + item.count;
   }
   // Sorted keys so the payload (and its hash) is order-stable, like the sim.
+  const sorted = {};
+  for (const key of Object.keys(counts).sort()) sorted[key] = counts[key];
+  return sorted;
+}
+
+function inventoryExactSummary(bot) {
+  const counts = {};
+  for (const item of bot.inventory.items()) {
+    const name = String(item.name || '').toLowerCase();
+    counts[name] = (counts[name] || 0) + item.count;
+  }
   const sorted = {};
   for (const key of Object.keys(counts).sort()) sorted[key] = counts[key];
   return sorted;
@@ -182,8 +214,11 @@ function buildObservation(bot, tick, config, spawn) {
     selected_slot: bot.quickBarSlot || 0,
     hotbar: hotbarSlots(bot),
     inventory: inventorySummary(bot),
+    inventory_exact: inventoryExactSummary(bot),
     nearby_blocks: nearbyBlocks(bot, 2),
+    nearby_blocks_exact: nearbyBlocksExact(bot, 2),
     front_block: frontBlock(bot),
+    front_block_exact: frontBlockExact(bot),
     mobs: mobs(bot, 4),
     distance_from_spawn: round(dist, 2),
     dead: (bot.health != null && bot.health <= 0),

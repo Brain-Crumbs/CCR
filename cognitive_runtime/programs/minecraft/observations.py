@@ -15,7 +15,8 @@ from cognitive_runtime.programs.minecraft.world import SimulatedWorld
 OBSERVATION_KEYS = [
     "health", "hunger", "oxygen", "position", "yaw", "pitch", "time_of_day",
     "day_length", "is_night", "biome", "in_water", "sheltered", "selected_slot",
-    "hotbar", "inventory", "nearby_blocks", "front_block", "mobs",
+    "hotbar", "inventory", "inventory_exact", "nearby_blocks",
+    "nearby_blocks_exact", "front_block", "front_block_exact", "mobs",
     "distance_from_spawn", "dead",
 ]
 
@@ -41,8 +42,11 @@ def build_observation(world: SimulatedWorld, timestamp: float) -> Observation:
         "selected_slot": world.selected_slot,
         "hotbar": list(world.hotbar),
         "inventory": dict(sorted(world.inventory.items())),
+        "inventory_exact": dict(sorted(world.inventory.items())),
         "nearby_blocks": world.nearby_blocks(radius=2),
+        "nearby_blocks_exact": world.nearby_blocks(radius=2),
         "front_block": world.terrain[bx][bz],
+        "front_block_exact": world.terrain[bx][bz],
         "mobs": world.mob_summary(),
         "distance_from_spawn": round(math.dist((world.x, world.z), world.spawn), 2),
         "dead": world.dead,

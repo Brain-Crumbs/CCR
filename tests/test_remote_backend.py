@@ -213,3 +213,51 @@ def test_node_frame_codes_match_python():
     assert result.returncode == 0, result.stderr
     js = json.loads(result.stdout)
     assert js == {"BLOCK_IDS": BLOCK_IDS, "MOB": MOB_FRAME_ID, "AGENT": AGENT_FRAME_ID}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_node_semantic_mapper_common_minecraft_names():
+    import json
+
+    cases = {
+        "oak_log": "tree",
+        "mangrove_leaves": "tree",
+        "wheat": "berry_bush",
+        "diamond_ore": "coal_ore",
+        "deepslate": "stone",
+        "sand": "sand",
+        "ice": "water",
+        "lava": "barrier",
+        "oak_door": "placed_block",
+        "glass": "placed_block",
+        "chest": "placed_block",
+        "crafting_table": "placed_block",
+        "torch": "placed_block",
+    }
+    script = (
+        "const b=require('./blocks');"
+        f"const cases={json.dumps(cases)};"
+        "const out={};"
+        "for (const [name,_] of Object.entries(cases)) "
+        "out[name]=b.blockToVocab({name,boundingBox:'block'});"
+        "out.unknownSolid=b.blockToVocab({name:'modded_dense_block',boundingBox:'block'});"
+        "out.unknownOpen=b.blockToVocab({name:'modded_flower',boundingBox:'empty'});"
+        "out.zombie=b.entityToSemantic('zombie');"
+        "out.cow=b.entityToSemantic('cow');"
+        "out.wolf=b.entityToSemantic('wolf');"
+        "out.pickaxe=b.itemToVocab('stone_pickaxe');"
+        "process.stdout.write(JSON.stringify(out));"
+    )
+    result = subprocess.run(
+        ["node", "-e", script], cwd=str(BRIDGE_DIR), capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+    for name, vocab in cases.items():
+        assert out[name] == vocab
+    assert out["unknownSolid"] == "stone"
+    assert out["unknownOpen"] == "grass"
+    assert out["zombie"] == "hostile_mob"
+    assert out["cow"] == "passive_mob"
+    assert out["wolf"] == "neutral_mob"
+    assert out["pickaxe"] == "stone_pickaxe"

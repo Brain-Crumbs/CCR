@@ -44,7 +44,16 @@ FUSION_VERSION = "fusion-v1"
 def default_encoder_registry() -> StreamEncoderRegistry:
     """Generic modality -> encoder mapping (first match wins)."""
     registry = StreamEncoderRegistry()
-    registry.register("body.*", ScalarEncoder())
+    for stream_id in (
+        "body.alive",
+        "body.health",
+        "body.hotbar",
+        "body.hunger",
+        "body.in_water",
+        "body.inventory",
+        "body.oxygen",
+    ):
+        registry.register(stream_id, ScalarEncoder())
     registry.register("reward.*", ScalarEncoder())
     # Scalar spatial streams (a distance is one number, not a pose) must match
     # before the generic pose encoder; first registered match wins.
@@ -52,7 +61,18 @@ def default_encoder_registry() -> StreamEncoderRegistry:
     registry.register("spatial.*", SpatialEncoder())
     registry.register("vision.frame.grid", GridVisionEncoder())
     registry.register("vision.entities", EntityEncoder())
-    registry.register("event.*", EventEncoder())
+    for stream_id in (
+        "event.action_rejected",
+        "event.block_broken",
+        "event.block_placed",
+        "event.damage_taken",
+        "event.died",
+        "event.entered_shelter",
+        "event.food_eaten",
+        "event.item_collected",
+        "event.survived_night",
+    ):
+        registry.register(stream_id, EventEncoder())
     # Generic categorical/scalar world state (vocab/range from the spec).
     registry.register("world.front_block", CategoryEncoder())
     registry.register("world.sheltered", ScalarEncoder())

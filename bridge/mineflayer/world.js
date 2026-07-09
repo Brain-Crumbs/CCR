@@ -7,7 +7,7 @@
 
 const mineflayer = require('mineflayer');
 const Vec3 = require('vec3');
-const { itemToVocab, FOOD_ITEMS } = require('./blocks');
+const { itemToVocab, FOOD_ITEMS, LIGHT_ITEMS } = require('./blocks');
 const { applyAction, clearControls } = require('./actions');
 const { buildObservation, isSheltered, timeState } = require('./observation');
 
@@ -51,7 +51,7 @@ class WorldSession {
     if (this.connection.version) opts.version = this.connection.version;
     log('connecting to', opts.host + ':' + opts.port, 'as', opts.username);
     this.bot = mineflayer.createBot(opts);
-    this.bot.vec3 = (x, y, z) => new Vec3(x, y, z);
+    this.bot.vec3 = Vec3;
     this._wireEvents();
     await new Promise((resolve, reject) => {
       const onSpawn = () => { cleanup(); resolve(); };
@@ -107,9 +107,19 @@ class WorldSession {
   async step(action) {
     if (!this.bot) throw new Error('step before reset');
     const events = [];
+    const beforePos = {
+      x: this.bot.entity.position.x,
+      z: this.bot.entity.position.z,
+    };
     const hooks = {
       onBroke: (vocab) => { this._pending.push(`broke_block:${vocab}`); this._stats.blocks_broken += 1; },
-      onPlaced: () => { this._pending.push('placed_block'); this._stats.blocks_placed += 1; },
+      onPlaced: (vocab, exact) => {
+        this._pending.push('placed_block');
+        if (LIGHT_ITEMS.has(String(exact || vocab || '').toLowerCase())) {
+          this._pending.push('created_light_source');
+        }
+        this._stats.blocks_placed += 1;
+      },
       onAte: () => { this._pending.push('ate_food'); this._stats.food_consumed += 1; },
       onKilled: () => { this._pending.push('killed_mob'); this._stats.mobs_killed += 1; },
     };
@@ -123,6 +133,11 @@ class WorldSession {
     await this._awaitTick();
     clearControls(this.bot);
     this.tick += 1;
+
+    if (isMovementAction(action.name) && horizontalDistance(beforePos, this.bot.entity.position) < 0.01) {
+      const block = blockInMoveDirection(this.bot, action.name);
+      if (block && block.boundingBox === 'block') events.push('bumped');
+    }
 
     // Diff-based events.
     const health = this.bot.health == null ? 0 : this.bot.health;
@@ -237,6 +252,31 @@ function freshStats() {
 function round(value, digits) {
   const f = Math.pow(10, digits);
   return Math.round(value * f) / f;
+}
+
+function isMovementAction(name) {
+  return ['MOVE_FORWARD', 'MOVE_BACKWARD', 'MOVE_LEFT', 'MOVE_RIGHT', 'SPRINT', 'SNEAK'].includes(name);
+}
+
+function horizontalDistance(a, b) {
+  return Math.hypot((b.x || 0) - (a.x || 0), (b.z || 0) - (a.z || 0));
+}
+
+function blockInMoveDirection(bot, actionName) {
+  const yaw = bot.entity.yaw;
+  const fx = -Math.sin(yaw);
+  const fz = Math.cos(yaw);
+  let dx = fx;
+  let dz = fz;
+  if (actionName === 'MOVE_BACKWARD') {
+    dx = -fx; dz = -fz;
+  } else if (actionName === 'MOVE_LEFT') {
+    dx = fz; dz = -fx;
+  } else if (actionName === 'MOVE_RIGHT') {
+    dx = -fz; dz = fx;
+  }
+  const p = bot.entity.position;
+  return bot.blockAt(new Vec3(Math.floor(p.x + dx), Math.floor(p.y), Math.floor(p.z + dz)));
 }
 
 module.exports = { WorldSession };
