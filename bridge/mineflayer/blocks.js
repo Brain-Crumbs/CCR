@@ -10,11 +10,12 @@ const DEFAULT_VERSION = '1.19.4';
 const BLOCK_IDS = {
   grass: 1, dirt: 2, sand: 3, water: 4, tree: 5,
   stone: 6, coal_ore: 7, berry_bush: 8, placed_block: 9, barrier: 10,
+  crafting_table: 11, furnace: 12, chest: 13, portal: 14,
 };
 const MOB_FRAME_ID = 90;
 const AGENT_FRAME_ID = 99;
 
-// The 10 block-name classes; front_block/nearby_blocks payloads use these
+// The block-name classes; front_block/nearby_blocks payloads use these
 // strings, and the CategoryEncoder one-hots front_block against them.
 const VOCAB = Object.keys(BLOCK_IDS);
 
@@ -83,7 +84,34 @@ const WATER_BLOCKS = setOf([
 const HAZARD_BLOCKS = setOf([
   'lava', 'fire', 'soul_fire', 'magma_block', 'cactus',
   'wither_rose', 'campfire', 'soul_campfire', 'barrier', 'bedrock',
-  'end_portal', 'end_gateway', 'nether_portal',
+  'end_gateway',
+]);
+
+// Container / crafting-table / furnace interaction targets (issue #40) --
+// USE against one of these opens it instead of the food/placeable logic.
+const CRAFTING_TABLE_BLOCKS = setOf(['crafting_table']);
+const FURNACE_BLOCKS = setOf(['furnace', 'blast_furnace', 'smoker']);
+const CHEST_BLOCKS = setOf([
+  'chest', 'trapped_chest', 'barrel', 'ender_chest',
+  'white_shulker_box', 'orange_shulker_box', 'magenta_shulker_box',
+  'light_blue_shulker_box', 'yellow_shulker_box', 'lime_shulker_box',
+  'pink_shulker_box', 'gray_shulker_box', 'light_gray_shulker_box',
+  'cyan_shulker_box', 'purple_shulker_box', 'blue_shulker_box',
+  'brown_shulker_box', 'green_shulker_box', 'red_shulker_box',
+  'black_shulker_box', 'shulker_box',
+]);
+// Portal blocks -- crossing one flips the sim-equivalent `dimension` concept
+// (see event.dimension_changed); real dimension identity comes from
+// `bot.game.dimension` in world.js, this is only the frame/vocab mapping.
+const PORTAL_BLOCKS = setOf(['nether_portal', 'end_portal']);
+
+// Curated structure "marker" blocks: seeing one of these nearby is a
+// best-effort, heuristic proxy for having found the structure that
+// generates it -- mineflayer has no direct "structure discovered" signal.
+const STRUCTURE_MARKERS = new Map([
+  ['bell', 'village'], ['end_portal_frame', 'stronghold'],
+  ['nether_wart_block', 'fortress'], ['nether_bricks', 'fortress'],
+  ['prismarine', 'monument'], ['sea_lantern', 'monument'],
 ]);
 
 const FOOD_PLANT_BLOCKS = setOf([
@@ -248,6 +276,10 @@ function nameToVocab(name, block = null) {
   if (isWoodBlock(n)) return 'tree';
   if (isOreBlock(n)) return 'coal_ore';
   if (STONE_BLOCKS.has(n)) return 'stone';
+  if (CRAFTING_TABLE_BLOCKS.has(n)) return 'crafting_table';
+  if (FURNACE_BLOCKS.has(n)) return 'furnace';
+  if (CHEST_BLOCKS.has(n)) return 'chest';
+  if (PORTAL_BLOCKS.has(n)) return 'portal';
   if (isConstructedBlock(n)) return 'placed_block';
   if (isOpen(block)) return 'grass';
   // Unknown but collidable: treat as generic solid so movement/vision see a wall.
@@ -258,6 +290,22 @@ function nameToVocab(name, block = null) {
 function blockToVocab(block) {
   if (!block) return 'grass';
   return nameToVocab(block.name, block);
+}
+
+// 'crafting_table' | 'furnace' | 'chest' | null -- which container/interaction
+// class a block belongs to (issue #40: container / crafting-table / furnace
+// interactions), independent of the coarser vision vocab above.
+function containerType(name) {
+  const n = String(name || '').toLowerCase();
+  if (CRAFTING_TABLE_BLOCKS.has(n)) return 'crafting_table';
+  if (FURNACE_BLOCKS.has(n)) return 'furnace';
+  if (CHEST_BLOCKS.has(n)) return 'chest';
+  return null;
+}
+
+// The structure name a marker block is best-effort evidence of, or null.
+function structureMarker(name) {
+  return STRUCTURE_MARKERS.get(String(name || '').toLowerCase()) || null;
 }
 
 function blockToFrameCode(block) {
@@ -374,6 +422,9 @@ module.exports = {
   isWeaponItem,
   isArmorItem,
   entityToSemantic,
+  containerType,
+  structureMarker,
+  mcDataFor: loadMinecraftData,
   FOOD_ITEMS,
   PLACEABLE_ITEMS,
   LIGHT_ITEMS,

@@ -15,6 +15,7 @@ the world produces byte-identical observations.  Replay depends on this.
 from __future__ import annotations
 
 import copy
+import json
 import math
 import random
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,7 +25,15 @@ from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
 
 # Ground (passable) and feature (solid) cell types.
 PASSABLE = {"grass", "dirt", "sand", "water"}
-SOLID = {"tree", "stone", "coal_ore", "berry_bush", "placed_block", "barrier"}
+SOLID = {
+    "tree", "stone", "coal_ore", "berry_bush", "placed_block", "barrier",
+    "crafting_table", "furnace", "chest",
+}
+
+#: Blocks that respond to USE with a container/crafting interaction instead
+#: of the food/placeable-item logic (issue #40: container / crafting table /
+#: furnace interactions).
+CONTAINER_BLOCKS = {"crafting_table", "furnace", "chest"}
 
 BREAK_YIELD = {
     "tree": "log",
@@ -36,12 +45,40 @@ BREAK_YIELD = {
 FOOD_ITEMS = {"berries": 3.0}  # hunger restored per unit
 PLACEABLE_ITEMS = {"log", "cobblestone", "dirt", "sand"}
 
+#: The sim's minimal crafting/smelting table: one deterministic recipe per
+#: container type -- (recipe id, inputs, outputs).  Real vanilla recipes are
+#: far richer; this is the smallest slice that exercises the `event.crafted`
+#: stream end to end without a live server (issue #40).
+RECIPES: Dict[str, Tuple[str, Dict[str, int], Dict[str, int]]] = {
+    "crafting_table": ("log_to_planks", {"log": 1}, {"planks": 4}),
+    "furnace": ("smelt_cobblestone", {"cobblestone": 1, "coal": 1}, {"stone": 1}),
+}
+
 BLOCK_IDS = {
     "grass": 1, "dirt": 2, "sand": 3, "water": 4, "tree": 5,
     "stone": 6, "coal_ore": 7, "berry_bush": 8, "placed_block": 9, "barrier": 10,
+    "crafting_table": 11, "furnace": 12, "chest": 13, "portal": 14,
 }
 MOB_FRAME_ID = 90
 AGENT_FRAME_ID = 99
+
+#: Milestone -> synthetic advancement id, each earned once per episode.
+#: "sim.*" ids are the toy sandbox's stand-in for vanilla advancements (a
+#: real backend forwards actual vanilla ids instead; see event.advancement in
+#: streams.py).  Each predicate reads the tick's raw event-string list.
+_ADVANCEMENT_TRIGGERS: Tuple[Tuple[str, Any], ...] = (
+    ("sim.mine_wood", lambda events: "new_item:log" in events),
+    ("sim.mine_stone", lambda events: "new_item:cobblestone" in events),
+    ("sim.eat_food", lambda events: "ate_food" in events),
+    ("sim.kill_mob", lambda events: "killed_mob" in events),
+    ("sim.build_shelter", lambda events: "entered_shelter" in events),
+    ("sim.survive_night", lambda events: "survived_night" in events),
+    ("sim.craft_item", lambda events: any(e.startswith("crafted:") for e in events)),
+    ("sim.explore_structure",
+     lambda events: any(e.startswith("structure_discovered:") for e in events)),
+    ("sim.enter_portal",
+     lambda events: any(e.startswith("dimension_changed:") for e in events)),
+)
 
 #: Deterministic RGB palette for the pixel render -- a stand-in for "what the
 #: player sees".  Pure function of world state, so ``render_pixels`` stays
@@ -57,6 +94,10 @@ BLOCK_COLORS = {
     "berry_bush": (150, 40, 70),
     "placed_block": (170, 140, 100),
     "barrier": (20, 20, 20),
+    "crafting_table": (120, 80, 40),
+    "furnace": (90, 90, 90),
+    "chest": (150, 110, 40),
+    "portal": (130, 60, 200),
 }
 AGENT_COLOR = (240, 220, 40)
 MOB_COLOR = (200, 40, 40)
@@ -131,6 +172,8 @@ class SimulatedWorld:
         self.terrain: List[List[str]] = []
         self.biome_map: List[List[str]] = []
         self._generate_terrain()
+        self._place_features()
+        self.structures: Dict[Tuple[int, int], str] = self._place_structures()
 
         self.tick = 0
         spawn = self._find_spawn()
@@ -154,6 +197,10 @@ class SimulatedWorld:
         self._drown_counter = 0
         self._was_night = False
         self._sheltered = False
+        self.dimension = "overworld"
+        self._biome = self.biome_map[spawn[0]][spawn[1]]
+        self._discovered_structures: set = set()
+        self._advancements_earned: set = set()
         # Episode statistics.
         self.stats: Dict[str, Any] = {
             "damage_taken": 0.0,
@@ -229,6 +276,41 @@ class SimulatedWorld:
             self.terrain[i][size - 1] = "barrier"
             self.terrain[0][i] = "barrier"
             self.terrain[size - 1][i] = "barrier"
+
+    def _safe_place(self, x: int, z: int, block: str) -> bool:
+        """Overwrite one non-boundary, non-water cell; no-op if out of range
+        or already water/boundary (keeps tiny world sizes safe)."""
+        if 0 < x < self.size - 1 and 0 < z < self.size - 1 and self.terrain[x][z] not in (
+            "barrier", "water",
+        ):
+            self.terrain[x][z] = block
+            return True
+        return False
+
+    def _place_features(self) -> None:
+        """Deterministic (non-random) placement of the container/portal
+        blocks, so every seed offers the same reachable set for exercising
+        `event.container_interaction` / `event.crafted` / `event.dimension_changed`
+        without depending on the procedural terrain roll (issue #40)."""
+        half = self.size // 2
+        self._safe_place(half + half // 2, max(1, half // 4), "crafting_table")
+        self._safe_place(max(1, half // 4), half + half // 2, "furnace")
+        self._safe_place(self.size - 2, half + 2, "chest")
+        self._safe_place(2, 2, "portal")
+
+    def _place_structures(self) -> Dict[Tuple[int, int], str]:
+        """Fixed marker cells for the three discoverable structures.
+
+        The sim has no real village/stronghold/fortress generation; these are
+        location labels one biome quadrant apiece so `event.structure_discovered`
+        is exercisable deterministically without a live server.  A real
+        backend reports actual generated structures instead."""
+        half = self.size // 2
+        return {
+            (min(self.size - 2, half + half // 4), max(1, half // 2)): "village",
+            (max(1, half - 2), 2): "stronghold",
+            (max(1, half - 2), self.size - 2): "fortress",
+        }
 
     def _find_spawn(self) -> Tuple[int, int]:
         # Spawn in the plains quadrant, near its centre.
@@ -306,6 +388,8 @@ class SimulatedWorld:
         self._update_mobs(events)
         self._update_time(events)
         self._update_shelter(events)
+        self._update_biome(events)
+        self._update_structures(events)
 
         dist = math.dist((self.x, self.z), self.spawn)
         if dist > self.stats["max_distance_from_spawn"]:
@@ -315,6 +399,7 @@ class SimulatedWorld:
             self.dead = True
             self.health = 0.0
             events.append("died")
+        self._check_advancements(events)
         return events
 
     def _apply_action(self, action: Action, events: List[str]) -> None:
@@ -365,7 +450,12 @@ class SimulatedWorld:
         if self.cell(nx, nz) in SOLID:
             events.append("bumped")
             return
+        entering_portal = self.cell(nx, nz) == "portal"
         self.x, self.z = nx, nz
+        if entering_portal:
+            to_dim = "nether" if self.dimension == "overworld" else "overworld"
+            events.append(f"dimension_changed:{self.dimension}:{to_dim}")
+            self.dimension = to_dim
 
     def _attack(self, events: List[str]) -> None:
         # Prefer a mob within reach and inside the attack cone.
@@ -392,11 +482,28 @@ class SimulatedWorld:
                 self.terrain[bx][bz] = "dirt"
                 self.stats["blocks_broken"] += 1
                 events.append(f"broke_block:{block}")
+                events.append(
+                    "block_broken_exact:" + json.dumps(
+                        {"block": block, "position": {"x": bx, "y": 64.0, "z": bz}}
+                    )
+                )
                 item = BREAK_YIELD.get(block)
                 if item:
                     self._add_item(item, events)
 
     def _use(self, events: List[str]) -> None:
+        bx, bz = self._front_cell()
+        if 0 < bx < self.size - 1 and 0 < bz < self.size - 1:
+            front = self.terrain[bx][bz]
+            if front in CONTAINER_BLOCKS:
+                events.append(
+                    "container_interact:" + json.dumps(
+                        {"container": front, "position": {"x": bx, "y": 64.0, "z": bz}}
+                    )
+                )
+                self._try_craft(front, events)
+                return
+
         item = self.hotbar[self.selected_slot]
         if item is None or self.inventory.get(item, 0) <= 0:
             return
@@ -406,17 +513,43 @@ class SimulatedWorld:
             self.stats["food_consumed"] += 1
             events.append("ate_food")
         elif item in PLACEABLE_ITEMS:
-            bx, bz = self._front_cell()
             if 0 < bx < self.size - 1 and 0 < bz < self.size - 1:
                 if self.terrain[bx][bz] in PASSABLE and (bx, bz) != (int(self.x), int(self.z)):
                     self.terrain[bx][bz] = "placed_block"
                     self._remove_item(item)
                     self.stats["blocks_placed"] += 1
                     events.append("placed_block")
+                    events.append(
+                        "block_placed_exact:" + json.dumps(
+                            {"block": item, "position": {"x": bx, "y": 64.0, "z": bz}}
+                        )
+                    )
 
-    def _add_item(self, item: str, events: List[str]) -> None:
+    def _try_craft(self, container: str, events: List[str]) -> None:
+        """Minimal deterministic crafting/smelting: one fixed recipe per
+        container type (see `RECIPES`).  Out of scope: a CRAFT action to
+        trigger this on demand -- USE against the container is the trigger,
+        consistent with issue #40 (new event streams, no new actions)."""
+        recipe = RECIPES.get(container)
+        if recipe is None:
+            return
+        name, inputs, outputs = recipe
+        if not all(self.inventory.get(item, 0) >= count for item, count in inputs.items()):
+            return
+        for item, count in inputs.items():
+            self._remove_item(item, count)
+        for item, count in outputs.items():
+            self._add_item(item, events, count)
+        events.append(
+            "crafted:" + json.dumps({"recipe": name, "inputs": inputs, "outputs": outputs})
+        )
+
+    def _add_item(self, item: str, events: List[str], count: int = 1) -> None:
         is_new = item not in self.inventory
-        self.inventory[item] = self.inventory.get(item, 0) + 1
+        self.inventory[item] = self.inventory.get(item, 0) + count
+        events.append(
+            "item_collected_exact:" + json.dumps({"item": item, "count": count})
+        )
         if is_new:
             self.stats["unique_items_collected"] += 1
             events.append(f"new_item:{item}")
@@ -428,13 +561,13 @@ class SimulatedWorld:
                         self.hotbar[i] = item
                         break
 
-    def _remove_item(self, item: str) -> None:
-        count = self.inventory.get(item, 0) - 1
-        if count <= 0:
+    def _remove_item(self, item: str, amount: int = 1) -> None:
+        remaining = self.inventory.get(item, 0) - amount
+        if remaining <= 0:
             self.inventory.pop(item, None)
             self.hotbar = [None if s == item else s for s in self.hotbar]
         else:
-            self.inventory[item] = count
+            self.inventory[item] = remaining
 
     # ---------------------------------------------------------------- vitals
 
@@ -533,6 +666,26 @@ class SimulatedWorld:
             events.append("entered_shelter")
         self._sheltered = sheltered
 
+    def _update_biome(self, events: List[str]) -> None:
+        biome = self.biome_map[int(self.x)][int(self.z)]
+        if biome != self._biome:
+            self._biome = biome
+            events.append(f"biome_entered:{biome}")
+
+    def _update_structures(self, events: List[str]) -> None:
+        name = self.structures.get((int(self.x), int(self.z)))
+        if name is not None and name not in self._discovered_structures:
+            self._discovered_structures.add(name)
+            events.append(f"structure_discovered:{name}")
+
+    def _check_advancements(self, events: List[str]) -> None:
+        for advancement_id, predicate in _ADVANCEMENT_TRIGGERS:
+            if advancement_id in self._advancements_earned:
+                continue
+            if predicate(events):
+                self._advancements_earned.add(advancement_id)
+                events.append(f"advancement:{advancement_id}")
+
     # ----------------------------------------------------------- observation
 
     def nearby_blocks(self, radius: int = 2) -> List[List[str]]:
@@ -599,6 +752,7 @@ class SimulatedWorld:
         "oxygen", "inventory", "hotbar", "selected_slot", "mobs", "_mob_serial",
         "dead", "death_reason", "_regen_counter", "_starve_counter",
         "_drown_counter", "_was_night", "_sheltered", "stats", "terrain",
+        "dimension", "_biome", "_discovered_structures", "_advancements_earned",
     )
 
     def snapshot(self) -> str:

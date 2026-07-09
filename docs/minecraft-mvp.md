@@ -63,6 +63,14 @@ synthesizes the semantic event vocabulary — `damage:<reason>`,
 `entered_shelter`, `survived_night`, `died` — that the stream publisher and
 reward function already consume. The dormant reward rules (`first_tool`,
 `created_light_source`) activate as soon as the bridge emits those events.
+It also emits the richer, exact-identity/progression streams from issue #40
+(`event.item_collected_exact`, `event.block_broken_exact`,
+`event.block_placed_exact`, `event.crafted`, `event.advancement`,
+`event.dimension_changed`, `event.biome_entered`,
+`event.structure_discovered`, `event.container_interaction`); see
+`bridge/mineflayer/README.md`'s live smoke checklist and
+`programs/minecraft/streams.py` for the full schema. These are environment
+facts (aux/reward labels), not reward values themselves.
 
 How the seam behaves for a live, non-deterministic world:
 
