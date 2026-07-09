@@ -195,6 +195,7 @@ def build_dataset(
 # --------------------------------------------------------------------------
 
 NEURAL_PIXELS = "neural_pixels"
+PIXEL_SEQUENCES = "pixel_sequences"
 
 
 def _non_vision_fusion(metadata: Dict[str, Any]) -> TemporalFusion:
@@ -227,6 +228,21 @@ class NeuralDataset:
             key = self.action_keys[label]
             counts[key] = counts.get(key, 0) + 1
         return counts
+
+
+@dataclass
+class PixelSequenceDataset:
+    """Adjacent pixel-frame pairs for offline visual representation learning."""
+
+    pixels: List[Any] = field(default_factory=list)
+    next_pixels: List[Any] = field(default_factory=list)
+    pixel_shape: Optional[Tuple[int, int, int]] = None
+    layout_hash: Optional[str] = None
+    sources: List[str] = field(default_factory=list)
+    representation: str = PIXEL_SEQUENCES
+
+    def __len__(self) -> int:
+        return len(self.pixels)
 
 
 def _pixel_shape_from_catalog(metadata: Dict[str, Any]) -> Optional[Tuple[int, int, int]]:
@@ -313,5 +329,74 @@ def build_neural_dataset(
             f"no pixel samples: the {PIXEL_STREAM} stream was recorded hash-only. "
             "Re-record the training sessions with --record-frames so pixel vision "
             "has frames to learn from."
+        )
+    return dataset
+
+
+def build_pixel_sequence_dataset(
+    session_dirs: List[str],
+    max_samples: Optional[int] = None,
+    min_episode_reward: Optional[float] = None,
+) -> PixelSequenceDataset:
+    """Walk recorded sessions and emit adjacent pixel-frame pairs.
+
+    Requires the pixel frames to be present in the log (record with
+    ``--record-frames``).  Each sample is ``(frame_t, frame_t+1)`` within the
+    same episode; episode boundaries are never crossed.
+    """
+    dataset = PixelSequenceDataset()
+    fusion: Optional[TemporalFusion] = None
+    pixels_were_elided = False
+
+    for session_dir in session_dirs:
+        if not os.path.isdir(session_dir):
+            raise FileNotFoundError(f"session directory not found: {session_dir}")
+        metadata = load_session_metadata(session_dir)
+        require_streams_v2(metadata)
+        session_fusion = TemporalFusion(_catalog(metadata))
+        if fusion is None:
+            fusion = session_fusion
+            dataset.layout_hash = fusion.layout_hash
+            dataset.pixel_shape = _pixel_shape_from_catalog(metadata)
+        elif session_fusion.layout_hash != fusion.layout_hash:
+            raise ValueError(
+                f"session {session_dir} has an incompatible stream catalog "
+                f"({session_fusion.layout_hash} vs {fusion.layout_hash}); train on "
+                "sessions recorded with the same program config"
+            )
+
+        frame_store = open_frame_store(session_dir)
+        for episode_id in list_episodes(session_dir):
+            reward_total = 0.0
+            frames: List[Any] = []
+            for decision, sensory, _motor in iter_cognitive_ticks(session_dir, episode_id):
+                reward_total += float(decision.get("reward_window_total", 0.0))
+                for record in sensory:
+                    if record.get("stream_id") != PIXEL_STREAM:
+                        continue
+                    if record.get("elided"):
+                        pixels_were_elided = True
+                        continue
+                    frames.append(stream_event_from_log(record, frame_store=frame_store).payload)
+            if min_episode_reward is not None and reward_total < min_episode_reward:
+                continue
+            for left, right in zip(frames, frames[1:]):
+                dataset.pixels.append(left)
+                dataset.next_pixels.append(right)
+                if max_samples is not None and len(dataset) >= max_samples:
+                    dataset.sources.append(f"{session_dir}/{episode_id} (truncated)")
+                    if frame_store is not None:
+                        frame_store.close()
+                    return dataset
+            if len(frames) >= 2:
+                dataset.sources.append(f"{session_dir}/{episode_id}")
+        if frame_store is not None:
+            frame_store.close()
+
+    if len(dataset) == 0 and pixels_were_elided:
+        raise ValueError(
+            f"no pixel sequence samples: the {PIXEL_STREAM} stream was recorded hash-only. "
+            "Re-record the training sessions with --record-frames so pixel vision "
+            "has adjacent frames to learn from."
         )
     return dataset

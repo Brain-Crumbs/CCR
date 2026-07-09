@@ -15,7 +15,7 @@ only when neural training is requested, so torch stays optional.
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -69,6 +69,7 @@ def train_neural_bc(
     max_class_weight: float = 25.0,
     embed_dim: int = 64,
     hidden_dim: int = 64,
+    encoder_init_path: Optional[str] = None,
 ) -> Tuple[VisionBCModel, Dict[str, float]]:
     if len(dataset) == 0:
         raise ValueError("neural dataset is empty; record sessions with --record-frames first")
@@ -94,6 +95,13 @@ def train_neural_bc(
         train_idx, val_idx = perm, perm[:0]
 
     net = VisionPolicyNet(pixel_shape, n_non_vision, n_motor, n_actions, embed_dim, hidden_dim)
+    if encoder_init_path is not None:
+        from cognitive_runtime.training.visual_representation import load_pretrained_pixel_encoder
+
+        pretrained = load_pretrained_pixel_encoder(
+            encoder_init_path, pixel_shape=pixel_shape, latent_width=embed_dim
+        )
+        net.encoder.load_state_dict(pretrained.state_dict())
     weight = _class_weights(dataset.labels, n_actions, max_class_weight) if class_balance else None
     loss_fn = nn.CrossEntropyLoss(weight=weight)
     optimizer = torch.optim.Adam(net.parameters(), lr=lr)
@@ -126,6 +134,8 @@ def train_neural_bc(
         "random_class_baseline": round(1.0 / max(int((counts > 0).sum().item()), 1), 4),
         "epochs": float(epochs),
     }
+    if encoder_init_path is not None:
+        metrics["encoder_initialized"] = 1.0
     model = VisionBCModel(
         net,
         action_keys=list(dataset.action_keys),
@@ -136,6 +146,7 @@ def train_neural_bc(
             "layout_hash": dataset.layout_hash,
             "pixel_shape": list(pixel_shape),
             "non_vision_names": dataset.non_vision_names,
+            "encoder_init_path": encoder_init_path,
         },
     )
     return model, metrics
