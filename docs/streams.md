@@ -68,6 +68,7 @@ generic: Minecraft health, a Linux battery and robot joint stress are all
 | `StreamEncoderRegistry` | `encoder_registry.py` | Maps stream patterns to `StreamEncoder`s producing `LatentToken`s. |
 | Modality encoders | `encoders/` | Fixed-width, spec-driven, environment-agnostic: `ScalarEncoder` (body/reward), `SpatialEncoder`, `GridVisionEncoder`, `EntityEncoder`, `EventEncoder`, `CategoryEncoder`. |
 | `TemporalFusion` | `fusion.py` | Assembles per-stream tokens + recent history into one fixed-width `LatentState` (flat vector + named per-stream slices) with a deterministic, versioned `layout_hash`. |
+| `StreamDeclaration` / `StreamRegistry` | `registry.py` | The per-stream schema registry (issue #21): one declaration per stream binding its encoder (or an explicit "raw"/no-fusion-slot stub), `trainable` flag, `checkpoint_key`, and `train_eval_behavior`, alongside the shape/rate already on its `StreamSpec`. `DEFAULT_STREAM_REGISTRY` holds the generic modality declarations (plus reserved ids for audio, keyboard and mouse/look inputs not yet published by any Program); `TemporalFusion`'s `default_encoder_registry()` is generated from it. A Program extends it (`StreamRegistry.extend`) for stream ids that don't fit a generic pattern — see `programs/minecraft/stream_registry.py`. `StreamRegistry.assert_complete(catalog)` fails loudly if any catalog stream has no declaration; `describe(catalog)` is what `runtime/loop.py` records into session metadata. |
 
 ## Encoders & fusion (Phase 4)
 
@@ -240,3 +241,10 @@ and the formerly observation-only fields are streams
 (`body.in_water`, `body.alive`, `spatial.distance_from_spawn`). Remaining:
 real neural encoders/fusion and learned world models. See the tracking
 issue for the full plan.
+
+Every stream in the Minecraft catalog now has an explicit `StreamDeclaration`
+(issue #21: shape/schema and rate on `StreamSpec`, plus encoder binding,
+trainable/fixed-stub, latent width, checkpoint key and train/eval behavior in
+`registry.py`) — `test_stream_registry.py` asserts none are missing. Every
+declaration today is a deliberate fixed stub; trainable
+`StreamEncoderModule`s (`cognitive_runtime.neural`) are Phase B+.

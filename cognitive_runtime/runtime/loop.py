@@ -40,9 +40,11 @@ from cognitive_runtime.core.perception import State
 from cognitive_runtime.core.policy import Policy
 from cognitive_runtime.core.program import Program
 from cognitive_runtime.core.streams import (
+    DEFAULT_STREAM_REGISTRY,
     MotorStreamBus,
     SensoryStreamBus,
     StreamEncoderRegistry,
+    StreamRegistry,
     TemporalFusion,
     TickSynchronizer,
     default_encoder_registry,
@@ -70,6 +72,7 @@ class CognitiveRuntime:
         learner: Optional[Learner] = None,
         recorder: Optional[Recorder] = None,
         encoders: Optional[StreamEncoderRegistry] = None,
+        stream_registry: Optional[StreamRegistry] = None,
     ):
         self.program = program
         self.policy = policy
@@ -77,6 +80,14 @@ class CognitiveRuntime:
         self.world_model = world_model or TrendWorldModel()
         self.learner = learner or NullLearner()
         self.encoders = encoders or default_encoder_registry()
+        #: Per-stream schema declarations (issue #21): shape/rate come from
+        #: the Program's `StreamSpec` catalog, the rest -- encoder binding,
+        #: trainable/fixed-stub, latent width, checkpoint key, train/eval
+        #: behavior -- from here. Defaults to the generic registry; a Program
+        #: with concrete streams that don't fit a generic pattern passes its
+        #: own extended `StreamRegistry` (e.g.
+        #: `programs.minecraft.stream_registry.MINECRAFT_STREAM_REGISTRY`).
+        self.stream_registry = stream_registry or DEFAULT_STREAM_REGISTRY
         self.fusion = TemporalFusion(self.program.stream_catalog(), self.encoders)
         self.memory = Memory(capacity=self.config.memory_capacity)
         # Two clocks: the simulated timestamp drives windowing/hashing/replay;
@@ -147,6 +158,7 @@ class CognitiveRuntime:
             # recorded before this format, so replay knows not to fault a
             # frame-hash mismatch there as tampering.
             "frame_hash_algorithm": FRAME_HASH_ALGORITHM,
+            "stream_registry": self.stream_registry.describe(self.program.stream_catalog()),
         }
         online_metadata = self._online_metadata()
         if online_metadata:

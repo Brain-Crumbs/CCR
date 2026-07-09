@@ -85,8 +85,13 @@ def test_stream_catalog_covers_the_survival_taxonomy():
         "world.time", "world.biome", "world.nearby_blocks",
         "world.nearby_blocks_exact", "world.front_block",
         "world.front_block_exact", "world.sheltered",
-        "event.damage_taken", "event.item_collected", "event.block_broken",
-        "event.block_placed", "event.created_light_source",
+        "event.damage_taken", "event.item_collected", "event.item_collected_exact",
+        "event.block_broken", "event.block_broken_exact",
+        "event.block_placed", "event.block_placed_exact",
+        "event.crafted", "event.advancement", "event.dimension_changed",
+        "event.biome_entered", "event.structure_discovered",
+        "event.container_interaction",
+        "event.created_light_source",
         "event.mob_killed", "event.bumped", "event.food_eaten",
         "event.entered_shelter", "event.survived_night", "event.died",
         "event.action_rejected",
@@ -252,6 +257,162 @@ def test_bumped_and_mob_killed_events_are_published_in_sim_sessions():
     program.step()
     killed = [e for e in sensory.drain() if e.stream_id == "event.mob_killed"]
     assert killed
+
+
+# --------------------------------------------------- richer event streams (#40)
+
+
+def _by_stream(events, stream_id):
+    return [e for e in events if e.stream_id == stream_id]
+
+
+def test_exact_block_broken_and_item_collected_events():
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    world = program._backend.world
+    bx, bz = world._front_cell()
+    world.terrain[bx][bz] = "tree"  # BREAK_YIELD -> log
+
+    publish_motor_command(motor, Action("ATTACK"), timestamp=0.0)
+    program.step()
+    events = sensory.drain()
+
+    broken = _by_stream(events, "event.block_broken_exact")
+    assert broken and broken[0].payload == {
+        "block": "tree", "position": {"x": bx, "y": 64.0, "z": bz}
+    }
+    collected = _by_stream(events, "event.item_collected_exact")
+    assert collected and collected[0].payload == {"item": "log", "count": 1}
+    advancement = _by_stream(events, "event.advancement")
+    assert {"id": "sim.mine_wood"} in [e.payload for e in advancement]
+
+
+def test_exact_block_placed_event():
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    world = program._backend.world
+    bx, bz = world._front_cell()
+    world.terrain[bx][bz] = "grass"
+    world.inventory["dirt"] = 1
+    world.hotbar[0] = "dirt"
+    world.selected_slot = 0
+
+    publish_motor_command(motor, Action("USE"), timestamp=0.0)
+    program.step()
+    events = sensory.drain()
+
+    placed = _by_stream(events, "event.block_placed_exact")
+    assert placed and placed[0].payload == {
+        "block": "dirt", "position": {"x": bx, "y": 64.0, "z": bz}
+    }
+
+
+def test_container_interaction_and_crafted_events_at_a_crafting_table():
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    world = program._backend.world
+    bx, bz = world._front_cell()
+    world.terrain[bx][bz] = "crafting_table"
+    world.inventory["log"] = 1
+
+    publish_motor_command(motor, Action("USE"), timestamp=0.0)
+    program.step()
+    events = sensory.drain()
+
+    container = _by_stream(events, "event.container_interaction")
+    assert container and container[0].payload == {
+        "container": "crafting_table", "position": {"x": bx, "y": 64.0, "z": bz}
+    }
+    crafted = _by_stream(events, "event.crafted")
+    assert crafted and crafted[0].payload == {
+        "recipe": "log_to_planks", "inputs": {"log": 1}, "outputs": {"planks": 4}
+    }
+    assert world.inventory.get("log", 0) == 0
+    assert world.inventory.get("planks") == 4
+    collected = [e.payload for e in _by_stream(events, "event.item_collected_exact")]
+    assert {"item": "planks", "count": 4} in collected
+    advancement = [e.payload for e in _by_stream(events, "event.advancement")]
+    assert {"id": "sim.craft_item"} in advancement
+
+
+def test_container_interaction_without_ingredients_does_not_craft():
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    world = program._backend.world
+    bx, bz = world._front_cell()
+    world.terrain[bx][bz] = "chest"
+
+    publish_motor_command(motor, Action("USE"), timestamp=0.0)
+    program.step()
+    events = sensory.drain()
+
+    assert _by_stream(events, "event.container_interaction")
+    assert not _by_stream(events, "event.crafted")
+
+
+def test_furnace_smelting_produces_crafted_event():
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    world = program._backend.world
+    bx, bz = world._front_cell()
+    world.terrain[bx][bz] = "furnace"
+    world.inventory["cobblestone"] = 1
+    world.inventory["coal"] = 1
+
+    publish_motor_command(motor, Action("USE"), timestamp=0.0)
+    program.step()
+    events = sensory.drain()
+
+    crafted = _by_stream(events, "event.crafted")
+    assert crafted and crafted[0].payload == {
+        "recipe": "smelt_cobblestone",
+        "inputs": {"cobblestone": 1, "coal": 1},
+        "outputs": {"stone": 1},
+    }
+
+
+def test_dimension_changed_event_when_crossing_a_portal():
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    world = program._backend.world
+    bx, bz = world._front_cell()
+    world.terrain[bx][bz] = "portal"
+    world.z = bz - 0.1  # one WALK_SPEED (0.25) step crosses straight into it
+
+    publish_motor_command(motor, Action("MOVE_FORWARD"), timestamp=0.0)
+    program.step()
+    events = sensory.drain()
+
+    changed = _by_stream(events, "event.dimension_changed")
+    assert changed and changed[0].payload == {"from": "overworld", "to": "nether"}
+    assert world.dimension == "nether"
+    advancement = [e.payload for e in _by_stream(events, "event.advancement")]
+    assert {"id": "sim.enter_portal"} in advancement
+
+
+def test_structure_discovered_and_biome_entered_events():
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    world = program._backend.world
+    (sx, sz), name = next(iter(world.structures.items()))
+    world.x, world.z = float(sx), float(sz)
+    world._biome = None  # force a biome_entered event regardless of destination biome
+
+    publish_motor_command(motor, Action("NULL"), timestamp=0.0)
+    program.step()
+    events = sensory.drain()
+
+    discovered = _by_stream(events, "event.structure_discovered")
+    assert discovered and discovered[0].payload == {"structure": name}
+    assert _by_stream(events, "event.biome_entered")
+    advancement = [e.payload for e in _by_stream(events, "event.advancement")]
+    assert {"id": "sim.explore_structure"} in advancement
+
+    # One-shot: entering the same structure cell again does not refire.
+    sensory.drain()
+    publish_motor_command(motor, Action("NULL"), timestamp=0.0)
+    program.step()
+    assert not _by_stream(sensory.drain(), "event.structure_discovered")
 
 
 # ------------------------------------------------------------ legacy shim

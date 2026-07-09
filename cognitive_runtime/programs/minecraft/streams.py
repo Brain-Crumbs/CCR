@@ -13,6 +13,7 @@ works unchanged.
 
 from __future__ import annotations
 
+import json
 from typing import Dict, List, Optional
 
 from cognitive_runtime.core.observation import Observation
@@ -142,8 +143,36 @@ def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
                    payload_schema="bool"),
         StreamSpec("event.damage_taken", "event", payload_schema='{"reason": str}'),
         StreamSpec("event.item_collected", "event", payload_schema='{"item": str}'),
+        StreamSpec("event.item_collected_exact", "event",
+                   "Exact item id + count gained, every gain (not just the first).",
+                   payload_schema='{"item": str, "count": int}'),
         StreamSpec("event.block_broken", "event", payload_schema='{"block": str}'),
+        StreamSpec("event.block_broken_exact", "event",
+                   "Exact block id + position mined.",
+                   payload_schema='{"block": str, "position": {"x": float, "y": float, "z": float}}'),
         StreamSpec("event.block_placed", "event"),
+        StreamSpec("event.block_placed_exact", "event",
+                   "Exact block id + position placed.",
+                   payload_schema='{"block": str, "position": {"x": float, "y": float, "z": float}}'),
+        StreamSpec("event.crafted", "event",
+                   "Crafting/smelting outcome: recipe id + exact inputs/outputs.",
+                   payload_schema='{"recipe": str, "inputs": {"item": int}, "outputs": {"item": int}}'),
+        StreamSpec("event.advancement", "event",
+                   "Milestone/advancement earned (vanilla id on a live server; "
+                   "sim.* on the simulated backend), once per episode.",
+                   payload_schema='{"id": str}'),
+        StreamSpec("event.dimension_changed", "event",
+                   "Dimension transition, e.g. overworld <-> nether.",
+                   payload_schema='{"from": str, "to": str}'),
+        StreamSpec("event.biome_entered", "event",
+                   "Biome underfoot changed (event view of world.biome).",
+                   payload_schema='{"biome": str}'),
+        StreamSpec("event.structure_discovered", "event",
+                   "Named structure entered for the first time this episode.",
+                   payload_schema='{"structure": str}'),
+        StreamSpec("event.container_interaction", "event",
+                   "Container / crafting-table / furnace opened.",
+                   payload_schema='{"container": str, "position": {"x": float, "y": float, "z": float}}'),
         StreamSpec("event.created_light_source", "event"),
         StreamSpec("event.mob_killed", "event"),
         StreamSpec("event.bumped", "event"),
@@ -263,10 +292,29 @@ class SurvivalStreamPublisher:
             return "event.damage_taken", {"reason": event_string.split(":", 1)[1]}
         if event_string.startswith("new_item:"):
             return "event.item_collected", {"item": event_string.split(":", 1)[1]}
+        if event_string.startswith("item_collected_exact:"):
+            return "event.item_collected_exact", json.loads(event_string.split(":", 1)[1])
         if event_string.startswith("broke_block:"):
             return "event.block_broken", {"block": event_string.split(":", 1)[1]}
+        if event_string.startswith("block_broken_exact:"):
+            return "event.block_broken_exact", json.loads(event_string.split(":", 1)[1])
         if event_string == "placed_block":
             return "event.block_placed", {}
+        if event_string.startswith("block_placed_exact:"):
+            return "event.block_placed_exact", json.loads(event_string.split(":", 1)[1])
+        if event_string.startswith("crafted:"):
+            return "event.crafted", json.loads(event_string.split(":", 1)[1])
+        if event_string.startswith("advancement:"):
+            return "event.advancement", {"id": event_string.split(":", 1)[1]}
+        if event_string.startswith("dimension_changed:"):
+            _, from_dim, to_dim = event_string.split(":", 2)
+            return "event.dimension_changed", {"from": from_dim, "to": to_dim}
+        if event_string.startswith("biome_entered:"):
+            return "event.biome_entered", {"biome": event_string.split(":", 1)[1]}
+        if event_string.startswith("structure_discovered:"):
+            return "event.structure_discovered", {"structure": event_string.split(":", 1)[1]}
+        if event_string.startswith("container_interact:"):
+            return "event.container_interaction", json.loads(event_string.split(":", 1)[1])
         if event_string == "created_light_source":
             return "event.created_light_source", {}
         if event_string == "killed_mob":

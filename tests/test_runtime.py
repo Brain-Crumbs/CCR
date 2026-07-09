@@ -262,7 +262,7 @@ def test_legacy_session_without_frame_store_still_loads_and_replays(tmp_path):
     for line in lines:
         record = json.loads(line)
         if record.get("stream_id") == "vision.frame.pixels" and "frame_ref" in record:
-            array = frame_store.read_frame(record.pop("frame_ref"))
+            array = frame_store.read_frame(record.pop("frame_ref")).copy()
             record.pop("shape", None)
             record.pop("dtype", None)
             payload = array.tolist()

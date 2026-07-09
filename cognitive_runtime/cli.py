@@ -31,6 +31,7 @@ from cognitive_runtime.policies import (
 from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
 from cognitive_runtime.programs.minecraft.adapter import BACKENDS, MinecraftSurvivalBox
 from cognitive_runtime.programs.minecraft.evaluation import comparison_table, summarize_episodes
+from cognitive_runtime.programs.minecraft.stream_registry import MINECRAFT_STREAM_REGISTRY
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
 from cognitive_runtime.runtime.replay import NonDeterministicSessionError
@@ -170,6 +171,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         policy=policy,
         config=config,
         learner=learner,
+        stream_registry=MINECRAFT_STREAM_REGISTRY,
     )
     summaries = runtime.run()
     for summary in summaries:
