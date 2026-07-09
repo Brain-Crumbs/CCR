@@ -162,6 +162,10 @@ then train a model from those recordings. Phase 1 introduces the pure
 `OnlineQModel` checkpoint/update layer, but online updates are not wired into
 the runtime loop until the online policy/learner phase.
 
+Online Q runtime usage, simulated acceptance, live Mineflayer rollout commands,
+and the future trainable stream-module path are documented in
+[`online-learning.md`](online-learning.md).
+
 ## Recording, replay, metrics
 
 The recorded artifact of a session is the **stream log** (streams-v2), not
