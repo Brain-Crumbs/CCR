@@ -13,7 +13,8 @@ This phase defines contracts only — abstract base classes with docstrings
 covering input/output tensor shapes and checkpoint keys for the pieces the
 neural stream agent target (see ``docs/online-learning.md``) will need:
 
-- :class:`StreamEncoderModule` -- trainable per-stream encoder.
+- :class:`StreamEncoderModule` -- trainable per-stream encoder contract.
+- :class:`PixelStreamEncoder` -- CNN encoder for ``vision.frame.pixels``.
 - :class:`LatentFusionModel` -- per-stream latents -> fused agent state.
 - :class:`WorldModel` / :class:`WorldModelOutput` -- next-state/reward/
   terminal/risk/prediction-error head.
@@ -23,9 +24,10 @@ neural stream agent target (see ``docs/online-learning.md``) will need:
 - :class:`OnlineOptimizer` -- losses, gradient steps, clipping, target
   networks, and optimizer checkpoint state.
 
-No concrete encoder/fusion/world-model/policy implementation lives here yet;
-the package does define the unified checkpoint bundle format those concrete
-modules will use once wired into a learner.
+The pixel encoder is the first concrete stream module; learned fusion,
+world-model, policy and value implementations still arrive in later phases.
+The package also defines the unified checkpoint bundle format those concrete
+modules use once wired into a learner.
 """
 
 from __future__ import annotations
@@ -39,6 +41,12 @@ except ImportError as exc:  # pragma: no cover - exercised by test w/o torch
     ) from exc
 
 from cognitive_runtime.neural.encoder import StreamEncoderModule
+from cognitive_runtime.neural.pixel_stream_encoder import (
+    PIXEL_CHECKPOINT_KEY,
+    PIXEL_STREAM_ID,
+    PixelStreamEncoder,
+    pixels_to_chw,
+)
 from cognitive_runtime.neural.fusion import LatentFusionModel
 from cognitive_runtime.neural.optimizer import OnlineOptimizer
 from cognitive_runtime.neural.policy import PolicyModel
@@ -56,6 +64,10 @@ from cognitive_runtime.neural.checkpoint import (
 
 __all__ = [
     "StreamEncoderModule",
+    "PixelStreamEncoder",
+    "PIXEL_STREAM_ID",
+    "PIXEL_CHECKPOINT_KEY",
+    "pixels_to_chw",
     "LatentFusionModel",
     "WorldModel",
     "WorldModelOutput",
