@@ -23,9 +23,9 @@ neural stream agent target (see ``docs/online-learning.md``) will need:
 - :class:`OnlineOptimizer` -- losses, gradient steps, clipping, target
   networks, and optimizer checkpoint state.
 
-No concrete encoder/fusion/world-model/policy implementation lives here yet,
-and no checkpoint *bundle* (multi-module save/load) format is defined here --
-both are later phases tracked separately.
+No concrete encoder/fusion/world-model/policy implementation lives here yet;
+the package does define the unified checkpoint bundle format those concrete
+modules will use once wired into a learner.
 """
 
 from __future__ import annotations
@@ -44,6 +44,15 @@ from cognitive_runtime.neural.optimizer import OnlineOptimizer
 from cognitive_runtime.neural.policy import PolicyModel
 from cognitive_runtime.neural.value import ValueModel
 from cognitive_runtime.neural.world_model import WorldModel, WorldModelOutput
+from cognitive_runtime.neural.checkpoint import (
+    FORMAT_VERSION as NEURAL_CHECKPOINT_FORMAT,
+    CheckpointCompatibilityError,
+    NeuralAgentCheckpoint,
+    action_space_hash,
+    checkpoint_metadata_path,
+    compatibility_hash,
+    read_checkpoint_metadata,
+)
 
 __all__ = [
     "StreamEncoderModule",
@@ -53,4 +62,11 @@ __all__ = [
     "PolicyModel",
     "ValueModel",
     "OnlineOptimizer",
+    "NEURAL_CHECKPOINT_FORMAT",
+    "CheckpointCompatibilityError",
+    "NeuralAgentCheckpoint",
+    "action_space_hash",
+    "checkpoint_metadata_path",
+    "compatibility_hash",
+    "read_checkpoint_metadata",
 ]

@@ -55,10 +55,9 @@ class OnlineOptimizer(abc.ABC):
       effect.
 
     :meth:`load_state_dict` restores exactly what :meth:`state_dict` returns.
-    The checkpoint *bundle* format that serializes this to/from disk
-    alongside compatibility metadata (layout hash, action keys, ...) -- the
-    neural analogue of ``OnlineQModel.save``/``OnlineQModel.load`` -- is a
-    separate issue.
+    ``NeuralAgentCheckpoint`` serializes this to/from disk alongside
+    compatibility metadata (layout hash, action keys, ...) as the neural
+    analogue of ``OnlineQModel.save``/``OnlineQModel.load``.
     """
 
     @abc.abstractmethod

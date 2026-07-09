@@ -32,8 +32,8 @@ class ValueModel(nn.Module, abc.ABC):
     Checkpoint keys
     ---------------
     ``state_dict()``/``load_state_dict()`` are :class:`torch.nn.Module`'s own
-    (parameters and buffers); the checkpoint bundle format that pairs this
-    with its matching ``PolicyModel``/``WorldModel`` is a separate issue.
+    (parameters and buffers); ``NeuralAgentCheckpoint`` bundles this with its
+    matching ``PolicyModel``/``WorldModel`` state.
     """
 
     def __init__(self) -> None:

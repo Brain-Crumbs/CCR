@@ -46,8 +46,8 @@ class LatentFusionModel(nn.Module, abc.ABC):
     :meth:`fused_width` and the stream-id layout (order and per-stream width)
     the model was trained against, so it can refuse to load a bundle trained
     on an incompatible catalog the way ``OnlineQModel.check_compatible`` does
-    today; the checkpoint *bundle* format that carries those fields is a
-    separate issue.
+    today; ``cognitive_runtime.neural.checkpoint.NeuralAgentCheckpoint``
+    carries those compatibility fields in the unified bundle metadata.
     """
 
     def __init__(self) -> None:

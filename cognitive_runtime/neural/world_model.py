@@ -63,7 +63,7 @@ class WorldModel(nn.Module, abc.ABC):
     (parameters and buffers). A loader additionally needs ``fused_width`` and
     ``n_actions`` to validate compatibility before restoring weights, the
     same way ``OnlineQModel`` checks ``latent_width``/``action_keys`` today;
-    the checkpoint bundle format itself is a separate issue.
+    ``NeuralAgentCheckpoint`` carries those compatibility fields.
     """
 
     def __init__(self) -> None:
