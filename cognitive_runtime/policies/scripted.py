@@ -11,6 +11,9 @@ and proves the Program is usable:
 
 Program-specific knowledge is allowed here (policies are experiments);
 it must never leak into the runtime core.
+
+Status: teacher/baseline only — scripted behavior is never the agent's
+intelligence in the target architecture (docs/neural-stream-agent.md).
 """
 
 from __future__ import annotations

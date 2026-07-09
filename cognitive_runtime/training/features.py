@@ -4,6 +4,10 @@ Turns a structured observation plus recent action history into a fixed
 feature vector.  This is program-specific (it knows SurvivalBox observation
 keys); it lives in training/ because it is shared by the offline trainer
 and the online LearnedPolicy, and must stay identical between them.
+
+Status: the handcrafted featurizer is kept for parity tests only and is
+slated for removal from the main training path once learned encoders/fusion
+replace it (docs/neural-stream-agent.md).
 """
 
 from __future__ import annotations
