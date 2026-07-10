@@ -45,15 +45,38 @@ BREAK_YIELD = {
     "placed_block": "dirt",
 }
 FOOD_ITEMS = {"berries": 3.0}  # hunger restored per unit
-PLACEABLE_ITEMS = {"log", "cobblestone", "dirt", "sand"}
+PLACEABLE_ITEMS = {"log", "cobblestone", "dirt", "sand", "torch"}
 
-#: The sim's minimal crafting/smelting table: one deterministic recipe per
-#: container type -- (recipe id, inputs, outputs).  Real vanilla recipes are
-#: far richer; this is the smallest slice that exercises the `event.crafted`
-#: stream end to end without a live server (issue #40).
-RECIPES: Dict[str, Tuple[str, Dict[str, int], Dict[str, int]]] = {
-    "crafting_table": ("log_to_planks", {"log": 1}, {"planks": 4}),
-    "furnace": ("smelt_cobblestone", {"cobblestone": 1, "coal": 1}, {"stone": 1}),
+#: Item names the "tool use" / "first tool" reward goals key on (issue #30):
+#: real vanilla tool/weapon suffixes plus a few whole-name tool items. Shared
+#: with `rewards.py` so world mechanics and reward rules agree on vocabulary.
+_TOOL_SUFFIXES = ("_pickaxe", "_axe", "_shovel", "_hoe", "_sword")
+TOOL_ITEMS = {
+    "shears", "fishing_rod", "flint_and_steel", "bucket",
+    "bow", "crossbow", "trident", "shield",
+}
+
+
+def is_tool_or_weapon(item: str) -> bool:
+    return item in TOOL_ITEMS or item.endswith(_TOOL_SUFFIXES)
+
+
+#: The sim's minimal crafting/smelting table: each container type tries its
+#: recipes in order, applying the first whose inputs are satisfied --
+#: (recipe id, inputs, outputs) per entry.  Real vanilla recipes are far
+#: richer; this is the smallest slice that exercises the `event.crafted`
+#: stream (issue #40) and, via `planks_to_pickaxe` / `smelt_torch`, the
+#: "tool use" and "light placement" reward goals (issue #30) end to end
+#: without a live server.
+RECIPES: Dict[str, List[Tuple[str, Dict[str, int], Dict[str, int]]]] = {
+    "crafting_table": [
+        ("log_to_planks", {"log": 1}, {"planks": 4}),
+        ("planks_to_pickaxe", {"planks": 3}, {"wooden_pickaxe": 1}),
+    ],
+    "furnace": [
+        ("smelt_cobblestone", {"cobblestone": 1, "coal": 1}, {"stone": 1}),
+        ("smelt_torch", {"coal": 1}, {"torch": 4}),
+    ],
 }
 
 BLOCK_IDS = {
@@ -464,6 +487,12 @@ class SimulatedWorld:
             self.dimension = to_dim
 
     def _attack(self, events: List[str]) -> None:
+        # "Tool use" reward goal (issue #30): a swing while a tool/weapon is
+        # equipped is the signal, independent of whether it lands -- rewards
+        # state the goal (use your tools), never the strategy.
+        held = self.hotbar[self.selected_slot]
+        if held is not None and is_tool_or_weapon(held):
+            events.append(f"used_tool:{held}")
         # Prefer a mob within reach and inside the attack cone.
         fx, fz = self._facing_vector()
         for mob in self.mobs:
@@ -530,25 +559,29 @@ class SimulatedWorld:
                             {"block": item, "position": {"x": bx, "y": 64.0, "z": bz}}
                         )
                     )
+                    if item == "torch":
+                        # "Light placement" reward goal (issue #30): completes
+                        # the light_source reward, dormant since it had no
+                        # sim-side trigger.
+                        events.append("created_light_source")
 
     def _try_craft(self, container: str, events: List[str]) -> None:
-        """Minimal deterministic crafting/smelting: one fixed recipe per
-        container type (see `RECIPES`).  Out of scope: a CRAFT action to
-        trigger this on demand -- USE against the container is the trigger,
-        consistent with issue #40 (new event streams, no new actions)."""
-        recipe = RECIPES.get(container)
-        if recipe is None:
+        """Minimal deterministic crafting/smelting: fixed recipes per
+        container type, tried in order (see `RECIPES`).  Out of scope: a
+        CRAFT action to trigger this on demand -- USE against the container
+        is the trigger, consistent with issue #40 (new event streams, no new
+        actions)."""
+        for name, inputs, outputs in RECIPES.get(container, []):
+            if not all(self.inventory.get(item, 0) >= count for item, count in inputs.items()):
+                continue
+            for item, count in inputs.items():
+                self._remove_item(item, count)
+            for item, count in outputs.items():
+                self._add_item(item, events, count)
+            events.append(
+                "crafted:" + json.dumps({"recipe": name, "inputs": inputs, "outputs": outputs})
+            )
             return
-        name, inputs, outputs = recipe
-        if not all(self.inventory.get(item, 0) >= count for item, count in inputs.items()):
-            return
-        for item, count in inputs.items():
-            self._remove_item(item, count)
-        for item, count in outputs.items():
-            self._add_item(item, events, count)
-        events.append(
-            "crafted:" + json.dumps({"recipe": name, "inputs": inputs, "outputs": outputs})
-        )
 
     def _add_item(self, item: str, events: List[str], count: int = 1) -> None:
         is_new = item not in self.inventory

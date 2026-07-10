@@ -154,4 +154,5 @@ runtime changes; that is the point.
 - [docs/online-learning.md](docs/online-learning.md) — trainable stream modules and the online Q baseline
 - [docs/program-interface.md](docs/program-interface.md) — the universal Program contract
 - [docs/minecraft-mvp.md](docs/minecraft-mvp.md) — SurvivalBox: scope, rewards, milestones
+- [docs/curriculum.md](docs/curriculum.md) — staged `--curriculum` presets (world config + reward goals) for training
 - [docs/future-ai-os.md](docs/future-ai-os.md) — the long-term AI-native OS direction

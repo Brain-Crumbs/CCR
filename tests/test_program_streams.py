@@ -92,6 +92,7 @@ def test_stream_catalog_covers_the_survival_taxonomy():
         "event.biome_entered", "event.structure_discovered",
         "event.container_interaction",
         "event.created_light_source",
+        "event.tool_used",
         "event.mob_killed", "event.bumped", "event.food_eaten",
         "event.entered_shelter", "event.survived_night", "event.died",
         "event.action_rejected",
@@ -369,6 +370,98 @@ def test_furnace_smelting_produces_crafted_event():
         "inputs": {"cobblestone": 1, "coal": 1},
         "outputs": {"stone": 1},
     }
+
+
+def test_crafting_table_crafts_a_pickaxe_once_planks_are_stockpiled():
+    """Issue #30: completes the "tool use" / "first tool" reward goal in the
+    simulated backend -- planks_to_pickaxe is the furnace's second recipe,
+    tried once log_to_planks's input (a log) is no longer available."""
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    world = program._backend.world
+    bx, bz = world._front_cell()
+    world.terrain[bx][bz] = "crafting_table"
+    world.inventory["planks"] = 3
+
+    publish_motor_command(motor, Action("USE"), timestamp=0.0)
+    program.step()
+    events = sensory.drain()
+
+    crafted = _by_stream(events, "event.crafted")
+    assert crafted and crafted[0].payload == {
+        "recipe": "planks_to_pickaxe", "inputs": {"planks": 3}, "outputs": {"wooden_pickaxe": 1}
+    }
+    assert world.inventory.get("wooden_pickaxe") == 1
+    collected = [e.payload for e in _by_stream(events, "event.item_collected")]
+    assert {"item": "wooden_pickaxe"} in collected
+
+
+def test_furnace_smelts_a_torch_when_no_cobblestone_is_held():
+    """Issue #30: completes the "light placement" reward goal -- smelt_torch
+    is the furnace's second recipe, reachable with just coal."""
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    world = program._backend.world
+    bx, bz = world._front_cell()
+    world.terrain[bx][bz] = "furnace"
+    world.inventory["coal"] = 1
+
+    publish_motor_command(motor, Action("USE"), timestamp=0.0)
+    program.step()
+    events = sensory.drain()
+
+    crafted = _by_stream(events, "event.crafted")
+    assert crafted and crafted[0].payload == {
+        "recipe": "smelt_torch", "inputs": {"coal": 1}, "outputs": {"torch": 4}
+    }
+    assert world.inventory.get("torch") == 4
+
+
+def test_placing_a_torch_emits_created_light_source():
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    world = program._backend.world
+    bx, bz = world._front_cell()
+    world.inventory["torch"] = 1
+    world.hotbar[0] = "torch"
+    world.selected_slot = 0
+
+    publish_motor_command(motor, Action("USE"), timestamp=0.0)
+    program.step()
+    events = sensory.drain()
+
+    assert _by_stream(events, "event.block_placed")
+    assert _by_stream(events, "event.created_light_source")
+    assert world.terrain[bx][bz] == "placed_block"
+
+
+def test_attacking_while_a_tool_is_equipped_emits_tool_used():
+    """Issue #30: the "tool use" reward signal fires on the swing itself,
+    independent of whether it lands on a mob or a block."""
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    world = program._backend.world
+    world.inventory["wooden_pickaxe"] = 1
+    world.hotbar[0] = "wooden_pickaxe"
+    world.selected_slot = 0
+
+    publish_motor_command(motor, Action("ATTACK"), timestamp=0.0)
+    program.step()
+    events = sensory.drain()
+
+    tool_used = [e.payload for e in _by_stream(events, "event.tool_used")]
+    assert {"item": "wooden_pickaxe"} in tool_used
+
+
+def test_attacking_without_a_tool_does_not_emit_tool_used():
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+
+    publish_motor_command(motor, Action("ATTACK"), timestamp=0.0)
+    program.step()
+    events = sensory.drain()
+
+    assert not _by_stream(events, "event.tool_used")
 
 
 def test_dimension_changed_event_when_crossing_a_portal():

@@ -21,6 +21,7 @@ can emit `new_item:<tool>` / `created_light_source` events.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from collections import deque
 from dataclasses import dataclass
@@ -29,17 +30,9 @@ from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.reward import RewardSignal
 from cognitive_runtime.core.streams.events import StreamEvent
+from cognitive_runtime.programs.minecraft.world import is_tool_or_weapon
 
-_TOOL_SUFFIXES = ("_pickaxe", "_axe", "_shovel", "_hoe", "_sword")
-TOOL_ITEMS = {
-    "shears", "fishing_rod", "flint_and_steel", "bucket",
-    "bow", "crossbow", "trident", "shield",
-}
 FOOD_ITEM_NAMES = {"berries", "apple", "bread", "cooked_meat"}
-
-
-def _is_tool_or_weapon(item: str) -> bool:
-    return item in TOOL_ITEMS or item.endswith(_TOOL_SUFFIXES)
 
 
 @dataclass
@@ -63,12 +56,25 @@ class SurvivalRewardConfig:
     distance_step: float = 0.1           # per `distance_unit` of new max distance
     distance_unit: float = 10.0
     distance_cap: float = 2.0
+    # New-cell/new-chunk visitation (capped): distinct from new_block_type
+    # above -- this rewards covering new *area*, regardless of what's there.
+    new_chunk: float = 0.1
+    new_chunk_cap: float = 2.0
+    chunk_size: float = 8.0
     # Item diversity (capped).
     new_item: float = 0.5
     new_item_cap: float = 5.0
     first_tool: float = 1.0
     first_food: float = 1.0
     first_block_placed: float = 1.0
+    # Tool use (capped): rewards actually swinging a tool/weapon that is
+    # equipped, once per distinct tool type -- distinct from first_tool
+    # above, which rewards merely acquiring one.
+    tool_used_item: float = 0.3
+    tool_used_cap: float = 1.5
+    # Crafting progress (capped): rewards each distinct recipe crafted.
+    craft_progress: float = 0.5
+    craft_progress_cap: float = 2.0
     # Safety / shelter (each once per episode).
     shelter: float = 1.0
     light_source: float = 1.0
@@ -98,10 +104,16 @@ class SurvivalReward:
         self._seen_blocks: Set[str] = set()
         self._seen_biomes: Set[str] = set()
         self._seen_items: Set[str] = set()
+        self._seen_chunks: Set[Tuple[int, int]] = set()
+        self._used_tools: Set[str] = set()
+        self._crafted_recipes: Set[str] = set()
         self._block_reward_total = 0.0
         self._biome_reward_total = 0.0
         self._distance_reward_total = 0.0
         self._item_reward_total = 0.0
+        self._chunk_reward_total = 0.0
+        self._tool_used_reward_total = 0.0
+        self._craft_reward_total = 0.0
         self._max_distance_rewarded = 0.0
         self._first_tool = False
         self._first_food = False
@@ -139,6 +151,7 @@ class SurvivalReward:
             events=events,
             action=action,
             novelty_hash=observation_hash,
+            position=obs_data.get("position"),
         )
 
     def prime_stream_state(self, stream_events: List[StreamEvent]) -> None:
@@ -192,6 +205,7 @@ class SurvivalReward:
             events=semantic_events,
             action=action,
             novelty_hash=window_digest,
+            position=position,
         )
 
     def _evaluate(
@@ -205,6 +219,7 @@ class SurvivalReward:
         events: List[str],
         action: Action,
         novelty_hash: str,
+        position: Optional[Dict[str, float]] = None,
     ) -> RewardSignal:
         cfg = self.cfg
         components: Dict[str, float] = {}
@@ -271,6 +286,18 @@ class SurvivalReward:
             components["distance"] = components.get("distance", 0.0) + bonus
             self._distance_reward_total += bonus
 
+        if position is not None:
+            chunk = (
+                math.floor(position["x"] / cfg.chunk_size),
+                math.floor(position["z"] / cfg.chunk_size),
+            )
+            if chunk not in self._seen_chunks:
+                self._seen_chunks.add(chunk)
+                bonus = min(cfg.new_chunk, cfg.new_chunk_cap - self._chunk_reward_total)
+                if bonus > 0:
+                    components["new_chunk"] = bonus
+                    self._chunk_reward_total += bonus
+
         # ------------------------------------------------ item diversity
         for event in events:
             if event.startswith("new_item:"):
@@ -281,12 +308,28 @@ class SurvivalReward:
                     if bonus > 0:
                         components["new_item"] = components.get("new_item", 0.0) + bonus
                         self._item_reward_total += bonus
-                    if _is_tool_or_weapon(item) and not self._first_tool:
+                    if is_tool_or_weapon(item) and not self._first_tool:
                         self._first_tool = True
                         components["first_tool"] = cfg.first_tool
                     if item in FOOD_ITEM_NAMES and not self._first_food:
                         self._first_food = True
                         components["first_food"] = cfg.first_food
+            elif event.startswith("used_tool:"):
+                item = event.split(":", 1)[1]
+                if item not in self._used_tools:
+                    self._used_tools.add(item)
+                    bonus = min(cfg.tool_used_item, cfg.tool_used_cap - self._tool_used_reward_total)
+                    if bonus > 0:
+                        components["tool_used"] = components.get("tool_used", 0.0) + bonus
+                        self._tool_used_reward_total += bonus
+            elif event.startswith("crafted:"):
+                recipe = json.loads(event.split(":", 1)[1])["recipe"]
+                if recipe not in self._crafted_recipes:
+                    self._crafted_recipes.add(recipe)
+                    bonus = min(cfg.craft_progress, cfg.craft_progress_cap - self._craft_reward_total)
+                    if bonus > 0:
+                        components["craft_progress"] = components.get("craft_progress", 0.0) + bonus
+                        self._craft_reward_total += bonus
         if "placed_block" in events and not self._first_block_placed:
             self._first_block_placed = True
             components["first_block_placed"] = cfg.first_block_placed
@@ -348,6 +391,8 @@ _SEMANTIC_EVENTS = {
     "event.block_broken": lambda p: f"broke_block:{p['block']}",
     "event.block_placed": lambda p: "placed_block",
     "event.created_light_source": lambda p: "created_light_source",
+    "event.tool_used": lambda p: f"used_tool:{p['item']}",
+    "event.crafted": lambda p: "crafted:" + json.dumps(p),
     "event.mob_killed": lambda p: "killed_mob",
     "event.bumped": lambda p: "bumped",
     "event.food_eaten": lambda p: "ate_food",

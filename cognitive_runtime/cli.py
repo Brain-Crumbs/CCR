@@ -12,9 +12,10 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 import sys
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from cognitive_runtime.core.policy import Policy
 from cognitive_runtime.core.streams import TemporalFusion, default_encoder_registry
@@ -30,7 +31,9 @@ from cognitive_runtime.policies import (
 )
 from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
 from cognitive_runtime.programs.minecraft.adapter import BACKENDS, MinecraftSurvivalBox
+from cognitive_runtime.programs.minecraft.curriculum import CURRICULUM_ORDER, get_curriculum
 from cognitive_runtime.programs.minecraft.evaluation import comparison_table, summarize_episodes
+from cognitive_runtime.programs.minecraft.rewards import SurvivalRewardConfig
 from cognitive_runtime.programs.minecraft.stream_registry import MINECRAFT_STREAM_REGISTRY
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
@@ -46,6 +49,42 @@ DEFAULT_MODEL_OUT = "models/bc.json"
 DEFAULT_ONLINE_MODEL_OUT = "models/online-q.json"
 
 
+#: Historical CLI defaults for the world knobs a curriculum preset can also
+#: set (issue #30).  `_add_world_args` leaves these unset (`None`) so a
+#: chosen curriculum's `world_config` can fill them in; an explicit flag
+#: always wins over the curriculum, and this dict wins when neither is given.
+_WORLD_DEFAULTS: Dict[str, Any] = {
+    "episode_ticks": 6000,
+    "difficulty": 1.0,
+    "world_size": 64,
+    "day_length": 6000,
+    "start_time": 0,
+    "max_mobs": 3,
+}
+
+
+def _resolve_world_args(args: argparse.Namespace) -> None:
+    """Fill unset world/seed args from `--curriculum`'s preset, falling back
+    to the historical CLI defaults; mutates `args` in place so every caller
+    downstream sees plain resolved values, curriculum or not."""
+    preset = get_curriculum(args.curriculum) if args.curriculum else None
+    for key, default in _WORLD_DEFAULTS.items():
+        if getattr(args, key, None) is None:
+            value = preset.world_config.get(key, default) if preset else default
+            setattr(args, key, value)
+    if args.seed is None:
+        args.seed = preset.seed if preset else 0
+
+
+def _reward_config_for(args: argparse.Namespace) -> Optional[SurvivalRewardConfig]:
+    """The curriculum's reward-weight bundle applied over the defaults, or
+    `None` (default reward config) when no curriculum was chosen."""
+    if not args.curriculum:
+        return None
+    preset = get_curriculum(args.curriculum)
+    return dataclasses.replace(SurvivalRewardConfig(), **preset.reward_config)
+
+
 def _program_config(args: argparse.Namespace) -> Dict[str, Any]:
     return {
         "episode_ticks": args.episode_ticks,
@@ -53,6 +92,7 @@ def _program_config(args: argparse.Namespace) -> Dict[str, Any]:
         "world_size": args.world_size,
         "day_length": args.day_length,
         "start_time": args.start_time,
+        "max_mobs": args.max_mobs,
     }
 
 
@@ -128,14 +168,26 @@ def _make_online_policy_and_learner(
 
 
 def _add_world_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--seed", type=int, default=0, help="base episode seed")
-    parser.add_argument("--episode-ticks", type=int, default=6000,
-                        help="episode length in ticks (5 min at 20 tps)")
-    parser.add_argument("--difficulty", type=float, default=1.0)
-    parser.add_argument("--world-size", type=int, default=64)
-    parser.add_argument("--day-length", type=int, default=6000,
-                        help="full day/night cycle in ticks; night is the second half")
-    parser.add_argument("--start-time", type=int, default=0, help="time of day at spawn")
+    parser.add_argument("--curriculum", default=None, choices=CURRICULUM_ORDER,
+                        help="named curriculum preset: world config + reward weights + a "
+                             "default seed, staged flat-safe -> resource-world -> "
+                             "night-survival -> caves -> combat -> crafting (docs/curriculum.md); "
+                             "an explicit flag below still overrides its world_config value")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="base episode seed (default: the curriculum's seed, else 0)")
+    parser.add_argument("--episode-ticks", type=int, default=None,
+                        help="episode length in ticks (default: the curriculum's, else 6000)")
+    parser.add_argument("--difficulty", type=float, default=None,
+                        help="default: the curriculum's, else 1.0")
+    parser.add_argument("--world-size", type=int, default=None,
+                        help="default: the curriculum's, else 64")
+    parser.add_argument("--day-length", type=int, default=None,
+                        help="full day/night cycle in ticks; night is the second half "
+                             "(default: the curriculum's, else 6000)")
+    parser.add_argument("--start-time", type=int, default=None,
+                        help="time of day at spawn (default: the curriculum's, else 0)")
+    parser.add_argument("--max-mobs", type=int, default=None,
+                        help="max concurrent hostile mobs (default: the curriculum's, else 3)")
     parser.add_argument("--model", default=None, help="path to a trained BC model (learned policy)")
     parser.add_argument("--backend", default="simulated", choices=sorted(BACKENDS),
                         help="survival backend: the deterministic simulated world, or "
@@ -143,8 +195,11 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> None:
+    _resolve_world_args(args)
     program_config = _program_config(args)
-    program = MinecraftSurvivalBox(config=program_config, backend=args.backend)
+    program = MinecraftSurvivalBox(
+        config=program_config, reward_config=_reward_config_for(args), backend=args.backend
+    )
     learner = None
     if args.policy == "online":
         policy, learner = _make_online_policy_and_learner(args, program)
@@ -165,6 +220,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         pin_on_streams=args.pin_on_streams,
         session_id=args.session_id,
         program_config=program_config,
+        curriculum=args.curriculum,
     )
     runtime = CognitiveRuntime(
         program=program,
@@ -206,13 +262,17 @@ def cmd_demo(args: argparse.Namespace) -> None:
 
 
 def cmd_evaluate(args: argparse.Namespace) -> None:
+    _resolve_world_args(args)
     program_config = _program_config(args)
+    reward_config = _reward_config_for(args)
     names = [p.strip() for p in args.policies.split(",") if p.strip()]
     factories: Dict[str, Callable[[], Policy]] = {}
     for name in names:
         factories[name] = (lambda n: (lambda: _make_policy(n, args)))(name)
     rows = compare_policies(
-        program_factory=lambda: MinecraftSurvivalBox(config=program_config, backend=args.backend),
+        program_factory=lambda: MinecraftSurvivalBox(
+            config=program_config, reward_config=reward_config, backend=args.backend
+        ),
         policy_factories=factories,
         episodes=args.episodes,
         seed=args.seed,

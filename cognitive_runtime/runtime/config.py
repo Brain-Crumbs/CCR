@@ -30,6 +30,11 @@ class RuntimeConfig:
     record_streams: List[str] = field(default_factory=lambda: ["*"])
     exclude_streams: List[str] = field(default_factory=list)
 
+    #: Named curriculum preset (issue #30), if any -- recorded into session
+    #: metadata so dashboard comparisons can group runs by curriculum step.
+    #: `None` for a plain (non-curriculum) run.
+    curriculum: Optional[str] = None
+
     # Rolling-window binary frame store (only used when a frame stream is
     # actually being recorded, i.e. record_frames=True or it's named in
     # record_streams).  A segment rotates on whichever threshold hits first;

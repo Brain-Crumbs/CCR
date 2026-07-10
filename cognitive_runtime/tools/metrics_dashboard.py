@@ -77,28 +77,42 @@ def _realtime_health(summaries: List[EpisodeSummary]) -> str:
     return "\n".join(lines)
 
 
+#: Dashboard comparison columns: curriculum + policy identify the group,
+#: everything else is `evaluation.comparison_table`'s default set.
+_DASHBOARD_COLUMNS = [
+    "curriculum", "policy", "episodes", "avg_survival_ticks", "death_rate",
+    "success_rate", "avg_total_reward", "reward_per_minute", "avg_food_consumed",
+    "avg_unique_items", "avg_blocks_placed", "null_action_rate",
+    "avg_max_distance", "avg_decision_latency_ms", "stream_events_per_sec",
+]
+
+
 def dashboard(record_dir: str) -> str:
-    """One row per policy, aggregated over every session under record_dir."""
+    """One row per (curriculum, policy) group, aggregated over every session
+    under record_dir -- so a curriculum run (issue #30) is comparable across
+    steps, and plain runs (curriculum=None) still group by policy alone."""
     if not os.path.isdir(record_dir):
         return f"(no sessions directory at {record_dir})"
-    by_policy: Dict[str, List[EpisodeSummary]] = {}
+    by_group: Dict[tuple, List[EpisodeSummary]] = {}
     all_summaries: List[EpisodeSummary] = []
     for session_id in sorted(os.listdir(record_dir)):
         session_dir = os.path.join(record_dir, session_id)
         if not os.path.isdir(session_dir):
             continue
         for summary in _load_summaries(session_dir):
-            by_policy.setdefault(summary.policy_name, []).append(summary)
+            key = (summary.curriculum or "-", summary.policy_name)
+            by_group.setdefault(key, []).append(summary)
             all_summaries.append(summary)
-    if not by_policy:
+    if not by_group:
         return f"(no recorded episodes under {record_dir})"
     rows: List[Dict[str, Any]] = []
-    for policy_name in sorted(by_policy):
-        row = summarize_episodes(by_policy[policy_name])
+    for curriculum, policy_name in sorted(by_group):
+        row = summarize_episodes(by_group[(curriculum, policy_name)])
         row["policy"] = policy_name
+        row["curriculum"] = curriculum
         rows.append(row)
     return (
-        comparison_table(rows)
+        comparison_table(rows, columns=_DASHBOARD_COLUMNS)
         + "\n"
         + _per_stream_rate_table(all_summaries)
         + _realtime_health(all_summaries)

@@ -61,8 +61,10 @@ Minecraft block/biome/item names into the SurvivalBox vocabulary), and
 synthesizes the semantic event vocabulary — `damage:<reason>`,
 `new_item:<item>`, `broke_block:<block>`, `placed_block`, `ate_food`,
 `entered_shelter`, `survived_night`, `died` — that the stream publisher and
-reward function already consume. The dormant reward rules (`first_tool`,
-`created_light_source`) activate as soon as the bridge emits those events.
+reward function already consume. `first_tool` / `light_source` (issue #30)
+also fire in the simulated backend now that `world.py` can craft a
+`wooden_pickaxe` and a `torch`; a real backend just supplies richer vanilla
+item names for the same rules.
 It also emits the richer, exact-identity/progression streams from issue #40
 (`event.item_collected_exact`, `event.block_broken_exact`,
 `event.block_placed_exact`, `event.crafted`, `event.advancement`,
@@ -125,9 +127,12 @@ The reward prevents the agent from learning pure passivity:
 | Exploration | new block type observed (cap 2.0) | +0.1 |
 | | new biome (cap 1.0) | +0.2 |
 | | per 10 blocks of new max distance (cap 2.0) | +0.1 |
+| | new chunk/cell visited, `chunk_size` cells (cap 2.0) | +0.1 |
 | Item diversity | new inventory item type (cap 5.0) | +0.5 |
 | | first tool / first food | +1.0 each |
 | | first block placed | +1.0 |
+| Tool use | tool/weapon swung while equipped, per distinct type (cap 1.5) | +0.3 |
+| Crafting progress | distinct recipe crafted (cap 2.0) | +0.5 |
 | Safety/shelter | enters enclosed space / creates light source / survives first night | +1.0 each, once |
 | Anti-stagnation | identical action streak > 20 | −0.01/tick |
 | | idle too long *without context* (no threat, healthy) | −0.05 |
@@ -135,9 +140,17 @@ The reward prevents the agent from learning pure passivity:
 | | no observation novelty for 200 ticks | −0.1 |
 
 Novelty rewards are **capped** so the agent cannot optimize for endless
-wandering or junk collection. "First tool" and "light source" are dormant
-in the simulated backend (no crafting yet) and activate with a richer
-backend.
+wandering or junk collection. "New chunk" is distinct from "new block type":
+it rewards covering new *area*, regardless of what's there; "tool use" is
+distinct from "first tool": it rewards actually swinging a tool/weapon, not
+merely acquiring one. Issue #30 filled these plus "crafting progress" and
+completed "first tool" / "light source", which used to be dormant in the
+simulated backend (no crafting) -- `world.py` now crafts a `wooden_pickaxe`
+(crafting table) and a `torch` (furnace), so every reward rule is reachable
+without a live server. See [`docs/curriculum.md`](curriculum.md) for the
+named `--curriculum` presets that stage these goals (world config + reward
+weights) into flat-safe → resource-world → night-survival → caves → combat →
+crafting.
 
 ## Baseline policies
 

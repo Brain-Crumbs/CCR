@@ -87,6 +87,9 @@ class EpisodeSummary:
     missed_ticks: int = 0
     program_ticks_per_cognitive_tick: int = 1
     realtime: bool = False
+    #: Named curriculum preset (issue #30), if the run used one; `None` for a
+    #: plain run and for episode summaries recorded before this field existed.
+    curriculum: Optional[str] = None
     # Runtime health: events/sec per stream_id, total counts, and streams that
     # fell silent.
     stream_event_rates: Dict[str, float] = field(default_factory=dict)
