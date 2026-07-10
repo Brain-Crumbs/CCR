@@ -86,6 +86,15 @@ from cognitive_runtime.neural.checkpoint import (
     compatibility_hash,
     read_checkpoint_metadata,
 )
+from cognitive_runtime.neural.replay_buffer import (
+    MixedTrainingSchedule,
+    PriorityWeights,
+    ReplayBuffer,
+    ReplayBufferConfig,
+    Transition,
+    load_session_into_buffer,
+    transition_priority,
+)
 
 __all__ = [
     "StreamEncoderModule",
@@ -126,4 +135,11 @@ __all__ = [
     "checkpoint_metadata_path",
     "compatibility_hash",
     "read_checkpoint_metadata",
+    "PriorityWeights",
+    "Transition",
+    "transition_priority",
+    "ReplayBufferConfig",
+    "ReplayBuffer",
+    "MixedTrainingSchedule",
+    "load_session_into_buffer",
 ]
