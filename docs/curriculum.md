@@ -23,6 +23,23 @@ policy.
 Presets only tune existing world/reward knobs — no policy or heuristic
 behavior is encoded here; rewards state goals, never actions to take.
 
+## Stage zero: the nursery scenario suite (planned)
+
+Below the survival curriculum sits a planned "infant" stage (issue #62):
+scripted micro-scenarios — `walk_forward`, `turn_in_place`,
+`object_permanence`, `day_night`, `approach_entity` — that each isolate one
+worldly regularity, generate clean recorded sessions, and benchmark the
+world model's multi-horizon prediction (t+1, t+5, t+20) on held-out seeds
+against copy-last-frame/mean-frame baselines. No reward learning happens
+here; the point is that the world model learns the world is *lawful*
+(ego-motion produces optical flow, hidden objects persist, night follows
+day) before the policy is asked to survive in it. Nursery checkpoints seed
+step 1 below.
+
+Also planned: an automated **curriculum runner** (issue #43) that promotes
+the agent between the steps below only when statistical metrics pass
+(issue #44), carrying the same checkpoint bundle across stage boundaries.
+
 ## The six steps
 
 | Step | Name | World | Reward emphasis | Seed |
