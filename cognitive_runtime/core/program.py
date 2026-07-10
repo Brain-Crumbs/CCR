@@ -48,6 +48,15 @@ if TYPE_CHECKING:  # avoid a runtime cycle: core.streams.shim imports Program
     )
 
 
+class RecoverableEpisodeError(RuntimeError):
+    """A Program cannot continue this episode, but the process should not
+    crash: the runtime ends the current episode, checkpoints any online
+    learner, and moves on to the next episode (issue #33).  A live backend
+    whose connection dies mid-episode (e.g. the Mineflayer bridge process)
+    raises this instead of letting the failure propagate as process death --
+    the world is unrecoverable mid-episode, but the run is not."""
+
+
 @dataclass
 class ActionResult:
     ok: bool = True

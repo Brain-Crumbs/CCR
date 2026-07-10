@@ -162,3 +162,11 @@ Remote Minecraft sessions remain non-deterministic and snapshot-less. Replay
 verification intentionally skips them with a clear message, but the recordings
 remain usable for `view`, `dashboard`, and offline training datasets.
 
+## Live Childhood Run Protocol
+
+The rules a live (`--backend remote`) run enforces -- start from a checkpoint
+or explicit `--fresh`, always record with frames, checkpoint on every kind of
+exit including a crashed bridge connection -- plus the `review` command that
+closes the loop after a run, are documented in
+[`childhood-runs.md`](childhood-runs.md) (issue #33).
+

@@ -83,6 +83,7 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
     recent: List[str] = []
     health = hunger = None
     novelty = None
+    value_estimate = None
     for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
         for record in sensory:
             if record.get("elided"):
@@ -95,6 +96,10 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
                 payload = record.get("payload")
                 if isinstance(payload, dict):
                     novelty = payload.get("novelty")
+            elif record.get("stream_id") == "model.value_estimate":
+                payload = record.get("payload")
+                if isinstance(payload, dict):
+                    value_estimate = payload.get("value_estimate")
         action = _motor_label(motor)
         action_counts[action] = action_counts.get(action, 0) + 1
         line = (
@@ -108,6 +113,8 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
             line += f" pred_error={decision.get('prediction_error')}"
         if novelty is not None:
             line += f" novelty={novelty}"
+        if value_estimate is not None:
+            line += f" value_estimate={value_estimate}"
         recent.append(line)
 
     lines.append("  action distribution:")
