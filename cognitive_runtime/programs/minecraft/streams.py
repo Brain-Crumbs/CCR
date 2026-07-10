@@ -95,8 +95,9 @@ def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
                    payload_schema=f"{PIXEL_SHAPE[0]}x{PIXEL_SHAPE[1]}x3 uint8 image",
                    range=(0.0, 255.0), shape=PIXEL_SHAPE, overflow="coalesce"),
         StreamSpec("vision.entities", "vision",
-                   "Visible mobs (distance/angle), every tick while any are visible.",
-                   payload_schema="[{distance, angle}]", range=(0.0, 16.0)),
+                   "Visible mobs (id/distance/angle), every tick while any are visible; "
+                   "occluded by walls (line-of-sight), not just distance.",
+                   payload_schema="[{id, distance, angle}]", range=(0.0, 16.0)),
         StreamSpec("body.health", "body", "Health, on change + heartbeat.",
                    nominal_rate_hz=BODY_HEARTBEAT_HZ,
                    payload_schema="float 0..20", range=VITAL_RANGE, neutral=20.0),

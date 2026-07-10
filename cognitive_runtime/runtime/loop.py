@@ -34,8 +34,10 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
+from cognitive_runtime.core.entity_persistence import EntityPersistence, NullEntityPersistence
 from cognitive_runtime.core.learner import Learner, NullLearner, window_reward
 from cognitive_runtime.core.memory import Memory
+from cognitive_runtime.core.novelty import combine_novelty
 from cognitive_runtime.core.perception import State
 from cognitive_runtime.core.policy import Policy
 from cognitive_runtime.core.program import Program
@@ -45,6 +47,7 @@ from cognitive_runtime.core.streams import (
     SensoryStreamBus,
     StreamEncoderRegistry,
     StreamRegistry,
+    StreamSpec,
     TemporalFusion,
     TickSynchronizer,
     default_encoder_registry,
@@ -61,6 +64,21 @@ from cognitive_runtime.runtime.recorder import (
 )
 from cognitive_runtime.runtime.scheduler import FixedTickScheduler
 
+#: Combined novelty score (issue #27): world-model prediction error +
+#: entity-persistence surprise, published as its own stream so it is
+#: recorded, replayable, and visible in `view`/`dashboard` like any other
+#: sensory signal instead of living only in the decision record.  "event" is
+#: the closest existing modality for a model-introspection scalar; nothing
+#: about the id requires a real "model" stream head (see
+#: `core.streams.events.validate_stream_identity`).
+NOVELTY_STREAM = "model.novelty"
+NOVELTY_STREAM_SPEC = StreamSpec(
+    NOVELTY_STREAM, "event",
+    "Combined novelty: world-model prediction error + entity-persistence "
+    "surprise, averaged over whichever are available this tick.",
+    payload_schema="{novelty, world_model_error, entity_surprise}",
+)
+
 
 class CognitiveRuntime:
     def __init__(
@@ -69,6 +87,7 @@ class CognitiveRuntime:
         policy: Policy,
         config: Optional[RuntimeConfig] = None,
         world_model: Optional[WorldModel] = None,
+        entity_persistence: Optional[EntityPersistence] = None,
         learner: Optional[Learner] = None,
         recorder: Optional[Recorder] = None,
         encoders: Optional[StreamEncoderRegistry] = None,
@@ -78,6 +97,7 @@ class CognitiveRuntime:
         self.policy = policy
         self.config = config or RuntimeConfig()
         self.world_model = world_model or TrendWorldModel()
+        self.entity_persistence = entity_persistence or NullEntityPersistence()
         self.learner = learner or NullLearner()
         self.encoders = encoders or default_encoder_registry()
         #: Per-stream schema declarations (issue #21): shape/rate come from
@@ -128,6 +148,10 @@ class CognitiveRuntime:
         self.program.attach_buses(self.sensory_bus, self.motor_bus)
         # Let realtime-aware Programs pace publication to wall-clock rates.
         self.program.set_realtime(realtime, clock=wall_clock)
+        # Not part of any Program's catalog: a runtime/model-computed signal
+        # rather than an environment sensor, registered directly so it can
+        # still be published/recorded/replayed like any other stream.
+        self.sensory_bus.register(NOVELTY_STREAM_SPEC)
         self._stop_requested = False
 
     def stop(self) -> None:
@@ -189,6 +213,7 @@ class CognitiveRuntime:
         self.policy.reset()
         self.memory.reset()
         self.world_model.reset()
+        self.entity_persistence.reset()
         self.learner.reset()
         self.synchronizer.reset()
         self.scheduler.reset()
@@ -204,6 +229,8 @@ class CognitiveRuntime:
         risk_total = 0.0
         prediction_error_total = 0.0
         prediction_error_ticks = 0
+        novelty_total = 0.0
+        novelty_ticks = 0
 
         while not self._stop_requested:
             if ticks >= self.config.max_ticks_per_episode or self.program.is_complete():
@@ -227,6 +254,21 @@ class CognitiveRuntime:
             )
             state = State(observation=observation)
             prediction = self.world_model.predict(state, self.memory)
+            entity_prediction = self.entity_persistence.predict(state, self.memory)
+            novelty = combine_novelty(prediction.prediction_error, entity_prediction.surprise)
+            if novelty is not None:
+                novelty_total += novelty
+                novelty_ticks += 1
+                self.sensory_bus.publish(
+                    NOVELTY_STREAM,
+                    {
+                        "novelty": round(novelty, 6),
+                        "world_model_error": prediction.prediction_error,
+                        "entity_surprise": entity_prediction.surprise,
+                    },
+                    window.ended_at,
+                    source="model",
+                )
             emissions = self.policy.emit(state, self.memory, prediction)
             latency_ms = (time.perf_counter() - decide_start) * 1000.0
             if self.policy.stop_requested:
@@ -317,6 +359,9 @@ class CognitiveRuntime:
                 round(prediction_error_total / prediction_error_ticks, 6)
                 if prediction_error_ticks
                 else None
+            ),
+            avg_novelty=(
+                round(novelty_total / novelty_ticks, 6) if novelty_ticks else None
             ),
         )
         self.recorder.write_summary(summary)

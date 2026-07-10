@@ -121,6 +121,12 @@ class EpisodeSummary:
     # recorded before this field existed).
     avg_risk: float = 0.0
     avg_prediction_error: Optional[float] = None
+    # Combined novelty score (issue #27): world-model prediction error +
+    # entity-persistence surprise, averaged over ticks where at least one was
+    # available; `None` when neither ever fired this episode (no learned
+    # world model and no occluded tracked entities), and for every episode
+    # recorded before this field existed.
+    avg_novelty: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

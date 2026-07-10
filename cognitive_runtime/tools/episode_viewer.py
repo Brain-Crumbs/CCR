@@ -33,7 +33,7 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
             "policy_name", "seed", "duration_ticks", "total_reward", "success",
             "termination_reason", "null_action_ticks", "avg_latency_ms",
             "ticks_per_second", "program_ticks_per_cognitive_tick",
-            "avg_risk", "avg_prediction_error",
+            "avg_risk", "avg_prediction_error", "avg_novelty",
         ):
             lines.append(f"  {key}: {summary.get(key)}")
         program_stats = summary.get("program_stats") or {}
@@ -82,6 +82,7 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
     action_counts: Dict[str, int] = {}
     recent: List[str] = []
     health = hunger = None
+    novelty = None
     for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
         for record in sensory:
             if record.get("elided"):
@@ -90,6 +91,10 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
                 health = record.get("payload")
             elif record.get("stream_id") == "body.hunger":
                 hunger = record.get("payload")
+            elif record.get("stream_id") == "model.novelty":
+                payload = record.get("payload")
+                if isinstance(payload, dict):
+                    novelty = payload.get("novelty")
         action = _motor_label(motor)
         action_counts[action] = action_counts.get(action, 0) + 1
         line = (
@@ -101,6 +106,8 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
             line += f" p_death={decision.get('p_death')}"
         if decision.get("prediction_error") is not None:
             line += f" pred_error={decision.get('prediction_error')}"
+        if novelty is not None:
+            line += f" novelty={novelty}"
         recent.append(line)
 
     lines.append("  action distribution:")

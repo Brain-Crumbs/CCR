@@ -11,6 +11,12 @@ from cognitive_runtime.core.policy import Policy, SingleActionPolicy
 from cognitive_runtime.core.perception import State
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.world_model import Prediction, TrendWorldModel, WorldModel
+from cognitive_runtime.core.entity_persistence import (
+    EntityPersistence,
+    EntityPersistencePrediction,
+    NullEntityPersistence,
+)
+from cognitive_runtime.core.novelty import combine_novelty
 from cognitive_runtime.core.learner import Learner, NullLearner
 
 __all__ = [
@@ -28,6 +34,10 @@ __all__ = [
     "WorldModel",
     "TrendWorldModel",
     "Prediction",
+    "EntityPersistence",
+    "EntityPersistencePrediction",
+    "NullEntityPersistence",
+    "combine_novelty",
     "Learner",
     "NullLearner",
 ]
