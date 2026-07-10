@@ -67,6 +67,46 @@ python -m cognitive_runtime run --backend simulated --policy online \
   --record-dir sessions --session-id online-eval
 ```
 
+## Phase E Evaluation Gates
+
+Before the actor/critic can replace the linear-Q baseline (or go live), it has
+to clear the deprecation gates from
+[`neural-stream-agent.md`](neural-stream-agent.md) Phase E. The
+`phase-e-gates` subcommand (issue #31) is the one-liner: it trains both the
+actor/critic and the linear online-Q in simulation, evaluates both plus
+`scripted` and `random` with no mutation on identical seeds, and reports:
+
+1. actor/critic > random — hard requirement.
+2. actor/critic > linear Q — unlocks deprecating `OnlineQ*` as primary.
+3. reproducible improvement — the same seeds reproduce gate 1 across reruns.
+
+A policy "beats" another when it earns more total reward *or* survives more
+total ticks on the shared seeds (the acceptance convention): random wanders
+into more incidental novelty reward than the trained learners do, so the
+meaningful signal against it is survival.
+
+Small deterministic run (the automated `tests/test_phase_e_gates.py` budget),
+recording eval sessions and writing the gate report into the checkpoint:
+
+```bash
+python -m cognitive_runtime phase-e-gates \
+  --checkpoint models/actor-critic.pt --record-dir sessions
+```
+
+Reproduce gates 2–3 on a larger curriculum preset, then inspect the recorded
+sessions in the dashboard:
+
+```bash
+python -m cognitive_runtime phase-e-gates --curriculum night-survival \
+  --train-episodes 40 --reproducible \
+  --checkpoint models/actor-critic-night.pt --record-dir sessions
+python -m cognitive_runtime dashboard --record-dir sessions
+```
+
+The gate report lands in the checkpoint bundle's training stats under
+`phase_e_gates` (issue #20), so `read_checkpoint_metadata(path)` recovers the
+gate booleans, per-policy eval reward/ticks, and the seeds used.
+
 ## Live Mineflayer Rollout
 
 Install and configure the bridge as described in

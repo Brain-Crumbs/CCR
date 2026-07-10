@@ -729,6 +729,49 @@ def cmd_view(args: argparse.Namespace) -> None:
     print(view_episode(args.session, args.episode, tail=args.tail))
 
 
+def cmd_phase_e_gates(args: argparse.Namespace) -> None:
+    """The Phase E evaluation-gate one-liner (issue #31): train actor/critic
+    and linear online-Q, eval both plus scripted/random on identical seeds,
+    and report the three deprecation gates.  Recorded eval sessions are
+    summarizable with ``dashboard --record-dir``."""
+    try:
+        from cognitive_runtime.training.phase_e_gates import run_phase_e_gates
+    except ImportError as exc:  # torch not installed
+        sys.exit(f"the phase-e gates need PyTorch ({exc}); install '.[neural]'.")
+
+    result = run_phase_e_gates(
+        curriculum=args.curriculum,
+        config=None,  # curriculum preset or the default gate config supplies it
+        train_episodes=args.train_episodes,
+        eval_episodes=args.eval_episodes,
+        record_dir=None if args.no_record else args.record_dir,
+        checkpoint_path=args.checkpoint,
+        check_reproducible=args.reproducible,
+    )
+
+    columns = ["policy", "total_reward", "total_ticks", "average_reward"]
+    rows = [
+        {
+            "policy": name,
+            "total_reward": s.total_reward,
+            "total_ticks": s.total_ticks,
+            "average_reward": s.average_reward,
+        }
+        for name, s in result.summaries.items()
+    ]
+    print(comparison_table(rows, columns=columns))
+    print()
+    print(f"metric: {result.metric} (identical eval seeds)")
+    print(f"gate 1  actor/critic > random     : {result.gate1_beats_random}")
+    print(f"gate 2  actor/critic > linear Q    : {result.gate2_beats_linear_q}")
+    print(f"gate 3  reproducible improvement   : {result.gate3_reproducible}")
+    if not args.no_record:
+        print(f"\nrecorded eval sessions under {args.record_dir!r}; inspect with:")
+        print(f"    python -m cognitive_runtime dashboard --record-dir {args.record_dir}")
+    if args.checkpoint:
+        print(f"\ngate results written to checkpoint training stats: {args.checkpoint}")
+
+
 def cmd_dashboard(args: argparse.Namespace) -> None:
     print(dashboard(args.record_dir))
 
@@ -820,6 +863,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--episodes", type=int, default=3)
     _add_world_args(p_eval)
     p_eval.set_defaults(func=cmd_evaluate)
+
+    p_gates = sub.add_parser(
+        "phase-e-gates",
+        help="Phase E evaluation gates: actor/critic vs random/scripted/linear-Q "
+             "on identical seeds (issue #31)",
+    )
+    p_gates.add_argument("--curriculum", default=None, choices=CURRICULUM_ORDER,
+                         help="curriculum preset supplying world + reward config "
+                              "(default: the fixed DEFAULT_GATE_CONFIG)")
+    p_gates.add_argument("--train-episodes", type=int, default=20,
+                         help="training episodes per learner before eval")
+    p_gates.add_argument("--eval-episodes", type=int, default=2,
+                         help="no-mutation eval episodes per policy on identical seeds")
+    p_gates.add_argument("--reproducible", action="store_true",
+                         help="rerun train+eval with the same seeds and report gate 3 "
+                              "(reproducible improvement)")
+    p_gates.add_argument("--record-dir", default="sessions",
+                         help="record eval sessions here for dashboard inspection")
+    p_gates.add_argument("--no-record", action="store_true",
+                         help="skip recording eval sessions")
+    p_gates.add_argument("--checkpoint", default=None,
+                         help="write the trained actor/critic bundle here with the gate "
+                              "results in its training stats (issue #20)")
+    p_gates.set_defaults(func=cmd_phase_e_gates)
 
     p_train = sub.add_parser("train", help="train a behavioral-cloning policy from sessions")
     p_train.add_argument("--sessions", nargs="+", required=True,

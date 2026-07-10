@@ -270,8 +270,16 @@ is no way to understand what it saw, did, predicted, or learned.
 - Train in simulation first. Landed: a smoke acceptance run
   (`cognitive_runtime/training/actor_critic_acceptance.py`) checks it beats
   random on identical seeds.
-- Evaluate against random/scripted/linear Q. Random-baseline smoke check
-  landed; the full actor-critic-vs-online-Q gate is issue #31.
+- Evaluate against random/scripted/linear Q. Landed (issue #31): the
+  evaluation-gate harness `cognitive_runtime/training/phase_e_gates.py`, wired
+  as `python -m cognitive_runtime phase-e-gates`. It trains the actor/critic
+  *and* the linear online-Q baseline in simulation, evaluates both plus
+  scripted and random with no mutation on identical seeds, and reports three
+  gates: (1) actor/critic > random (hard requirement), (2) actor/critic >
+  linear Q (unlocks deprecating `OnlineQ*` as primary), (3) reproducible
+  improvement across reruns with the same seeds. Recorded eval sessions feed
+  the existing dashboard; the gate report is written into the checkpoint
+  bundle's training stats.
 - Only then run live Mineflayer fine-tuning (issue #33).
 
 ### Phase F: Live Childhood Runs
