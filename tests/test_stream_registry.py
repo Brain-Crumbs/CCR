@@ -60,26 +60,36 @@ def test_assert_complete_raises_with_missing_stream_ids():
         registry.assert_complete(catalog)
 
 
-# ------------------------------------------------------------- fixed stubs
+# ------------------------------------------------------------- trainable metadata / fixed stubs
 
 
-def test_every_declared_stream_is_a_fixed_stub_today():
-    """Phase B+ trainable encoders don't exist in this repo yet, so every
-    current declaration must be explicit about being a fixed stub (target
-    doc success criterion: 'trainable encoder or a deliberate fixed stub')."""
+def test_neural_input_streams_declare_trainable_encoders_or_deliberate_stubs():
     catalog = build_survival_stream_specs()
+    trainable = {}
+    fixed = {}
     for spec in catalog:
         decl = MINECRAFT_STREAM_REGISTRY.declaration_for(spec.stream_id)
         assert decl is not None, spec.stream_id
-        assert decl.trainable is False
-        assert decl.is_fixed_stub() is True
-        assert decl.train_eval_behavior in ("fixed", "raw")
+        if decl.trainable:
+            trainable[spec.stream_id] = decl
+            assert decl.train_eval_behavior == "trainable"
+            assert decl.neural_encoder
+            assert decl.neural_latent_width is not None
+        else:
+            fixed[spec.stream_id] = decl
+            assert decl.is_fixed_stub() is True
+            assert decl.train_eval_behavior in ("fixed", "raw")
+    assert trainable["body.health"].neural_encoder == "cognitive_runtime.neural.BodyStateEncoder"
+    assert trainable["reward.scalar"].neural_encoder == "cognitive_runtime.neural.RewardEncoder"
+    assert trainable["vision.entities"].neural_encoder == "cognitive_runtime.neural.EntityEncoder"
+    assert trainable["body.inventory_exact"].neural_encoder == "cognitive_runtime.neural.EntityEncoder"
+    assert fixed["vision.frame.pixels"].is_fixed_stub() is True
 
 
 def test_raw_streams_have_no_fusion_encoder_but_do_have_metadata():
     catalog = build_survival_stream_specs()
     by_id = {s.stream_id: s for s in catalog}
-    for stream_id in ("vision.frame.pixels", "world.time", "body.inventory_exact"):
+    for stream_id in ("vision.frame.pixels", "world.time"):
         decl = MINECRAFT_STREAM_REGISTRY.declaration_for(stream_id)
         assert decl.encoder() is None
         assert decl.train_eval_behavior == "raw"
@@ -92,7 +102,17 @@ def test_reserved_ids_for_audio_and_mouse_look():
     for stream_id in ("audio.ambient", "input.keypress", "input.mouse_look", "motor.history"):
         decl = DEFAULT_STREAM_REGISTRY.declaration_for(stream_id)
         assert decl is not None, stream_id
-        assert decl.train_eval_behavior == "raw"
+    audio = DEFAULT_STREAM_REGISTRY.declaration_for("audio.ambient")
+    assert audio is not None
+    assert audio.train_eval_behavior == "raw"
+    assert audio.neural_encoder == "cognitive_runtime.neural.AudioEncoder"
+    assert audio.neural_latent_width == 8
+    assert "Deliberate fixed neural stub" in audio.note
+
+    motor = DEFAULT_STREAM_REGISTRY.declaration_for("motor.history")
+    assert motor is not None
+    assert motor.train_eval_behavior == "trainable"
+    assert motor.neural_encoder == "cognitive_runtime.neural.MotorHistoryEncoder"
 
 
 # ------------------------------------------------------------- fusion parity
@@ -134,7 +154,9 @@ def test_describe_reports_shape_rate_encoder_width_checkpoint_and_behavior():
     health = described["body.health"]
     assert health["encoder"] == "ScalarEncoder"
     assert health["latent_width"] == 4
-    assert health["train_eval_behavior"] == "fixed"
+    assert health["neural_encoder"] == "cognitive_runtime.neural.BodyStateEncoder"
+    assert health["neural_latent_width"] == 8
+    assert health["train_eval_behavior"] == "trainable"
     assert health["checkpoint_key"] == "stream_encoder.body_health"
 
 
@@ -163,4 +185,5 @@ def test_session_metadata_records_stream_registry(tmp_path):
     catalog_ids = {s["stream_id"] for s in metadata["stream_catalog"]}
     assert catalog_ids == set(declared)
     assert declared["body.health"]["checkpoint_key"] == "stream_encoder.body_health"
+    assert declared["body.health"]["neural_encoder"] == "cognitive_runtime.neural.BodyStateEncoder"
     assert declared["vision.frame.pixels"]["train_eval_behavior"] == "raw"

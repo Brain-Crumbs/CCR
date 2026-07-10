@@ -246,5 +246,12 @@ Every stream in the Minecraft catalog now has an explicit `StreamDeclaration`
 (issue #21: shape/schema and rate on `StreamSpec`, plus encoder binding,
 trainable/fixed-stub, latent width, checkpoint key and train/eval behavior in
 `registry.py`) — `test_stream_registry.py` asserts none are missing. Every
-declaration today is a deliberate fixed stub; trainable
-`StreamEncoderModule`s (`cognitive_runtime.neural`) are Phase B+.
+declaration is either wired to trainable neural encoder metadata
+(`neural_encoder`, `neural_latent_width`) or called out as a deliberate fixed
+stub. The legacy scalar `TemporalFusion` path still uses the fixed
+`encoder_factory` bindings for checkpoint compatibility, while the neural
+path uses `StreamEncoderModule`s in `cognitive_runtime.neural`.
+
+The reserved `audio.*` declaration is intentionally a fixed neural stub:
+`AudioEncoder` emits a stable zero latent and checkpoints its stub state, but
+no Program publishes audio and no capture/spectrogram backend exists yet.
