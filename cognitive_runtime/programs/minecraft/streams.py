@@ -174,6 +174,9 @@ def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
                    "Container / crafting-table / furnace opened.",
                    payload_schema='{"container": str, "position": {"x": float, "y": float, "z": float}}'),
         StreamSpec("event.created_light_source", "event"),
+        StreamSpec("event.tool_used", "event",
+                   "Tool/weapon swung while equipped (issue #30 tool-use goal).",
+                   payload_schema='{"item": str}'),
         StreamSpec("event.mob_killed", "event"),
         StreamSpec("event.bumped", "event"),
         StreamSpec("event.food_eaten", "event"),
@@ -317,6 +320,8 @@ class SurvivalStreamPublisher:
             return "event.container_interaction", json.loads(event_string.split(":", 1)[1])
         if event_string == "created_light_source":
             return "event.created_light_source", {}
+        if event_string.startswith("used_tool:"):
+            return "event.tool_used", {"item": event_string.split(":", 1)[1]}
         if event_string == "killed_mob":
             return "event.mob_killed", {}
         if event_string == "bumped":

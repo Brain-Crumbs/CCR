@@ -151,6 +151,7 @@ def test_exact_streams_and_new_events_do_not_change_default_fusion_layout():
             "world.front_block_exact",
             "world.nearby_blocks_exact",
             "event.created_light_source",
+            "event.tool_used",
             "event.mob_killed",
             "event.bumped",
         }

@@ -87,6 +87,84 @@ def test_stream_rewards_activate_first_tool_and_light_source():
     assert signal.components["light_source"] == 1.0
 
 
+def test_new_chunk_exploration_reward_is_capped():
+    """Issue #30: new-chunk/new-cell visitation, distinct from new_block_type
+    (which rewards new terrain, not new area)."""
+    cfg = SurvivalRewardConfig(new_chunk=0.1, new_chunk_cap=0.15, chunk_size=8.0)
+    reward = SurvivalReward(cfg)
+    first = _eval(reward, _obs(position={"x": 0.0, "y": 64.0, "z": 0.0}))
+    assert abs(first.components["new_chunk"] - 0.1) < 1e-9
+    # Same chunk again: no further bonus.
+    second = _eval(reward, _obs(position={"x": 1.0, "y": 64.0, "z": 1.0}))
+    assert "new_chunk" not in second.components
+    # A new chunk, but capped.
+    third = _eval(reward, _obs(position={"x": 20.0, "y": 64.0, "z": 0.0}))
+    assert abs(third.components["new_chunk"] - 0.05) < 1e-9
+    fourth = _eval(reward, _obs(position={"x": 40.0, "y": 64.0, "z": 0.0}))
+    assert "new_chunk" not in fourth.components
+
+
+def test_tool_used_reward_activates_once_per_tool_type():
+    """Issue #30: tool use, distinct from first_tool (which rewards merely
+    acquiring one)."""
+    cfg = SurvivalRewardConfig(tool_used_item=0.3, tool_used_cap=0.4)
+    reward = SurvivalReward(cfg)
+    reward.prime_stream_state([
+        StreamEvent("body.health", "body", 0.0, 0, 20.0),
+        StreamEvent("body.hunger", "body", 0.0, 0, 20.0),
+        StreamEvent("spatial.position", "spatial", 0.0, 0, {"x": 0.0, "y": 64.0, "z": 0.0}),
+    ])
+    signal = reward.evaluate_stream_window(
+        [StreamEvent("event.tool_used", "event", 1.0, 0, {"item": "wooden_pickaxe"})],
+        NULL_ACTION,
+    )
+    assert abs(signal.components["tool_used"] - 0.3) < 1e-9
+    # Same tool again: no further bonus.
+    signal = reward.evaluate_stream_window(
+        [StreamEvent("event.tool_used", "event", 2.0, 1, {"item": "wooden_pickaxe"})],
+        NULL_ACTION,
+    )
+    assert "tool_used" not in signal.components
+    # A different tool type, but capped.
+    signal = reward.evaluate_stream_window(
+        [StreamEvent("event.tool_used", "event", 3.0, 2, {"item": "stone_sword"})],
+        NULL_ACTION,
+    )
+    assert abs(signal.components["tool_used"] - 0.1) < 1e-9
+
+
+def test_craft_progress_reward_activates_once_per_recipe():
+    """Issue #30: crafting progress, keyed on distinct recipe ids from
+    event.crafted (issue #40's structured crafting event)."""
+    cfg = SurvivalRewardConfig(craft_progress=0.5, craft_progress_cap=0.75)
+    reward = SurvivalReward(cfg)
+    reward.prime_stream_state([
+        StreamEvent("body.health", "body", 0.0, 0, 20.0),
+        StreamEvent("body.hunger", "body", 0.0, 0, 20.0),
+        StreamEvent("spatial.position", "spatial", 0.0, 0, {"x": 0.0, "y": 64.0, "z": 0.0}),
+    ])
+    signal = reward.evaluate_stream_window(
+        [StreamEvent("event.crafted", "event", 1.0, 0,
+                     {"recipe": "log_to_planks", "inputs": {"log": 1}, "outputs": {"planks": 4}})],
+        NULL_ACTION,
+    )
+    assert abs(signal.components["craft_progress"] - 0.5) < 1e-9
+    # Same recipe again: no further bonus.
+    signal = reward.evaluate_stream_window(
+        [StreamEvent("event.crafted", "event", 2.0, 1,
+                     {"recipe": "log_to_planks", "inputs": {"log": 1}, "outputs": {"planks": 4}})],
+        NULL_ACTION,
+    )
+    assert "craft_progress" not in signal.components
+    # A different recipe, but capped.
+    signal = reward.evaluate_stream_window(
+        [StreamEvent("event.crafted", "event", 3.0, 2,
+                     {"recipe": "smelt_torch", "inputs": {"coal": 1}, "outputs": {"torch": 4}})],
+        NULL_ACTION,
+    )
+    assert abs(signal.components["craft_progress"] - 0.25) < 1e-9
+
+
 def test_shelter_and_night_once_per_episode():
     reward = SurvivalReward()
     signal = _eval(reward, _obs(), events=["entered_shelter", "survived_night"])

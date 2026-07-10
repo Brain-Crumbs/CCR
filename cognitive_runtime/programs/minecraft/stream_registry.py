@@ -144,6 +144,12 @@ MINECRAFT_STREAM_REGISTRY: StreamRegistry = DEFAULT_STREAM_REGISTRY.extend(
             note="Semantic event with no fusion slot today; not one of the nine events EventEncoder is bound to.",
         ),
         StreamDeclaration(
+            "event.tool_used",
+            encoder_factory=None,
+            train_eval_behavior="raw",
+            note="Semantic event with no fusion slot today; not one of the nine events EventEncoder is bound to.",
+        ),
+        StreamDeclaration(
             "event.bumped",
             encoder_factory=None,
             train_eval_behavior="raw",
