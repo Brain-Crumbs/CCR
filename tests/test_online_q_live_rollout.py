@@ -37,6 +37,7 @@ def test_remote_online_eval_smoke_does_not_train_and_records_nondeterministic_se
             "--policy",
             "online",
             "--no-online-train",
+            "--fresh",
             "--episodes",
             "1",
             "--episode-ticks",
@@ -81,7 +82,7 @@ def test_remote_online_training_checkpoint_reloads_across_sessions(tmp_path, mon
         "--record-dir",
         str(tmp_path),
     ]
-    main([*base_args, "--session-id", "remote-online-train-a"])
+    main([*base_args, "--fresh", "--session-id", "remote-online-train-a"])
     first_ticks = OnlineQModel.load(str(checkpoint)).training_ticks
     main([*base_args, "--session-id", "remote-online-train-b"])
     second_ticks = OnlineQModel.load(str(checkpoint)).training_ticks
@@ -110,6 +111,7 @@ def test_remote_dashboard_can_compare_online_random_and_scripted(tmp_path, monke
             "--policy",
             "online",
             "--no-online-train",
+            "--fresh",
             "--online-model",
             str(checkpoint),
             "--session-id",

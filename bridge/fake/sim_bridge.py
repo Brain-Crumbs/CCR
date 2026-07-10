@@ -22,6 +22,7 @@ or point the backend at it::
 from __future__ import annotations
 
 import json
+import os
 import sys
 from typing import Any, Dict, Optional
 
@@ -29,6 +30,12 @@ from cognitive_runtime.core.action import Action
 from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
 from cognitive_runtime.programs.minecraft.observations import build_observation
 from cognitive_runtime.programs.minecraft.world import SimulatedWorld
+
+#: When set to an int N, the bridge process exits abruptly after handling its
+#: (N+1)th "step" command -- simulating a crashed live connection so the
+#: remote-backend crash-resume path (issue #33) is testable with no Node and
+#: no real Minecraft server.
+ENV_CRASH_AFTER_STEPS = "CCR_FAKE_BRIDGE_CRASH_AFTER_STEPS"
 
 
 class SimBridge:
@@ -78,6 +85,9 @@ class SimBridge:
 
 def main() -> None:
     bridge = SimBridge()
+    raw_crash_after = os.environ.get(ENV_CRASH_AFTER_STEPS)
+    crash_after = int(raw_crash_after) if raw_crash_after else None
+    steps_handled = 0
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -88,6 +98,10 @@ def main() -> None:
             response: Dict[str, Any] = {"ok": False, "error": f"bad json: {exc}"}
         else:
             response = bridge.handle(message)
+            if message.get("cmd") == "step":
+                steps_handled += 1
+                if crash_after is not None and steps_handled > crash_after:
+                    sys.exit(1)  # simulate a crashed live connection
         closing = response.pop("_close", False)
         sys.stdout.write(json.dumps(response) + "\n")
         sys.stdout.flush()

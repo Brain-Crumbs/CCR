@@ -10,7 +10,9 @@ from cognitive_runtime.programs.minecraft.evaluation import comparison_table, su
 from cognitive_runtime.runtime.recorder import EpisodeSummary
 
 
-def _load_summaries(session_dir: str) -> List[EpisodeSummary]:
+def load_summaries(session_dir: str) -> List[EpisodeSummary]:
+    """Every recorded `EpisodeSummary` under one session directory (shared
+    with `tools.review`, issue #33's post-run review command)."""
     summaries = []
     for name in sorted(os.listdir(session_dir)):
         if not name.endswith(".summary.json"):
@@ -100,7 +102,7 @@ def dashboard(record_dir: str) -> str:
         session_dir = os.path.join(record_dir, session_id)
         if not os.path.isdir(session_dir):
             continue
-        for summary in _load_summaries(session_dir):
+        for summary in load_summaries(session_dir):
             key = (summary.curriculum or "-", summary.policy_name)
             by_group.setdefault(key, []).append(summary)
             all_summaries.append(summary)

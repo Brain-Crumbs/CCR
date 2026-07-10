@@ -406,14 +406,27 @@ to be byte-reproducible.)
   bundle's training stats.
 - Only then run live Mineflayer fine-tuning (issue #33).
 
-### Phase F: Live Childhood Runs
+### Phase F: Live Childhood Runs — landed
 
-- Start each run from a checkpoint.
-- Save frequently.
-- Record every session.
-- Use dashboard and viewer after each curriculum step.
-- Compare against baselines before increasing difficulty.
-- Issue #33; curriculum promotion automation is #43.
+- Start each run from a checkpoint, or explicit `--fresh`: the CLI refuses a
+  live (`--backend remote`) run with neither (issue #33).
+- Save frequently: periodic tick-count checkpointing, plus checkpoint on
+  clean shutdown, uncaught exception, `KeyboardInterrupt`, and a recoverable
+  bridge crash (`BridgeError` / `RecoverableEpisodeError`,
+  `cognitive_runtime/core/program.py`) -- a dropped live connection ends that
+  episode, not the process; the next episode's `reset()` respawns the bridge.
+- Record every session, frames included -- enforced automatically for live
+  runs, not opt-in.
+- Model-side streams (`model.novelty`, `model.value_estimate`) are recorded
+  every tick so a session explains what the agent predicted, not just what
+  it did.
+- `review` (`cognitive_runtime/tools/review.py`) is the post-run command:
+  summarize a run, compare it against baseline sessions on the same
+  curriculum, and show per-episode detail in one call
+  (`docs/childhood-runs.md`).
+- Workflow documented end-to-end in `docs/childhood-runs.md`: pretrain in
+  sim → eval gates → live fine-tune → review → next curriculum step.
+- Curriculum promotion automation is #43.
 
 ### Phase G: Attention, Modulation And Motivation
 

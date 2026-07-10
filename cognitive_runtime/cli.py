@@ -41,6 +41,7 @@ from cognitive_runtime.runtime.replay import NonDeterministicSessionError
 from cognitive_runtime.tools.episode_viewer import view_episode
 from cognitive_runtime.tools.metrics_dashboard import dashboard
 from cognitive_runtime.tools.replay_runner import format_results, replay_session
+from cognitive_runtime.tools.review import review_run
 from cognitive_runtime.training.datasets import build_dataset
 from cognitive_runtime.training.evaluation import compare_policies
 from cognitive_runtime.training.imitation import train_bc
@@ -341,8 +342,40 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
                              "a real-Minecraft client (remote; not yet implemented)")
 
 
+#: Online-learning policies whose model path needs a checkpoint-or-`--fresh`
+#: decision for live runs (issue #33).
+_CHECKPOINTED_POLICIES = {"online": "online_model", "actor-critic": "actor_critic_model"}
+
+
+def _enforce_live_run_protocol(args: argparse.Namespace) -> None:
+    """Issue #33 Phase F: every live (``--backend remote``) run must start
+    from a checkpoint bundle or explicitly opt out with ``--fresh``, and must
+    always record the session including frames -- childhood runs are only
+    reviewable if they were recorded, and interruption is only survivable if
+    training started from (and saves back to) a checkpoint."""
+    if args.backend != "remote":
+        return
+    if args.no_record:
+        sys.exit(
+            "live (--backend remote) runs must be recorded -- drop --no-record "
+            "(issue #33: recordings are how a childhood run gets reviewed)."
+        )
+    args.record_frames = True
+    model_attr = _CHECKPOINTED_POLICIES.get(args.policy)
+    if model_attr is None:
+        return
+    model_path = getattr(args, model_attr)
+    if not os.path.exists(model_path) and not args.fresh:
+        sys.exit(
+            f"live run: no checkpoint found at {model_path!r}. Pass --fresh to start "
+            "a new checkpoint there, or point the model flag at an existing one "
+            "(issue #33: live runs must start from a checkpoint or explicitly --fresh)."
+        )
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     _resolve_world_args(args)
+    _enforce_live_run_protocol(args)
     program_config = _program_config(args)
     program = MinecraftSurvivalBox(
         config=program_config, reward_config=_reward_config_for(args), backend=args.backend
@@ -776,6 +809,16 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
     print(dashboard(args.record_dir))
 
 
+def cmd_review(args: argparse.Namespace) -> None:
+    """Post-run review (issue #33): summarize a session, compare it against
+    baseline sessions on the same curriculum, and show per-episode detail --
+    the one command to run after a childhood run before deciding whether to
+    advance to the next curriculum step."""
+    print(review_run(
+        args.session, record_dir=args.record_dir, episode=args.episode, tail=args.tail
+    ))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cognitive_runtime", description="Continuous Cognitive Runtime (Minecraft MVP)"
@@ -818,6 +861,10 @@ def build_parser() -> argparse.ArgumentParser:
                        default=True, help="train the online Q model while running")
     p_run.add_argument("--no-online-train", dest="online_train", action="store_false",
                        help="run online Q in eval mode without mutating the model")
+    p_run.add_argument("--fresh", action="store_true",
+                       help="initialize online/actor-critic weights fresh even though no "
+                            "checkpoint exists yet at the model path; required for "
+                            "--backend remote with no existing checkpoint (issue #33)")
     p_run.add_argument("--actor-critic-model", default=DEFAULT_ACTOR_CRITIC_MODEL_OUT,
                        help="actor-critic checkpoint bundle path (.pt)")
     p_run.add_argument("--actor-critic-save-every", type=int, default=1000,
@@ -944,6 +991,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_dash = sub.add_parser("dashboard", help="aggregate metrics across all sessions")
     p_dash.add_argument("--record-dir", default="sessions")
     p_dash.set_defaults(func=cmd_dashboard)
+
+    p_review = sub.add_parser(
+        "review",
+        help="post-run review: summarize a session, compare it against baseline "
+             "sessions on the same curriculum, and show per-episode detail (issue #33)",
+    )
+    p_review.add_argument("--session", required=True,
+                          help="the run's session directory, e.g. sessions/<id>")
+    p_review.add_argument("--record-dir", default="sessions",
+                          help="directory to search for baseline sessions on the same curriculum")
+    p_review.add_argument("--episode", default=None,
+                          help="specific episode id to show in detail (default: the last "
+                               "--tail episodes)")
+    p_review.add_argument("--tail", type=int, default=3,
+                          help="number of most-recent episodes to show in detail")
+    p_review.set_defaults(func=cmd_review)
 
     return parser
 

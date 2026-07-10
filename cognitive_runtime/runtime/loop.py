@@ -40,7 +40,7 @@ from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.novelty import combine_novelty
 from cognitive_runtime.core.perception import State
 from cognitive_runtime.core.policy import Policy
-from cognitive_runtime.core.program import Program
+from cognitive_runtime.core.program import Program, RecoverableEpisodeError
 from cognitive_runtime.core.streams import (
     DEFAULT_STREAM_REGISTRY,
     MotorStreamBus,
@@ -77,6 +77,19 @@ NOVELTY_STREAM_SPEC = StreamSpec(
     "Combined novelty: world-model prediction error + entity-persistence "
     "surprise, averaged over whichever are available this tick.",
     payload_schema="{novelty, world_model_error, entity_surprise}",
+)
+
+#: The policy's own value estimate for the current fused state (issue #33
+#: Phase F: "record model-side streams ... so the viewer can show what the
+#: agent predicted vs what happened"), published whenever the policy exposes
+#: one (currently `ActorCriticPolicy.latest_decision.value_estimate`; other
+#: policies simply never publish it).
+VALUE_ESTIMATE_STREAM = "model.value_estimate"
+VALUE_ESTIMATE_STREAM_SPEC = StreamSpec(
+    VALUE_ESTIMATE_STREAM, "event",
+    "The policy's critic value estimate for the current fused state, when "
+    "the policy exposes one.",
+    payload_schema="{value_estimate}",
 )
 
 
@@ -152,6 +165,7 @@ class CognitiveRuntime:
         # rather than an environment sensor, registered directly so it can
         # still be published/recorded/replayed like any other stream.
         self.sensory_bus.register(NOVELTY_STREAM_SPEC)
+        self.sensory_bus.register(VALUE_ESTIMATE_STREAM_SPEC)
         self._stop_requested = False
 
     def stop(self) -> None:
@@ -231,14 +245,24 @@ class CognitiveRuntime:
         prediction_error_ticks = 0
         novelty_total = 0.0
         novelty_ticks = 0
+        recoverable_error: Optional[str] = None
 
         while not self._stop_requested:
             if ticks >= self.config.max_ticks_per_episode or self.program.is_complete():
                 break
             self.scheduler.wait_for_next_tick()
 
-            for _ in range(ratio):
-                self.program.step()
+            try:
+                for _ in range(ratio):
+                    self.program.step()
+            except RecoverableEpisodeError as exc:
+                # A live backend's connection died mid-episode (issue #33):
+                # end this episode instead of crashing the run.  The next
+                # episode's program.reset() reconnects (RemoteBridge.start()
+                # respawns a dead subprocess).
+                recoverable_error = str(exc)
+                self._checkpoint_online("bridge_error")
+                break
 
             # "What streams arrived since the last cognitive tick?"  Decision
             # latency is measured from here (window collection) to emission.
@@ -270,6 +294,15 @@ class CognitiveRuntime:
                     source="model",
                 )
             emissions = self.policy.emit(state, self.memory, prediction)
+            policy_decision = getattr(self.policy, "latest_decision", None)
+            value_estimate = getattr(policy_decision, "value_estimate", None)
+            if value_estimate is not None:
+                self.sensory_bus.publish(
+                    VALUE_ESTIMATE_STREAM,
+                    {"value_estimate": round(float(value_estimate), 6)},
+                    window.ended_at,
+                    source="model",
+                )
             latency_ms = (time.perf_counter() - decide_start) * 1000.0
             if self.policy.stop_requested:
                 self._stop_requested = True
@@ -329,9 +362,12 @@ class CognitiveRuntime:
             curriculum=self.config.curriculum,
             duration_ticks=ticks,
             total_reward=round(total_reward, 4),
-            success=bool(stats.get("success", not self.program.is_complete())),
-            termination_reason=str(
-                stats.get("termination_reason", "max_ticks" if ticks else "empty")
+            success=False if recoverable_error else bool(
+                stats.get("success", not self.program.is_complete())
+            ),
+            termination_reason=(
+                "bridge_error" if recoverable_error
+                else str(stats.get("termination_reason", "max_ticks" if ticks else "empty"))
             ),
             null_action_ticks=null_ticks,
             avg_latency_ms=round(latency_total_ms / ticks, 3) if ticks else 0.0,
@@ -353,7 +389,9 @@ class CognitiveRuntime:
             ),
             stream_overflow_counts=self.sensory_bus.overflow_counts(),
             stream_wallclock_rates=self.synchronizer.wall_clock_rates(),
-            program_stats=stats,
+            program_stats=(
+                {**stats, "recoverable_error": recoverable_error} if recoverable_error else stats
+            ),
             avg_risk=round(risk_total / ticks, 6) if ticks else 0.0,
             avg_prediction_error=(
                 round(prediction_error_total / prediction_error_ticks, 6)
@@ -366,7 +404,11 @@ class CognitiveRuntime:
         )
         self.recorder.write_summary(summary)
         self.recorder.end_episode_file()
-        self._end_online_episode()
+        # A recoverable-error episode already checkpointed with a reason that
+        # names the cause (`bridge_error`); don't mask it with the generic
+        # "episode_end" reason a normal episode close would write.
+        if not recoverable_error:
+            self._end_online_episode()
         return summary
 
     def _stream_rates(self, sim_elapsed: float) -> dict:

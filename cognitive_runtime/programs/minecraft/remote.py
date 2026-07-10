@@ -52,6 +52,7 @@ from typing import Any, Deque, Dict, List, Optional
 
 from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.observation import Observation
+from cognitive_runtime.core.program import RecoverableEpisodeError
 from cognitive_runtime.programs.minecraft.backend import SurvivalBackend
 from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
 from cognitive_runtime.programs.minecraft.world import pixels_from_frame
@@ -96,8 +97,13 @@ def connection_from_env() -> Dict[str, Any]:
     return conn
 
 
-class BridgeError(RuntimeError):
-    """A bridge subprocess failed, crashed, or returned an error response."""
+class BridgeError(RecoverableEpisodeError):
+    """A bridge subprocess failed, crashed, or returned an error response.
+
+    Recoverable at the episode level (issue #33): the runtime ends the
+    current episode and checkpoints rather than crashing the whole run --
+    ``RemoteBridge.start()`` respawns a dead subprocess on the next
+    ``reset()``, so the following episode can reconnect."""
 
 
 class RemoteBridge:
@@ -121,8 +127,12 @@ class RemoteBridge:
     # -- lifecycle ----------------------------------------------------------
 
     def start(self) -> None:
-        if self._proc is not None:
+        """Spawn the bridge subprocess, or a fresh one if the previous
+        process has died (issue #33 crash-resume: a live run's next
+        ``reset()`` reconnects instead of talking to a dead process)."""
+        if self._proc is not None and self._proc.poll() is None:
             return
+        self._proc = None
         try:
             self._proc = subprocess.Popen(
                 self.command,
