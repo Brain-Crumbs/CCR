@@ -388,10 +388,22 @@ to be byte-reproducible.)
 
 ### Phase E: Actor/Critic Policy — first cut landed
 
-- `MLPPolicyModel`/`MLPValueModel`/`ActorCriticOptimizer`, wired as
-  `--policy actor-critic` (#29), with a beats-random smoke acceptance.
-- The full evaluation gates against random/scripted/linear-Q are issue #31;
-  the statistical harness is #44; training moves off the tick thread in #37.
+- Add neural online policy. Landed: `MLPPolicyModel`/`MLPValueModel`/
+  `ActorCriticOptimizer` (`cognitive_runtime/neural/`), wired to the runtime
+  as `--policy actor-critic` (`cognitive_runtime/policies/actor_critic.py`).
+- Train in simulation first. Landed: a smoke acceptance run
+  (`cognitive_runtime/training/actor_critic_acceptance.py`) checks it beats
+  random on identical seeds.
+- Evaluate against random/scripted/linear Q. Landed (issue #31): the
+  evaluation-gate harness `cognitive_runtime/training/evaluation_gates.py`, wired
+  as `python -m cognitive_runtime evaluation-gates`. It trains the actor/critic
+  *and* the linear online-Q baseline in simulation, evaluates both plus
+  scripted and random with no mutation on identical seeds, and reports three
+  gates: (1) actor/critic > random (hard requirement), (2) actor/critic >
+  linear Q (unlocks deprecating `OnlineQ*` as primary), (3) reproducible
+  improvement across reruns with the same seeds. Recorded eval sessions feed
+  the existing dashboard; the gate report is written into the checkpoint
+  bundle's training stats.
 - Only then run live Mineflayer fine-tuning (issue #33).
 
 ### Phase F: Live Childhood Runs
