@@ -84,6 +84,7 @@ _DASHBOARD_COLUMNS = [
     "success_rate", "avg_total_reward", "reward_per_minute", "avg_food_consumed",
     "avg_unique_items", "avg_blocks_placed", "null_action_rate",
     "avg_max_distance", "avg_decision_latency_ms", "stream_events_per_sec",
+    "avg_risk", "avg_prediction_error",
 ]
 
 

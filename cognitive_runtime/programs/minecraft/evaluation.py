@@ -64,6 +64,13 @@ def summarize_episodes(summaries: List[EpisodeSummary]) -> Dict[str, Any]:
             3,
         ),
         "success_rate": round(_mean([1.0 if s.success else 0.0 for s in summaries]), 3),
+        # World-model prediction health (issue #26).
+        "avg_risk": round(_mean([s.avg_risk for s in summaries]), 4),
+        "avg_prediction_error": (
+            round(_mean([s.avg_prediction_error for s in summaries if s.avg_prediction_error is not None]), 4)
+            if any(s.avg_prediction_error is not None for s in summaries)
+            else None
+        ),
         # Runtime health.
         "avg_decision_latency_ms": round(_mean([s.avg_latency_ms for s in summaries]), 3),
         "avg_ticks_per_second": round(_mean([s.ticks_per_second for s in summaries]), 1),

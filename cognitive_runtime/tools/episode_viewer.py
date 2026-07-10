@@ -33,6 +33,7 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
             "policy_name", "seed", "duration_ticks", "total_reward", "success",
             "termination_reason", "null_action_ticks", "avg_latency_ms",
             "ticks_per_second", "program_ticks_per_cognitive_tick",
+            "avg_risk", "avg_prediction_error",
         ):
             lines.append(f"  {key}: {summary.get(key)}")
         program_stats = summary.get("program_stats") or {}
@@ -91,10 +92,16 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
                 hunger = record.get("payload")
         action = _motor_label(motor)
         action_counts[action] = action_counts.get(action, 0) + 1
-        recent.append(
+        line = (
             f"    tick {decision.get('tick_index')}: action={action} "
-            f"reward={decision.get('reward_window_total')} hp={health} food={hunger}"
+            f"reward={decision.get('reward_window_total')} hp={health} food={hunger} "
+            f"risk={decision.get('risk', 0.0)}"
         )
+        if decision.get("p_death") is not None:
+            line += f" p_death={decision.get('p_death')}"
+        if decision.get("prediction_error") is not None:
+            line += f" pred_error={decision.get('prediction_error')}"
+        recent.append(line)
 
     lines.append("  action distribution:")
     for name, count in sorted(action_counts.items(), key=lambda kv: -kv[1]):

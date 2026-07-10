@@ -66,6 +66,15 @@ class DecisionRecord:
     policy_name: str
     latency_ms: float
     reward_window_total: float
+    # World-model prediction for this tick (issue #26): `risk` is always the
+    # `TrendWorldModel` heuristic 0..1 unless a learned bridge (e.g.
+    # `NeuralWorldModel`) supplied the additive Phase-D fields, in which case
+    # they carry the learned p_death/prediction_error too.  `None` for every
+    # session recorded before this field existed and for the heuristic's
+    # unset additive fields.
+    risk: float = 0.0
+    p_death: Optional[float] = None
+    prediction_error: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -106,6 +115,12 @@ class EpisodeSummary:
     stream_overflow_counts: Dict[str, Any] = field(default_factory=dict)
     stream_wallclock_rates: Dict[str, float] = field(default_factory=dict)
     program_stats: Dict[str, Any] = field(default_factory=dict)
+    # World-model prediction health (issue #26), averaged over the episode's
+    # decisions; `avg_prediction_error` is `None` when no decision this
+    # episode carried one (the heuristic `TrendWorldModel`, or episodes
+    # recorded before this field existed).
+    avg_risk: float = 0.0
+    avg_prediction_error: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

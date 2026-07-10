@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.perception import State
@@ -25,6 +25,15 @@ VITAL_STREAMS: List[str] = ["body.health", "body.hunger", "body.oxygen"]
 class Prediction:
     expected_features: Dict[str, float] = field(default_factory=dict)
     risk: float = 0.0  # heuristic 0..1: how quickly things are getting worse
+    # Additive Phase-D fields (issue #26): populated by a learned WorldModel
+    # bridge, `None` for the heuristic `TrendWorldModel` and any older caller
+    # that never set them.  Kept optional so `TrendWorldModel`/`Prediction()`
+    # callers throughout the codebase (and every recorded session so far)
+    # stay valid without touching the loop or existing policies.
+    p_death: Optional[float] = None
+    predicted_reward: Optional[float] = None
+    next_latent: Optional[List[float]] = None
+    prediction_error: Optional[float] = None
 
 
 class WorldModel(abc.ABC):
