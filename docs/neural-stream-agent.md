@@ -428,6 +428,37 @@ to be byte-reproducible.)
   sim → eval gates → live fine-tune → review → next curriculum step.
 - Curriculum promotion automation is #43.
 
+### Async Actor/Learner Split — landed (issue #37)
+
+Continuous training must never block the realtime tick. Neural gradient
+steps don't fit in a tick budget, so the synchronous in-tick
+`ActorCriticLearner` (Phase E) now has an actor/learner-split counterpart:
+
+- `cognitive_runtime/neural/experience_queue.py`'s `SharedExperienceRing`:
+  a bounded shared-memory ring of transitions the actor pushes to every
+  tick (O(1), never blocks) and a separate trainer process drains in
+  batches. Backpressure is drop-oldest.
+- `cognitive_runtime/neural/weight_publisher.py`'s `WeightPublisher`/
+  `WeightSubscriber`: the trainer publishes versioned checkpoint snapshots;
+  the actor polls and hot-swaps them into its live policy/critic modules
+  in place, between ticks.
+- `cognitive_runtime/training/async_trainer.py`'s `AsyncTrainer`: the
+  learner side -- optimizer, replay buffer, checkpoint ownership. The same
+  `ReplayBuffer` is fed from a live ring and/or `load_session_into_buffer`
+  recorded sessions (issue #28), so live training and offline pretraining
+  are the same code path with different source mixes.
+  `spawn_trainer_process`/`TrainerSupervisor` run it in a real OS process
+  (not a thread -- the GIL), isolated so a trainer crash never kills the
+  actor; a restarted trainer resumes from the last published checkpoint.
+- `cognitive_runtime.policies.actor_critic.AsyncActorCriticLearner`: the
+  actor side. Requires zero changes to `runtime/loop.py` -- it satisfies
+  the same `Learner` contract `ActorCriticLearner` does, but only captures
+  data and polls for new weights instead of taking gradient steps inline.
+- CLI: `ccr run --policy actor-critic --async-trainer` wires the split for
+  a live run; `ccr trainer --sessions ... --out ...` runs an `AsyncTrainer`
+  to completion in the foreground, pointed only at recorded sessions with
+  no live actor, for offline pretraining.
+
 ### Phase G: Attention, Modulation And Motivation
 
 The follow-up roadmap (2026-07), in dependency order:

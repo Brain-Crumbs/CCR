@@ -46,6 +46,7 @@ from cognitive_runtime.core.streams.synchronizer import TickWindow
 from cognitive_runtime.core.world_model import Prediction
 from cognitive_runtime.models.online_q import motor_history_features_for_actions
 from cognitive_runtime.neural.checkpoint import NeuralAgentCheckpoint
+from cognitive_runtime.neural.experience_queue import SharedExperienceRing
 from cognitive_runtime.neural.optimizer import ActorCriticOptimizer
 from cognitive_runtime.neural.policy import PolicyModel
 from cognitive_runtime.neural.replay_buffer import (
@@ -54,6 +55,7 @@ from cognitive_runtime.neural.replay_buffer import (
     Transition,
 )
 from cognitive_runtime.neural.value import ValueModel
+from cognitive_runtime.neural.weight_publisher import WeightSubscriber
 
 WORLD_FEATURE_BASE_WIDTH = 4  # [risk, p_death, predicted_reward, prediction_error]
 
@@ -411,3 +413,113 @@ class ActorCriticLearner(Learner):
             and self.optimizer.step_count % self.save_every_ticks == 0
         ):
             self.save(reason=reason)
+
+
+class AsyncActorCriticLearner(Learner):
+    """The actor-side half of the async actor/learner split (issue #37):
+    "the live loop only does inference and data capture; training happens
+    asynchronously in batches" -- unlike :class:`ActorCriticLearner`, this
+    learner never calls ``optimizer.step``.  Every tick it does exactly two
+    O(1), non-blocking things:
+
+    1. Pushes the just-completed transition into ``experience_ring`` (a
+       :class:`~cognitive_runtime.neural.experience_queue.SharedExperienceRing`)
+       for a separate trainer process to consume on its own schedule.
+       Backpressure is drop-oldest and lives inside the ring itself -- this
+       call never blocks regardless of whether a trainer is running.
+    2. Polls ``weight_subscriber`` (a
+       :class:`~cognitive_runtime.neural.weight_publisher.WeightSubscriber`)
+       for a newer published snapshot and, if one exists, hot-swaps it into
+       the *same* policy/critic module objects the attached
+       :class:`ActorCriticPolicy` already uses for inference -- "the actor
+       swaps them in atomically between ticks": the loop calls
+       ``learner.update(window)`` immediately after ``policy.emit()`` and
+       before the next tick's ``policy.emit()``, so this is exactly between
+       ticks. A missing/stale/crashed trainer just means the poll finds
+       nothing new; the actor keeps acting on its last weights.
+
+    Plugs into the existing ``Learner`` contract, so ``runtime/loop.py``
+    needs no changes to run this instead of the synchronous
+    :class:`ActorCriticLearner`.
+    """
+
+    def __init__(
+        self,
+        policy: ActorCriticPolicy,
+        experience_ring: SharedExperienceRing,
+        *,
+        weight_subscriber: Optional[WeightSubscriber] = None,
+        reload_every_ticks: int = 1,
+    ):
+        self.policy = policy
+        self.experience_ring = experience_ring
+        self.weight_subscriber = weight_subscriber
+        self.reload_every_ticks = max(1, reload_every_ticks)
+
+        self.total_reward = 0.0
+        self.episode_reward = 0.0
+        self.observed_ticks = 0
+        self.pushed_count = 0
+        self.skipped_updates = 0
+        self._previous_decision: Optional[ActorCriticDecision] = None
+        self._tick = 0
+
+    def reset(self) -> None:
+        self.episode_reward = 0.0
+        self._previous_decision = None
+
+    def update(self, window: TickWindow) -> None:
+        reward = window_reward(window)
+        self.total_reward += reward
+        self.episode_reward += reward
+        self.observed_ticks += 1
+
+        current = self.policy.latest_decision
+        if current is None:
+            self.skipped_updates += 1
+        else:
+            if self._previous_decision is not None:
+                self.experience_ring.push(Transition(
+                    latent=self._previous_decision.fused_latent,
+                    action=self._previous_decision.action_index,
+                    reward=reward,
+                    next_latent=current.fused_latent,
+                    done=False,
+                ))
+                self.pushed_count += 1
+            self._previous_decision = current
+
+        self._tick += 1
+        if self.weight_subscriber is not None and self._tick % self.reload_every_ticks == 0:
+            self.weight_subscriber.maybe_reload()
+
+    def model_metadata(self) -> Dict[str, Any]:
+        return self.policy.model_metadata()
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "mode": "async-actor",
+            "reward_total": round(self.total_reward, 6),
+            "episode_reward": round(self.episode_reward, 6),
+            "observed_ticks": self.observed_ticks,
+            "pushed_transitions": self.pushed_count,
+            "skipped_updates": self.skipped_updates,
+            "experience_ring": self.experience_ring.stats().__dict__,
+            "weight_subscriber": (
+                self.weight_subscriber.stats() if self.weight_subscriber else None
+            ),
+        }
+
+    def checkpoint_metadata(self) -> Dict[str, Any]:
+        return {"format": "async-actor-critic-v1", "stats": self.stats()}
+
+    def checkpoint(self, reason: str = "manual") -> None:
+        # Checkpoint ownership belongs to the trainer process (issue #20 /
+        # #37's "the trainer owns checkpoint writes; the actor only ever
+        # loads"); the loop still calls this hook on shutdown/crash
+        # (`CognitiveRuntime._checkpoint_online`), so it must exist, but the
+        # actor has nothing of its own to persist.
+        pass
+
+    def end_episode(self) -> None:
+        pass
