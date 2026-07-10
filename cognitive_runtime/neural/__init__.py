@@ -69,7 +69,7 @@ from cognitive_runtime.neural.fusion import (
 from cognitive_runtime.neural.optimizer import OnlineOptimizer
 from cognitive_runtime.neural.policy import PolicyModel
 from cognitive_runtime.neural.value import ValueModel
-from cognitive_runtime.neural.world_model import WorldModel, WorldModelOutput
+from cognitive_runtime.neural.world_model import MLPWorldModel, WorldModel, WorldModelOutput
 from cognitive_runtime.neural.checkpoint import (
     FORMAT_VERSION as NEURAL_CHECKPOINT_FORMAT,
     CheckpointCompatibilityError,
@@ -103,6 +103,7 @@ __all__ = [
     "latent_fusion_inputs_from_buffer",
     "WorldModel",
     "WorldModelOutput",
+    "MLPWorldModel",
     "PolicyModel",
     "ValueModel",
     "OnlineOptimizer",

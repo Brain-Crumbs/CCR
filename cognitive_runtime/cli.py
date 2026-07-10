@@ -120,6 +120,27 @@ def _make_policy(name: str, args: argparse.Namespace) -> Policy:
     sys.exit(f"unknown policy: {name}")
 
 
+def _make_world_model(args: argparse.Namespace, program: MinecraftSurvivalBox):
+    """The heuristic default (`None`, `TrendWorldModel`), or a trained neural
+    world-model checkpoint bridged behind the same `world_model` seam
+    (issue #26); `--world-model` is unset unless the caller opts in."""
+    path = getattr(args, "world_model", None)
+    if not path:
+        return None
+    try:
+        from cognitive_runtime.policies.neural_world_model import NeuralWorldModel
+    except ImportError as exc:  # torch not installed
+        sys.exit(f"the neural world model needs PyTorch ({exc}); install '.[neural]'.")
+    action_keys = [action.key() for action in program.metadata().action_space]
+    return NeuralWorldModel(path, action_keys=action_keys)
+
+
+def _add_world_model_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--world-model", default=None,
+                        help="path to a trained neural world-model checkpoint (.pt bundle, "
+                             "--model-type world-model); default: the heuristic TrendWorldModel")
+
+
 def _make_online_policy_and_learner(
     args: argparse.Namespace, program: MinecraftSurvivalBox
 ) -> tuple[OnlineQPolicy, OnlineQLearner]:
@@ -205,6 +226,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         policy, learner = _make_online_policy_and_learner(args, program)
     else:
         policy = _make_policy(args.policy, args)
+    world_model = _make_world_model(args, program)
     config = RuntimeConfig(
         tick_rate=args.tick_rate,
         realtime=args.realtime,
@@ -227,6 +249,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         policy=policy,
         config=config,
         learner=learner,
+        world_model=world_model,
         stream_registry=MINECRAFT_STREAM_REGISTRY,
     )
     summaries = runtime.run()
@@ -290,6 +313,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         return
     if args.model_type == "fusion":
         _train_latent_fusion(args)
+        return
+    if args.model_type == "world-model":
+        _train_world_model(args)
         return
     dataset = build_dataset(
         args.sessions,
@@ -451,6 +477,63 @@ def _train_latent_fusion(args: argparse.Namespace) -> None:
     print(f"checkpoint bundle saved to {out}")
 
 
+def _train_world_model(args: argparse.Namespace) -> None:
+    """Offline Phase-D action-conditioned world-model training (issue #26)."""
+    try:
+        from cognitive_runtime.training.datasets import build_world_model_dataset
+        from cognitive_runtime.training.world_model import (
+            WorldModelTrainingConfig,
+            death_prediction_auc,
+            save_world_model_checkpoint,
+            train_world_model,
+        )
+    except ImportError as exc:  # torch not installed
+        sys.exit(
+            f"world-model training needs PyTorch ({exc}). Install it with "
+            "'pip install -e .[neural]'."
+        )
+    dataset = build_world_model_dataset(
+        args.sessions,
+        max_samples=args.max_samples,
+        min_episode_reward=args.min_reward,
+    )
+    if len(dataset) == 0:
+        sys.exit("no world-model training samples found (were the sessions recorded as streams-v2?)")
+    print(
+        f"dataset: {len(dataset)} transitions ({dataset.death_count()} death-preceding) "
+        f"from {len(dataset.sources)} episodes (dim={len(dataset.feature_names)})"
+    )
+    config = WorldModelTrainingConfig(
+        epochs=args.epochs,
+        lr=args.neural_lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        hidden_dim=args.hidden_dim,
+        depth=args.fusion_depth,
+        dropout=args.fusion_dropout,
+    )
+    model, stats = train_world_model(dataset, config)
+    out = args.out if args.out != DEFAULT_MODEL_OUT else "models/world_model.pt"
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    save_world_model_checkpoint(out, model, dataset, stats)
+    for key in (
+        "final_next_latent_loss",
+        "final_reward_loss",
+        "final_death_loss",
+        "final_risk_loss",
+        "final_prediction_error_loss",
+        "final_total_loss",
+    ):
+        print(f"  {key}: {stats[key]}")
+    if dataset.death_count() > 0:
+        try:
+            auc = death_prediction_auc(model, dataset)
+            print(f"  death_prediction_auc (in-sample): {round(auc, 4)}")
+        except ValueError as exc:
+            print(f"  death_prediction_auc: skipped ({exc})")
+    print(f"checkpoint bundle saved to {out}")
+
+
 def cmd_replay(args: argparse.Namespace) -> None:
     try:
         results = replay_session(args.session, episode_id=args.episode, verify=not args.no_verify)
@@ -512,6 +595,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--no-online-train", dest="online_train", action="store_false",
                        help="run online Q in eval mode without mutating the model")
     _add_world_args(p_run)
+    _add_world_model_arg(p_run)
     p_run.set_defaults(func=cmd_run)
 
     p_demo = sub.add_parser("demo", help="play SurvivalBox yourself; recorded as demonstrations")
@@ -520,6 +604,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_demo.add_argument("--record-dir", default="sessions")
     p_demo.add_argument("--session-id", default=None)
     _add_world_args(p_demo)
+    _add_world_model_arg(p_demo)
     p_demo.set_defaults(func=cmd_demo)
 
     p_eval = sub.add_parser("evaluate", help="compare policies on identical episodes")
@@ -533,10 +618,11 @@ def build_parser() -> argparse.ArgumentParser:
                          help="session directories (e.g. sessions/20260101-...-scripted)")
     p_train.add_argument("--out", default=DEFAULT_MODEL_OUT,
                          help="output path; neural models default to models/vision_bc.pt")
-    p_train.add_argument("--model-type", choices=["linear", "neural", "pixel-encoder", "fusion"],
+    p_train.add_argument("--model-type",
+                         choices=["linear", "neural", "pixel-encoder", "fusion", "world-model"],
                          default="linear",
                          help="linear softmax head (default), pixel BC, pixel encoder pretrain, "
-                              "or learned latent fusion")
+                              "learned latent fusion, or the action-conditioned world model")
     p_train.add_argument("--epochs", type=int, default=10)
     p_train.add_argument("--lr", type=float, default=0.5, help="linear-model learning rate")
     p_train.add_argument("--neural-lr", type=float, default=1e-3, help="neural-model learning rate")

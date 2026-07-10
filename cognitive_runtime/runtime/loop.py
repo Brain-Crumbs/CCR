@@ -201,6 +201,9 @@ class CognitiveRuntime:
         motor_emissions = 0
         ticks = 0
         last_timestamp = 0.0
+        risk_total = 0.0
+        prediction_error_total = 0.0
+        prediction_error_ticks = 0
 
         while not self._stop_requested:
             if ticks >= self.config.max_ticks_per_episode or self.program.is_complete():
@@ -245,6 +248,10 @@ class CognitiveRuntime:
             if not emissions:
                 null_ticks += 1
             ticks += 1
+            risk_total += prediction.risk
+            if prediction.prediction_error is not None:
+                prediction_error_total += prediction.prediction_error
+                prediction_error_ticks += 1
 
             self.recorder.write_cognitive_tick(
                 sensory_events=window.events,
@@ -259,6 +266,15 @@ class CognitiveRuntime:
                     policy_name=self.policy.name,
                     latency_ms=round(latency_ms, 3),
                     reward_window_total=round(reward_value, 6),
+                    risk=round(prediction.risk, 6),
+                    p_death=(
+                        round(prediction.p_death, 6) if prediction.p_death is not None else None
+                    ),
+                    prediction_error=(
+                        round(prediction.prediction_error, 6)
+                        if prediction.prediction_error is not None
+                        else None
+                    ),
                 ),
             )
 
@@ -296,6 +312,12 @@ class CognitiveRuntime:
             stream_overflow_counts=self.sensory_bus.overflow_counts(),
             stream_wallclock_rates=self.synchronizer.wall_clock_rates(),
             program_stats=stats,
+            avg_risk=round(risk_total / ticks, 6) if ticks else 0.0,
+            avg_prediction_error=(
+                round(prediction_error_total / prediction_error_ticks, 6)
+                if prediction_error_ticks
+                else None
+            ),
         )
         self.recorder.write_summary(summary)
         self.recorder.end_episode_file()

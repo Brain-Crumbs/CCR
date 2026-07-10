@@ -307,6 +307,7 @@ def build_latent_fusion_dataset(
 NEURAL_PIXELS = "neural_pixels"
 PIXEL_SEQUENCES = "pixel_sequences"
 LATENT_FUSION = "latent_fusion"
+WORLD_MODEL = "world_model"
 
 
 def _non_vision_fusion(metadata: Dict[str, Any]) -> TemporalFusion:
@@ -393,6 +394,149 @@ class LatentFusionDataset:
             key = self.action_keys[label]
             counts[key] = counts.get(key, 0) + 1
         return counts
+
+
+@dataclass
+class WorldModelDataset:
+    """Recorded-session samples for the action-conditioned neural world model
+    (Phase D, issue #26).
+
+    Each sample is one ``(fused_latent_t, action_t) -> (fused_latent_{t+1},
+    reward_{t+1}, died_{t+1}, risk_{t+1})`` transition, using the same
+    deterministic ``TemporalFusion`` vector the runtime loop already computes
+    each tick (``memory.fused_latent()``) -- not the learned
+    ``LatentFusionModel`` -- so the bridge into the loop needs no new plumbing.
+
+    ``rewards``/``dones``/``risks`` are read off the *next* tick's decision
+    record and sensory events, since that is the tick whose state and
+    ``reward.scalar``/``event.died``/``event.damage_taken`` streams are the
+    causal consequence of ``labels[i]`` applied from ``latents[i]`` (the
+    runtime drains the motor bus for tick ``t``'s action during the physics
+    steps leading into tick ``t+1``'s sensory window).
+    """
+
+    latents: List[List[float]] = field(default_factory=list)
+    next_latents: List[List[float]] = field(default_factory=list)
+    labels: List[int] = field(default_factory=list)
+    rewards: List[float] = field(default_factory=list)
+    dones: List[float] = field(default_factory=list)
+    risks: List[float] = field(default_factory=list)
+    action_keys: List[str] = field(default_factory=lambda: list(ACTION_KEYS))
+    feature_names: List[str] = field(default_factory=list)
+    layout_hash: Optional[str] = None
+    sources: List[str] = field(default_factory=list)
+    representation: str = WORLD_MODEL
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def label_counts(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for label in self.labels:
+            key = self.action_keys[label]
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def death_count(self) -> int:
+        return sum(1 for d in self.dones if d >= 0.5)
+
+
+def build_world_model_dataset(
+    session_dirs: List[str],
+    max_samples: Optional[int] = None,
+    min_episode_reward: Optional[float] = None,
+) -> WorldModelDataset:
+    """Walk recorded sessions and emit action-conditioned world-model samples.
+
+    Ticks with an empty (``NULL``) motor window are dropped, same as the
+    other latent dataset builders, so a sample pair may skip a few raw ticks;
+    ``labels[i]`` is always the action that was actually taken between
+    ``latents[i]`` and ``next_latents[i]``.
+    """
+
+    dataset = WorldModelDataset()
+    key_to_label = {key: i for i, key in enumerate(ACTION_KEYS)}
+    fusion: Optional[TemporalFusion] = None
+    elided_layout_streams: set = set()
+
+    for session_dir in session_dirs:
+        if not os.path.isdir(session_dir):
+            raise FileNotFoundError(f"session directory not found: {session_dir}")
+        metadata = load_session_metadata(session_dir)
+        require_streams_v2(metadata)
+        session_fusion = TemporalFusion(_catalog(metadata))
+        if fusion is None:
+            fusion = session_fusion
+            dataset.layout_hash = fusion.layout_hash
+            dataset.feature_names = list(fusion.feature_names())
+        elif session_fusion.layout_hash != fusion.layout_hash:
+            raise ValueError(
+                f"session {session_dir} has an incompatible stream catalog "
+                f"({session_fusion.layout_hash} vs {fusion.layout_hash}); train on "
+                "sessions recorded with the same program config"
+            )
+
+        frame_store = open_frame_store(session_dir)
+        for episode_id in list_episodes(session_dir):
+            buffer = TemporalBuffer()
+            reward_total = 0.0
+            episode_samples: List[Tuple[List[float], int, float, bool, bool]] = []
+            for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
+                reward = float(decision.get("reward_window_total", 0.0))
+                reward_total += reward
+                died = False
+                damaged = False
+                for record in sensory:
+                    stream_id = record.get("stream_id", "")
+                    if stream_id == "event.died":
+                        died = True
+                    elif stream_id == "event.damage_taken":
+                        damaged = True
+                    if record.get("elided"):
+                        if fusion is not None and any(
+                            e.stream_id == stream_id for e in fusion.layout
+                        ):
+                            elided_layout_streams.add(stream_id)
+                        continue
+                    buffer.append(stream_event_from_log(record, frame_store=frame_store))
+                label_key = _motor_label(motor)
+                if label_key in key_to_label:
+                    assert fusion is not None
+                    latent = fusion.fuse(None, buffer).vector
+                    episode_samples.append(
+                        (latent, key_to_label[label_key], reward, died, damaged)
+                    )
+            if min_episode_reward is not None and reward_total < min_episode_reward:
+                continue
+            for current, nxt in zip(episode_samples, episode_samples[1:]):
+                latent, label, _reward, _died, _damaged = current
+                next_latent, _next_label, next_reward, next_died, next_damaged = nxt
+                dataset.latents.append(latent)
+                dataset.next_latents.append(next_latent)
+                dataset.labels.append(label)
+                dataset.rewards.append(next_reward)
+                dataset.dones.append(1.0 if next_died else 0.0)
+                dataset.risks.append(1.0 if (next_died or next_damaged) else 0.0)
+                if max_samples is not None and len(dataset) >= max_samples:
+                    dataset.sources.append(f"{session_dir}/{episode_id} (truncated)")
+                    if frame_store is not None:
+                        frame_store.close()
+                    return dataset
+            if len(episode_samples) >= 2:
+                dataset.sources.append(f"{session_dir}/{episode_id}")
+        if frame_store is not None:
+            frame_store.close()
+
+    if elided_layout_streams:
+        print(
+            "warning: these streams were recorded hash-only (payload elided) and "
+            "contribute nothing to the world-model input this tick: "
+            + ", ".join(sorted(elided_layout_streams))
+            + " -- record training sessions with --record-frames / --record-streams "
+            "to include them",
+            file=sys.stderr,
+        )
+    return dataset
 
 
 def _pixel_shape_from_catalog(metadata: Dict[str, Any]) -> Optional[Tuple[int, int, int]]:
