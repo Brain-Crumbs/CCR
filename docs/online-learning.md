@@ -1,13 +1,16 @@
 # Online Learning And Modular Streams
 
-CCR's first online learner is still intentionally small: a dependency-free
-linear Q model over the existing fused latent vector.  The neural modular path
-is represented by module interfaces plus a checkpoint bundle format, not yet
-as a behavior change.
+CCR's first online learner is intentionally small: a dependency-free linear
+Q model over the existing fused latent vector.  The neural path now also has
+a first behavioral cut — an MLP actor/critic behind `--policy actor-critic`
+(issue #29) — though it still consumes the fixed fused latent rather than
+learned fusion (issue #57).
 
 The linear Q learner is a **baseline**, not the target.  The end-state — a
-neural, stream-native agent with trainable encoders, learned fusion, a world
-model, and an actor/critic policy — is specified in
+neural, stream-native agent with trainable encoders, budgeted attention,
+learned fusion, a multi-horizon world model, internal modulation streams,
+and an actor/critic policy driven by both extrinsic reward and a
+"safe surprise" intrinsic drive — is specified in
 [neural-stream-agent.md](neural-stream-agent.md).
 
 ## Trainable Stream Modules
@@ -36,13 +39,22 @@ The intended upgrade path is incremental:
 
 1. Keep fixed stream encoders as the regression baseline.
 2. Replace selected streams with trainable encoders that expose the same fixed
-   slice width and checkpoint hooks.
+   slice width and checkpoint hooks (landed, #24).
 3. Add learned fusion over per-stream slices while preserving layout/version
-   checks for saved models.
+   checks for saved models (module landed, #25; live wiring is #57).
 4. Add a learned world model that predicts next latent state, expected reward,
-   terminal/death probability, risk, and prediction error.
+   terminal/death probability, risk, and prediction error (first cut landed,
+   #26; multi-horizon generative version with uncertainty is #39).
 5. Use those predictions as inputs to an actor/critic policy, keeping the
-   linear online Q learner as the baseline and smoke-test target.
+   linear online Q learner as the baseline and smoke-test target (first cut
+   landed, #29; evaluation gates are #31).
+6. Publish internal modulation signals (prediction error, reward prediction
+   error, learning progress, novelty, risk) as `internal.*` streams (#58).
+7. Add the budgeted attention controller between memory and fusion, with a
+   recorded per-tick `AttentionState` (#59) and the orienting reflex (#60).
+8. Move gradient steps off the tick thread via the async actor/learner split
+   (#37), and add the risk-gated surprise intrinsic drive through the reward
+   profile schema (#41, #61).
 
 ## Simulated Pretraining
 
