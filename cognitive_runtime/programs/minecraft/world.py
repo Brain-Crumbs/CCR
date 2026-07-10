@@ -771,16 +771,43 @@ class SimulatedWorld:
         """
         return pixels_from_frame(self.render_frame(radius), scale)
 
+    def _has_line_of_sight(self, x0: float, z0: float, x1: float, z1: float) -> bool:
+        """True when no SOLID cell lies strictly between the two points.
+
+        A coarse raycast on the terrain grid, sampled roughly every half
+        cell -- the sim's stand-in for a real backend's occlusion check, so
+        a mob standing behind a wall stops appearing in ``vision.entities``
+        instead of always being "visible" purely by distance (issue #27:
+        object permanence needs entities that can actually go out of view).
+        """
+        distance = math.hypot(x1 - x0, z1 - z0)
+        if distance <= 0:
+            return True
+        steps = max(1, int(distance * 2))
+        for i in range(1, steps):
+            t = i / steps
+            if self.cell(x0 + (x1 - x0) * t, z0 + (z1 - z0) * t) in SOLID:
+                return False
+        return True
+
     def mob_summary(self, limit: int = 4) -> List[Dict[str, float]]:
+        """Visible mobs, nearest first: id + distance/angle, occluded ones
+        dropped by ``_has_line_of_sight``.  The stable ``id`` (assigned once
+        at spawn, see ``_spawn_zombie``) is what lets a consumer track one
+        mob's identity across an occlusion gap instead of only ever seeing
+        an anonymous nearest-mob blob.
+        """
         fx, fz = self._facing_vector()
         facing_deg = math.degrees(math.atan2(-fx, fz))
         out = []
         for mob in self.mobs:
+            if not self._has_line_of_sight(self.x, self.z, mob["x"], mob["z"]):
+                continue
             vx, vz = mob["x"] - self.x, mob["z"] - self.z
             dist = math.hypot(vx, vz)
             bearing = math.degrees(math.atan2(-vx, vz))
             rel = (bearing - facing_deg + 180.0) % 360.0 - 180.0
-            out.append({"distance": round(dist, 2), "angle": round(rel, 1)})
+            out.append({"id": mob["id"], "distance": round(dist, 2), "angle": round(rel, 1)})
         out.sort(key=lambda m: m["distance"])
         return out[:limit]
 

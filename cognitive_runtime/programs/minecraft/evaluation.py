@@ -71,6 +71,11 @@ def summarize_episodes(summaries: List[EpisodeSummary]) -> Dict[str, Any]:
             if any(s.avg_prediction_error is not None for s in summaries)
             else None
         ),
+        "avg_novelty": (
+            round(_mean([s.avg_novelty for s in summaries if s.avg_novelty is not None]), 4)
+            if any(s.avg_novelty is not None for s in summaries)
+            else None
+        ),
         # Runtime health.
         "avg_decision_latency_ms": round(_mean([s.avg_latency_ms for s in summaries]), 3),
         "avg_ticks_per_second": round(_mean([s.ticks_per_second for s in summaries]), 1),

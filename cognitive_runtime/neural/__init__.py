@@ -70,6 +70,13 @@ from cognitive_runtime.neural.optimizer import OnlineOptimizer
 from cognitive_runtime.neural.policy import PolicyModel
 from cognitive_runtime.neural.value import ValueModel
 from cognitive_runtime.neural.world_model import MLPWorldModel, WorldModel, WorldModelOutput
+from cognitive_runtime.neural.entity_persistence import (
+    DEFAULT_GAP_CAP_TICKS,
+    ENTITY_PERSISTENCE_CHECKPOINT_KEY,
+    EntityPersistenceModel,
+    EntityPersistenceOutput,
+    normalize_gap,
+)
 from cognitive_runtime.neural.checkpoint import (
     FORMAT_VERSION as NEURAL_CHECKPOINT_FORMAT,
     CheckpointCompatibilityError,
@@ -104,6 +111,11 @@ __all__ = [
     "WorldModel",
     "WorldModelOutput",
     "MLPWorldModel",
+    "EntityPersistenceModel",
+    "EntityPersistenceOutput",
+    "ENTITY_PERSISTENCE_CHECKPOINT_KEY",
+    "DEFAULT_GAP_CAP_TICKS",
+    "normalize_gap",
     "PolicyModel",
     "ValueModel",
     "OnlineOptimizer",

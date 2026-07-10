@@ -141,6 +141,26 @@ def _add_world_model_arg(parser: argparse.ArgumentParser) -> None:
                              "--model-type world-model); default: the heuristic TrendWorldModel")
 
 
+def _make_entity_persistence(args: argparse.Namespace):
+    """`None` (no entity-persistence surprise contribution to novelty) unless
+    `--entity-persistence` opts into a trained checkpoint (issue #27)."""
+    path = getattr(args, "entity_persistence", None)
+    if not path:
+        return None
+    try:
+        from cognitive_runtime.policies.neural_entity_persistence import NeuralEntityPersistence
+    except ImportError as exc:  # torch not installed
+        sys.exit(f"the neural entity-persistence model needs PyTorch ({exc}); install '.[neural]'.")
+    return NeuralEntityPersistence(path)
+
+
+def _add_entity_persistence_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--entity-persistence", default=None,
+                         help="path to a trained entity-persistence checkpoint (.pt bundle, "
+                              "--model-type entity-persistence); default: no entity-persistence "
+                              "contribution to the model.novelty stream")
+
+
 def _make_online_policy_and_learner(
     args: argparse.Namespace, program: MinecraftSurvivalBox
 ) -> tuple[OnlineQPolicy, OnlineQLearner]:
@@ -227,6 +247,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     else:
         policy = _make_policy(args.policy, args)
     world_model = _make_world_model(args, program)
+    entity_persistence = _make_entity_persistence(args)
     config = RuntimeConfig(
         tick_rate=args.tick_rate,
         realtime=args.realtime,
@@ -250,6 +271,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         config=config,
         learner=learner,
         world_model=world_model,
+        entity_persistence=entity_persistence,
         stream_registry=MINECRAFT_STREAM_REGISTRY,
     )
     summaries = runtime.run()
@@ -316,6 +338,9 @@ def cmd_train(args: argparse.Namespace) -> None:
         return
     if args.model_type == "world-model":
         _train_world_model(args)
+        return
+    if args.model_type == "entity-persistence":
+        _train_entity_persistence(args)
         return
     dataset = build_dataset(
         args.sessions,
@@ -534,6 +559,54 @@ def _train_world_model(args: argparse.Namespace) -> None:
     print(f"checkpoint bundle saved to {out}")
 
 
+def _train_entity_persistence(args: argparse.Namespace) -> None:
+    """Offline entity-persistence training (issue #27: object permanence).
+
+    Learns to predict a tracked mob's feature during an occlusion gap from
+    every occlusion-then-reappearance recorded sessions went through --
+    record with a mix of night/combat episodes so mobs actually go behind
+    walls and come back.
+    """
+    try:
+        from cognitive_runtime.training.entity_persistence import (
+            EntityPersistenceTrainingConfig,
+            build_entity_persistence_dataset,
+            save_entity_persistence_checkpoint,
+            train_entity_persistence_model,
+        )
+    except ImportError as exc:  # torch not installed
+        sys.exit(
+            f"entity-persistence training needs PyTorch ({exc}). Install it with "
+            "'pip install -e .[neural]'."
+        )
+    dataset = build_entity_persistence_dataset(args.sessions, max_samples=args.max_samples)
+    if len(dataset) == 0:
+        sys.exit(
+            "no entity-persistence training samples found: no tracked mob was ever "
+            "occluded and then reappeared in these sessions (record night/combat "
+            "episodes where mobs walk behind walls)"
+        )
+    print(
+        f"dataset: {len(dataset)} occlusion/reappearance samples from "
+        f"{len(dataset.sources)} episodes (baseline_mse={round(dataset.baseline_mse(), 4)})"
+    )
+    config = EntityPersistenceTrainingConfig(
+        epochs=args.epochs,
+        lr=args.neural_lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        hidden_dim=args.hidden_dim,
+    )
+    model, stats = train_entity_persistence_model(dataset, config)
+    out = args.out if args.out != DEFAULT_MODEL_OUT else "models/entity_persistence.pt"
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    save_entity_persistence_checkpoint(out, model, dataset, stats)
+    for key in ("final_feature_loss", "final_surprise_loss", "final_total_loss",
+                "baseline_mse", "model_mse", "beats_forget_baseline"):
+        print(f"  {key}: {stats[key]}")
+    print(f"checkpoint bundle saved to {out}")
+
+
 def cmd_replay(args: argparse.Namespace) -> None:
     try:
         results = replay_session(args.session, episode_id=args.episode, verify=not args.no_verify)
@@ -596,6 +669,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="run online Q in eval mode without mutating the model")
     _add_world_args(p_run)
     _add_world_model_arg(p_run)
+    _add_entity_persistence_arg(p_run)
     p_run.set_defaults(func=cmd_run)
 
     p_demo = sub.add_parser("demo", help="play SurvivalBox yourself; recorded as demonstrations")
@@ -605,6 +679,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_demo.add_argument("--session-id", default=None)
     _add_world_args(p_demo)
     _add_world_model_arg(p_demo)
+    _add_entity_persistence_arg(p_demo)
     p_demo.set_defaults(func=cmd_demo)
 
     p_eval = sub.add_parser("evaluate", help="compare policies on identical episodes")
@@ -619,10 +694,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--out", default=DEFAULT_MODEL_OUT,
                          help="output path; neural models default to models/vision_bc.pt")
     p_train.add_argument("--model-type",
-                         choices=["linear", "neural", "pixel-encoder", "fusion", "world-model"],
+                         choices=["linear", "neural", "pixel-encoder", "fusion", "world-model",
+                                  "entity-persistence"],
                          default="linear",
                          help="linear softmax head (default), pixel BC, pixel encoder pretrain, "
-                              "learned latent fusion, or the action-conditioned world model")
+                              "learned latent fusion, the action-conditioned world model, or "
+                              "the entity-persistence (object permanence) model")
     p_train.add_argument("--epochs", type=int, default=10)
     p_train.add_argument("--lr", type=float, default=0.5, help="linear-model learning rate")
     p_train.add_argument("--neural-lr", type=float, default=1e-3, help="neural-model learning rate")
