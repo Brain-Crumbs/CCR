@@ -55,6 +55,14 @@ generic: Minecraft health, a Linux battery and robot joint stress are all
 | `input` | Raw human input (demos) | `input.keypress` |
 | `world` | Global world state | `world.time`, `world.nearby_blocks` |
 | `motor` | Actions, the other direction | `motor.command` |
+| `internal` | Interoception: the runtime's own modulation signals, published back onto the bus (planned, issue #58) | `internal.prediction_error`, `internal.reward_prediction_error`, `internal.learning_progress`, `internal.novelty`, `internal.risk`, `internal.attention.weights` |
+
+The planned `internal` modality is the biological-modulation analog
+(dopamine as reward-prediction-error, etc.): the agent's own error, progress,
+novelty and risk signals become recordable, replayable streams like any
+sense, consumable by the attention controller (#59), intrinsic drive (#61)
+and replay prioritization — see
+[neural-stream-agent.md](neural-stream-agent.md).
 
 ## The primitives
 
@@ -239,8 +247,11 @@ The loop's policy `State` is now **derived from stream state**
 `program.observe()` is no longer called by the loop (a test enforces it),
 and the formerly observation-only fields are streams
 (`body.in_water`, `body.alive`, `spatial.distance_from_spawn`). Remaining:
-real neural encoders/fusion and learned world models. See the tracking
-issue for the full plan.
+wiring the neural encoders/learned fusion into the live policy path (#57),
+the `internal.*` modulation streams (#58), the budgeted attention layer
+between memory and fusion (#59), and the generative multi-horizon world
+model (#39). See [neural-stream-agent.md](neural-stream-agent.md) for the
+full roadmap.
 
 Every stream in the Minecraft catalog now has an explicit `StreamDeclaration`
 (issue #21: shape/schema and rate on `StreamSpec`, plus encoder binding,

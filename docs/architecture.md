@@ -25,6 +25,14 @@ and records.
      Minecraft       ToyOS        Linux VM        AI OS
 ```
 
+Where this is heading: the target organism is an *attentive* neural stream
+agent — budgeted attention deciding which senses get processed each tick,
+dopamine-like internal modulation streams (`internal.*`), a multi-horizon
+world model, an orienting reflex, and a "safe surprise" intrinsic drive.
+The full end-state, what exists today, and the issue-by-issue roadmap live
+in [neural-stream-agent.md](neural-stream-agent.md); this document describes
+the runtime substrate those components plug into.
+
 ## Design principles
 
 - continuous execution
@@ -139,6 +147,12 @@ Determinism is infrastructure, not an afterthought:
   captured by `snapshot()`.
 - `python -m cognitive_runtime replay --session <dir>` re-simulates every
   episode and fails loudly on the first diverging tick or reward mismatch.
+
+Scope note (issue #44): byte-identical replay is the contract for the
+*simulated* backend and remains a fast CI smoke test of the loop/stream/
+recorder plumbing. It is not a promise for neural learning runs (weights
+change mid-episode, torch/GPU nondeterminism) or the remote backend — there,
+regressions are caught *statistically* over N episodes instead.
 
 ## The key architectural rule
 
