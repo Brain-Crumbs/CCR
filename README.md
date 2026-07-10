@@ -65,12 +65,12 @@ python -m cognitive_runtime train --model-type neural \
     --sessions sessions/<session-id> --out models/vision_bc.pt
 python -m cognitive_runtime evaluate --policies scripted,neural --model models/vision_bc.pt
 
-# Phase E evaluation gates (issue #31): train actor/critic + linear online-Q,
+# Evaluation gates (issue #31): train actor/critic + linear online-Q,
 # eval both plus scripted/random on identical seeds, and report the three
 # deprecation gates. Records eval sessions for the dashboard + writes the gate
 # report into the checkpoint. --reproducible adds gate 3; --curriculum picks a
 # larger preset for manual runs (needs the neural extra).
-python -m cognitive_runtime phase-e-gates --reproducible \
+python -m cognitive_runtime evaluation-gates --reproducible \
     --checkpoint models/actor-critic.pt --record-dir sessions
 python -m cognitive_runtime dashboard --record-dir sessions
 

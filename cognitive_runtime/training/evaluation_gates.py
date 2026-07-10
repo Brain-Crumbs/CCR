@@ -1,6 +1,6 @@
-"""Phase E evaluation gates: actor/critic vs random/scripted/linear-Q on
-identical seeds (issue #31, ``docs/neural-stream-agent.md`` Phase E "Evaluate
-against random/scripted/linear Q").
+"""Evaluation gates: actor/critic vs random/scripted/linear-Q on identical
+seeds (issue #31, ``docs/neural-stream-agent.md`` Phase E "Evaluate against
+random/scripted/linear Q").
 
 Where :mod:`cognitive_runtime.training.actor_critic_acceptance` is a smoke
 check ("actor/critic beats random"), this is the full deprecation gate. It
@@ -80,7 +80,7 @@ GATE_METRIC = "reward-or-survival-ticks"
 
 
 @dataclass(frozen=True)
-class PhaseEGateResult:
+class EvaluationGateResult:
     summaries: Dict[str, EvaluationSummary]
     gate1_beats_random: bool
     gate2_beats_linear_q: bool
@@ -234,7 +234,7 @@ def _new_online_q_model(world_config: Dict[str, int], seed: int) -> OnlineQModel
         epsilon_decay_ticks=20000,
         lr=0.05,
         gamma=0.99,
-        meta={"source": "phase-e-gates"},
+        meta={"source": "evaluation-gates"},
     )
 
 
@@ -302,19 +302,19 @@ def _evaluate_all(
     ac_eval = _run_actor_critic(
         policy_model, critic_model, optimizer, action_keys, world_config, reward_config,
         eval_episodes, eval_seed, train=False, record_dir=record_dir,
-        session_id="phase-e-actor-critic",
+        session_id="eval-gate-actor-critic",
     )
     oq_eval = _run_online_q(
         online_model, world_config, reward_config, eval_episodes, eval_seed, train=False,
-        record_dir=record_dir, session_id="phase-e-online-q",
+        record_dir=record_dir, session_id="eval-gate-online-q",
     )
     scripted_eval = _run_scripted(
         world_config, reward_config, eval_episodes, eval_seed,
-        record_dir=record_dir, session_id="phase-e-scripted",
+        record_dir=record_dir, session_id="eval-gate-scripted",
     )
     random_eval = _run_random(
         world_config, reward_config, eval_episodes, eval_seed,
-        record_dir=record_dir, session_id="phase-e-random",
+        record_dir=record_dir, session_id="eval-gate-random",
     )
     summaries = {
         "actor-critic": EvaluationSummary.from_episodes("actor-critic", ac_eval),
@@ -325,7 +325,7 @@ def _evaluate_all(
     return summaries, optimizer, online_model, fusion, action_keys, policy_model, critic_model, arch
 
 
-def run_phase_e_gates(
+def run_evaluation_gates(
     *,
     curriculum: Optional[str] = None,
     config: Optional[Dict[str, int]] = None,
@@ -340,7 +340,7 @@ def run_phase_e_gates(
     record_dir: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
     check_reproducible: bool = False,
-) -> PhaseEGateResult:
+) -> EvaluationGateResult:
     """Train actor/critic and linear online-Q, eval both plus scripted/random
     on identical seeds, and report the three Phase E gates.
 
@@ -371,7 +371,7 @@ def run_phase_e_gates(
         rerun, *_ = _evaluate_all(world_config, rewards, record_dir=None, **common)
         gate3 = summaries == rerun and _beats(rerun["actor-critic"], rerun["random"])
 
-    result = PhaseEGateResult(
+    result = EvaluationGateResult(
         summaries=summaries,
         gate1_beats_random=gate1,
         gate2_beats_linear_q=gate2,
@@ -405,7 +405,7 @@ def _write_gate_checkpoint(
         critic=critic_model,
         online_optimizer=optimizer,
         training_ticks=optimizer.step_count,
-        training_stats={"phase_e_gates": result.gate_summary()},
+        training_stats={"evaluation_gates": result.gate_summary()},
         extra_metadata={"actor_critic": arch},
     )
-    checkpoint.save(reason="phase-e-gates")
+    checkpoint.save(reason="evaluation-gates")

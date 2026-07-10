@@ -729,17 +729,17 @@ def cmd_view(args: argparse.Namespace) -> None:
     print(view_episode(args.session, args.episode, tail=args.tail))
 
 
-def cmd_phase_e_gates(args: argparse.Namespace) -> None:
-    """The Phase E evaluation-gate one-liner (issue #31): train actor/critic
-    and linear online-Q, eval both plus scripted/random on identical seeds,
-    and report the three deprecation gates.  Recorded eval sessions are
-    summarizable with ``dashboard --record-dir``."""
+def cmd_evaluation_gates(args: argparse.Namespace) -> None:
+    """The evaluation-gate one-liner (issue #31, docs/neural-stream-agent.md
+    Phase E): train actor/critic and linear online-Q, eval both plus
+    scripted/random on identical seeds, and report the three deprecation gates.
+    Recorded eval sessions are summarizable with ``dashboard --record-dir``."""
     try:
-        from cognitive_runtime.training.phase_e_gates import run_phase_e_gates
+        from cognitive_runtime.training.evaluation_gates import run_evaluation_gates
     except ImportError as exc:  # torch not installed
-        sys.exit(f"the phase-e gates need PyTorch ({exc}); install '.[neural]'.")
+        sys.exit(f"the evaluation gates need PyTorch ({exc}); install '.[neural]'.")
 
-    result = run_phase_e_gates(
+    result = run_evaluation_gates(
         curriculum=args.curriculum,
         config=None,  # curriculum preset or the default gate config supplies it
         train_episodes=args.train_episodes,
@@ -865,8 +865,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.set_defaults(func=cmd_evaluate)
 
     p_gates = sub.add_parser(
-        "phase-e-gates",
-        help="Phase E evaluation gates: actor/critic vs random/scripted/linear-Q "
+        "evaluation-gates",
+        help="evaluation gates: actor/critic vs random/scripted/linear-Q "
              "on identical seeds (issue #31)",
     )
     p_gates.add_argument("--curriculum", default=None, choices=CURRICULUM_ORDER,
@@ -886,7 +886,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_gates.add_argument("--checkpoint", default=None,
                          help="write the trained actor/critic bundle here with the gate "
                               "results in its training stats (issue #20)")
-    p_gates.set_defaults(func=cmd_phase_e_gates)
+    p_gates.set_defaults(func=cmd_evaluation_gates)
 
     p_train = sub.add_parser("train", help="train a behavioral-cloning policy from sessions")
     p_train.add_argument("--sessions", nargs="+", required=True,
