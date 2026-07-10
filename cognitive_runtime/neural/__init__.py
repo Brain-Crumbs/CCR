@@ -47,6 +47,20 @@ from cognitive_runtime.neural.pixel_stream_encoder import (
     PixelStreamEncoder,
     pixels_to_chw,
 )
+from cognitive_runtime.neural.trainable_stream_encoders import (
+    AUDIO_CHECKPOINT_KEY,
+    AUDIO_STREAM_PATTERN,
+    BODY_STATE_CHECKPOINT_KEY,
+    ENTITY_CHECKPOINT_KEY,
+    MOTOR_HISTORY_CHECKPOINT_KEY,
+    MOTOR_HISTORY_STREAM_ID,
+    REWARD_CHECKPOINT_KEY,
+    AudioEncoder,
+    BodyStateEncoder,
+    EntityEncoder,
+    MotorHistoryEncoder,
+    RewardEncoder,
+)
 from cognitive_runtime.neural.fusion import LatentFusionModel
 from cognitive_runtime.neural.optimizer import OnlineOptimizer
 from cognitive_runtime.neural.policy import PolicyModel
@@ -68,6 +82,18 @@ __all__ = [
     "PIXEL_STREAM_ID",
     "PIXEL_CHECKPOINT_KEY",
     "pixels_to_chw",
+    "MotorHistoryEncoder",
+    "BodyStateEncoder",
+    "RewardEncoder",
+    "EntityEncoder",
+    "AudioEncoder",
+    "MOTOR_HISTORY_STREAM_ID",
+    "MOTOR_HISTORY_CHECKPOINT_KEY",
+    "BODY_STATE_CHECKPOINT_KEY",
+    "REWARD_CHECKPOINT_KEY",
+    "ENTITY_CHECKPOINT_KEY",
+    "AUDIO_STREAM_PATTERN",
+    "AUDIO_CHECKPOINT_KEY",
     "LatentFusionModel",
     "WorldModel",
     "WorldModelOutput",

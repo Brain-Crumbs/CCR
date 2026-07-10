@@ -68,6 +68,8 @@ class StreamDeclaration:
     train_eval_behavior: str = "fixed"
     checkpoint_key: Optional[str] = None
     note: str = ""
+    neural_encoder: Optional[str] = None
+    neural_latent_width: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.train_eval_behavior not in TRAIN_EVAL_BEHAVIORS:
@@ -75,17 +77,24 @@ class StreamDeclaration:
                 f"invalid train_eval_behavior {self.train_eval_behavior!r} for "
                 f"{self.pattern!r}; expected one of {sorted(TRAIN_EVAL_BEHAVIORS)}"
             )
-        if self.encoder_factory is None and self.train_eval_behavior != "raw":
+        if self.encoder_factory is None and self.train_eval_behavior not in ("raw", "trainable"):
             raise ValueError(
                 f"{self.pattern!r} has no encoder_factory (no fusion-layout "
                 f"slot) but train_eval_behavior={self.train_eval_behavior!r}; "
-                "expected 'raw'"
+                "expected 'raw' or 'trainable'"
             )
         if self.trainable and self.train_eval_behavior != "trainable":
             raise ValueError(
                 f"{self.pattern!r} is declared trainable but "
                 f"train_eval_behavior={self.train_eval_behavior!r}; expected "
                 "'trainable'"
+            )
+        if self.trainable and not self.neural_encoder:
+            raise ValueError(f"{self.pattern!r} is trainable but has no neural_encoder")
+        if self.neural_latent_width is not None and self.neural_latent_width <= 0:
+            raise ValueError(
+                f"{self.pattern!r} neural_latent_width must be positive, "
+                f"got {self.neural_latent_width!r}"
             )
 
     def encoder(self) -> Optional[StreamEncoder]:
@@ -163,6 +172,10 @@ class StreamRegistry:
                     "nominal_rate_hz": spec.nominal_rate_hz,
                     "encoder": type(encoder).__name__ if encoder is not None else None,
                     "latent_width": encoder.width(spec) if encoder is not None else 0,
+                    "neural_encoder": decl.neural_encoder if decl is not None else None,
+                    "neural_latent_width": (
+                        decl.neural_latent_width if decl is not None else None
+                    ),
                     "trainable": decl.trainable if decl is not None else None,
                     "fixed_stub": decl.is_fixed_stub() if decl is not None else None,
                     "train_eval_behavior": decl.train_eval_behavior if decl is not None else None,
@@ -181,14 +194,78 @@ class StreamRegistry:
 #: `default_encoder_registry()` has always had.
 DEFAULT_STREAM_REGISTRY = StreamRegistry(
     [
-        StreamDeclaration("body.alive", ScalarEncoder, note="Alive flag, scalar-encoded."),
-        StreamDeclaration("body.health", ScalarEncoder, note="Health vital."),
-        StreamDeclaration("body.hotbar", ScalarEncoder, note="Hotbar summary."),
-        StreamDeclaration("body.hunger", ScalarEncoder, note="Hunger vital."),
-        StreamDeclaration("body.in_water", ScalarEncoder, note="In-water flag."),
-        StreamDeclaration("body.inventory", ScalarEncoder, note="Inventory summary."),
-        StreamDeclaration("body.oxygen", ScalarEncoder, note="Oxygen vital."),
-        StreamDeclaration("reward.*", ScalarEncoder, note="Reward scalar(s)."),
+        StreamDeclaration(
+            "body.alive",
+            ScalarEncoder,
+            trainable=True,
+            train_eval_behavior="trainable",
+            neural_encoder="cognitive_runtime.neural.BodyStateEncoder",
+            neural_latent_width=8,
+            note="Alive flag; legacy fusion scalar-encoded, neural path uses BodyStateEncoder.",
+        ),
+        StreamDeclaration(
+            "body.health",
+            ScalarEncoder,
+            trainable=True,
+            train_eval_behavior="trainable",
+            neural_encoder="cognitive_runtime.neural.BodyStateEncoder",
+            neural_latent_width=8,
+            note="Health vital; legacy fusion scalar-encoded, neural path uses BodyStateEncoder.",
+        ),
+        StreamDeclaration(
+            "body.hotbar",
+            ScalarEncoder,
+            trainable=True,
+            train_eval_behavior="trainable",
+            neural_encoder="cognitive_runtime.neural.EntityEncoder",
+            neural_latent_width=16,
+            note="Hotbar symbolic summary; legacy fusion scalar-encoded, neural path uses EntityEncoder.",
+        ),
+        StreamDeclaration(
+            "body.hunger",
+            ScalarEncoder,
+            trainable=True,
+            train_eval_behavior="trainable",
+            neural_encoder="cognitive_runtime.neural.BodyStateEncoder",
+            neural_latent_width=8,
+            note="Hunger vital; legacy fusion scalar-encoded, neural path uses BodyStateEncoder.",
+        ),
+        StreamDeclaration(
+            "body.in_water",
+            ScalarEncoder,
+            trainable=True,
+            train_eval_behavior="trainable",
+            neural_encoder="cognitive_runtime.neural.BodyStateEncoder",
+            neural_latent_width=8,
+            note="In-water flag; legacy fusion scalar-encoded, neural path uses BodyStateEncoder.",
+        ),
+        StreamDeclaration(
+            "body.inventory",
+            ScalarEncoder,
+            trainable=True,
+            train_eval_behavior="trainable",
+            neural_encoder="cognitive_runtime.neural.EntityEncoder",
+            neural_latent_width=16,
+            note="Inventory summary; legacy fusion scalar-encoded, neural path uses EntityEncoder.",
+        ),
+        StreamDeclaration(
+            "body.oxygen",
+            ScalarEncoder,
+            trainable=True,
+            train_eval_behavior="trainable",
+            neural_encoder="cognitive_runtime.neural.BodyStateEncoder",
+            neural_latent_width=8,
+            note="Oxygen vital; legacy fusion scalar-encoded, neural path uses BodyStateEncoder.",
+        ),
+        StreamDeclaration(
+            "reward.*",
+            ScalarEncoder,
+            trainable=True,
+            train_eval_behavior="trainable",
+            neural_encoder="cognitive_runtime.neural.RewardEncoder",
+            neural_latent_width=8,
+            note="Reward scalar(s); legacy fusion scalar-encoded, neural path uses RewardEncoder.",
+        ),
         # A distance is one number, not a pose: this exact id must be checked
         # before the "spatial.*" pose pattern below (first match wins).
         StreamDeclaration(
@@ -196,7 +273,15 @@ DEFAULT_STREAM_REGISTRY = StreamRegistry(
         ),
         StreamDeclaration("spatial.*", SpatialEncoder, note="Position/rotation pose streams."),
         StreamDeclaration("vision.frame.grid", GridVisionEncoder, note="Coarse semantic grid frame."),
-        StreamDeclaration("vision.entities", EntityEncoder, note="Visible-entity summary."),
+        StreamDeclaration(
+            "vision.entities",
+            EntityEncoder,
+            trainable=True,
+            train_eval_behavior="trainable",
+            neural_encoder="cognitive_runtime.neural.EntityEncoder",
+            neural_latent_width=16,
+            note="Visible entities; legacy fusion uses fixed summary, neural path uses EntityEncoder.",
+        ),
         StreamDeclaration(
             "vision.frame.pixels",
             encoder_factory=None,
@@ -224,10 +309,15 @@ DEFAULT_STREAM_REGISTRY = StreamRegistry(
         # ahead of the target input set (docs/neural-stream-agent.md
         # "Make Input Streams Explicit"): audio, keyboard, and mouse/look.
         StreamDeclaration(
-            "audio.ambient",
+            "audio.*",
             encoder_factory=None,
             train_eval_behavior="raw",
-            note="Reserved id: no Program publishes audio yet (target input: audio).",
+            neural_encoder="cognitive_runtime.neural.AudioEncoder",
+            neural_latent_width=8,
+            note=(
+                "Reserved audio stream ids. Deliberate fixed neural stub: no "
+                "Program publishes audio yet and no capture backend exists."
+            ),
         ),
         StreamDeclaration(
             "input.keypress",
@@ -247,13 +337,16 @@ DEFAULT_STREAM_REGISTRY = StreamRegistry(
         StreamDeclaration(
             "motor.history",
             encoder_factory=None,
-            train_eval_behavior="raw",
+            trainable=True,
+            train_eval_behavior="trainable",
+            neural_encoder="cognitive_runtime.neural.MotorHistoryEncoder",
+            neural_latent_width=16,
             note=(
                 "Reserved id: recent-action history is today computed ad hoc "
                 "by training/features.py:motor_history_features from the "
                 "recorded motor log, not published as a sensory stream. "
-                "Reserved for when it becomes a real input stream "
-                "(target input: keyboard/control/motor history)."
+                "Neural path uses MotorHistoryEncoder; parity mode reproduces "
+                "the one-hot baseline exactly."
             ),
         ),
     ]

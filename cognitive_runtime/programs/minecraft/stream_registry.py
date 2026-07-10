@@ -66,13 +66,15 @@ MINECRAFT_STREAM_REGISTRY: StreamRegistry = DEFAULT_STREAM_REGISTRY.extend(
         StreamDeclaration(
             "body.inventory_exact",
             encoder_factory=None,
-            train_eval_behavior="raw",
+            trainable=True,
+            train_eval_behavior="trainable",
+            neural_encoder="cognitive_runtime.neural.EntityEncoder",
+            neural_latent_width=16,
             note=(
                 "Exact {minecraft_item_name: count} payload with an unbounded "
-                "item vocabulary -- needs a learned embedding (target doc: "
-                "'inventory/entities -> embedding or small MLP', Phase B+). "
-                "Redundant today with the bounded body.inventory summary, "
-                "which is fused."
+                "item vocabulary. Neural path uses EntityEncoder; no legacy "
+                "fusion slot is bound because the bounded body.inventory "
+                "summary remains the compatibility baseline."
             ),
         ),
         StreamDeclaration(
