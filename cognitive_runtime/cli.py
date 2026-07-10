@@ -228,6 +228,9 @@ def cmd_train(args: argparse.Namespace) -> None:
     if args.model_type == "pixel-encoder":
         _train_pixel_encoder(args)
         return
+    if args.model_type == "fusion":
+        _train_latent_fusion(args)
+        return
     dataset = build_dataset(
         args.sessions,
         history=args.history,
@@ -339,6 +342,55 @@ def _train_pixel_encoder(args: argparse.Namespace) -> None:
     print(f"checkpoint bundle saved to {out}")
 
 
+def _train_latent_fusion(args: argparse.Namespace) -> None:
+    """Offline Phase-C learned latent fusion training."""
+    try:
+        from cognitive_runtime.training.datasets import build_latent_fusion_dataset
+        from cognitive_runtime.training.fusion import (
+            FusionTrainingConfig,
+            save_latent_fusion_checkpoint,
+            train_latent_fusion_model,
+        )
+    except ImportError as exc:  # torch not installed
+        sys.exit(
+            f"latent fusion training needs PyTorch ({exc}). Install it with "
+            "'pip install -e .[neural]'."
+        )
+    dataset = build_latent_fusion_dataset(
+        args.sessions,
+        max_samples=args.max_samples,
+        min_episode_reward=args.min_reward,
+    )
+    if len(dataset) == 0:
+        sys.exit("no fusion training samples found (were the sessions recorded as streams-v2?)")
+    print(
+        f"dataset: {len(dataset)} fusion samples from {len(dataset.sources)} episodes "
+        f"(streams={len(dataset.stream_ids)}, dim={len(dataset.feature_names)})"
+    )
+    config = FusionTrainingConfig(
+        epochs=args.epochs,
+        lr=args.neural_lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        fused_width=args.latent_width,
+        hidden_dim=args.hidden_dim,
+        depth=args.fusion_depth,
+        dropout=args.fusion_dropout,
+    )
+    model, stats = train_latent_fusion_model(dataset, config)
+    out = args.out if args.out != DEFAULT_MODEL_OUT else "models/latent_fusion.pt"
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    save_latent_fusion_checkpoint(out, model, dataset, stats)
+    for key in (
+        "final_action_loss",
+        "final_reward_loss",
+        "final_next_latent_loss",
+        "final_total_loss",
+    ):
+        print(f"  {key}: {stats[key]}")
+    print(f"checkpoint bundle saved to {out}")
+
+
 def cmd_replay(args: argparse.Namespace) -> None:
     try:
         results = replay_session(args.session, episode_id=args.episode, verify=not args.no_verify)
@@ -421,9 +473,10 @@ def build_parser() -> argparse.ArgumentParser:
                          help="session directories (e.g. sessions/20260101-...-scripted)")
     p_train.add_argument("--out", default=DEFAULT_MODEL_OUT,
                          help="output path; neural models default to models/vision_bc.pt")
-    p_train.add_argument("--model-type", choices=["linear", "neural", "pixel-encoder"],
+    p_train.add_argument("--model-type", choices=["linear", "neural", "pixel-encoder", "fusion"],
                          default="linear",
-                         help="linear softmax head (default), pixel BC, or pixel encoder pretrain")
+                         help="linear softmax head (default), pixel BC, pixel encoder pretrain, "
+                              "or learned latent fusion")
     p_train.add_argument("--epochs", type=int, default=10)
     p_train.add_argument("--lr", type=float, default=0.5, help="linear-model learning rate")
     p_train.add_argument("--neural-lr", type=float, default=1e-3, help="neural-model learning rate")
@@ -434,7 +487,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--latent-width", type=int, default=64,
                          help="pixel-encoder latent width for pretraining")
     p_train.add_argument("--hidden-dim", type=int, default=128,
-                         help="hidden width for pixel-encoder pretraining heads")
+                         help="hidden width for neural training heads")
+    p_train.add_argument("--fusion-depth", type=int, default=2,
+                         help="number of hidden layers for learned fusion")
+    p_train.add_argument("--fusion-dropout", type=float, default=0.0,
+                         help="dropout for learned fusion hidden layers")
     p_train.add_argument("--reconstruction-size", type=int, default=16,
                          help="max side length for downsampled reconstruction targets")
     p_train.add_argument("--reconstruction-weight", type=float, default=1.0)

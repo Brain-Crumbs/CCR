@@ -17,7 +17,7 @@ import os
 import sys
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from cognitive_runtime.core.streams import (
     LatestValueView,
@@ -185,6 +185,116 @@ def build_dataset(
     return dataset
 
 
+def build_latent_fusion_dataset(
+    session_dirs: List[str],
+    max_samples: Optional[int] = None,
+    min_episode_reward: Optional[float] = None,
+) -> LatentFusionDataset:
+    """Walk recorded sessions and emit samples for learned fusion training.
+
+    The current and next inputs are produced with the same ``TemporalFusion``
+    layout as the online baseline, plus current-window presence masks and
+    recency/staleness scalars.  The final tick of each episode is omitted
+    because it has no next latent target.
+    """
+
+    dataset = LatentFusionDataset()
+    key_to_label = {key: i for i, key in enumerate(ACTION_KEYS)}
+    fusion: Optional[TemporalFusion] = None
+    elided_layout_streams: set = set()
+
+    for session_dir in session_dirs:
+        if not os.path.isdir(session_dir):
+            raise FileNotFoundError(f"session directory not found: {session_dir}")
+        metadata = load_session_metadata(session_dir)
+        require_streams_v2(metadata)
+        session_fusion = TemporalFusion(_catalog(metadata))
+        if fusion is None:
+            fusion = session_fusion
+            dataset.layout_hash = fusion.layout_hash
+            dataset.feature_names = list(fusion.feature_names())
+            dataset.stream_ids = [entry.stream_id for entry in fusion.layout]
+            dataset.stream_slices = _stream_slices(fusion)
+        elif session_fusion.layout_hash != fusion.layout_hash:
+            raise ValueError(
+                f"session {session_dir} has an incompatible stream catalog "
+                f"({session_fusion.layout_hash} vs {fusion.layout_hash}); train on "
+                "sessions recorded with the same program config"
+            )
+
+        frame_store = open_frame_store(session_dir)
+        for episode_id in list_episodes(session_dir):
+            buffer = TemporalBuffer()
+            reward_total = 0.0
+            episode_samples: List[
+                Tuple[List[float], List[float], List[float], List[float], int, float]
+            ] = []
+            for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
+                reward = float(decision.get("reward_window_total", 0.0))
+                reward_total += reward
+                present_streams = []
+                for record in sensory:
+                    stream_id = record.get("stream_id", "")
+                    if record.get("elided"):
+                        if fusion is not None and any(
+                            e.stream_id == stream_id for e in fusion.layout
+                        ):
+                            elided_layout_streams.add(stream_id)
+                        continue
+                    buffer.append(stream_event_from_log(record, frame_store=frame_store))
+                    present_streams.append(stream_id)
+                label_key = _motor_label(motor)
+                if label_key in key_to_label:
+                    assert fusion is not None
+                    latent = fusion.fuse(None, buffer).vector
+                    mask, recent, stale = _fusion_aux_lists(fusion, buffer, present_streams)
+                    episode_samples.append(
+                        (
+                            latent,
+                            mask,
+                            recent,
+                            stale,
+                            key_to_label[label_key],
+                            reward,
+                        )
+                    )
+            if min_episode_reward is not None and reward_total < min_episode_reward:
+                continue
+            for current, nxt in zip(episode_samples, episode_samples[1:]):
+                latent, mask, recent, stale, label, reward = current
+                next_latent, next_mask, next_recent, next_stale, _next_label, _next_reward = nxt
+                dataset.latents.append(latent)
+                dataset.presence_masks.append(mask)
+                dataset.recency.append(recent)
+                dataset.staleness.append(stale)
+                dataset.labels.append(label)
+                dataset.rewards.append(reward)
+                dataset.next_latents.append(next_latent)
+                dataset.next_presence_masks.append(next_mask)
+                dataset.next_recency.append(next_recent)
+                dataset.next_staleness.append(next_stale)
+                if max_samples is not None and len(dataset) >= max_samples:
+                    dataset.sources.append(f"{session_dir}/{episode_id} (truncated)")
+                    if frame_store is not None:
+                        frame_store.close()
+                    return dataset
+            if len(episode_samples) >= 2:
+                dataset.sources.append(f"{session_dir}/{episode_id}")
+        if frame_store is not None:
+            frame_store.close()
+
+    if elided_layout_streams:
+        print(
+            "warning: these streams were recorded hash-only (payload elided) and "
+            "contribute no learned-fusion input this tick: "
+            + ", ".join(sorted(elided_layout_streams))
+            + " -- record training sessions with --record-frames / --record-streams "
+            "to include them",
+            file=sys.stderr,
+        )
+    return dataset
+
+
 # --------------------------------------------------------------------------
 # Neural (pixel) dataset: raw pixel frames + the fused NON-vision vector.
 #
@@ -196,6 +306,7 @@ def build_dataset(
 
 NEURAL_PIXELS = "neural_pixels"
 PIXEL_SEQUENCES = "pixel_sequences"
+LATENT_FUSION = "latent_fusion"
 
 
 def _non_vision_fusion(metadata: Dict[str, Any]) -> TemporalFusion:
@@ -245,11 +356,80 @@ class PixelSequenceDataset:
         return len(self.pixels)
 
 
+@dataclass
+class LatentFusionDataset:
+    """Recorded-session samples for learned latent fusion.
+
+    Each sample contains the fixed ``TemporalFusion`` vector plus the learned
+    fusion side channels for the current tick, the demonstrated action label,
+    the tick reward, and the next tick's inputs for next-fused-latent training.
+    Stored as plain lists so importing this module never imports torch.
+    """
+
+    latents: List[List[float]] = field(default_factory=list)
+    presence_masks: List[List[float]] = field(default_factory=list)
+    recency: List[List[float]] = field(default_factory=list)
+    staleness: List[List[float]] = field(default_factory=list)
+    labels: List[int] = field(default_factory=list)
+    rewards: List[float] = field(default_factory=list)
+    next_latents: List[List[float]] = field(default_factory=list)
+    next_presence_masks: List[List[float]] = field(default_factory=list)
+    next_recency: List[List[float]] = field(default_factory=list)
+    next_staleness: List[List[float]] = field(default_factory=list)
+    action_keys: List[str] = field(default_factory=lambda: list(ACTION_KEYS))
+    stream_ids: List[str] = field(default_factory=list)
+    stream_slices: Dict[str, Tuple[int, int]] = field(default_factory=dict)
+    feature_names: List[str] = field(default_factory=list)
+    layout_hash: Optional[str] = None
+    sources: List[str] = field(default_factory=list)
+    representation: str = LATENT_FUSION
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def label_counts(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for label in self.labels:
+            key = self.action_keys[label]
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+
 def _pixel_shape_from_catalog(metadata: Dict[str, Any]) -> Optional[Tuple[int, int, int]]:
     for spec in _catalog(metadata):
         if spec.stream_id == PIXEL_STREAM and spec.shape is not None:
             return tuple(spec.shape)  # type: ignore[return-value]
     return None
+
+
+def _stream_slices(fusion: TemporalFusion) -> Dict[str, Tuple[int, int]]:
+    offset = 0
+    slices: Dict[str, Tuple[int, int]] = {}
+    for entry in fusion.layout:
+        slices[entry.stream_id] = (offset, offset + entry.width)
+        offset += entry.width
+    return slices
+
+
+def _fusion_aux_lists(
+    fusion: TemporalFusion,
+    buffer: TemporalBuffer,
+    present_stream_ids: Iterable[str],
+    stale_streams: Iterable[str] = (),
+) -> Tuple[List[float], List[float], List[float]]:
+    present = set(present_stream_ids)
+    stale = set(stale_streams)
+    reference_time = fusion._reference_time(buffer)
+    mask: List[float] = []
+    recency: List[float] = []
+    staleness: List[float] = []
+    for entry in fusion.layout:
+        latest = buffer.latest(entry.stream_id)
+        recent = fusion._event_recency(latest.timestamp, reference_time) if latest else 0.0
+        mask.append(1.0 if entry.stream_id in present else 0.0)
+        recency.append(float(recent))
+        staleness.append(1.0 if entry.stream_id in stale else 1.0 - float(recent))
+    return mask, recency, staleness
 
 
 def build_neural_dataset(

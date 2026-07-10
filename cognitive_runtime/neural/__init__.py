@@ -61,7 +61,11 @@ from cognitive_runtime.neural.trainable_stream_encoders import (
     MotorHistoryEncoder,
     RewardEncoder,
 )
-from cognitive_runtime.neural.fusion import LatentFusionModel
+from cognitive_runtime.neural.fusion import (
+    LatentFusionInputs,
+    LatentFusionModel,
+    latent_fusion_inputs_from_buffer,
+)
 from cognitive_runtime.neural.optimizer import OnlineOptimizer
 from cognitive_runtime.neural.policy import PolicyModel
 from cognitive_runtime.neural.value import ValueModel
@@ -95,6 +99,8 @@ __all__ = [
     "AUDIO_STREAM_PATTERN",
     "AUDIO_CHECKPOINT_KEY",
     "LatentFusionModel",
+    "LatentFusionInputs",
+    "latent_fusion_inputs_from_buffer",
     "WorldModel",
     "WorldModelOutput",
     "PolicyModel",
