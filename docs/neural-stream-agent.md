@@ -53,12 +53,18 @@ Useful pieces already in CCR:
 - `TrainableStreamModule` interface and fixed wrappers.
 - Online checkpoint lifecycle.
 - Online Q baseline over the fixed fused latent state.
+- Neural module contracts (`cognitive_runtime/neural/`): stream encoders,
+  learned fusion, an MLP world model, and now (Phase E) an MLP actor/critic
+  policy/value pair with an `OnlineOptimizer` online update, behind
+  `--policy actor-critic`.
 
 Important limitation:
 
-`--policy online` currently uses fixed stream encoders plus a linear Q model.
-It does not train CNN stream encoders, learned fusion, a world model, or an
-actor/critic policy.
+`--policy online` uses fixed stream encoders plus a linear Q model; it stays
+as the baseline. `--policy actor-critic` trains an MLP policy/critic (and
+optionally an MLP world model) over the fused latent state, but the fused
+latent itself is still `TemporalFusion`'s fixed concatenation -- CNN stream
+encoders and learned fusion are not yet wired into the online policy path.
 
 ## Necessary Changes
 
@@ -258,10 +264,15 @@ is no way to understand what it saw, did, predicted, or learned.
 
 ### Phase E: Actor/Critic Policy
 
-- Add neural online policy.
-- Train in simulation first.
-- Evaluate against random/scripted/linear Q.
-- Only then run live Mineflayer fine-tuning.
+- Add neural online policy. Landed: `MLPPolicyModel`/`MLPValueModel`/
+  `ActorCriticOptimizer` (`cognitive_runtime/neural/`), wired to the runtime
+  as `--policy actor-critic` (`cognitive_runtime/policies/actor_critic.py`).
+- Train in simulation first. Landed: a smoke acceptance run
+  (`cognitive_runtime/training/actor_critic_acceptance.py`) checks it beats
+  random on identical seeds.
+- Evaluate against random/scripted/linear Q. Random-baseline smoke check
+  landed; the full actor-critic-vs-online-Q gate is issue #31.
+- Only then run live Mineflayer fine-tuning (issue #33).
 
 ### Phase F: Live Childhood Runs
 
