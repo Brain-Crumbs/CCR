@@ -24,9 +24,12 @@ neural stream agent target (see ``docs/online-learning.md``) will need:
 - :class:`OnlineOptimizer` -- losses, gradient steps, clipping, target
   networks, and optimizer checkpoint state.
 
-The pixel encoder is the first concrete stream module; learned fusion,
-world-model, policy and value implementations still arrive in later phases.
-The package also defines the unified checkpoint bundle format those concrete
+Concrete modules have landed phase by phase: the pixel encoder (Phase B),
+learned fusion and the MLP world model (Phases C/D), and now (Phase E) an
+MLP policy/value pair (:class:`MLPPolicyModel`, :class:`MLPValueModel`) and
+:class:`ActorCriticOptimizer`, the online update wired to the runtime behind
+``--policy actor-critic`` (``cognitive_runtime.policies.actor_critic``). The
+package also defines the unified checkpoint bundle format those concrete
 modules use once wired into a learner.
 """
 
@@ -66,9 +69,9 @@ from cognitive_runtime.neural.fusion import (
     LatentFusionModel,
     latent_fusion_inputs_from_buffer,
 )
-from cognitive_runtime.neural.optimizer import OnlineOptimizer
-from cognitive_runtime.neural.policy import PolicyModel
-from cognitive_runtime.neural.value import ValueModel
+from cognitive_runtime.neural.optimizer import ActorCriticOptimizer, OnlineOptimizer
+from cognitive_runtime.neural.policy import MLPPolicyModel, PolicyModel
+from cognitive_runtime.neural.value import MLPValueModel, ValueModel
 from cognitive_runtime.neural.world_model import MLPWorldModel, WorldModel, WorldModelOutput
 from cognitive_runtime.neural.entity_persistence import (
     DEFAULT_GAP_CAP_TICKS,
@@ -126,8 +129,11 @@ __all__ = [
     "DEFAULT_GAP_CAP_TICKS",
     "normalize_gap",
     "PolicyModel",
+    "MLPPolicyModel",
     "ValueModel",
+    "MLPValueModel",
     "OnlineOptimizer",
+    "ActorCriticOptimizer",
     "NEURAL_CHECKPOINT_FORMAT",
     "CheckpointCompatibilityError",
     "NeuralAgentCheckpoint",

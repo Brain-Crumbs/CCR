@@ -47,6 +47,7 @@ from cognitive_runtime.training.imitation import train_bc
 
 DEFAULT_MODEL_OUT = "models/bc.json"
 DEFAULT_ONLINE_MODEL_OUT = "models/online-q.json"
+DEFAULT_ACTOR_CRITIC_MODEL_OUT = "models/actor-critic.pt"
 
 
 #: Historical CLI defaults for the world knobs a curriculum preset can also
@@ -208,6 +209,111 @@ def _make_online_policy_and_learner(
     return policy, learner
 
 
+def _make_actor_critic_policy_and_learner(
+    args: argparse.Namespace, program: MinecraftSurvivalBox
+):
+    """``--policy actor-critic``: the neural actor/critic online policy
+    (issue #29, docs/neural-stream-agent.md Phase E), wired the same way
+    ``_make_online_policy_and_learner`` wires the linear online-Q baseline.
+    Imported lazily -- torch stays optional for every other policy.
+    """
+    try:
+        import torch
+
+        from cognitive_runtime.neural import (
+            ActorCriticOptimizer,
+            MLPPolicyModel,
+            MLPValueModel,
+            MLPWorldModel,
+            NeuralAgentCheckpoint,
+            read_checkpoint_metadata,
+        )
+        from cognitive_runtime.neural.replay_buffer import MixedTrainingSchedule, ReplayBuffer
+        from cognitive_runtime.policies.actor_critic import (
+            ActorCriticLearner,
+            ActorCriticPolicy,
+            world_feature_width,
+        )
+    except ImportError as exc:  # torch not installed
+        sys.exit(f"the actor-critic policy needs PyTorch ({exc}); install '.[neural]'.")
+
+    action_space = list(program.metadata().action_space)
+    action_keys = [action.key() for action in action_space]
+    fusion = TemporalFusion(program.stream_catalog(), default_encoder_registry())
+    model_path = args.actor_critic_model
+
+    arch: Dict[str, Any] = {
+        "fused_width": fusion.width,
+        "world_feature_width": world_feature_width(action_keys),
+        "n_actions": len(action_keys),
+        "hidden_dim": args.actor_critic_hidden_dim,
+        "has_world_model": args.actor_critic_world_model_loss,
+    }
+    if os.path.exists(model_path):
+        saved_arch = read_checkpoint_metadata(model_path).get("extra", {}).get("actor_critic")
+        if saved_arch:
+            arch = saved_arch
+
+    # Deterministic weight init: ActorCriticOptimizer's own `seed` only covers
+    # its later stochastic ops, not construction, which happens before it exists.
+    torch.manual_seed(args.seed)
+    policy_model = MLPPolicyModel(
+        arch["fused_width"], arch["world_feature_width"], arch["n_actions"],
+        hidden_dim=arch["hidden_dim"], layout_hash=fusion.layout_hash, action_keys=action_keys,
+    )
+    critic_model = MLPValueModel(
+        arch["fused_width"], arch["world_feature_width"],
+        hidden_dim=arch["hidden_dim"], layout_hash=fusion.layout_hash, action_keys=action_keys,
+    )
+    world_model = None
+    if arch["has_world_model"]:
+        world_model = MLPWorldModel(
+            arch["fused_width"], arch["n_actions"],
+            hidden_dim=arch["hidden_dim"], layout_hash=fusion.layout_hash, action_keys=action_keys,
+        )
+
+    optimizer = ActorCriticOptimizer(
+        policy_model,
+        critic_model,
+        world_model=world_model,
+        lr=args.actor_critic_lr,
+        gamma=args.actor_critic_gamma,
+        entropy_coef=args.actor_critic_entropy_coef,
+        grad_clip_norm=args.actor_critic_grad_clip_norm,
+        seed=args.seed,
+    )
+
+    checkpoint = NeuralAgentCheckpoint(
+        model_path,
+        layout_hash=fusion.layout_hash,
+        action_keys=action_keys,
+        online_optimizer=optimizer,
+        extra_metadata={"actor_critic": arch},
+    )
+    if os.path.exists(model_path):
+        try:
+            checkpoint.load()
+        except ValueError as exc:
+            sys.exit(str(exc))
+
+    policy = ActorCriticPolicy(
+        policy_model, critic_model, action_keys, action_space=action_space,
+        history=args.actor_critic_history, training=args.actor_critic_train, seed=args.seed,
+    )
+    replay_buffer = ReplayBuffer()
+    learner = ActorCriticLearner(
+        optimizer,
+        policy,
+        training=args.actor_critic_train,
+        checkpoint=checkpoint,
+        save_every_ticks=args.actor_critic_save_every,
+        replay_buffer=replay_buffer,
+        mixed_schedule=MixedTrainingSchedule(replay_every_n_ticks=args.actor_critic_replay_every),
+        replay_batch_size=args.actor_critic_replay_batch_size,
+    )
+    return policy, learner
+
+
 def _add_world_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--curriculum", default=None, choices=CURRICULUM_ORDER,
                         help="named curriculum preset: world config + reward weights + a "
@@ -244,6 +350,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     learner = None
     if args.policy == "online":
         policy, learner = _make_online_policy_and_learner(args, program)
+    elif args.policy == "actor-critic":
+        policy, learner = _make_actor_critic_policy_and_learner(args, program)
     else:
         policy = _make_policy(args.policy, args)
     world_model = _make_world_model(args, program)
@@ -634,7 +742,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="run the runtime with a policy")
     p_run.add_argument("--policy", default="scripted",
                        choices=["null", "random", "scripted", "learned", "neural", "online",
-                                "human"])
+                                "actor-critic", "human"])
     p_run.add_argument("--episodes", type=int, default=1)
     p_run.add_argument("--tick-rate", type=float, default=20.0)
     p_run.add_argument("--realtime", action="store_true",
@@ -667,6 +775,31 @@ def build_parser() -> argparse.ArgumentParser:
                        default=True, help="train the online Q model while running")
     p_run.add_argument("--no-online-train", dest="online_train", action="store_false",
                        help="run online Q in eval mode without mutating the model")
+    p_run.add_argument("--actor-critic-model", default=DEFAULT_ACTOR_CRITIC_MODEL_OUT,
+                       help="actor-critic checkpoint bundle path (.pt)")
+    p_run.add_argument("--actor-critic-save-every", type=int, default=1000,
+                       help="save the actor-critic checkpoint every N gradient steps")
+    p_run.add_argument("--actor-critic-lr", type=float, default=1e-3)
+    p_run.add_argument("--actor-critic-gamma", type=float, default=0.99)
+    p_run.add_argument("--actor-critic-entropy-coef", type=float, default=0.01,
+                       help="entropy-bonus weight encouraging exploration")
+    p_run.add_argument("--actor-critic-grad-clip-norm", type=float, default=5.0)
+    p_run.add_argument("--actor-critic-hidden-dim", type=int, default=128)
+    p_run.add_argument("--actor-critic-history", type=int, default=8,
+                       help="recent-action window fed into world_features")
+    p_run.add_argument("--actor-critic-replay-every", type=int, default=32,
+                       help="pull a replay minibatch every N ticks")
+    p_run.add_argument("--actor-critic-replay-batch-size", type=int, default=32)
+    p_run.add_argument("--actor-critic-world-model-loss", dest="actor_critic_world_model_loss",
+                       action="store_true", default=True,
+                       help="jointly train an action-conditioned world model from the same "
+                            "transitions (default: on)")
+    p_run.add_argument("--no-actor-critic-world-model-loss", dest="actor_critic_world_model_loss",
+                       action="store_false")
+    p_run.add_argument("--actor-critic-train", dest="actor_critic_train", action="store_true",
+                       default=True, help="train the actor-critic model while running")
+    p_run.add_argument("--no-actor-critic-train", dest="actor_critic_train", action="store_false",
+                       help="run actor-critic in eval mode without mutating weights")
     _add_world_args(p_run)
     _add_world_model_arg(p_run)
     _add_entity_persistence_arg(p_run)
