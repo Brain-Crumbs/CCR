@@ -3,8 +3,8 @@
 CCR's first online learner is intentionally small: a dependency-free linear
 Q model over the existing fused latent vector.  The neural path now also has
 a first behavioral cut — an MLP actor/critic behind `--policy actor-critic`
-(issue #29) — though it still consumes the fixed fused latent rather than
-learned fusion (issue #57).
+(issue #29) — which consumes the fixed fused latent by default, or the
+learned-fusion path (`--fusion learned`, issue #57) instead.
 
 The linear Q learner is a **baseline**, not the target.  The end-state — a
 neural, stream-native agent with trainable encoders, budgeted attention,
@@ -41,7 +41,8 @@ The intended upgrade path is incremental:
 2. Replace selected streams with trainable encoders that expose the same fixed
    slice width and checkpoint hooks (landed, #24).
 3. Add learned fusion over per-stream slices while preserving layout/version
-   checks for saved models (module landed, #25; live wiring is #57).
+   checks for saved models (module landed, #25; live wiring behind
+   `--fusion learned` landed, #57).
 4. Add a learned world model that predicts next latent state, expected reward,
    terminal/death probability, risk, and prediction error (first cut landed,
    #26; multi-horizon generative version with uncertainty is #39).

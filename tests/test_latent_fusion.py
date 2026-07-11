@@ -60,6 +60,42 @@ def test_latent_fusion_handles_stream_going_silent_mid_episode():
     assert silent.presence_mask.tolist()[0][silent.stream_ids.index("reward.scalar")] == 0.0
 
 
+def test_omitting_attention_weights_is_byte_equivalent_to_all_ones():
+    """Issue #57 acceptance: the attention-weight hook must reproduce plain
+    fusion exactly until an attention controller (#59) actually plugs in."""
+    fusion = TemporalFusion(
+        [
+            StreamSpec("body.health", "body", range=(0.0, 20.0), neutral=20.0),
+            StreamSpec("reward.scalar", "reward", range=(-1.0, 1.0), neutral=0.0),
+        ]
+    )
+    model = LatentFusionModel.from_temporal_fusion(fusion, fused_width=6, hidden_dim=8)
+    model.eval()
+    buffer = TemporalBuffer()
+    buffer.extend(
+        [
+            StreamEvent("body.health", "body", 0.0, 1, 18.0),
+            StreamEvent("reward.scalar", "reward", 0.0, 1, {"value": 0.5}),
+        ]
+    )
+    inputs = latent_fusion_inputs_from_buffer(
+        fusion, buffer, present_stream_ids=["body.health", "reward.scalar"]
+    )
+
+    omitted = model(inputs.latents, inputs.presence_mask, inputs.recency, inputs.staleness)
+    ones = torch.ones((1, len(inputs.stream_ids)), dtype=torch.float32)
+    explicit = model(
+        inputs.latents, inputs.presence_mask, inputs.recency, inputs.staleness, ones
+    )
+    zeros = torch.zeros((1, len(inputs.stream_ids)), dtype=torch.float32)
+    zeroed = model(
+        inputs.latents, inputs.presence_mask, inputs.recency, inputs.staleness, zeros
+    )
+
+    assert torch.equal(omitted, explicit)
+    assert not torch.equal(omitted, zeroed)
+
+
 def _record_session(tmp_path, session_id: str, ticks: int = 80) -> str:
     config = {"episode_ticks": ticks, "world_size": 16}
     runtime_config = RuntimeConfig(

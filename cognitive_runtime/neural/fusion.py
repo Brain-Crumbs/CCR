@@ -50,6 +50,11 @@ class LatentFusionModel(nn.Module):
     - ``recency``: ``Tensor[batch, n_streams]`` in ``[0, 1]`` -- a
       recency-weighted activation per stream, the learned analogue of
       ``TemporalFusion._event_recency``.
+    - ``attention_weights`` (optional): ``Tensor[batch, n_streams]``, the
+      attention-controller hook (issue #57/#59) -- how much each stream
+      should contribute this tick. Omitting it (or passing all-ones) is
+      byte-equivalent: the channel defaults to ones, so a fresh model with
+      no attention controller attached reproduces plain fusion exactly.
     - Returns ``Tensor[batch, fused_width]``, the fused agent state consumed
       by :class:`~cognitive_runtime.neural.world_model.WorldModel` and
       :class:`~cognitive_runtime.neural.policy.PolicyModel`.
@@ -120,7 +125,7 @@ class LatentFusionModel(nn.Module):
         self.depth = int(depth)
         self.dropout = float(dropout)
 
-        model_input_width = self.input_width + 3 * len(self.stream_ids)
+        model_input_width = self.input_width + 4 * len(self.stream_ids)
         layers: List[nn.Module] = []
         width = model_input_width
         for _ in range(depth):
@@ -168,8 +173,10 @@ class LatentFusionModel(nn.Module):
         presence_mask: torch.Tensor,
         recency: torch.Tensor,
         staleness: Optional[torch.Tensor] = None,
+        attention_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Fuse per-stream latents (+ presence/recency) into one agent state.
+        """Fuse per-stream latents (+ presence/recency/attention) into one
+        agent state.
 
         Returns ``Tensor[batch, fused_width()]``.
         """
@@ -195,12 +202,22 @@ class LatentFusionModel(nn.Module):
                 f"staleness shape must be {expected_mask}, got "
                 f"{tuple(staleness.shape)}"
             )
+        if attention_weights is None:
+            attention_weights = torch.ones(expected_mask, dtype=torch.float32)
+        if tuple(attention_weights.shape) != expected_mask:
+            raise ValueError(
+                f"attention_weights shape must be {expected_mask}, got "
+                f"{tuple(attention_weights.shape)}"
+            )
 
         latents = latents.float()
         presence_mask = presence_mask.float()
         recency = recency.float()
         staleness = staleness.float()
-        features = torch.cat([latents, presence_mask, recency, staleness], dim=1)
+        attention_weights = attention_weights.float()
+        features = torch.cat(
+            [latents, presence_mask, recency, staleness, attention_weights], dim=1
+        )
         return self.net(features)
 
     def checkpoint_metadata(self) -> Dict[str, object]:

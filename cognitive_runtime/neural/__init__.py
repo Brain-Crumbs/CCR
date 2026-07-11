@@ -76,6 +76,12 @@ from cognitive_runtime.neural.fusion import (
     LatentFusionModel,
     latent_fusion_inputs_from_buffer,
 )
+from cognitive_runtime.neural.live_fusion import (
+    LiveLearnedFusion,
+    LiveLearnedFusionModule,
+    build_trainable_encoder_registry,
+    learned_fusion_layout_hash,
+)
 from cognitive_runtime.neural.optimizer import ActorCriticOptimizer, OnlineOptimizer
 from cognitive_runtime.neural.policy import MLPPolicyModel, PolicyModel
 from cognitive_runtime.neural.value import MLPValueModel, ValueModel
@@ -139,6 +145,10 @@ __all__ = [
     "LatentFusionModel",
     "LatentFusionInputs",
     "latent_fusion_inputs_from_buffer",
+    "LiveLearnedFusion",
+    "LiveLearnedFusionModule",
+    "build_trainable_encoder_registry",
+    "learned_fusion_layout_hash",
     "WorldModel",
     "WorldModelOutput",
     "MLPWorldModel",

@@ -101,9 +101,25 @@ Important limitations:
 - `--policy online` uses fixed stream encoders plus a linear Q model; it
   stays as the baseline.  `--policy actor-critic` trains an MLP
   policy/critic (and optionally an MLP world model) over the fused latent
-  state, but the fused latent itself is still `TemporalFusion`'s fixed
-  concatenation — CNN stream encoders and learned fusion are not yet wired
-  into the online policy path (issue #57 is that bridge).
+  state; the fused latent itself defaults to `TemporalFusion`'s fixed
+  concatenation, but `--fusion learned` (issue #57) now runs trainable
+  stream encoders (`cognitive_runtime.neural.live_fusion`, bound per-stream
+  from each `StreamDeclaration.neural_encoder`) through `LatentFusionModel`
+  in the live tick instead — the fused agent state the policy/critic consume
+  either way, so no downstream consumer needs to know which mode produced
+  it. `LatentFusionModel.forward` also takes an optional per-stream
+  `attention_weights` argument now (uniform/all-ones by default, byte-
+  equivalent to omitting it) so the attention controller (#59) can plug in
+  later without another interface change. A checkpoint's fusion mode is part
+  of its compatibility hash: resuming under the other mode fails loudly
+  instead of silently feeding the policy a differently-shaped, differently-
+  meaning vector. Training the trainable encoders + fusion model today is a
+  small synchronous online update (a reward-prediction auxiliary head,
+  every tick) behind the same checkpoint/learner interfaces the async
+  trainer (#37) will eventually replace it through — still CNN pixel
+  encoding is out of scope (`vision.frame.pixels` stays a deliberate raw
+  stub in both fusion modes) pending a trainable `PixelStreamEncoder`
+  binding.
 - Per-tick prediction error and novelty are computed but only written into
   decision records; they are not yet first-class `internal.*` streams
   (issue #58).
@@ -183,8 +199,9 @@ It should not assume every sensor fires every tick — and it should accept
 per-stream attention weights (uniform by default) so the attention
 controller can plug in without an interface change.
 
-*Status: `LatentFusionModel` landed (#25) but is not yet in the live policy
-path — wiring it in, with the attention-weight hook, is #57.*
+*Status: `LatentFusionModel` landed (#25) and is now wired into the live
+policy path behind `--fusion learned` (#57), with the attention-weight hook
+(uniform by default) on `LatentFusionModel.forward`.*
 
 ### 4. Add Representation Learning Losses
 
@@ -389,11 +406,21 @@ to be byte-reproducible.)
 - Reusable `PixelStreamEncoder` (#22) with reconstruction/next-latent
   prediction losses (#23); trainable non-vision encoders + audio stub (#24).
 
-### Phase C: Learned Fusion — landed as a module, not yet live
+### Phase C: Learned Fusion — landed, live behind `--fusion learned`
 
 - `LatentFusionModel` with stream masks and recency (#25).
-- **Wiring it into the live actor/critic path, with the attention-weight
-  hook, is issue #57 — the bridge this phase still owes.**
+- Wired into the live actor/critic path via `--fusion learned`, with the
+  attention-weight hook, landed (#57): trainable stream encoders
+  (`cognitive_runtime.neural.live_fusion.build_trainable_encoder_registry`,
+  bound per stream from `StreamDeclaration.neural_encoder`) feed
+  `LatentFusionModel` every tick; `--fusion fixed` (`TemporalFusion`) stays
+  the default until #31's gates pass a learned-fusion run. The checkpoint
+  bundle carries the trainable encoders and fusion model, keyed by a
+  fusion-mode-tagged compatibility hash distinct from the fixed path's, so a
+  checkpoint trained under one mode fails loudly if resumed under the
+  other. Online training of the encoders + fusion model is a small
+  synchronous reward-prediction update for now; the async trainer (#37)
+  owns replacing it with the full transition-based training loop.
 
 ### Phase D: World Model And Object Permanence — first cut landed
 
