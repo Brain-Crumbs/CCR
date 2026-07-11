@@ -314,6 +314,21 @@ class MinecraftSurvivalBox(Program):
             return None
         return self._reward_profile.metadata()
 
+    def observe_external_streams(self, payloads: Dict[str, Any]) -> None:
+        """Runtime-computed streams (issue #58's `internal.*`, issue #61's
+        derived risk-gated terms) are published directly onto the shared
+        sensory bus by `CognitiveRuntime`, *after* this Program's own
+        `step()` already ran this tick -- they never flow through
+        `SurvivalStreamPublisher.publish_tick`'s `tick_events`, so a
+        profile's `intrinsic` slots would otherwise never see them. Primed
+        here (called by `CognitiveRuntime` right after it publishes them)
+        so the *next* tick's reward evaluation picks them up -- the same
+        one-tick lag `model.novelty`/`internal.*` already have relative to
+        the window that first observes them. A no-op unless a `RewardProfile`
+        is active (the legacy `SurvivalReward` path never reads `internal.*`)."""
+        if isinstance(self._reward_fn, ProfileRewardEngine):
+            self._reward_fn.observe_external_streams(payloads)
+
     def reward_engine_state_dict(self) -> Optional[Dict[str, Any]]:
         """Brain-scoped milestone state + return normalizer (issue #41), for
         the checkpoint bundle.  `None` when no profile is active."""

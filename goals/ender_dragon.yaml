@@ -174,8 +174,8 @@ tiers:
         event: defeated_dragon
 
 # Pluggable intrinsic-drive slots (issue #41 schema; the components
-# themselves -- learning progress, risk-gated novelty, predicted-pain
-# aversion -- are specified and implemented in #61, reading from the
+# themselves -- learning progress, risk-gated safe novelty, predicted-pain
+# aversion -- are computed by #61 (`core/modulation.py`) from the
 # `internal.*` modulation streams #58 publishes).  Never raw world-model
 # prediction error or accuracy: those reward noise or wall-staring.
 intrinsic:

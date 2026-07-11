@@ -217,6 +217,14 @@ class ProfileRewardEngine:
             if self._spawn is None and event.stream_id == "spatial.position":
                 self._spawn = (event.payload["x"], event.payload["z"])
 
+    def observe_external_streams(self, payloads: Dict[str, Any]) -> None:
+        """Merge runtime-computed stream payloads (issue #58/#61's
+        `internal.*`) into the same latest-value cache `_eval_intrinsic`
+        reads from. Unlike `prime_stream_state`, these never arrive as
+        `StreamEvent`s the Program itself published -- `CognitiveRuntime`
+        calls this directly with the raw `{stream_id: payload}` map."""
+        self._latest_streams.update(payloads)
+
     def evaluate_stream_window(
         self, stream_events: List[StreamEvent], action: Action
     ) -> RewardSignal:

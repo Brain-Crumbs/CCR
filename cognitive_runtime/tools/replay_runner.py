@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+from cognitive_runtime.programs.minecraft.reward_profile import RewardProfile
 from cognitive_runtime.runtime.replay import (
     ReplayResult,
     list_episodes,
@@ -15,16 +16,51 @@ from cognitive_runtime.runtime.replay import (
 )
 
 
-def replay_session(session_dir: str, episode_id: str | None = None, verify: bool = True) -> List[ReplayResult]:
+def replay_session(
+    session_dir: str,
+    episode_id: str | None = None,
+    verify: bool = True,
+    reward_profile: Optional[RewardProfile] = None,
+) -> List[ReplayResult]:
     metadata = load_session_metadata(session_dir)
     require_streams_v2(metadata)
     require_deterministic(metadata)
     if metadata.get("program") != "MinecraftSurvivalBox":
         raise ValueError(f"unsupported program for replay: {metadata.get('program')}")
+    # A session recorded with `--reward-profile` scores `reward.scalar`
+    # through `ProfileRewardEngine`, not the default hard-coded
+    # `SurvivalReward` -- rebuilding the Program without the same profile
+    # would silently replay-verify against the wrong reward function
+    # instead of failing loudly (issue #61 found this while wiring
+    # intrinsic components through replay).
+    recorded_profile_meta = metadata.get("reward_profile")
+    if recorded_profile_meta and reward_profile is None:
+        raise ValueError(
+            f"session {session_dir!r} was recorded with reward profile "
+            f"{recorded_profile_meta.get('name')!r} "
+            f"(content_hash={recorded_profile_meta.get('content_hash')!r}); pass the same "
+            "profile via --reward-profile to replay it correctly -- without it, replay "
+            "would score reward.scalar against the wrong (default) reward function"
+        )
+    if reward_profile is not None:
+        if not recorded_profile_meta:
+            raise ValueError(
+                f"session {session_dir!r} was recorded without a reward profile (the "
+                "default SurvivalReward); drop --reward-profile to replay it"
+            )
+        if reward_profile.content_hash != recorded_profile_meta.get("content_hash"):
+            raise ValueError(
+                f"--reward-profile content_hash {reward_profile.content_hash!r} does not "
+                f"match the session's recorded {recorded_profile_meta.get('content_hash')!r} "
+                f"({recorded_profile_meta.get('name')!r}); replay needs the exact profile "
+                "content the session was recorded with"
+            )
     episodes = [episode_id] if episode_id else list_episodes(session_dir)
     results = []
     for episode in episodes:
-        program = MinecraftSurvivalBox(config=metadata.get("program_config") or None)
+        program = MinecraftSurvivalBox(
+            config=metadata.get("program_config") or None, reward_profile=reward_profile,
+        )
         results.append(replay_episode(program, session_dir, episode, verify=verify))
     return results
 

@@ -2,7 +2,7 @@
 modeled as first-class ``internal.*`` streams rather than hidden variables or
 decision-record-only fields.
 
-Five per-tick interoceptive streams:
+Five raw per-tick interoceptive streams:
 
 - ``internal.prediction_error`` — world-model next-latent error (already
   computed by ``core.world_model.Prediction``; this promotes it to a stream).
@@ -16,14 +16,33 @@ Five per-tick interoceptive streams:
 - ``internal.risk`` — the world model's risk/p_death head output: predicted
   pain/injury/death made visible.
 
+Plus three derived "risk-gated surprise-seeking" streams (issue #61 --
+"the motivation core"), computed from the five above and never recomputed
+reward-side:
+
+- ``internal.risk_gate`` — ``safe_gate()``: ``1.0`` when predicted risk is
+  well below ``risk_threshold`` (safe to be curious), ``0.0`` well above it
+  (surprise here is a warning, not curiosity), ``0.5`` exactly at the
+  threshold. Logged mainly for dashboards/debugging the gate itself.
+- ``internal.safe_novelty`` — ``novelty * risk_gate``: surprise sought only
+  when it doesn't forecast suffering.
+- ``internal.predicted_risk_aversion`` — ``-risk``: already sign-flipped, so
+  a reward profile's positive ``weight`` on this slot amplifies an
+  aversive (negative) shaping term proportional to predicted risk, before
+  any damage lands.
+
 Every payload is the uniform ``{"value": <float>}`` shape the reward
 engine's ``intrinsic_stream`` component kind already expects
 (``programs/minecraft/reward_profile.py``), so any of these streams can be
-wired straight into a reward profile's ``intrinsic`` slots.
+wired straight into a reward profile's ``intrinsic`` slots.  Deliberately
+*not* published: raw prediction accuracy or raw prediction error as a
+reward-shaped signal -- those reward wall-staring and noisy-TV/cliffs
+respectively; see ``docs/reward_profiles.md``.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Tuple
 
@@ -36,6 +55,9 @@ REWARD_PREDICTION_ERROR_STREAM = "internal.reward_prediction_error"
 LEARNING_PROGRESS_STREAM = "internal.learning_progress"
 NOVELTY_STREAM = "internal.novelty"
 RISK_STREAM = "internal.risk"
+RISK_GATE_STREAM = "internal.risk_gate"
+SAFE_NOVELTY_STREAM = "internal.safe_novelty"
+PREDICTED_RISK_AVERSION_STREAM = "internal.predicted_risk_aversion"
 
 #: Every internal.* stream id this module publishes, in a stable order.
 INTERNAL_MODULATION_STREAM_IDS: Tuple[str, ...] = (
@@ -44,7 +66,41 @@ INTERNAL_MODULATION_STREAM_IDS: Tuple[str, ...] = (
     LEARNING_PROGRESS_STREAM,
     NOVELTY_STREAM,
     RISK_STREAM,
+    RISK_GATE_STREAM,
+    SAFE_NOVELTY_STREAM,
+    PREDICTED_RISK_AVERSION_STREAM,
 )
+
+#: Default risk-gate shape (issue #61): the risk level ("predicted pain")
+#: at which safe novelty is cut in half, and the sigmoid's softness around
+#: it. Both configurable per run (``RuntimeConfig.intrinsic_risk_threshold``/
+#: ``intrinsic_risk_temperature``, ``--intrinsic-risk-threshold``/
+#: ``--intrinsic-risk-temperature``) and recorded into session metadata for
+#: provenance (issue #44's harness compares drives across runs).
+DEFAULT_RISK_THRESHOLD = 0.5
+DEFAULT_RISK_TEMPERATURE = 0.15
+
+
+def safe_gate(risk: float, risk_threshold: float = DEFAULT_RISK_THRESHOLD,
+              temperature: float = DEFAULT_RISK_TEMPERATURE) -> float:
+    """``sigmoid(-(risk - risk_threshold) / temperature)`` (issue #61).
+
+    ``1.0`` when ``risk`` sits well below ``risk_threshold`` (safe: novelty
+    passes through in full); ``0.0`` well above it (dangerous: novelty is
+    suppressed -- "surprising but painful is not curiosity, it is a
+    warning"); exactly ``0.5`` at the threshold.  ``temperature`` controls
+    how sharp the cutover is (smaller = sharper).
+    """
+    if temperature <= 0:
+        raise ValueError(f"temperature must be > 0, got {temperature!r}")
+    x = -(risk - risk_threshold) / temperature
+    # Overflow-safe logistic sigmoid: exp() of a large positive `x` would
+    # overflow, so branch on sign and always exponentiate the negative side.
+    if x >= 0:
+        z = math.exp(-x)
+        return 1.0 / (1.0 + z)
+    z = math.exp(x)
+    return z / (1.0 + z)
 
 
 def _spec(stream_id: str, description: str) -> StreamSpec:
@@ -83,6 +139,21 @@ INTERNAL_MODULATION_STREAM_SPECS: Tuple[StreamSpec, ...] = (
         RISK_STREAM,
         "World-model risk/p_death head output: predicted pain/injury/death, "
         "made visible (issue #58).",
+    ),
+    _spec(
+        RISK_GATE_STREAM,
+        "safe_gate(risk): 1.0 well below risk_threshold, 0.0 well above it "
+        "(issue #61).",
+    ),
+    _spec(
+        SAFE_NOVELTY_STREAM,
+        "novelty * risk_gate: surprise sought only when it doesn't forecast "
+        "suffering (issue #61).",
+    ),
+    _spec(
+        PREDICTED_RISK_AVERSION_STREAM,
+        "-risk: predicted pain/injury/death made aversive before it "
+        "happens (issue #61).",
     ),
 )
 
@@ -154,21 +225,35 @@ class LearningProgressTracker:
 class ModulationSignals:
     """One tick's internal.* modulation values. ``None`` where the
     underlying signal is unavailable this tick (e.g. a heuristic world model
-    with no reward head); ``risk`` is always available (``Prediction.risk``
-    defaults to 0.0, never ``None``)."""
+    with no reward head); ``risk``, ``risk_gate`` and
+    ``predicted_risk_aversion`` are always available (``Prediction.risk``
+    defaults to 0.0, never ``None``); ``safe_novelty`` follows ``novelty``'s
+    availability -- there is nothing to gate when there is no novelty
+    signal this tick."""
 
     prediction_error: Optional[float]
     reward_prediction_error: Optional[float]
     learning_progress: Optional[float]
     novelty: Optional[float]
     risk: float
+    #: safe_gate(risk) (issue #61): 1.0 well below risk_threshold, 0.0 well
+    #: above it.
+    risk_gate: float
+    #: novelty * risk_gate: surprise sought only when it doesn't forecast
+    #: suffering. `None` exactly when `novelty` is `None`.
+    safe_novelty: Optional[float]
+    #: -risk, already sign-flipped so a positive reward-profile weight on
+    #: this slot amplifies an aversive shaping term.
+    predicted_risk_aversion: float
 
     def as_payloads(self) -> Dict[str, Dict[str, float]]:
         """stream_id -> ``{"value": ...}`` for every signal that fired this
         tick, in the uniform payload shape the reward engine's
         ``intrinsic_stream`` components already expect."""
         payloads: Dict[str, Dict[str, float]] = {
-            RISK_STREAM: {"value": round(self.risk, 6)}
+            RISK_STREAM: {"value": round(self.risk, 6)},
+            RISK_GATE_STREAM: {"value": round(self.risk_gate, 6)},
+            PREDICTED_RISK_AVERSION_STREAM: {"value": round(self.predicted_risk_aversion, 6)},
         }
         if self.prediction_error is not None:
             payloads[PREDICTION_ERROR_STREAM] = {"value": round(self.prediction_error, 6)}
@@ -180,6 +265,8 @@ class ModulationSignals:
             payloads[LEARNING_PROGRESS_STREAM] = {"value": round(self.learning_progress, 6)}
         if self.novelty is not None:
             payloads[NOVELTY_STREAM] = {"value": round(self.novelty, 6)}
+        if self.safe_novelty is not None:
+            payloads[SAFE_NOVELTY_STREAM] = {"value": round(self.safe_novelty, 6)}
         return payloads
 
 
@@ -190,14 +277,29 @@ class ModulationTracker:
     -- a run's world model keeps predicting across episode resets, so its
     predictive skill is tracked continuously, not reset per episode).
 
+    ``risk_threshold``/``temperature`` shape the risk gate (:func:`safe_gate`,
+    issue #61) that turns raw novelty into risk-gated *safe* novelty and
+    scales the predicted-risk-aversion term; both are constant for the
+    tracker's lifetime (a run-level config knob, not evolving state), so they
+    are not part of ``state_dict()`` -- callers that need provenance record
+    them into session metadata instead (``RuntimeConfig.intrinsic_risk_threshold``
+    /``intrinsic_risk_temperature``).
+
     ``state_dict``/``load_state_dict`` are ready for a checkpoint's
     ``training_stats`` (issue #20), so a resumed run doesn't reset the EMA
     baselines -- wiring that into a concrete learner's checkpoint bundle is
     left to whichever learner owns one.
     """
 
-    def __init__(self, learning_progress: Optional[LearningProgressTracker] = None):
+    def __init__(
+        self,
+        learning_progress: Optional[LearningProgressTracker] = None,
+        risk_threshold: float = DEFAULT_RISK_THRESHOLD,
+        temperature: float = DEFAULT_RISK_TEMPERATURE,
+    ):
         self.learning_progress = learning_progress or LearningProgressTracker()
+        self.risk_threshold = risk_threshold
+        self.temperature = temperature
 
     def update(
         self,
@@ -206,6 +308,8 @@ class ModulationTracker:
         actual_reward: float,
     ) -> ModulationSignals:
         novelty = combine_novelty(prediction.prediction_error, entity_surprise)
+        risk = prediction.risk
+        gate = safe_gate(risk, self.risk_threshold, self.temperature)
         return ModulationSignals(
             prediction_error=prediction.prediction_error,
             reward_prediction_error=compute_reward_prediction_error(
@@ -213,7 +317,10 @@ class ModulationTracker:
             ),
             learning_progress=self.learning_progress.update(prediction.prediction_error),
             novelty=novelty,
-            risk=prediction.risk,
+            risk=risk,
+            risk_gate=gate,
+            safe_novelty=novelty * gate if novelty is not None else None,
+            predicted_risk_aversion=-risk,
         )
 
     def reset(self) -> None:

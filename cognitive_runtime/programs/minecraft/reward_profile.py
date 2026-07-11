@@ -193,7 +193,26 @@ class RewardProfile:
         return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
     def metadata(self) -> Dict[str, Any]:
-        return {"name": self.name, "content_hash": self.content_hash}
+        """Session-metadata summary: name + content hash (dashboard
+        grouping), plus each intrinsic slot's stream/weight/cap/disabled
+        (issue #61: "intrinsic weights ... in session metadata so #44's
+        harness can compare drives") -- the full profile is already
+        reproducible from `content_hash`, this just spells out the
+        intrinsic knobs for direct inspection without a profile-file lookup.
+        """
+        return {
+            "name": self.name,
+            "content_hash": self.content_hash,
+            "intrinsic": {
+                name: {
+                    "stream": spec.stream,
+                    "weight": spec.weight,
+                    "cap": spec.cap,
+                    "disabled": spec.disabled,
+                }
+                for name, spec in self.intrinsic.items()
+            },
+        }
 
 
 def _err(source: str, message: str) -> "RewardProfileError":

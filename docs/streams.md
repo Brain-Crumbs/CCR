@@ -55,7 +55,7 @@ generic: Minecraft health, a Linux battery and robot joint stress are all
 | `input` | Raw human input (demos) | `input.keypress` |
 | `world` | Global world state | `world.time`, `world.nearby_blocks` |
 | `motor` | Actions, the other direction | `motor.command` |
-| `internal` | Interoception: the runtime's own modulation signals, published back onto the bus (issue #58) | `internal.prediction_error`, `internal.reward_prediction_error`, `internal.learning_progress`, `internal.novelty`, `internal.risk` (published every tick, `core/modulation.py`); `internal.attention.weights` (published every tick by the deterministic attention controller, issue #59, `core/attention.py`) |
+| `internal` | Interoception: the runtime's own modulation signals, published back onto the bus (issue #58) | `internal.prediction_error`, `internal.reward_prediction_error`, `internal.learning_progress`, `internal.novelty`, `internal.risk`, `internal.risk_gate`, `internal.safe_novelty`, `internal.predicted_risk_aversion` (published every tick, `core/modulation.py`; the last three are issue #61's risk-gated intrinsic-drive terms); `internal.attention.weights` (published every tick by the deterministic attention controller, issue #59, `core/attention.py`) |
 
 The `internal` modality is the biological-modulation analog (dopamine as
 reward-prediction-error, etc.): the agent's own error, progress, novelty and
@@ -281,16 +281,18 @@ The reserved `audio.*` declaration is intentionally a fixed neural stub:
 `AudioEncoder` emits a stable zero latent and checkpoints its stub state, but
 no Program publishes audio and no capture/spectrogram backend exists yet.
 
-### Internal modulation streams (issue #58)
+### Internal modulation streams (issue #58) and the intrinsic drive (issue #61)
 
 The runtime already thinks in streams, so neuromodulation is modeled as
 *internal streams*, not hidden variables: `cognitive_runtime/core/modulation.py`
-computes and `runtime/loop.py` publishes five `internal.*` streams every
+computes and `runtime/loop.py` publishes eight `internal.*` streams every
 cognitive tick, each with the uniform `{"value": <float>}` payload the
 reward engine's `intrinsic_stream` component kind already expects
 (`programs/minecraft/reward_profile.py`, so any of them can be wired
 straight into a reward profile's `intrinsic` slots without a translation
-layer):
+layer). Five are the raw signals #58 introduced; three are #61's risk-gated
+"safe surprise" terms, derived from the raw five and never recomputed
+reward-side:
 
 - `internal.prediction_error` — the world model's next-latent prediction
   error (`core.world_model.Prediction.prediction_error`, issue #26),
@@ -313,6 +315,21 @@ layer):
 - `internal.risk` — the world model's risk/p_death head output
   (`Prediction.risk`), made visible. Always published: `Prediction.risk`
   defaults to `0.0`, never `None`.
+- `internal.risk_gate` — `safe_gate(risk) = sigmoid(-(risk - risk_threshold)
+  / temperature)` (issue #61): `1.0` well below `risk_threshold` (safe to
+  be curious), `0.0` well above it, `0.5` exactly at the threshold. Always
+  published, like `internal.risk`. `risk_threshold`/`temperature` are
+  `ModulationTracker` construction params, sourced from
+  `RuntimeConfig.intrinsic_risk_threshold`/`intrinsic_risk_temperature`
+  (`--intrinsic-risk-threshold`/`--intrinsic-risk-temperature`, defaults
+  `0.5`/`0.15`).
+- `internal.safe_novelty` — `internal.novelty * internal.risk_gate` (issue
+  #61): surprise sought only when it doesn't forecast suffering. `None`
+  exactly when `internal.novelty` is `None`.
+- `internal.predicted_risk_aversion` — `-internal.risk` (issue #61),
+  already sign-flipped so a *positive* reward-profile weight on this slot
+  amplifies an aversive shaping term proportional to predicted risk —
+  avoidance happens before damage, not after. Always published.
 
 `ModulationTracker` owns the `learning_progress` EMA state across ticks and
 episodes within a run (a world model's predictive skill is a property of
@@ -320,15 +337,18 @@ the model, not of any one episode, so episode resets don't reset it) and
 exposes `state_dict()`/`load_state_dict()`, ready for a checkpoint's
 `training_stats` (issue #20) so a resumed run doesn't reset the baselines —
 wiring that into a concrete learner's checkpoint bundle is left to whichever
-learner owns one. The `internal.*` wildcard was already declared
-`agent_input` with `AttentionMetadata(modality="internal")` in
-`DEFAULT_STREAM_REGISTRY` ahead of this issue (issue #32); these are runtime
--computed signals registered directly on the sensory bus, like `model.novelty`
-/`model.value_estimate`, not part of any Program's stream catalog.
-`episode_viewer.py` renders all five per recent decision, and
-`neural.replay_buffer.load_session_into_buffer` reads `internal.novelty` and
-`internal.reward_prediction_error` per tick (issue #28) instead of always
-leaving novelty `None` for loaded sessions.
+learner owns one. `risk_threshold`/`temperature` are constant for the
+tracker's lifetime (a run-level config knob, not evolving state), so they
+are not part of `state_dict()`; `CognitiveRuntime.run()` instead records
+them into session metadata's `intrinsic_modulation` field for provenance.
+The `internal.*` wildcard was already declared `agent_input` with
+`AttentionMetadata(modality="internal")` in `DEFAULT_STREAM_REGISTRY` ahead
+of this issue (issue #32); these are runtime-computed signals registered
+directly on the sensory bus, like `model.novelty`/`model.value_estimate`,
+not part of any Program's stream catalog. `episode_viewer.py` renders all
+eight per recent decision, and `neural.replay_buffer.load_session_into_buffer`
+reads `internal.novelty` and `internal.reward_prediction_error` per tick
+(issue #28) instead of always leaving novelty `None` for loaded sessions.
 
 ### Stream classification and attention metadata (issue #32)
 

@@ -202,13 +202,24 @@ class CognitiveRuntime:
         self.sensory_bus.register(ATTENTION_WEIGHTS_STREAM_SPEC)
         for spec in INTERNAL_MODULATION_STREAM_SPECS:
             self.sensory_bus.register(spec)
-        #: Interoceptive modulation signals (issue #58): prediction error,
-        #: reward-prediction error, learning progress, novelty and risk,
-        #: published as `internal.*` streams every cognitive tick. Persists
-        #: across episodes within a run -- the world model's predictive
-        #: skill (learning_progress's EMA state) is a property of the model,
-        #: not of any one episode.
-        self.modulation = ModulationTracker()
+        #: Interoceptive modulation signals (issue #58) plus the risk-gated
+        #: intrinsic-drive terms derived from them (issue #61): prediction
+        #: error, reward-prediction error, learning progress, novelty, risk,
+        #: risk_gate, safe_novelty and predicted_risk_aversion, published as
+        #: `internal.*` streams every cognitive tick. Persists across
+        #: episodes within a run -- the world model's predictive skill
+        #: (learning_progress's EMA state) is a property of the model, not
+        #: of any one episode.
+        self.modulation = ModulationTracker(
+            risk_threshold=self.config.intrinsic_risk_threshold,
+            temperature=self.config.intrinsic_risk_temperature,
+        )
+        #: Optional Program hook (issue #61) that primes a profile-driven
+        #: reward engine's `internal.*` view -- see the call site below for
+        #: why this can't just flow through the Program's own tick_events.
+        self._observe_external_streams = getattr(
+            self.program, "observe_external_streams", None
+        )
         attention_mode = self.config.attention_mode
         if attention_mode not in ATTENTION_MODES:
             raise ValueError(
@@ -306,6 +317,17 @@ class CognitiveRuntime:
             profile_metadata = profile_meta_fn()
             if profile_metadata:
                 session_metadata["reward_profile"] = profile_metadata
+        # Risk-gated intrinsic drive provenance (issue #61): the risk
+        # threshold/temperature shaping `internal.risk_gate` this run used,
+        # so #44's harness can compare drives across runs/profiles that tune
+        # them differently -- the intrinsic component weights themselves
+        # already ride along inside `reward_profile.content_hash` above, and
+        # (when a profile is active) are also spelled out in
+        # `reward_profile.intrinsic` for direct inspection.
+        session_metadata["intrinsic_modulation"] = {
+            "risk_threshold": self.modulation.risk_threshold,
+            "risk_temperature": self.modulation.temperature,
+        }
         self.recorder.write_session_metadata(session_metadata)
         summaries: List[EpisodeSummary] = []
         checkpoint_reason = "shutdown"
@@ -508,10 +530,20 @@ class CognitiveRuntime:
             modulation = self.modulation.update(
                 prediction, entity_prediction.surprise, reward_value
             )
-            for stream_id, payload in modulation.as_payloads().items():
+            modulation_payloads = modulation.as_payloads()
+            for stream_id, payload in modulation_payloads.items():
                 self.sensory_bus.publish(
                     stream_id, payload, window.ended_at, source="model"
                 )
+            # `internal.*` streams are computed here, after this tick's
+            # `program.step()` already ran -- a Program's own reward
+            # evaluation can never see them the same tick it's published, so
+            # this primes the *next* tick's evaluation instead (mirrors the
+            # window's own one-tick lag for runtime-computed streams). A
+            # no-op for Programs that don't expose the hook (e.g. no active
+            # reward profile).
+            if self._observe_external_streams is not None:
+                self._observe_external_streams(modulation_payloads)
 
             self.recorder.write_cognitive_tick(
                 sensory_events=window.events,

@@ -11,12 +11,16 @@ from cognitive_runtime.core.modulation import (
     INTERNAL_MODULATION_STREAM_IDS,
     LEARNING_PROGRESS_STREAM,
     NOVELTY_STREAM,
+    PREDICTED_RISK_AVERSION_STREAM,
     PREDICTION_ERROR_STREAM,
     REWARD_PREDICTION_ERROR_STREAM,
+    RISK_GATE_STREAM,
     RISK_STREAM,
+    SAFE_NOVELTY_STREAM,
     LearningProgressTracker,
     ModulationTracker,
     compute_reward_prediction_error,
+    safe_gate,
 )
 from cognitive_runtime.core.world_model import Prediction, WorldModel
 from cognitive_runtime.policies import ScriptedSurvivalPolicy
@@ -113,15 +117,20 @@ def test_reward_prediction_error_is_none_without_a_reward_head():
 # --------------------------------------------------------------- ModulationTracker
 
 
-def test_modulation_tracker_publishes_risk_every_tick_even_without_other_signals():
+def test_modulation_tracker_publishes_risk_and_gated_terms_every_tick_even_without_other_signals():
     tracker = ModulationTracker()
     signals = tracker.update(Prediction(risk=0.25), entity_surprise=None, actual_reward=0.0)
     payloads = signals.as_payloads()
-    assert payloads.keys() == {RISK_STREAM}
+    # risk, risk_gate and predicted_risk_aversion are always available
+    # (Prediction.risk defaults to 0.0, never None); safe_novelty is not,
+    # since there is no novelty signal this tick to gate.
+    assert payloads.keys() == {RISK_STREAM, RISK_GATE_STREAM, PREDICTED_RISK_AVERSION_STREAM}
     assert payloads[RISK_STREAM] == {"value": 0.25}
+    assert payloads[PREDICTED_RISK_AVERSION_STREAM] == {"value": -0.25}
+    assert 0.0 < payloads[RISK_GATE_STREAM]["value"] < 1.0
 
 
-def test_modulation_tracker_publishes_all_five_when_every_signal_is_available():
+def test_modulation_tracker_publishes_all_eight_when_every_signal_is_available():
     tracker = ModulationTracker()
     prediction = Prediction(risk=0.1, predicted_reward=0.2, prediction_error=0.5)
     signals = tracker.update(prediction, entity_surprise=0.3, actual_reward=0.6)
@@ -131,6 +140,52 @@ def test_modulation_tracker_publishes_all_five_when_every_signal_is_available():
     assert payloads[REWARD_PREDICTION_ERROR_STREAM] == {"value": pytest.approx(0.4)}
     assert payloads[NOVELTY_STREAM] == {"value": pytest.approx(0.4)}  # mean(0.5, 0.3)
     assert payloads[LEARNING_PROGRESS_STREAM] == {"value": 0.0}  # first sample
+    assert payloads[PREDICTED_RISK_AVERSION_STREAM] == {"value": -0.1}
+    # risk=0.1 is well below the default 0.5 threshold -> gate close to 1,
+    # so safe_novelty is close to (uncapped) novelty.
+    assert payloads[RISK_GATE_STREAM]["value"] > 0.9
+    assert payloads[SAFE_NOVELTY_STREAM]["value"] == pytest.approx(
+        payloads[NOVELTY_STREAM]["value"] * payloads[RISK_GATE_STREAM]["value"], abs=1e-5
+    )
+
+
+# ------------------------------------------------------------------ safe_gate
+
+
+def test_safe_gate_is_one_half_exactly_at_the_threshold():
+    assert safe_gate(0.5, risk_threshold=0.5, temperature=0.15) == pytest.approx(0.5)
+
+
+def test_safe_gate_approaches_one_well_below_threshold():
+    assert safe_gate(0.0, risk_threshold=0.5, temperature=0.05) > 0.999
+
+
+def test_safe_gate_approaches_zero_well_above_threshold():
+    assert safe_gate(1.0, risk_threshold=0.5, temperature=0.05) < 0.001
+
+
+def test_safe_gate_is_monotonically_decreasing_in_risk():
+    risks = [round(0.05 * i, 2) for i in range(21)]  # 0.0 .. 1.0
+    gates = [safe_gate(r, risk_threshold=0.5, temperature=0.15) for r in risks]
+    assert all(a >= b for a, b in zip(gates, gates[1:]))
+
+
+def test_safe_gate_rejects_non_positive_temperature():
+    with pytest.raises(ValueError, match="temperature"):
+        safe_gate(0.5, risk_threshold=0.5, temperature=0.0)
+
+
+def test_modulation_tracker_risk_threshold_and_temperature_are_configurable():
+    permissive = ModulationTracker(risk_threshold=0.9, temperature=0.15)
+    strict = ModulationTracker(risk_threshold=0.1, temperature=0.15)
+    prediction = Prediction(risk=0.5, prediction_error=0.4)
+    permissive_gate = permissive.update(prediction, None, 0.0).risk_gate
+    strict_gate = strict.update(prediction, None, 0.0).risk_gate
+    # Same risk reading, different thresholds: a lenient threshold (0.9)
+    # still treats risk=0.5 as safe; a strict one (0.1) treats it as
+    # dangerous.
+    assert permissive_gate > 0.9
+    assert strict_gate < 0.1
 
 
 def test_modulation_tracker_state_dict_round_trips():
@@ -151,7 +206,7 @@ def test_modulation_tracker_state_dict_round_trips():
 
 class _FakeWorldModel(WorldModel):
     """Deterministic non-None prediction/reward/error every tick, so a short
-    run exercises all five `internal.*` streams without a trained model."""
+    run exercises all eight `internal.*` streams without a trained model."""
 
     def __init__(self):
         self.tick = 0
@@ -169,7 +224,7 @@ class _FakeWorldModel(WorldModel):
         self.tick = 0
 
 
-def test_simulated_run_records_all_five_internal_streams_every_tick(tmp_path):
+def test_simulated_run_records_all_eight_internal_streams_every_tick(tmp_path):
     config = {"episode_ticks": 15, "world_size": 16, "max_mobs": 1}
     runtime_config = RuntimeConfig(
         episodes=1,
@@ -191,14 +246,14 @@ def test_simulated_run_records_all_five_internal_streams_every_tick(tmp_path):
     # appear in the *next* tick's window -- tick 0 never carries them.
     session_dir = os.path.join(str(tmp_path), "modulation-session")
     ticks_seen = 0
-    ticks_with_all_five = 0
+    ticks_with_all_eight = 0
     for decision, sensory, _motor in iter_cognitive_ticks(session_dir, "episode_00000"):
         ids = {r["stream_id"] for r in sensory if not r.get("elided")}
         ticks_seen += 1
         if set(INTERNAL_MODULATION_STREAM_IDS) <= ids:
-            ticks_with_all_five += 1
+            ticks_with_all_eight += 1
     assert ticks_seen == 15
-    assert ticks_with_all_five == 14
+    assert ticks_with_all_eight == 14
 
     rendered = view_episode(session_dir, "episode_00000")
     for stream_id in INTERNAL_MODULATION_STREAM_IDS:

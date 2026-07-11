@@ -1,0 +1,45 @@
+# Nursery intrinsic-only profile (issue #61/#62): no extrinsic tiers at
+# all -- a newborn agent's only reward is curiosity, shaped so it wants to
+# predict the world accurately, is drawn toward safe surprise, and is
+# repelled by predicted pain before it happens:
+#
+#   intrinsic = w_lp * learning_progress + w_nov * safe_novelty
+#               + w_risk * predicted_risk_aversion
+#
+# `safe_novelty` (= novelty * risk_gate) and `predicted_risk_aversion`
+# (= -risk) are computed by `cognitive_runtime/core/modulation.py` from the
+# `internal.*` streams #58 publishes -- this profile only wires the
+# already-sign-correct streams into weighted, capped slots
+# (`docs/reward_profiles.md`); no reward-side recomputation.
+#
+# Load with: --reward-profile goals/intrinsic_only.yaml
+
+name: intrinsic_only
+description: >
+  Nursery stage: pure curiosity, no survival/capability/quest tiers.
+  Learning progress + risk-gated safe novelty + predicted-pain aversion,
+  reading internal.* streams #58 publishes.
+
+tiers: {}
+
+intrinsic:
+  learning_progress:
+    stream: internal.learning_progress
+    weight: 1.0
+    cap: 1.0
+
+  safe_novelty:
+    stream: internal.safe_novelty
+    weight: 1.0
+    cap: 1.0
+
+  predicted_risk_aversion:
+    stream: internal.predicted_risk_aversion
+    weight: 1.0
+    cap: 0.5
+
+normalization:
+  method: running
+  clip: 5.0
+  epsilon: 0.0001
+  warmup_ticks: 50
