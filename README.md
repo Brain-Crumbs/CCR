@@ -78,6 +78,16 @@ python -m cognitive_runtime train --model-type multi-horizon-world-model \
 python -m cognitive_runtime ego-motion-canary --record-dir sessions \
     --train-seeds 6 --holdout-seeds 2
 
+# Nursery scenario suite (issue #62): scripted micro-scenarios --
+# walk_forward, turn_in_place, strafe_and_stop, object_permanence,
+# day_night, approach_entity -- generalizing the ego-motion canary above
+# into stage zero of docs/curriculum.md. Each scenario benchmarks
+# multi-horizon next-frame prediction the same way; object_permanence also
+# reports whether entity-persistence training beats a forget-immediately
+# baseline, and every held-out episode gets a rendered dream strip.
+python -m cognitive_runtime nursery list
+python -m cognitive_runtime nursery run all --record-dir sessions
+
 # Evaluation gates (issue #31): train actor/critic + linear online-Q,
 # eval both plus scripted/random on identical seeds, and report the three
 # deprecation gates. Records eval sessions for the dashboard + writes the gate

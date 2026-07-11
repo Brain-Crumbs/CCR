@@ -148,7 +148,7 @@ def run_ego_motion_canary(
 
     consistency_stats: Dict[str, List[float]] = {}
     if cfg.consistency_epochs > 0:
-        consistency_stats = _train_horizon_consistency(
+        consistency_stats = train_horizon_consistency(
             model,
             train_sessions,
             cfg.horizons,
@@ -304,7 +304,7 @@ class _StubPixelDataset:
         return len(self.sources)
 
 
-def _train_horizon_consistency(
+def train_horizon_consistency(
     model: VisualRepresentationModel,
     train_sessions: Sequence[str],
     horizons: Sequence[int],
@@ -326,6 +326,10 @@ def _train_horizon_consistency(
     loss" alternative docs/neural-stream-agent.md calls out as a valid
     reading of the multi-horizon interface, alongside dedicated per-horizon
     heads (used by ``MultiHorizonMLPWorldModel`` on the fused latent).
+
+    Scenario-agnostic (only reads recorded pixel frames), so the nursery
+    scenario suite (issue #62) reuses this directly for every scenario
+    rather than re-deriving it per scenario.
     """
 
     horizons_sorted = sorted(set(int(h) for h in horizons))

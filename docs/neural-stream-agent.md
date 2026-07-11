@@ -282,13 +282,15 @@ scripted intelligence:
 - Reward goals for survival, exploration, tool use, shelter, light, food.
 - Curriculum configs: flat safe world, resource world, night survival, caves,
   combat, crafting (landed, #30; automated stage promotion is #43).
-- **Nursery scenario suite (issue #62)** below the survival curriculum:
+- **Nursery scenario suite (landed, #62)** below the survival curriculum:
   scripted micro-scenarios (`walk_forward`, `turn_in_place`,
-  `object_permanence`, `day_night`, …) that each isolate one worldly
-  regularity, generate clean recorded sessions, and benchmark multi-horizon
-  prediction (t+1, t+5, t+20) on held-out seeds.  This is stage zero of the
-  childhood: the world model learns that the world is lawful before the
-  policy learns to survive in it.
+  `strafe_and_stop`, `object_permanence`, `day_night`, `approach_entity`)
+  that each isolate one worldly regularity, generate clean recorded
+  sessions, and benchmark multi-horizon prediction (t+1, t+5, t+20) on
+  held-out seeds — `cognitive_runtime/training/nursery.py`,
+  `ccr nursery list`/`ccr nursery run`, see `docs/curriculum.md`.  This is
+  stage zero of the childhood: the world model learns that the world is
+  lawful before the policy learns to survive in it.
 
 The backend exposes raw/near-raw streams where possible (landed, #32): every
 published stream is classified agent_input/aux_debug/privileged in the
@@ -623,7 +625,7 @@ The follow-up roadmap (2026-07), in dependency order:
 2. **#57** learned fusion into the live path and **#39** multi-horizon
    generative world model — the learning stack.
 3. **#59** deterministic attention controller (needs #58) and **#62**
-   nursery scenario suite (needs #37/#39) — parallel tracks.
+   nursery scenario suite (needs #37/#39, landed) — parallel tracks.
 4. **#41** reward profiles → **#61** risk-gated surprise intrinsic drive →
    **#60** orienting reflex.
 5. **#44/#31** referee everything; **#43/#42/#33/#34** proceed as planned;
