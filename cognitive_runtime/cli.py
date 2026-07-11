@@ -8,6 +8,8 @@
     python -m cognitive_runtime replay --session sessions/<id> --verify
     python -m cognitive_runtime view --session sessions/<id> --episode episode_00000
     python -m cognitive_runtime dashboard
+    python -m cognitive_runtime nursery list
+    python -m cognitive_runtime nursery run walk_forward
 """
 
 from __future__ import annotations
@@ -1146,6 +1148,123 @@ def cmd_ego_motion_canary(args: argparse.Namespace) -> None:
         print(f"checkpoint bundle saved to {args.out}")
 
 
+def cmd_nursery_list(args: argparse.Namespace) -> None:
+    """``ccr nursery list`` (issue #62): print every registered nursery
+    scenario -- scripted micro-scenarios that isolate one worldly regularity
+    each, feeding checkpoints into the survival curriculum's stage one."""
+    try:
+        from cognitive_runtime.training.nursery import NURSERY_SCENARIOS
+    except ImportError as exc:  # torch not installed
+        sys.exit(f"the nursery suite needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+    for name in sorted(NURSERY_SCENARIOS):
+        scenario = NURSERY_SCENARIOS[name]
+        tag = " [+entity-persistence metric]" if scenario.entity_persistence_metric else ""
+        print(f"{name}{tag}: {scenario.description}")
+
+
+def cmd_nursery_run(args: argparse.Namespace) -> None:
+    """``ccr nursery run <scenario|all>`` (issue #62): record train/holdout
+    episodes for one nursery scenario (or every scenario via ``all``),
+    pretrain a pixel encoder+decoder+next-latent predictor on the train
+    seeds only, and evaluate multi-horizon next-frame prediction on
+    held-out seeds against copy-last-frame and mean-frame baselines --
+    generalizing ``ego-motion-canary`` (issue #39) into a suite.
+    ``object_permanence`` also reports an entity-persistence metric (issue
+    #27); every held-out episode gets a rendered dream strip (predicted vs.
+    actual frames at each horizon).
+    """
+    try:
+        import json
+
+        from cognitive_runtime.training.nursery import (
+            NURSERY_SCENARIOS,
+            NurseryConfig,
+            run_nursery_scenario,
+            save_nursery_scenario_checkpoint,
+        )
+    except ImportError as exc:  # torch not installed
+        sys.exit(f"the nursery suite needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+
+    if args.scenario != "all" and args.scenario not in NURSERY_SCENARIOS:
+        sys.exit(
+            f"unknown nursery scenario {args.scenario!r}; choices: "
+            f"{sorted(NURSERY_SCENARIOS)} or 'all'"
+        )
+    scenario_names = sorted(NURSERY_SCENARIOS) if args.scenario == "all" else [args.scenario]
+
+    train_seeds = list(range(args.train_seeds))
+    holdout_seeds = list(range(args.train_seeds, args.train_seeds + args.holdout_seeds))
+    config = NurseryConfig(
+        train_seeds=train_seeds,
+        holdout_seeds=holdout_seeds,
+        episode_ticks=args.episode_ticks,
+        world_size=args.world_size,
+        horizons=args.horizons,
+        latent_width=args.latent_width,
+        hidden_dim=args.hidden_dim,
+        reconstruction_size=args.reconstruction_size,
+        epochs=args.epochs,
+        lr=args.neural_lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        consistency_epochs=args.consistency_epochs,
+        entity_persistence_epochs=args.entity_persistence_epochs,
+    )
+    print(
+        f"nursery: running {'all scenarios' if args.scenario == 'all' else args.scenario} "
+        f"({len(train_seeds)} train seeds, {len(holdout_seeds)} held-out seeds, "
+        f"{config.episode_ticks} ticks each, world_size={config.world_size})"
+    )
+
+    report_payload: Dict[str, Any] = {}
+    for name in scenario_names:
+        model, report = run_nursery_scenario(args.record_dir, name, config)
+        print(f"\n{name}:")
+        for h, entry in report.horizon_metrics.items():
+            print(
+                f"  horizon t+{h} (n={entry['n_samples']}): "
+                f"psnr model={round(entry['psnr_model'], 2)} "
+                f"copy_last={round(entry['psnr_copy_last'], 2)} "
+                f"mean_frame={round(entry['psnr_mean_frame'], 2)} | "
+                f"ssim model={round(entry['ssim_model'], 4)} "
+                f"copy_last={round(entry['ssim_copy_last'], 4)} "
+                f"mean_frame={round(entry['ssim_mean_frame'], 4)} | "
+                f"beats_copy_last={entry['beats_copy_last']} "
+                f"beats_mean_frame={entry['beats_mean_frame']}"
+            )
+        if report.entity_persistence_stats is not None:
+            eps = report.entity_persistence_stats
+            if "beats_forget_baseline" in eps:
+                print(
+                    f"  entity persistence: model_mse={round(eps['model_mse'], 4)} "
+                    f"baseline_mse={round(eps['baseline_mse'], 4)} "
+                    f"beats_forget_baseline={eps['beats_forget_baseline']}"
+                )
+            else:
+                print(f"  entity persistence: {eps.get('note', eps)}")
+        print(f"  dream strips rendered: {len(report.dream_strips)}")
+
+        if args.out_dir:
+            os.makedirs(args.out_dir, exist_ok=True)
+            checkpoint_path = os.path.join(args.out_dir, f"{name}.pt")
+            save_nursery_scenario_checkpoint(checkpoint_path, model, report)
+            print(f"  checkpoint saved to {checkpoint_path}")
+
+        report_payload[name] = {
+            "horizon_metrics": {str(h): v for h, v in report.horizon_metrics.items()},
+            "entity_persistence_stats": report.entity_persistence_stats,
+            "dream_strips": report.dream_strips,
+            "train_sessions": report.train_sessions,
+            "holdout_sessions": report.holdout_sessions,
+        }
+
+    if args.report:
+        os.makedirs(os.path.dirname(os.path.abspath(args.report)) or ".", exist_ok=True)
+        with open(args.report, "w", encoding="utf-8") as fh:
+            json.dump(report_payload, fh, indent=2)
+        print(f"\nreport written to {args.report}")
+
+
 def cmd_trainer(args: argparse.Namespace) -> None:
     """``ccr trainer`` (issue #37): run an ``AsyncTrainer`` to completion in
     the foreground, pointed only at recorded sessions and no live actor --
@@ -1687,6 +1806,54 @@ def build_parser() -> argparse.ArgumentParser:
     p_canary.add_argument("--out", default=None,
                           help="checkpoint bundle path (.pt); omit to skip saving")
     p_canary.set_defaults(func=cmd_ego_motion_canary)
+
+    p_nursery = sub.add_parser(
+        "nursery",
+        help="issue #62: nursery scenario suite -- scripted micro-scenarios "
+             "benchmarking multi-horizon (t+1/t+5/t+20) world-model prediction "
+             "against copy-last-frame/mean-frame baselines",
+    )
+    nursery_sub = p_nursery.add_subparsers(dest="nursery_command", required=True)
+
+    p_nursery_list = nursery_sub.add_parser("list", help="list available nursery scenarios")
+    p_nursery_list.set_defaults(func=cmd_nursery_list)
+
+    p_nursery_run = nursery_sub.add_parser(
+        "run", help="record + benchmark one scenario (or 'all' for the whole suite)"
+    )
+    p_nursery_run.add_argument(
+        "scenario", help="scenario name (see 'nursery list'), or 'all' to run the full suite"
+    )
+    p_nursery_run.add_argument("--record-dir", default="sessions",
+                               help="directory to record each scenario's train/holdout episodes into")
+    p_nursery_run.add_argument("--train-seeds", type=int, default=6,
+                               help="number of train-seed episodes (seeds 0..N-1)")
+    p_nursery_run.add_argument("--holdout-seeds", type=int, default=2,
+                               help="number of held-out-seed episodes (seeds N..N+M-1, never trained on)")
+    p_nursery_run.add_argument("--episode-ticks", type=int, default=120)
+    p_nursery_run.add_argument("--world-size", type=int, default=48)
+    p_nursery_run.add_argument("--horizons", type=int, nargs="+", default=[1, 5, 20],
+                               help="tick offsets to evaluate next-frame prediction at")
+    p_nursery_run.add_argument("--latent-width", type=int, default=32)
+    p_nursery_run.add_argument("--hidden-dim", type=int, default=64)
+    p_nursery_run.add_argument("--reconstruction-size", type=int, default=16,
+                               help="max side length for downsampled reconstruction targets")
+    p_nursery_run.add_argument("--epochs", type=int, default=15,
+                               help="pixel encoder/decoder pretraining epochs")
+    p_nursery_run.add_argument("--consistency-epochs", type=int, default=15,
+                               help="horizon-consistency fine-tuning epochs (0 skips it)")
+    p_nursery_run.add_argument("--entity-persistence-epochs", type=int, default=30,
+                               help="object_permanence only: entity-persistence model training epochs")
+    p_nursery_run.add_argument("--neural-lr", type=float, default=1e-3)
+    p_nursery_run.add_argument("--batch-size", type=int, default=32)
+    p_nursery_run.add_argument("--seed", type=int, default=0)
+    p_nursery_run.add_argument("--out-dir", default=None,
+                               help="directory to save one checkpoint bundle per scenario "
+                                    "(<out-dir>/<scenario>.pt); omit to skip saving")
+    p_nursery_run.add_argument("--report", default=None,
+                               help="path to save a JSON report (per-scenario per-horizon "
+                                    "metrics + dream strips); omit to skip saving")
+    p_nursery_run.set_defaults(func=cmd_nursery_run)
 
     p_replay = sub.add_parser("replay", help="re-simulate a session and verify determinism")
     p_replay.add_argument("--session", required=True)

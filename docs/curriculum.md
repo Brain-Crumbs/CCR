@@ -23,18 +23,60 @@ policy.
 Presets only tune existing world/reward knobs — no policy or heuristic
 behavior is encoded here; rewards state goals, never actions to take.
 
-## Stage zero: the nursery scenario suite (planned)
+## Stage zero: the nursery scenario suite (issue #62)
 
-Below the survival curriculum sits a planned "infant" stage (issue #62):
-scripted micro-scenarios — `walk_forward`, `turn_in_place`,
-`object_permanence`, `day_night`, `approach_entity` — that each isolate one
-worldly regularity, generate clean recorded sessions, and benchmark the
-world model's multi-horizon prediction (t+1, t+5, t+20) on held-out seeds
+Below the survival curriculum sits an "infant" stage,
+`cognitive_runtime/training/nursery.py`: scripted micro-scenarios —
+`walk_forward`, `turn_in_place`, `strafe_and_stop`, `object_permanence`,
+`day_night`, `approach_entity` — that each isolate one worldly regularity,
+generate clean recorded sessions, and benchmark the world model's
+multi-horizon prediction (t+1, t+5, t+20 by default) on held-out seeds
 against copy-last-frame/mean-frame baselines. No reward learning happens
 here; the point is that the world model learns the world is *lawful*
 (ego-motion produces optical flow, hidden objects persist, night follows
 day) before the policy is asked to survive in it. Nursery checkpoints seed
 step 1 below.
+
+Every scenario generalizes issue #39's `walk_forward` ego-motion canary
+(`training.ego_motion_canary`, still available standalone as
+`ccr ego-motion-canary`) into a suite: `nursery.py` reuses that canary's
+scenario-agnostic `evaluate_ego_motion_holdout`/`train_horizon_consistency`
+helpers and `training.visual_representation`'s pixel encoder + decoder +
+next-latent predictor, rather than re-deriving the multi-horizon
+pixel-prediction harness per scenario.
+
+| Scenario | Regularity | Policy/setup |
+|---|---|---|
+| `walk_forward` | ego-motion / optical flow (subsumes #39's canary) | constant `MOVE_FORWARD` |
+| `turn_in_place` | view rotation consistency | constant `LOOK_LEFT` |
+| `strafe_and_stop` | motion onset/offset dynamics | alternating `MOVE_LEFT` / stand-still |
+| `object_permanence` | hidden-object persistence (issue #27) | a scripted mob walks behind a wall occluder while the agent stands still |
+| `day_night` | slow global dynamics | agent stands still through a light transition |
+| `approach_entity` | scale change with distance | constant `MOVE_FORWARD` toward a stationary mob |
+
+Each scenario records train-seed and held-out-seed episodes through the
+simulated backend with `curriculum=f"nursery/{scenario_name}"` in session
+metadata, so `dashboard`/`review`/the statistical evaluation harness (issue
+#44) group nursery runs the same way they already group curriculum-preset
+runs — no separate grouping mechanism was needed. `object_permanence` also
+trains an entity-persistence model (`training.entity_persistence`, issue
+#27) on the recorded occlusion/reappearance events and reports whether it
+beats the "forget immediately" baseline — the metric that distinguishes a
+model with entity-persistence training from one without. Every held-out
+episode gets a rendered "dream strip": predicted vs. actual frames at each
+horizon, as ASCII (no image-rendering dependency exists in this project).
+
+```bash
+# List the registered scenarios:
+python -m cognitive_runtime nursery list
+
+# Record + benchmark one scenario:
+python -m cognitive_runtime nursery run walk_forward \
+    --record-dir sessions --out-dir checkpoints/nursery --report nursery-report.json
+
+# The whole suite, unattended:
+python -m cognitive_runtime nursery run all --record-dir sessions
+```
 
 An automated **curriculum runner** (issue #43,
 `cognitive_runtime/training/curriculum_runner.py`) promotes the agent between
