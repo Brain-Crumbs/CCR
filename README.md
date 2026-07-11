@@ -177,4 +177,5 @@ runtime changes; that is the point.
 - [docs/program-interface.md](docs/program-interface.md) — the universal Program contract
 - [docs/minecraft-mvp.md](docs/minecraft-mvp.md) — SurvivalBox: scope, rewards, milestones
 - [docs/curriculum.md](docs/curriculum.md) — staged `--curriculum` presets (world config + reward goals) for training
+- [docs/reward_profiles.md](docs/reward_profiles.md) — `--reward-profile` YAML/JSON reward tiers, milestones, intrinsic slots, normalized returns
 - [docs/future-ai-os.md](docs/future-ai-os.md) — the long-term AI-native OS direction

@@ -33,6 +33,11 @@ from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
 from cognitive_runtime.programs.minecraft.adapter import BACKENDS, MinecraftSurvivalBox
 from cognitive_runtime.programs.minecraft.curriculum import CURRICULUM_ORDER, get_curriculum
 from cognitive_runtime.programs.minecraft.evaluation import comparison_table, summarize_episodes
+from cognitive_runtime.programs.minecraft.reward_profile import (
+    RewardProfile,
+    RewardProfileError,
+    load_reward_profile,
+)
 from cognitive_runtime.programs.minecraft.rewards import SurvivalRewardConfig
 from cognitive_runtime.programs.minecraft.stream_registry import MINECRAFT_STREAM_REGISTRY
 from cognitive_runtime.runtime.config import RuntimeConfig
@@ -98,6 +103,20 @@ def _reward_config_for(args: argparse.Namespace) -> Optional[SurvivalRewardConfi
         return None
     preset = get_curriculum(args.curriculum)
     return dataclasses.replace(SurvivalRewardConfig(), **preset.reward_config)
+
+
+def _reward_profile_for(args: argparse.Namespace) -> Optional[RewardProfile]:
+    """The loaded `--reward-profile`, or `None` for the legacy hard-coded
+    reward path.  Fails the whole invocation immediately (issue #41: "a
+    malformed profile fails at startup with a clear message, not mid-run")
+    rather than letting a bad profile surface as a mid-episode crash."""
+    path = getattr(args, "reward_profile", None)
+    if not path:
+        return None
+    try:
+        return load_reward_profile(path)
+    except RewardProfileError as exc:
+        sys.exit(str(exc))
 
 
 def _program_config(args: argparse.Namespace) -> Dict[str, Any]:
@@ -456,6 +475,11 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--backend", default="simulated", choices=sorted(BACKENDS),
                         help="survival backend: the deterministic simulated world, or "
                              "a real-Minecraft client (remote; not yet implemented)")
+    parser.add_argument("--reward-profile", default=None,
+                        help="path to a YAML/JSON reward profile (e.g. goals/survival.yaml, "
+                             "goals/ender_dragon.yaml); overrides --curriculum's reward weights "
+                             "with a profile-driven reward engine (docs/reward_profiles.md). "
+                             "Malformed profiles fail immediately with a diagnosis.")
 
 
 #: Online-learning policies whose model path needs a checkpoint-or-`--fresh`
@@ -493,8 +517,12 @@ def cmd_run(args: argparse.Namespace) -> None:
     _resolve_world_args(args)
     _enforce_live_run_protocol(args)
     program_config = _program_config(args)
+    reward_profile = _reward_profile_for(args)
     program = MinecraftSurvivalBox(
-        config=program_config, reward_config=_reward_config_for(args), backend=args.backend
+        config=program_config,
+        reward_config=None if reward_profile else _reward_config_for(args),
+        backend=args.backend,
+        reward_profile=reward_profile,
     )
     encoders = _encoders_for_input_profile(args.input_profile)
     learner = None
@@ -571,14 +599,16 @@ def cmd_demo(args: argparse.Namespace) -> None:
 def cmd_evaluate(args: argparse.Namespace) -> None:
     _resolve_world_args(args)
     program_config = _program_config(args)
-    reward_config = _reward_config_for(args)
+    reward_profile = _reward_profile_for(args)
+    reward_config = None if reward_profile else _reward_config_for(args)
     names = [p.strip() for p in args.policies.split(",") if p.strip()]
     factories: Dict[str, Callable[[], Policy]] = {}
     for name in names:
         factories[name] = (lambda n: (lambda: _make_policy(n, args)))(name)
     rows = compare_policies(
         program_factory=lambda: MinecraftSurvivalBox(
-            config=program_config, reward_config=reward_config, backend=args.backend
+            config=program_config, reward_config=reward_config, backend=args.backend,
+            reward_profile=reward_profile,
         ),
         policy_factories=factories,
         episodes=args.episodes,

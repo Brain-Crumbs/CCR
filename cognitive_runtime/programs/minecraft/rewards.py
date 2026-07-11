@@ -180,7 +180,7 @@ class SurvivalReward:
         semantic_events: List[str] = []
         for event in stream_events:
             self.prime_stream_state([event])
-            translated = _SEMANTIC_EVENTS.get(event.stream_id)
+            translated = SEMANTIC_EVENT_TRANSLATORS.get(event.stream_id)
             if translated is not None:
                 semantic_events.append(translated(event.payload))
 
@@ -384,8 +384,10 @@ class SurvivalReward:
 
 
 # Stream event → legacy semantic event string, so the reward core keeps
-# reading the exact event vocabulary it always has.
-_SEMANTIC_EVENTS = {
+# reading the exact event vocabulary it always has.  Public so other reward
+# engines (e.g. the profile-driven ProfileRewardEngine) share one
+# translation table instead of re-deriving the event vocabulary.
+SEMANTIC_EVENT_TRANSLATORS = {
     "event.damage_taken": lambda p: f"damage:{p['reason']}",
     "event.item_collected": lambda p: f"new_item:{p['item']}",
     "event.block_broken": lambda p: f"broke_block:{p['block']}",

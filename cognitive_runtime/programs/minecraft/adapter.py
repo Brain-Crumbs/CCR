@@ -28,6 +28,8 @@ from cognitive_runtime.programs.minecraft.backend import SimulatedBackend, Survi
 from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
 from cognitive_runtime.programs.minecraft.observations import OBSERVATION_KEYS
 from cognitive_runtime.programs.minecraft.remote import RemoteMinecraftBackend
+from cognitive_runtime.programs.minecraft.reward_engine import ProfileRewardEngine
+from cognitive_runtime.programs.minecraft.reward_profile import RewardProfile
 from cognitive_runtime.programs.minecraft.rewards import SurvivalReward, SurvivalRewardConfig
 from cognitive_runtime.programs.minecraft.streams import (
     BODY_HEARTBEAT_KEY,
@@ -54,11 +56,20 @@ class MinecraftSurvivalBox(Program):
         config: Optional[Dict[str, Any]] = None,
         reward_config: Optional[SurvivalRewardConfig] = None,
         backend: str = "simulated",
+        reward_profile: Optional[RewardProfile] = None,
     ):
         self._config = SurvivalBoxConfig()
         self._backend_name = backend
         self._backend: Optional[SurvivalBackend] = None
-        self._reward_fn = SurvivalReward(reward_config)
+        self._reward_profile = reward_profile
+        #: A loaded profile (issue #41) drives rewards generically through
+        #: ProfileRewardEngine; otherwise the historical hard-coded
+        #: SurvivalReward (optionally tuned by `reward_config`) is unchanged.
+        self._reward_fn = (
+            ProfileRewardEngine(reward_profile)
+            if reward_profile is not None
+            else SurvivalReward(reward_config)
+        )
         self._pending_events: List[str] = []
         self._last_action: Action = NULL_ACTION
         self._last_reward: RewardSignal = RewardSignal()
@@ -232,7 +243,17 @@ class MinecraftSurvivalBox(Program):
         signal = self._reward_fn.evaluate_stream_window(tick_events, action)
         self._sensory_bus.publish(
             "reward.scalar",
-            {"value": signal.value, "components": dict(signal.components)},
+            {
+                "value": signal.value,
+                "components": dict(signal.components),
+                # Two-scale rewards (issue #41): raw `value`/`components` for
+                # dashboards/logging; `training_value` -- normalized/clipped
+                # when a reward profile is active, otherwise identical to
+                # `value` -- is what an optimizer should actually consume.
+                "training_value": (
+                    signal.training_value if signal.training_value is not None else signal.value
+                ),
+            },
             observation.timestamp,
         )
         self._sensory_bus.publish(
@@ -269,6 +290,28 @@ class MinecraftSurvivalBox(Program):
                 f"the {self._backend_name!r} backend does not support snapshots"
             )
         self._backend.restore(snapshot_id)
+
+    def reward_profile_metadata(self) -> Optional[Dict[str, Any]]:
+        """Profile name + content hash (issue #41), for session metadata so
+        dashboards can group runs by profile.  `None` when no profile is
+        active (the legacy hard-coded SurvivalReward path)."""
+        if self._reward_profile is None:
+            return None
+        return self._reward_profile.metadata()
+
+    def reward_engine_state_dict(self) -> Optional[Dict[str, Any]]:
+        """Brain-scoped milestone state + return normalizer (issue #41), for
+        the checkpoint bundle.  `None` when no profile is active."""
+        if not isinstance(self._reward_fn, ProfileRewardEngine):
+            return None
+        return self._reward_fn.state_dict()
+
+    def load_reward_engine_state_dict(self, state: Dict[str, Any]) -> None:
+        """Restore brain-scoped milestone state on resume, so a checkpoint
+        interrupt/resume does not re-grant one-time rewards already earned."""
+        if not isinstance(self._reward_fn, ProfileRewardEngine):
+            raise ValueError("no reward profile is active; nothing to restore state into")
+        self._reward_fn.load_state_dict(state)
 
     def metadata(self) -> ProgramMetadata:
         return ProgramMetadata(

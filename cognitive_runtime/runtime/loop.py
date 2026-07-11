@@ -202,6 +202,14 @@ class CognitiveRuntime:
         online_metadata = self._online_metadata()
         if online_metadata:
             session_metadata["online_model"] = online_metadata
+        # Profile name + content hash (issue #41), when the Program has an
+        # active reward profile, so dashboards can group sessions "like with
+        # like" instead of mixing runs tuned by different profiles.
+        profile_meta_fn = getattr(self.program, "reward_profile_metadata", None)
+        if callable(profile_meta_fn):
+            profile_metadata = profile_meta_fn()
+            if profile_metadata:
+                session_metadata["reward_profile"] = profile_metadata
         self.recorder.write_session_metadata(session_metadata)
         summaries: List[EpisodeSummary] = []
         checkpoint_reason = "shutdown"
