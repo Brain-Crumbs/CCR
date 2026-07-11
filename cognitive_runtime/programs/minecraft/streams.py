@@ -14,7 +14,7 @@ works unchanged.
 from __future__ import annotations
 
 import json
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from cognitive_runtime.core.observation import Observation
 from cognitive_runtime.core.streams.bus import SensoryStreamBus
@@ -73,6 +73,21 @@ def mouse_look_delta(action_name: str) -> Dict[str, float]:
     return dict(LOOK_ACTION_DELTAS.get(action_name, NULL_MOUSE_LOOK))
 
 
+def _entity_bearing_payload(mobs: List[Dict[str, float]]) -> Dict[str, Any]:
+    """The orienting reflex's stimulus localization contract (issue #60):
+    the nearest visible entity's salience (closer = higher) and bearing
+    (signed degrees, positive = right, matching `world.mob_summary`'s
+    `angle`), in the generic `{"value", "direction": {"bearing_deg"}}`
+    shape `core.attention._direction` reads off any `localization_hint`
+    stream. `mobs` is already nearest-first (`mob_summary`), so the first
+    entry is the one to orient toward."""
+    if not mobs:
+        return {"value": 0.0, "direction": None}
+    nearest = mobs[0]
+    salience = round(1.0 / (1.0 + max(float(nearest["distance"]), 0.0)), 4)
+    return {"value": salience, "direction": {"bearing_deg": nearest["angle"]}}
+
+
 #: Naturally harvestable blocks (yield an item, not player-placed) map to the
 #: generic "resource" class so the vision encoder senses resource density.
 _RESOURCE_BLOCKS = set(BREAK_YIELD) - {"placed_block"}
@@ -120,6 +135,12 @@ def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
                    "Visible mobs (id/distance/angle), every tick while any are visible; "
                    "occluded by walls (line-of-sight), not just distance.",
                    payload_schema="[{id, distance, angle}]", range=(0.0, 16.0)),
+        StreamSpec("world.entity_bearing", "world",
+                   "Nearest visible entity's salience + bearing, for the orienting "
+                   "reflex's stimulus localization contract (issue #60): 0.0/no "
+                   "direction when nothing is visible.",
+                   payload_schema='{"value": float, "direction": {"bearing_deg": float}|null}',
+                   range=(0.0, 1.0)),
         StreamSpec("body.health", "body", "Health, on change + heartbeat.",
                    nominal_rate_hz=BODY_HEARTBEAT_HZ,
                    payload_schema="float 0..20", range=VITAL_RANGE, neutral=20.0),
@@ -285,6 +306,7 @@ class SurvivalStreamPublisher:
                 pub(PIXEL_STREAM, observation.pixels, force=True)
         mobs = data["mobs"]
         pub("vision.entities", mobs, force=bool(mobs))
+        pub("world.entity_bearing", _entity_bearing_payload(mobs))
         pub("body.health", data["health"], force=heartbeat)
         pub("body.hunger", data["hunger"], force=heartbeat)
         pub("body.oxygen", data["oxygen"], force=heartbeat)

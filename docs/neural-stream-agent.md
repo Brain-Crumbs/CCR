@@ -352,8 +352,8 @@ dwell/hysteresis-protected focus. `--attention {off,budgeted}` (default
 per-stream weights, `Memory.attention_state()` holds the tick's state,
 `DecisionRecord.attention` and `internal.attention.weights` record it, and
 `tools.episode_viewer`/`tools.metrics_dashboard` render the focus timeline
-and per-stream focus totals. Neural attention (#63) and the orienting
-reflex (#60) are not built yet.*
+and per-stream focus totals. Neural attention (#63) is not built yet; the
+scripted orienting reflex (#60) is (below).*
 
 ### 10. Add The Orienting Reflex And Active Perception
 
@@ -364,6 +364,23 @@ registry from world-changing actions.  A scripted, brainstem-style reflex
 turns toward localizable salient stimuli (bounded, recorded, vetoed by high
 predicted risk and survival-critical policy actions); the learned policy can
 later inherit or override it.
+
+*Status: landed. `core.action_registry.ActionRegistry`
+(`programs/minecraft/action_registry.py`'s `MINECRAFT_ACTION_REGISTRY`)
+classifies every action `world_changing`/`information_gathering` (or both),
+enforced complete the same way #32's stream classification is.
+`core.attention.StimulusDirection` extends `AttentionSignal` with an optional
+`{bearing_deg, region}` hint for any `localization_hint=True` stream
+(Minecraft's `world.entity_bearing`), and `AttentionState.bottom_up_capture`
+marks the tick a real salience spike (not a routine dwell handoff) lands.
+`core.orienting_reflex.OrientingReflex` turns toward it for a bounded
+`hold_ticks`, vetoed by `internal.risk >= risk_veto_threshold` or a
+world-changing policy action this tick (issue #60's own "never suppress
+fleeing/eating" precedence rule, read straight off the action registry).
+`RuntimeConfig.reflex_mode` (`on`/`off`/`learned-only`, `--reflex` on the
+CLI) controls it end to end; `DecisionRecord.reflex` and
+`EpisodeSummary.reflex_activations` record it, and
+`tools.episode_viewer`/`tools.metrics_dashboard` render activations.*
 
 ### 11. Add The Intrinsic Drive
 

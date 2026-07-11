@@ -26,6 +26,18 @@ from cognitive_runtime.core.attention import (
     AttentionReason,
     AttentionSignal,
     AttentionState,
+    StimulusDirection,
+)
+from cognitive_runtime.core.action_registry import (
+    ActionDeclaration,
+    ActionRegistry,
+    DEFAULT_ACTION_REGISTRY,
+)
+from cognitive_runtime.core.orienting_reflex import (
+    OrientingDecision,
+    OrientingReflex,
+    OrientingReflexConfig,
+    REFLEX_MODES,
 )
 
 __all__ = [
@@ -56,4 +68,12 @@ __all__ = [
     "AttentionCoefficients",
     "AttentionConfig",
     "AttentionReason",
+    "StimulusDirection",
+    "ActionDeclaration",
+    "ActionRegistry",
+    "DEFAULT_ACTION_REGISTRY",
+    "OrientingReflex",
+    "OrientingReflexConfig",
+    "OrientingDecision",
+    "REFLEX_MODES",
 ]

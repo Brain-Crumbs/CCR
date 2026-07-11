@@ -68,6 +68,28 @@ class RuntimeConfig:
     #: caller opts in.
     attention_mode: str = "off"
 
+    #: Scripted orienting reflex (issue #60): ``"on"`` (default) turns
+    #: toward a bottom-up salience capture with a localizable direction
+    #: hint; ``"off"`` disables it entirely (the ablation #44's harness
+    #: measures its effect with); ``"learned-only"`` leaves orienting to the
+    #: policy/neural attention (#63) instead of the scripted reflex. Inert
+    #: whenever ``attention_mode="off"`` (no capture ever fires), so the
+    #: default is safe for every existing recorded session/checkpoint.
+    reflex_mode: str = "on"
+    #: Ticks a single reflex activation holds its look/turn action for.
+    reflex_hold_ticks: int = 3
+    #: ``internal.risk`` (issue #58) at/above this vetoes the reflex,
+    #: deferring to the policy's own response to danger.
+    reflex_risk_veto_threshold: float = 0.7
+    #: Bearings within this many degrees of dead ahead count as "already
+    #: facing it" -- no reflex turn action needed.
+    reflex_bearing_deadzone_deg: float = 15.0
+    #: Program-supplied action names for "turn toward a stimulus on my
+    #: left/right" -- Minecraft's LOOK_LEFT/LOOK_RIGHT by default, the only
+    #: concrete Program in this repo today.
+    reflex_left_action: str = "LOOK_LEFT"
+    reflex_right_action: str = "LOOK_RIGHT"
+
     def effective_exclude_streams(self) -> List[str]:
         """exclude_streams plus the frame streams when frames are opted out."""
         excluded = list(self.exclude_streams)

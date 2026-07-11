@@ -90,6 +90,9 @@ def summarize_episodes(summaries: List[EpisodeSummary]) -> Dict[str, Any]:
             if any(s.avg_attention_budget_used is not None for s in summaries)
             else None
         ),
+        # Scripted orienting reflex (issue #60).
+        "reflex_mode": summaries[0].reflex_mode,
+        "reflex_activations": sum(s.reflex_activations for s in summaries),
         # Runtime health.
         "avg_decision_latency_ms": round(_mean([s.avg_latency_ms for s in summaries]), 3),
         "avg_ticks_per_second": round(_mean([s.ticks_per_second for s in summaries]), 1),
