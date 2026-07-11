@@ -38,6 +38,10 @@ from cognitive_runtime.core.action_space import action_space_hash
 from cognitive_runtime.core.entity_persistence import EntityPersistence, NullEntityPersistence
 from cognitive_runtime.core.learner import Learner, NullLearner, window_reward, window_training_reward
 from cognitive_runtime.core.memory import Memory
+from cognitive_runtime.core.modulation import (
+    INTERNAL_MODULATION_STREAM_SPECS,
+    ModulationTracker,
+)
 from cognitive_runtime.core.novelty import combine_novelty
 from cognitive_runtime.core.perception import State
 from cognitive_runtime.core.policy import Policy
@@ -174,6 +178,15 @@ class CognitiveRuntime:
         # still be published/recorded/replayed like any other stream.
         self.sensory_bus.register(NOVELTY_STREAM_SPEC)
         self.sensory_bus.register(VALUE_ESTIMATE_STREAM_SPEC)
+        for spec in INTERNAL_MODULATION_STREAM_SPECS:
+            self.sensory_bus.register(spec)
+        #: Interoceptive modulation signals (issue #58): prediction error,
+        #: reward-prediction error, learning progress, novelty and risk,
+        #: published as `internal.*` streams every cognitive tick. Persists
+        #: across episodes within a run -- the world model's predictive
+        #: skill (learning_progress's EMA state) is a property of the model,
+        #: not of any one episode.
+        self.modulation = ModulationTracker()
         self._stop_requested = False
 
     def stop(self) -> None:
@@ -356,6 +369,14 @@ class CognitiveRuntime:
             if prediction.prediction_error is not None:
                 prediction_error_total += prediction.prediction_error
                 prediction_error_ticks += 1
+
+            modulation = self.modulation.update(
+                prediction, entity_prediction.surprise, reward_value
+            )
+            for stream_id, payload in modulation.as_payloads().items():
+                self.sensory_bus.publish(
+                    stream_id, payload, window.ended_at, source="model"
+                )
 
             self.recorder.write_cognitive_tick(
                 sensory_events=window.events,

@@ -55,14 +55,14 @@ generic: Minecraft health, a Linux battery and robot joint stress are all
 | `input` | Raw human input (demos) | `input.keypress` |
 | `world` | Global world state | `world.time`, `world.nearby_blocks` |
 | `motor` | Actions, the other direction | `motor.command` |
-| `internal` | Interoception: the runtime's own modulation signals, published back onto the bus (planned, issue #58) | `internal.prediction_error`, `internal.reward_prediction_error`, `internal.learning_progress`, `internal.novelty`, `internal.risk`, `internal.attention.weights` |
+| `internal` | Interoception: the runtime's own modulation signals, published back onto the bus (issue #58) | `internal.prediction_error`, `internal.reward_prediction_error`, `internal.learning_progress`, `internal.novelty`, `internal.risk` (published every tick, `core/modulation.py`); `internal.attention.weights` (planned, issue #59) |
 
-The planned `internal` modality is the biological-modulation analog
-(dopamine as reward-prediction-error, etc.): the agent's own error, progress,
-novelty and risk signals become recordable, replayable streams like any
-sense, consumable by the attention controller (#59), intrinsic drive (#61)
-and replay prioritization — see
-[neural-stream-agent.md](neural-stream-agent.md).
+The `internal` modality is the biological-modulation analog (dopamine as
+reward-prediction-error, etc.): the agent's own error, progress, novelty and
+risk signals are recordable, replayable streams like any sense, consumable
+by the attention controller (#59), intrinsic drive (#61) and replay
+prioritization — see "Internal modulation streams (issue #58)" under
+Migration status below, and [neural-stream-agent.md](neural-stream-agent.md).
 
 ## The primitives
 
@@ -263,10 +263,9 @@ The loop's policy `State` is now **derived from stream state**
 and the formerly observation-only fields are streams
 (`body.in_water`, `body.alive`, `spatial.distance_from_spawn`). Remaining:
 wiring the neural encoders/learned fusion into the live policy path (#57),
-the `internal.*` modulation streams (#58), the budgeted attention layer
-between memory and fusion (#59), and the generative multi-horizon world
-model (#39). See [neural-stream-agent.md](neural-stream-agent.md) for the
-full roadmap.
+the budgeted attention layer between memory and fusion (#59), and the
+generative multi-horizon world model (#39). See
+[neural-stream-agent.md](neural-stream-agent.md) for the full roadmap.
 
 Every stream in the Minecraft catalog now has an explicit `StreamDeclaration`
 (issue #21: shape/schema and rate on `StreamSpec`, plus encoder binding,
@@ -281,6 +280,55 @@ path uses `StreamEncoderModule`s in `cognitive_runtime.neural`.
 The reserved `audio.*` declaration is intentionally a fixed neural stub:
 `AudioEncoder` emits a stable zero latent and checkpoints its stub state, but
 no Program publishes audio and no capture/spectrogram backend exists yet.
+
+### Internal modulation streams (issue #58)
+
+The runtime already thinks in streams, so neuromodulation is modeled as
+*internal streams*, not hidden variables: `cognitive_runtime/core/modulation.py`
+computes and `runtime/loop.py` publishes five `internal.*` streams every
+cognitive tick, each with the uniform `{"value": <float>}` payload the
+reward engine's `intrinsic_stream` component kind already expects
+(`programs/minecraft/reward_profile.py`, so any of them can be wired
+straight into a reward profile's `intrinsic` slots without a translation
+layer):
+
+- `internal.prediction_error` — the world model's next-latent prediction
+  error (`core.world_model.Prediction.prediction_error`, issue #26),
+  promoted to a stream. `None` for the heuristic `TrendWorldModel`, which
+  never populates it.
+- `internal.reward_prediction_error` — actual reward minus the world
+  model's predicted reward (`Prediction.predicted_reward`); the dopamine
+  analog. It is meant to modulate replay priority and memory tagging, not
+  act as the whole attention system (out of scope here). `None` without a
+  reward head.
+- `internal.learning_progress` — is prediction error improving? Computed by
+  `LearningProgressTracker` as a two-timescale EMA difference
+  (`slow_ema - fast_ema`): positive means the model is getting better at
+  predicting, near zero for a plateaued or noisy-but-static error. `None`
+  when `internal.prediction_error` is unavailable this tick.
+- `internal.novelty` — the combined novelty scalar (issue #27,
+  `core.novelty.combine_novelty`), promoted to a stream alongside the
+  richer `model.novelty` (which keeps its `{novelty, world_model_error,
+  entity_surprise}` breakdown for debugging).
+- `internal.risk` — the world model's risk/p_death head output
+  (`Prediction.risk`), made visible. Always published: `Prediction.risk`
+  defaults to `0.0`, never `None`.
+
+`ModulationTracker` owns the `learning_progress` EMA state across ticks and
+episodes within a run (a world model's predictive skill is a property of
+the model, not of any one episode, so episode resets don't reset it) and
+exposes `state_dict()`/`load_state_dict()`, ready for a checkpoint's
+`training_stats` (issue #20) so a resumed run doesn't reset the baselines —
+wiring that into a concrete learner's checkpoint bundle is left to whichever
+learner owns one. The `internal.*` wildcard was already declared
+`agent_input` with `AttentionMetadata(modality="internal")` in
+`DEFAULT_STREAM_REGISTRY` ahead of this issue (issue #32); these are runtime
+-computed signals registered directly on the sensory bus, like `model.novelty`
+/`model.value_estimate`, not part of any Program's stream catalog.
+`episode_viewer.py` renders all five per recent decision, and
+`neural.replay_buffer.load_session_into_buffer` reads `internal.novelty` and
+`internal.reward_prediction_error` per tick (issue #28) instead of always
+leaving novelty `None` for loaded sessions.
 
 ### Stream classification and attention metadata (issue #32)
 

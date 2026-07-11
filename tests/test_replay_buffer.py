@@ -18,11 +18,40 @@ from cognitive_runtime.neural import (  # noqa: E402
     load_session_into_buffer,
     transition_priority,
 )
+from cognitive_runtime.core.world_model import Prediction, WorldModel  # noqa: E402
 from cognitive_runtime.policies import ScriptedSurvivalPolicy  # noqa: E402
 from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox  # noqa: E402
 from cognitive_runtime.runtime.config import RuntimeConfig  # noqa: E402
 from cognitive_runtime.runtime.loop import CognitiveRuntime  # noqa: E402
 from cognitive_runtime.training.features import ACTION_KEYS  # noqa: E402
+
+
+class _FakeWorldModel(WorldModel):
+    """Deterministic non-None prediction_error/predicted_reward every tick
+    (issue #58), so a recorded session carries `internal.novelty` and
+    `internal.reward_prediction_error` for the session-loader tests below."""
+
+    def predict(self, state, memory) -> Prediction:
+        return Prediction(risk=0.1, predicted_reward=0.0, prediction_error=0.3)
+
+
+def _record_modulated_session(tmp_path, session_id: str, *, ticks: int, seed: int = 0):
+    config = {"episode_ticks": ticks, "world_size": 16, "max_mobs": 3}
+    runtime_config = RuntimeConfig(
+        episodes=1,
+        seed=seed,
+        max_ticks_per_episode=ticks,
+        record_dir=str(tmp_path),
+        session_id=session_id,
+        program_config=config,
+    )
+    CognitiveRuntime(
+        program=MinecraftSurvivalBox(config=config),
+        policy=ScriptedSurvivalPolicy(seed=seed),
+        config=runtime_config,
+        world_model=_FakeWorldModel(),
+    ).run()
+    return os.path.join(str(tmp_path), session_id)
 
 
 def _transition(source: str, reward: float = 0.0, done: bool = False) -> Transition:
@@ -261,3 +290,58 @@ def test_load_session_into_buffer_missing_directory_raises(tmp_path):
     buffer = ReplayBuffer()
     with pytest.raises(FileNotFoundError):
         load_session_into_buffer(buffer, os.path.join(str(tmp_path), "does-not-exist"))
+
+
+# --------------------------------------------------- internal.* modulation streams
+
+
+def test_load_session_into_buffer_reads_novelty_and_rpe_from_internal_streams(tmp_path):
+    """Issue #58: the loader reads `internal.novelty`/
+    `internal.reward_prediction_error` per tick instead of always leaving
+    them `None` for a loaded session."""
+    session_dir = _record_modulated_session(tmp_path, "modulated-session", ticks=60, seed=5)
+
+    buffer = ReplayBuffer(ReplayBufferConfig(capacity=200, seed=0))
+    added = load_session_into_buffer(buffer, session_dir)
+
+    assert added > 0
+    transitions = buffer.transitions()
+    assert any(t.novelty is not None for t in transitions)
+    assert any(t.reward_prediction_error is not None for t in transitions)
+
+
+def test_replay_prioritization_is_driven_by_recorded_internal_streams(tmp_path):
+    """Issue #58 acceptance: prioritization reads the recorded internal.*
+    streams instead of recomputing anything reward-side. Weighting
+    `reward_prediction_error` alone must differentiate transitions by their
+    recorded RPE magnitude."""
+    session_dir = _record_modulated_session(tmp_path, "modulated-priority", ticks=60, seed=6)
+
+    zero_weights = PriorityWeights(
+        reward=0.0, death=0.0, damage=0.0, novelty=0.0, prediction_error=0.0,
+        reward_prediction_error=0.0,
+    )
+    buffer_flat = ReplayBuffer(ReplayBufferConfig(capacity=200, seed=0, weights=zero_weights))
+    load_session_into_buffer(buffer_flat, session_dir)
+    # Every configured weight at 0: every transition degrades to the same
+    # eps floor -- proportional sampling has nothing to key off.
+    assert len({round(p, 9) for p in buffer_flat.priorities()}) == 1
+
+    rpe_weights = PriorityWeights(
+        reward=0.0, death=0.0, damage=0.0, novelty=0.0, prediction_error=0.0,
+        reward_prediction_error=1.0,
+    )
+    buffer_rpe = ReplayBuffer(ReplayBufferConfig(capacity=200, seed=0, weights=rpe_weights))
+    load_session_into_buffer(buffer_rpe, session_dir)
+    rpes = [t.reward_prediction_error for t in buffer_rpe.transitions()]
+    assert any(r is not None for r in rpes)
+    # Weighting the recorded reward-prediction-error alone now differentiates
+    # transitions by it.
+    assert len({round(p, 9) for p in buffer_rpe.priorities()}) > 1
+    priority_by_rpe = {
+        round(t.reward_prediction_error, 6): p
+        for t, p in zip(buffer_rpe.transitions(), buffer_rpe.priorities())
+        if t.reward_prediction_error is not None
+    }
+    biggest_surprise = max(priority_by_rpe, key=lambda rpe: abs(rpe))
+    assert priority_by_rpe[biggest_surprise] == max(priority_by_rpe.values())

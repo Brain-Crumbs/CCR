@@ -33,6 +33,10 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
+from cognitive_runtime.core.modulation import (
+    NOVELTY_STREAM as INTERNAL_NOVELTY_STREAM,
+    REWARD_PREDICTION_ERROR_STREAM as INTERNAL_REWARD_PREDICTION_ERROR_STREAM,
+)
 from cognitive_runtime.core.streams import TemporalBuffer, TemporalFusion
 from cognitive_runtime.core.streams.events import StreamSpec
 from cognitive_runtime.runtime.frame_store import open_frame_store
@@ -51,18 +55,21 @@ from cognitive_runtime.training.features import ACTION_KEYS
 #: still be sampled rather than permanently starved.
 _PRIORITY_EPS = 1e-3
 
-_WEIGHT_FIELDS = ("reward", "death", "damage", "novelty", "prediction_error")
+_WEIGHT_FIELDS = (
+    "reward", "death", "damage", "novelty", "prediction_error", "reward_prediction_error",
+)
 
 
 @dataclass(frozen=True)
 class PriorityWeights:
     """Per-signal weights combined into one transition priority.
 
-    Any signal a transition doesn't carry (``novelty``/``prediction_error``
-    are ``None`` when unavailable -- e.g. a heuristic world model, or a
-    recorded session that predates Phase D) is dropped from the combination
-    and the remaining weights are renormalized, so priority stays on a
-    comparable scale whether or not every signal fired this tick.
+    Any signal a transition doesn't carry (``novelty``/``prediction_error``/
+    ``reward_prediction_error`` are ``None`` when unavailable -- e.g. a
+    heuristic world model, or a recorded session that predates Phase D/#58)
+    is dropped from the combination and the remaining weights are
+    renormalized, so priority stays on a comparable scale whether or not
+    every signal fired this tick.
     """
 
     reward: float = 1.0
@@ -70,6 +77,10 @@ class PriorityWeights:
     damage: float = 0.5
     novelty: float = 0.5
     prediction_error: float = 0.5
+    #: The dopamine analog (issue #58): a large reward surprise -- the agent
+    #: got much more or less reward than the world model predicted -- is
+    #: exactly the kind of transition worth replaying.
+    reward_prediction_error: float = 0.5
 
     def to_dict(self) -> Dict[str, float]:
         return {name: getattr(self, name) for name in _WEIGHT_FIELDS}
@@ -99,6 +110,7 @@ class Transition:
     damage: bool = False
     novelty: Optional[float] = None
     prediction_error: Optional[float] = None
+    reward_prediction_error: Optional[float] = None
     source: str = ""
 
 
@@ -120,6 +132,10 @@ def transition_priority(
         components.append((weights.novelty, max(0.0, transition.novelty)))
     if transition.prediction_error is not None:
         components.append((weights.prediction_error, max(0.0, transition.prediction_error)))
+    if transition.reward_prediction_error is not None:
+        components.append((
+            weights.reward_prediction_error, abs(transition.reward_prediction_error),
+        ))
 
     weight_total = sum(w for w, _ in components)
     if weight_total <= 0:
@@ -323,13 +339,16 @@ def load_session_into_buffer(
     """Replay recorded session(s) (streams-v2) into ``buffer`` for offline
     pretraining/regression, returning the number of transitions added.
 
-    Reward/death/damage/prediction-error are read off the tick *after* the
-    one an action was taken on -- they are its causal consequence, the same
-    convention ``training.datasets.build_world_model_dataset`` uses.
-    ``novelty`` is always left ``None``: the combined novelty score (issue
-    #27) is only recorded per-episode (``EpisodeSummary.avg_novelty``), not
-    per-tick, so priority for loaded sessions degrades gracefully to
-    reward/death/damage/prediction-error, per ``transition_priority``.
+    Reward/death/damage/prediction-error/novelty/reward-prediction-error are
+    read off the tick *after* the one an action was taken on -- they are its
+    causal consequence, the same convention
+    ``training.datasets.build_world_model_dataset`` uses. ``novelty`` and
+    ``reward_prediction_error`` are read from the recorded
+    ``internal.novelty``/``internal.reward_prediction_error`` streams (issue
+    #58) when present; sessions recorded before those streams existed (or a
+    heuristic world model with no reward head) leave them ``None``, and
+    priority degrades gracefully to whichever signals are available, per
+    ``transition_priority``.
     """
     dirs = [session_dirs] if isinstance(session_dirs, str) else list(session_dirs)
     key_to_action = {key: i for i, key in enumerate(ACTION_KEYS)}
@@ -357,19 +376,35 @@ def load_session_into_buffer(
             tick_buffer = TemporalBuffer()
             reward_total = 0.0
             episode_samples: List[
-                Tuple[List[float], int, float, bool, bool, Optional[float]]
+                Tuple[
+                    List[float], int, float, bool, bool,
+                    Optional[float], Optional[float], Optional[float],
+                ]
             ] = []
             for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
                 reward = float(decision.get("reward_window_total", 0.0))
                 reward_total += reward
                 died = False
                 damaged = False
+                novelty: Optional[float] = None
+                reward_prediction_error: Optional[float] = None
                 for record in sensory:
                     stream_id = record.get("stream_id", "")
                     if stream_id == "event.died":
                         died = True
                     elif stream_id == "event.damage_taken":
                         damaged = True
+                    elif not record.get("elided") and stream_id in (
+                        INTERNAL_NOVELTY_STREAM, INTERNAL_REWARD_PREDICTION_ERROR_STREAM,
+                    ):
+                        payload = record.get("payload")
+                        if isinstance(payload, dict) and isinstance(
+                            payload.get("value"), (int, float)
+                        ):
+                            if stream_id == INTERNAL_NOVELTY_STREAM:
+                                novelty = float(payload["value"])
+                            else:
+                                reward_prediction_error = float(payload["value"])
                     if record.get("elided"):
                         continue
                     tick_buffer.append(stream_event_from_log(record, frame_store=frame_store))
@@ -385,12 +420,17 @@ def load_session_into_buffer(
                         died,
                         damaged,
                         float(prediction_error) if prediction_error is not None else None,
+                        novelty,
+                        reward_prediction_error,
                     ))
             if min_episode_reward is not None and reward_total < min_episode_reward:
                 continue
             for current, nxt in zip(episode_samples, episode_samples[1:]):
-                latent, action, _reward, _died, _damaged, _pe = current
-                next_latent, _next_action, next_reward, next_died, next_damaged, next_pe = nxt
+                latent, action, _reward, _died, _damaged, _pe, _novelty, _rpe = current
+                (
+                    next_latent, _next_action, next_reward, next_died, next_damaged,
+                    next_pe, next_novelty, next_rpe,
+                ) = nxt
                 buffer.add(Transition(
                     latent=latent,
                     action=action,
@@ -398,8 +438,9 @@ def load_session_into_buffer(
                     next_latent=next_latent,
                     done=next_died,
                     damage=next_damaged,
-                    novelty=None,
+                    novelty=next_novelty,
                     prediction_error=next_pe,
+                    reward_prediction_error=next_rpe,
                     source=f"{session_dir}/{episode_id}",
                 ))
                 added += 1
