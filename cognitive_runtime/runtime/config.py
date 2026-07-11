@@ -35,6 +35,13 @@ class RuntimeConfig:
     #: `None` for a plain (non-curriculum) run.
     curriculum: Optional[str] = None
 
+    #: Ordered position of `curriculum` within its curriculum definition
+    #: (issue #43's curriculum runner), so session metadata/episode summaries
+    #: can be ordered chronologically by stage instead of just grouped by
+    #: name. `None` for a plain run or a bare `--curriculum` preset run that
+    #: isn't driven by the staged runner.
+    curriculum_stage_index: Optional[int] = None
+
     # Rolling-window binary frame store (only used when a frame stream is
     # actually being recorded, i.e. record_frames=True or it's named in
     # record_streams).  A segment rotates on whichever threshold hits first;

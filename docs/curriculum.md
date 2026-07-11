@@ -36,9 +36,14 @@ here; the point is that the world model learns the world is *lawful*
 day) before the policy is asked to survive in it. Nursery checkpoints seed
 step 1 below.
 
-Also planned: an automated **curriculum runner** (issue #43) that promotes
-the agent between the steps below only when statistical metrics pass
-(issue #44), carrying the same checkpoint bundle across stage boundaries.
+An automated **curriculum runner** (issue #43,
+`cognitive_runtime/training/curriculum_runner.py`) promotes the agent between
+staged goals only when a metric passes, carrying the same checkpoint bundle
+across stage boundaries -- see "Curriculum runner" below. It gates on the
+plain mean of one summary metric over a fixed eval sample size; issue #44's
+full statistical harness (confidence intervals across survival/reward/
+coverage/prediction-error) hasn't landed yet and will replace that gate when
+it does.
 
 ## The six steps
 
@@ -114,3 +119,72 @@ All four new/completed components are unit-tested against synthetic stream
 events in `tests/test_rewards.py`, and the underlying world mechanics
 (pickaxe/torch crafting, the `used_tool`/`created_light_source` events) are
 covered end to end in `tests/test_program_streams.py`.
+
+## Curriculum runner (issue #43)
+
+The presets above are single-stage tuning: pick one, run it, look at the
+metrics. The **curriculum runner**
+(`cognitive_runtime/training/curriculum_runner.py`) chains stages together
+unattended: train an actor/critic on a stage, evaluate it, and promote to the
+next stage only when a metric clears a threshold -- holding (and logging why)
+otherwise, never spinning silently. The same policy/critic/optimizer -- the
+"brain" -- carries across every stage; only the world/reward config changes.
+
+A **curriculum definition** is a YAML/JSON file, distinct from a
+`CurriculumPreset` above (which only carries world/reward overrides, no
+promotion logic):
+
+```yaml
+name: toy-two-stage
+stages:
+  - name: flat-safe-toy
+    world_config: {world_size: 32, episode_ticks: 300, difficulty: 0.0, max_mobs: 0}
+    reward_config: {tick_alive: 0.02}       # or reward_profile_path: goals/survival.yaml
+    train_episodes: 2
+    promotion: {metric: average_ticks, threshold: 250, sample_size: 2}
+    max_attempts: 2
+  - name: night-survival-toy
+    world_config: {world_size: 32, episode_ticks: 300, day_length: 400, difficulty: 1.0, max_mobs: 2}
+    reward_config: {survived_night: 2.0}
+    train_episodes: 2
+    promotion: {metric: survival_rate, threshold: 0.0, sample_size: 2}
+    max_attempts: 2
+```
+
+- `world_config` / `reward_config` mirror `SurvivalBoxConfig`/`SurvivalRewardConfig`
+  overrides, same as a `CurriculumPreset`. `reward_profile_path` (issue #41)
+  is the alternative to `reward_config` -- the two are mutually exclusive per
+  stage.
+- `promotion.metric` is one of `average_reward`, `average_ticks`,
+  `total_reward`, `total_ticks`, `survival_rate` (fraction of eval episodes
+  that didn't end in death); `threshold` is compared against the *mean* over
+  `sample_size` eval episodes.
+- `max_attempts` is the demotion/plateau rule: a stage that hasn't met its
+  promotion criteria after this many train+evaluate attempts holds instead of
+  retrying forever.
+- All stages must share the same `world_size` (and any other knob that
+  reshapes the stream catalog) -- `load_curriculum_definition` checks this at
+  load time, since a stream-layout change would make the checkpoint
+  incompatible mid-curriculum.
+
+Curriculum progress (current stage, attempts, promotion history) is stored in
+the checkpoint bundle's `training_stats["curriculum"]` (issue #20), so
+interrupting the runner and restarting it resumes at the correct stage from
+the same checkpoint:
+
+```bash
+python -m cognitive_runtime curriculum-run \
+    --curriculum-file goals/curricula/toy_two_stage.yaml \
+    --checkpoint checkpoints/curriculum.pt
+
+# Resumes automatically from the checkpoint's saved stage; --stage/--force-promote
+# are manual overrides for experimentation:
+python -m cognitive_runtime curriculum-run \
+    --curriculum-file goals/curricula/toy_two_stage.yaml \
+    --checkpoint checkpoints/curriculum.pt --stage 1 --force-promote
+```
+
+Each stage's train/eval episodes are tagged with the stage name and index in
+session metadata (`session.json`'s `curriculum`/`curriculum_stage_index`
+fields, alongside every plain `--curriculum` run's), so `dashboard` groups a
+curriculum run's progress by stage.

@@ -189,6 +189,7 @@ class CognitiveRuntime:
             "episodes": self.config.episodes,
             "base_seed": self.config.seed,
             "curriculum": self.config.curriculum,
+            "curriculum_stage_index": self.config.curriculum_stage_index,
             "program_config": self.config.program_config,
             "action_space": [a.key() for a in meta.action_space],
             # Versions the action space (issue #42) alongside it: a curriculum
@@ -374,6 +375,7 @@ class CognitiveRuntime:
             seed=seed,
             policy_name=self.policy.name,
             curriculum=self.config.curriculum,
+            curriculum_stage_index=self.config.curriculum_stage_index,
             duration_ticks=ticks,
             total_reward=round(total_reward, 4),
             success=False if recoverable_error else bool(
