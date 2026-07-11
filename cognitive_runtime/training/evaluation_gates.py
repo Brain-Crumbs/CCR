@@ -24,12 +24,23 @@ lethal night episodes that kill random. The eval runs can be recorded
 (``record_dir``) for dashboard inspection, and the gate results can be written
 into the actor/critic checkpoint bundle's training stats (``checkpoint_path``,
 issue #20).
+
+Issue #44 ("actor/critic vs random/scripted/linear-Q becomes a statistical
+comparison") adds :mod:`cognitive_runtime.training.statistical_evaluation`
+mean +/- CI reports and significance-checked comparisons
+(``EvaluationGateResult.statistics``/``gate1_comparisons``/
+``gate2_comparisons``) alongside gates 1-2's single-run ordering above --
+informational at the small default ``eval_episodes``, and the way to tell a
+real regression from eval-episode noise at a curriculum-scale sample size.
+Gate 3 keeps its exact bit-for-bit reproducibility check: that is a
+`replay`-style guarantee the simulated backend still owes (see
+``docs/streams.md``'s smoke-test framing), not a statistical one.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -57,6 +68,12 @@ from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
 from cognitive_runtime.runtime.recorder import EpisodeSummary, NullRecorder
 from cognitive_runtime.training.online_q_acceptance import EvaluationSummary
+from cognitive_runtime.training.statistical_evaluation import (
+    MetricComparison,
+    PolicyStatistics,
+    compare_statistics,
+    compute_statistics,
+)
 
 #: The small deterministic config for the automated gate-1 test (issue #31's
 #: "small deterministic config for the automated test").  It mirrors the
@@ -91,6 +108,16 @@ class EvaluationGateResult:
     config: Dict[str, int]
     seeds: Dict[str, int]
     curriculum: Optional[str]
+    #: Statistical evaluation harness report (issue #44): mean +/- CI per
+    #: policy over the eval episodes, keyed like `summaries`. Empty when the
+    #: caller didn't request it (statistics need the raw per-episode data,
+    #: not just the aggregated `EvaluationSummary`).
+    statistics: Dict[str, PolicyStatistics] = field(default_factory=dict)
+    #: Statistical comparisons of actor-critic against random/online (issue
+    #: #44's regression-flagging convention: non-overlapping CIs on the worse
+    #: side), alongside gates 1-2's single-run "beats" ordering above.
+    gate1_comparisons: List[MetricComparison] = field(default_factory=list)
+    gate2_comparisons: List[MetricComparison] = field(default_factory=list)
 
     @property
     def accepted(self) -> bool:
@@ -122,6 +149,11 @@ class EvaluationGateResult:
                 }
                 for name, s in self.summaries.items()
             },
+            # Statistical evaluation harness (issue #44): mean +/- CI per
+            # policy, plus the significance-checked actor-critic comparisons.
+            "statistics": {name: s.to_dict() for name, s in self.statistics.items()} or None,
+            "gate1_statistical": [c.to_dict() for c in self.gate1_comparisons] or None,
+            "gate2_statistical": [c.to_dict() for c in self.gate2_comparisons] or None,
         }
 
 
@@ -322,7 +354,12 @@ def _evaluate_all(
         "scripted": EvaluationSummary.from_episodes("scripted", scripted_eval),
         "random": EvaluationSummary.from_episodes("random", random_eval),
     }
-    return summaries, optimizer, online_model, fusion, action_keys, policy_model, critic_model, arch
+    episodes = {
+        "actor-critic": ac_eval, "online": oq_eval, "scripted": scripted_eval, "random": random_eval,
+    }
+    return (
+        summaries, episodes, optimizer, online_model, fusion, action_keys, policy_model, critic_model, arch,
+    )
 
 
 def run_evaluation_gates(
@@ -355,7 +392,7 @@ def run_evaluation_gates(
         train_episodes=train_episodes, eval_episodes=eval_episodes,
         ac_lr=ac_lr, ac_entropy_coef=ac_entropy_coef,
     )
-    (summaries, optimizer, online_model, fusion, action_keys,
+    (summaries, episodes, optimizer, online_model, fusion, action_keys,
      policy_model, critic_model, arch) = _evaluate_all(
         world_config, rewards, record_dir=record_dir, **common
     )
@@ -371,6 +408,20 @@ def run_evaluation_gates(
         rerun, *_ = _evaluate_all(world_config, rewards, record_dir=None, **common)
         gate3 = summaries == rerun and _beats(rerun["actor-critic"], rerun["random"])
 
+    # Statistical evaluation harness (issue #44): mean +/- CI per policy over
+    # the same eval episodes, plus significance-checked comparisons of
+    # actor-critic against random/linear-Q -- "becomes a statistical
+    # comparison" alongside gates 1-2's single-run "beats" ordering. With the
+    # small default `eval_episodes`, most metrics land on
+    # "no_significant_difference" (honestly: not enough episodes to bound
+    # the interval) rather than a false positive; a curriculum-scale
+    # `--eval-episodes` run narrows the CI enough to be informative.
+    statistics = {
+        name: compute_statistics(name, eps) for name, eps in episodes.items()
+    }
+    gate1_comparisons = compare_statistics(statistics["random"], statistics["actor-critic"])
+    gate2_comparisons = compare_statistics(statistics["online"], statistics["actor-critic"])
+
     result = EvaluationGateResult(
         summaries=summaries,
         gate1_beats_random=gate1,
@@ -382,6 +433,9 @@ def run_evaluation_gates(
         config=world_config,
         seeds={"model": model_seed, "train": train_seed, "eval": eval_seed},
         curriculum=curriculum,
+        statistics=statistics,
+        gate1_comparisons=gate1_comparisons,
+        gate2_comparisons=gate2_comparisons,
     )
 
     if checkpoint_path is not None:

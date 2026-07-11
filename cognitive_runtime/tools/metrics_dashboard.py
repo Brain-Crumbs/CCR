@@ -90,10 +90,28 @@ _DASHBOARD_COLUMNS = [
 ]
 
 
-def dashboard(record_dir: str) -> str:
+def _statistical_section(by_group: Dict[tuple, List[EpisodeSummary]]) -> str:
+    """Mean +/- CI per group (issue #44), alongside the dashboard's plain-mean
+    table -- the statistical evaluation harness's report, rendered here so
+    recorded sessions get both views from one command."""
+    from cognitive_runtime.training.statistical_evaluation import (
+        compute_statistics, format_statistics_report,
+    )
+
+    stats = [
+        compute_statistics(f"{policy} [{curriculum}]" if curriculum != "-" else policy, group)
+        for (curriculum, policy), group in sorted(by_group.items())
+    ]
+    return "\nstatistical summary (mean +/- 95% CI, issue #44):\n" + format_statistics_report(stats)
+
+
+def dashboard(record_dir: str, statistical: bool = False) -> str:
     """One row per (curriculum, policy) group, aggregated over every session
     under record_dir -- so a curriculum run (issue #30) is comparable across
-    steps, and plain runs (curriculum=None) still group by policy alone."""
+    steps, and plain runs (curriculum=None) still group by policy alone.
+
+    ``statistical=True`` appends the statistical evaluation harness's mean
+    +/- confidence-interval report for the same groups."""
     if not os.path.isdir(record_dir):
         return f"(no sessions directory at {record_dir})"
     by_group: Dict[tuple, List[EpisodeSummary]] = {}
@@ -114,9 +132,12 @@ def dashboard(record_dir: str) -> str:
         row["policy"] = policy_name
         row["curriculum"] = curriculum
         rows.append(row)
-    return (
+    out = (
         comparison_table(rows, columns=_DASHBOARD_COLUMNS)
         + "\n"
         + _per_stream_rate_table(all_summaries)
         + _realtime_health(all_summaries)
     )
+    if statistical:
+        out += "\n" + _statistical_section(by_group)
+    return out

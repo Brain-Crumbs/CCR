@@ -8,13 +8,17 @@ either promotes to the next stage (metric passed the threshold) or holds the
 stage and logs why. The same policy/critic/optimizer weights -- the "brain" --
 carry across stage boundaries; only the world/reward config changes.
 
-Issue #44 (statistical evaluation harness with confidence intervals across
-survival/reward/coverage/prediction-error metrics) has not landed yet, so
-promotion here gates on the plain mean of one summary metric
+Promotion here gates on the plain mean of one summary metric
 (:class:`PromotionCriteria`) over a fixed sample size -- deliberately the
 simplest thing that is still an N-episode statistical aggregate, not a
-single-episode fluke. Swapping in the richer #44 harness later only touches
-:func:`_evaluate_stage`.
+single-episode fluke. Issue #44's richer statistical harness
+(:mod:`cognitive_runtime.training.statistical_evaluation`: confidence
+intervals across survival/reward-by-tier/coverage/prediction-error, with
+regression/improvement flagging) has since landed and can inspect a
+curriculum run's recorded sessions directly
+(``statistical-evaluate --from-sessions``), but this module's own promotion
+gate intentionally keeps the simple mean criterion rather than growing a
+second, harder-to-predict gating rule.
 
 Curriculum state (current stage, attempt count, promotion history) lives in
 the checkpoint bundle's ``training_stats["curriculum"]`` (issue #20), so

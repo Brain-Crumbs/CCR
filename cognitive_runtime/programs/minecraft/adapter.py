@@ -358,4 +358,6 @@ class MinecraftSurvivalBox(Program):
                 "final_tick": self._backend.tick(),
             }
         )
+        if isinstance(self._reward_fn, ProfileRewardEngine):
+            stats["reward_by_tier"] = self._reward_fn.tier_totals()
         return stats

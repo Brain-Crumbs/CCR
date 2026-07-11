@@ -147,6 +147,15 @@ class ProfileRewardEngine:
         self._null_streak = 0
         self._seen_obs_hashes: Set[str] = set()
         self._ticks_since_novel = 0
+        # Reward-by-tier accounting (issue #44): cumulative reward per tier
+        # this life/episode, for the statistical evaluation harness. Always
+        # cleared at an episode boundary, like the anti-stagnation trackers
+        # above -- it is not brain-scoped milestone state.
+        self._tier_totals: Dict[str, float] = {}
+
+    def tier_totals(self) -> Dict[str, float]:
+        """Cumulative reward per tier so far this life/episode."""
+        return dict(self._tier_totals)
 
     # --------------------------------------------------------- persistence
 
@@ -260,6 +269,10 @@ class ProfileRewardEngine:
                 self._eval_intrinsic(name, spec, ctx, components)
             else:
                 getattr(self, f"_kind_{spec.kind}")(name, spec, ctx, components)
+
+        for name, value in components.items():
+            tier = self._components[name][0]
+            self._tier_totals[tier] = round(self._tier_totals.get(tier, 0.0) + value, 6)
 
         raw_value = round(sum(components.values()), 6)
         self._normalizer.update(raw_value)

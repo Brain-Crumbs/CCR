@@ -40,10 +40,16 @@ An automated **curriculum runner** (issue #43,
 `cognitive_runtime/training/curriculum_runner.py`) promotes the agent between
 staged goals only when a metric passes, carrying the same checkpoint bundle
 across stage boundaries -- see "Curriculum runner" below. It gates on the
-plain mean of one summary metric over a fixed eval sample size; issue #44's
-full statistical harness (confidence intervals across survival/reward/
-coverage/prediction-error) hasn't landed yet and will replace that gate when
-it does.
+plain mean of one summary metric over a fixed eval sample size -- deliberately
+the simplest thing that is still an N-episode aggregate, not a single-episode
+fluke. Issue #44's full statistical harness
+(`cognitive_runtime.training.statistical_evaluation`: confidence intervals
+across survival/reward-by-tier/coverage/prediction-error, with
+regression/improvement flagging) has landed and is available for richer
+inspection of a curriculum run's recorded sessions
+(`statistical-evaluate --from-sessions <record_dir>`,
+`dashboard --statistical`), but the runner's own promotion gate intentionally
+stays on the plain-mean criterion for now.
 
 ## The six steps
 

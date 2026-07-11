@@ -134,11 +134,25 @@ def _optimizer_metadata(optimizer: torch.optim.Optimizer) -> Dict[str, Any]:
     }
 
 
+def _capture_deterministic_algorithms() -> Dict[str, Any]:
+    """Torch's global determinism switches (issue #44): recorded alongside RNG
+    state so single-run debugging reproducibility is *possible* to reconstruct
+    from a checkpoint, without these switches being a product guarantee for
+    live/learning runs (see docs/online-learning.md)."""
+    return {
+        "deterministic_algorithms_enabled": torch.are_deterministic_algorithms_enabled(),
+        "deterministic_algorithms_warn_only": torch.is_deterministic_algorithms_warn_only_enabled(),
+        "cudnn_deterministic": bool(getattr(torch.backends.cudnn, "deterministic", False)),
+        "cudnn_benchmark": bool(getattr(torch.backends.cudnn, "benchmark", False)),
+    }
+
+
 def _capture_rng_state() -> Dict[str, Any]:
     state: Dict[str, Any] = {
         "python": random.getstate(),
         "numpy": np.random.get_state(),
         "torch": torch.random.get_rng_state(),
+        "deterministic_algorithms": _capture_deterministic_algorithms(),
     }
     if torch.cuda.is_available():  # pragma: no cover - CI is CPU-only
         state["torch_cuda"] = torch.cuda.get_rng_state_all()
@@ -154,6 +168,14 @@ def _restore_rng_state(state: Mapping[str, Any]) -> None:
         torch.random.set_rng_state(state["torch"])
     if "torch_cuda" in state and torch.cuda.is_available():  # pragma: no cover
         torch.cuda.set_rng_state_all(state["torch_cuda"])
+    flags = state.get("deterministic_algorithms")
+    if isinstance(flags, Mapping):
+        torch.use_deterministic_algorithms(
+            bool(flags.get("deterministic_algorithms_enabled", False)),
+            warn_only=bool(flags.get("deterministic_algorithms_warn_only", False)),
+        )
+        torch.backends.cudnn.deterministic = bool(flags.get("cudnn_deterministic", False))
+        torch.backends.cudnn.benchmark = bool(flags.get("cudnn_benchmark", False))
 
 
 class NeuralAgentCheckpoint:

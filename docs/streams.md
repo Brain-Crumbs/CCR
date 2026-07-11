@@ -232,6 +232,21 @@ carry it forward:
 5. **Environment-agnostic.** Nothing under `core/streams/` imports from
    `programs/` (enforced by a test).
 
+**Scope note (issue #44).** Byte-identical replay (points 1-4 above) is the
+contract for the *simulated* backend, and stays a fast, dependency-free CI
+smoke test of the loop/stream/recorder plumbing (`tests/test_tools.py`,
+`python -m cognitive_runtime replay`) -- it still catches a broken publish
+order, a hashing regression, or a recorder/replay round-trip bug. It is
+**not** a regression gate for learning runs: neural online training breaks
+byte-identical replay (torch/GPU nondeterminism, weights mutating
+mid-episode), and the remote backend never had it (`NonDeterministicSessionError`).
+For those, `cognitive_runtime.training.statistical_evaluation` reports mean
++/- confidence interval over N episodes on matched conditions (survival,
+reward by tier, exploration coverage, world-model prediction error, death
+causes) and flags a regression only when a candidate checkpoint's interval no
+longer overlaps the baseline's on the worse side -- see
+[online-learning.md](online-learning.md)'s "Evaluation Gates" section.
+
 ## Migration status
 
 Completed phases: stream primitives (Phase 0), Program interface v2

@@ -45,6 +45,7 @@ def summarize_episodes(summaries: List[EpisodeSummary]) -> Dict[str, Any]:
         "avg_blocks_broken": round(_mean(stat("blocks_broken")), 2),
         "avg_blocks_placed": round(_mean(stat("blocks_placed")), 2),
         "avg_food_consumed": round(_mean(stat("food_consumed")), 2),
+        "avg_exploration_coverage": round(_mean(stat("exploration_coverage")), 2),
         "nights_survived_rate": round(
             _mean([1.0 if p.get("survived_night") else 0.0 for p in stats]), 2
         ),

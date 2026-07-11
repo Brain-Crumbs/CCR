@@ -3,6 +3,7 @@
     python -m cognitive_runtime run --policy scripted --episodes 3
     python -m cognitive_runtime demo
     python -m cognitive_runtime evaluate --episodes 3
+    python -m cognitive_runtime statistical-evaluate --episodes 20 --baseline random
     python -m cognitive_runtime train --sessions sessions/<id> --out models/bc.json
     python -m cognitive_runtime replay --session sessions/<id> --verify
     python -m cognitive_runtime view --session sessions/<id> --episode episode_00000
@@ -618,6 +619,64 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
     print(comparison_table(rows))
 
 
+def cmd_statistical_evaluate(args: argparse.Namespace) -> None:
+    """Statistical evaluation harness (issue #44): mean +/- CI over N episodes
+    per policy/checkpoint, either freshly run in sim or loaded from already-
+    recorded sessions (``--from-sessions``), with regression flagging against
+    a named ``--baseline`` policy."""
+    from cognitive_runtime.training.statistical_evaluation import (
+        compare_statistics, evaluate_recorded_sessions,
+        flagged_regressions, format_comparison_report, format_statistics_report,
+        run_statistical_evaluation,
+    )
+
+    if args.from_sessions:
+        by_group = evaluate_recorded_sessions(args.from_sessions, confidence=args.confidence)
+        if not by_group:
+            sys.exit(f"no recorded episodes found under {args.from_sessions!r}")
+        stats: Dict[str, Any] = {
+            (f"{policy} [{curriculum}]" if curriculum != "-" else policy): s
+            for (curriculum, policy), s in sorted(by_group.items())
+        }
+    else:
+        _resolve_world_args(args)
+        program_config = _program_config(args)
+        reward_profile = _reward_profile_for(args)
+        reward_config = None if reward_profile else _reward_config_for(args)
+        names = [p.strip() for p in args.policies.split(",") if p.strip()]
+        stats = {}
+        for name in names:
+            stats[name] = run_statistical_evaluation(
+                program_factory=lambda: MinecraftSurvivalBox(
+                    config=program_config, reward_config=reward_config, backend=args.backend,
+                    reward_profile=reward_profile,
+                ),
+                policy_factory=(lambda n: (lambda: _make_policy(n, args)))(name),
+                episodes=args.episodes,
+                seed=args.seed,
+                max_ticks=args.episode_ticks,
+                record_dir=args.record_dir,
+                session_id=f"stat-eval-{name}" if args.record_dir else None,
+                confidence=args.confidence,
+            )
+
+    print(format_statistics_report(list(stats.values())))
+
+    if args.baseline:
+        baseline = stats.get(args.baseline)
+        if baseline is None:
+            sys.exit(f"--baseline {args.baseline!r} not among evaluated groups: {sorted(stats)}")
+        for name, candidate in stats.items():
+            if name == args.baseline:
+                continue
+            comparisons = compare_statistics(baseline, candidate)
+            regressions = flagged_regressions(comparisons)
+            print(f"\n{name} vs baseline {args.baseline!r}:")
+            print(format_comparison_report(comparisons))
+            if regressions:
+                print(f"  ** {len(regressions)} statistically significant regression(s) **")
+
+
 def cmd_train(args: argparse.Namespace) -> None:
     if args.model_type == "neural":
         _train_neural(args)
@@ -1132,6 +1191,14 @@ def cmd_evaluation_gates(args: argparse.Namespace) -> None:
     print(f"gate 1  actor/critic > random     : {result.gate1_beats_random}")
     print(f"gate 2  actor/critic > linear Q    : {result.gate2_beats_linear_q}")
     print(f"gate 3  reproducible improvement   : {result.gate3_reproducible}")
+
+    from cognitive_runtime.training.statistical_evaluation import format_comparison_report
+
+    print("\nstatistical comparison (issue #44, mean +/- CI over the eval episodes):")
+    print("  actor-critic vs random:")
+    print("  " + format_comparison_report(result.gate1_comparisons).replace("\n", "\n  "))
+    print("  actor-critic vs linear-Q:")
+    print("  " + format_comparison_report(result.gate2_comparisons).replace("\n", "\n  "))
     if not args.no_record:
         print(f"\nrecorded eval sessions under {args.record_dir!r}; inspect with:")
         print(f"    python -m cognitive_runtime dashboard --record-dir {args.record_dir}")
@@ -1190,7 +1257,7 @@ def cmd_curriculum_run(args: argparse.Namespace) -> None:
 
 
 def cmd_dashboard(args: argparse.Namespace) -> None:
-    print(dashboard(args.record_dir))
+    print(dashboard(args.record_dir, statistical=args.statistical))
 
 
 def cmd_review(args: argparse.Namespace) -> None:
@@ -1321,6 +1388,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--episodes", type=int, default=3)
     _add_world_args(p_eval)
     p_eval.set_defaults(func=cmd_evaluate)
+
+    p_stat_eval = sub.add_parser(
+        "statistical-evaluate",
+        help="statistical evaluation harness (issue #44): mean +/- CI across N "
+             "episodes per policy/checkpoint, with regression flagging against "
+             "a --baseline",
+    )
+    p_stat_eval.add_argument("--policies", default="null,random,scripted",
+                             help="comma-separated policy names to run fresh in sim "
+                                  "(ignored with --from-sessions)")
+    p_stat_eval.add_argument("--episodes", type=int, default=10,
+                             help="episodes per policy (larger N narrows the CI)")
+    p_stat_eval.add_argument("--confidence", type=float, default=0.95,
+                             help="confidence level for the reported interval")
+    p_stat_eval.add_argument("--baseline", default=None,
+                             help="policy/group name to compare every other group "
+                                  "against, flagging statistically significant regressions")
+    p_stat_eval.add_argument("--record-dir", default=None,
+                             help="record each policy's eval episodes here (omit to skip)")
+    p_stat_eval.add_argument("--from-sessions", default=None,
+                             help="skip running fresh episodes; load recorded "
+                                  "EpisodeSummary data from this record_dir instead, "
+                                  "grouped by (curriculum, policy)")
+    _add_world_args(p_stat_eval)
+    p_stat_eval.set_defaults(func=cmd_statistical_evaluate)
 
     p_gates = sub.add_parser(
         "evaluation-gates",
@@ -1518,6 +1610,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_dash = sub.add_parser("dashboard", help="aggregate metrics across all sessions")
     p_dash.add_argument("--record-dir", default="sessions")
+    p_dash.add_argument("--statistical", action="store_true",
+                        help="append the statistical evaluation harness's mean +/- CI "
+                             "report (issue #44) for the same (curriculum, policy) groups")
     p_dash.set_defaults(func=cmd_dashboard)
 
     p_review = sub.add_parser(

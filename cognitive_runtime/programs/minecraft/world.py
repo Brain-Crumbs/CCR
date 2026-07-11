@@ -25,6 +25,9 @@ import numpy as np
 from cognitive_runtime.core.action import Action
 from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
 
+# Exploration-coverage chunk size (issue #44), in world units.
+EXPLORATION_CHUNK_SIZE = 8.0
+
 # Ground (passable) and feature (solid) cell types.
 PASSABLE = {"grass", "dirt", "sand", "water"}
 SOLID = {
@@ -240,6 +243,10 @@ class SimulatedWorld:
         self._biome = self.biome_map[spawn[0]][spawn[1]]
         self._discovered_structures: set = set()
         self._advancements_earned: set = set()
+        # Exploration coverage (issue #44): unique 8x8 position chunks visited
+        # this episode -- a spatial-novelty proxy independent of reward-profile
+        # configuration, unlike the profile's own capped-novelty components.
+        self._visited_chunks: set = set()
         # Episode statistics.
         self.stats: Dict[str, Any] = {
             "damage_taken": 0.0,
@@ -250,6 +257,7 @@ class SimulatedWorld:
             "max_distance_from_spawn": 0.0,
             "unique_items_collected": 0,
             "survived_night": False,
+            "exploration_coverage": 0,
         }
         self._snapshots: Dict[str, Any] = {}
 
@@ -433,6 +441,14 @@ class SimulatedWorld:
         dist = math.dist((self.x, self.z), self.spawn)
         if dist > self.stats["max_distance_from_spawn"]:
             self.stats["max_distance_from_spawn"] = round(dist, 2)
+
+        chunk = (
+            math.floor(self.x / EXPLORATION_CHUNK_SIZE),
+            math.floor(self.z / EXPLORATION_CHUNK_SIZE),
+        )
+        if chunk not in self._visited_chunks:
+            self._visited_chunks.add(chunk)
+            self.stats["exploration_coverage"] = len(self._visited_chunks)
 
         if self.health <= 0 and not self.dead:
             self.dead = True
@@ -979,6 +995,7 @@ class SimulatedWorld:
         "dead", "death_reason", "_regen_counter", "_starve_counter",
         "_drown_counter", "_was_night", "_sheltered", "stats", "terrain",
         "dimension", "_biome", "_discovered_structures", "_advancements_earned",
+        "_visited_chunks",
     )
 
     def snapshot(self) -> str:
