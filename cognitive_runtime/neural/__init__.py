@@ -31,6 +31,13 @@ MLP policy/value pair (:class:`MLPPolicyModel`, :class:`MLPValueModel`) and
 ``--policy actor-critic`` (``cognitive_runtime.policies.actor_critic``). The
 package also defines the unified checkpoint bundle format those concrete
 modules use once wired into a learner.
+
+Issue #37 splits training out of the realtime tick entirely:
+:class:`SharedExperienceRing` is the bounded shared-memory queue an actor
+pushes transitions to, and :class:`WeightPublisher`/:class:`WeightSubscriber`
+are the versioned-checkpoint mechanism a background trainer process
+(:mod:`cognitive_runtime.training.async_trainer`) publishes weights through
+and the actor polls, hot-swapping them in place between ticks.
 """
 
 from __future__ import annotations
@@ -98,6 +105,11 @@ from cognitive_runtime.neural.replay_buffer import (
     load_session_into_buffer,
     transition_priority,
 )
+from cognitive_runtime.neural.experience_queue import (
+    ExperienceRingStats,
+    SharedExperienceRing,
+)
+from cognitive_runtime.neural.weight_publisher import WeightPublisher, WeightSubscriber
 
 __all__ = [
     "StreamEncoderModule",
@@ -148,4 +160,8 @@ __all__ = [
     "ReplayBuffer",
     "MixedTrainingSchedule",
     "load_session_into_buffer",
+    "SharedExperienceRing",
+    "ExperienceRingStats",
+    "WeightPublisher",
+    "WeightSubscriber",
 ]
