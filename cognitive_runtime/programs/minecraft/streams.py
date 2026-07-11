@@ -25,7 +25,9 @@ from cognitive_runtime.programs.minecraft.world import (
     AGENT_FRAME_ID,
     BLOCK_IDS,
     BREAK_YIELD,
+    LOOK_STEP_DEG,
     MOB_FRAME_ID,
+    PITCH_STEP_DEG,
     PIXEL_RADIUS,
     PIXEL_SCALE,
     SOLID,
@@ -49,6 +51,26 @@ BODY_HEARTBEAT_KEY = "body.heartbeat"
 PIXEL_SHAPE = ((2 * PIXEL_RADIUS + 1) * PIXEL_SCALE, (2 * PIXEL_RADIUS + 1) * PIXEL_SCALE, 3)
 
 VITAL_RANGE = (0.0, 20.0)  # health/hunger/oxygen scale
+
+#: Mouse/look control history (issue #32): the {d_yaw, d_pitch} commanded by
+#: this tick's LOOK_* action, or (0.0, 0.0) for every other action -- a
+#: near-raw motor stream, distinct from `spatial.rotation` (the resulting
+#: absolute pose). Same magnitudes the sim and the mineflayer bridge both
+#: apply (`world.py` / `bridge/mineflayer/actions.js`), so the stream means
+#: the same thing on either backend without any bridge changes.
+MOUSE_LOOK_STREAM = "input.mouse_look"
+LOOK_ACTION_DELTAS: Dict[str, Dict[str, float]] = {
+    "LOOK_LEFT": {"d_yaw": -LOOK_STEP_DEG, "d_pitch": 0.0},
+    "LOOK_RIGHT": {"d_yaw": LOOK_STEP_DEG, "d_pitch": 0.0},
+    "LOOK_UP": {"d_yaw": 0.0, "d_pitch": -PITCH_STEP_DEG},
+    "LOOK_DOWN": {"d_yaw": 0.0, "d_pitch": PITCH_STEP_DEG},
+}
+NULL_MOUSE_LOOK: Dict[str, float] = {"d_yaw": 0.0, "d_pitch": 0.0}
+
+
+def mouse_look_delta(action_name: str) -> Dict[str, float]:
+    """The {d_yaw, d_pitch} commanded by `action_name`, or zero for the rest."""
+    return dict(LOOK_ACTION_DELTAS.get(action_name, NULL_MOUSE_LOOK))
 
 
 #: Naturally harvestable blocks (yield an item, not player-placed) map to the
@@ -142,6 +164,11 @@ def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
                    payload_schema="str"),
         StreamSpec("world.sheltered", "world", "Shelter state, on change.",
                    payload_schema="bool"),
+        StreamSpec(MOUSE_LOOK_STREAM, "input",
+                   "Mouse/look control history: the LOOK_* delta commanded this tick "
+                   "(zero for every other action), every tick.",
+                   nominal_rate_hz=20.0,
+                   payload_schema='{"d_yaw": float, "d_pitch": float}'),
         StreamSpec("event.damage_taken", "event", payload_schema='{"reason": str}'),
         StreamSpec("event.item_collected", "event", payload_schema='{"item": str}'),
         StreamSpec("event.item_collected_exact", "event",

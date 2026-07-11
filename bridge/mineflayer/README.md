@@ -44,6 +44,49 @@ Day/night (`time_of_day`, `is_night`) is **synthesized from the tick and
 `--day-length`/`--start-time`**, exactly like the simulated world, so those
 flags behave identically regardless of the server clock.
 
+- **Mouse/look control history (issue #32).** The `input.mouse_look` stream
+  ({`d_yaw`, `d_pitch`} per tick) is published for *both* backends by the
+  Python `MinecraftSurvivalBox` adapter
+  (`cognitive_runtime/programs/minecraft/adapter.py`), derived from the
+  `LOOK_*` action taken that tick -- the bridge needs no changes for it,
+  since the sim and this bridge apply the same `LOOK_STEP`/`PITCH_STEP`
+  magnitudes (`world.py` / `actions.js`).
+
+## Higher-fidelity pixels (issue #32, optional)
+
+By default `RemoteMinecraftBackend.observe()` colorizes the same 11×11
+semantic `frame` the sim renders, so `vision.frame.pixels` behaves
+identically on both backends. This bridge can instead capture a **real
+rendered screenshot** of the bot's view via
+[`prismarine-viewer`](https://github.com/PrismarineJS/prismarine-viewer)'s
+headless renderer (`bot.viewer` off-screen mode), resized to the fixed
+33×33×3 `PIXEL_SHAPE` so it's a drop-in replacement for the colorized frame.
+
+This is **opt-in and best-effort**: `prismarine-viewer` pulls in a
+headless-GL native dependency (`gl`) that many hosts (containers, CI, a
+sandbox with no GPU/X server) cannot build or run. Any failure to install,
+initialize, or capture a frame disables it for the session and silently
+falls back to the colorized-grid pixels -- nothing here ever breaks a run.
+
+To try it:
+
+```bash
+cd bridge/mineflayer
+npm install --include=optional     # prismarine-viewer is an optionalDependency
+# On headless Linux you likely also need a virtual display, e.g.:
+#   xvfb-run -a node index.js   (or wrap the whole `ccr run` invocation)
+
+export CCR_MINECRAFT_PIXELS=viewer   # or pass {"pixel_source": "viewer"} in reset's config
+python -m cognitive_runtime run --backend remote --policy scripted \
+    --episodes 1 --episode-ticks 200 --realtime --record-frames
+```
+
+Watch stderr for `[mc-bridge:pixels]` lines: `headless capture enabled` on
+success, or a reason it fell back (module not installed, headless-GL init
+failure, a bad frame). `bridge/mineflayer/pixels.js` is the whole
+integration (`PixelViewer`); nothing elsewhere needs to know which pixel
+source was used.
+
 ## Setup
 
 1. **Install Node deps** (Node ≥ 18):
@@ -154,6 +197,7 @@ timing) is what you tune against your server and mineflayer version.
 | `actions.js` | SurvivalBox action → mineflayer controls/activities |
 | `observation.js` | mineflayer state → SurvivalBox observation + 11×11 frame |
 | `blocks.js` | block/biome/item vocabulary + frame codes (kept in sync with `world.py`) |
+| `pixels.js` | optional higher-fidelity pixel capture via prismarine-viewer (issue #32) |
 
 ## Tuning notes
 

@@ -97,7 +97,14 @@ class StreamEncoderRegistry:
     def __init__(self) -> None:
         self._encoders: List[Tuple[str, StreamEncoder]] = []
 
-    def register(self, pattern: str, encoder: StreamEncoder) -> None:
+    def register(self, pattern: str, encoder: Optional[StreamEncoder]) -> None:
+        """Register `pattern` -> `encoder`, first-match-wins.
+
+        `encoder=None` is a deliberate "matched but no fusion slot" shadow:
+        it still wins over a later, broader pattern that would otherwise
+        match the same stream id (see `StreamRegistry.to_encoder_registry`'s
+        classification filter), while contributing nothing to a layout.
+        """
         self._encoders.append((pattern, encoder))
 
     def encoder_for(self, stream_id: str) -> Optional[StreamEncoder]:

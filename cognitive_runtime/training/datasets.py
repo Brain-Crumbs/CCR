@@ -309,9 +309,35 @@ PIXEL_SEQUENCES = "pixel_sequences"
 LATENT_FUSION = "latent_fusion"
 WORLD_MODEL = "world_model"
 
+#: Issue #32 ablation profiles for the neural (pixel) dataset's non-vision
+#: companion vector:
+#:  - "full"  every non-vision stream the (generic) default registry fuses,
+#:            including hand-computed semantic scalars (front_block,
+#:            sheltered) -- "pixels + semantics".
+#:  - "raw"   only streams the Minecraft stream registry classifies
+#:            agent_input (body/reward/spatial proprioception) -- "pixel
+#:            only" (plus the minimal self-state a raw sensorimotor agent
+#:            has, since pixels alone carry no vitals/reward/pose).
+NEURAL_INPUT_PROFILES = frozenset({"full", "raw"})
+NEURAL_FULL = "full"
+NEURAL_RAW = "raw"
 
-def _non_vision_fusion(metadata: Dict[str, Any]) -> TemporalFusion:
+
+def _non_vision_fusion(metadata: Dict[str, Any], stream_profile: str = NEURAL_FULL) -> TemporalFusion:
+    if stream_profile not in NEURAL_INPUT_PROFILES:
+        raise ValueError(
+            f"unknown stream_profile {stream_profile!r}; expected one of "
+            f"{sorted(NEURAL_INPUT_PROFILES)}"
+        )
     specs = [s for s in _catalog(metadata) if s.modality != "vision"]
+    if stream_profile == NEURAL_RAW:
+        from cognitive_runtime.programs.minecraft.stream_registry import (
+            MINECRAFT_STREAM_REGISTRY,
+        )
+
+        return TemporalFusion(
+            specs, MINECRAFT_STREAM_REGISTRY.to_encoder_registry(classifications={"agent_input"})
+        )
     return TemporalFusion(specs)
 
 
@@ -330,6 +356,7 @@ class NeuralDataset:
     pixel_shape: Optional[Tuple[int, int, int]] = None
     sources: List[str] = field(default_factory=list)
     representation: str = NEURAL_PIXELS
+    stream_profile: str = NEURAL_FULL
 
     def __len__(self) -> int:
         return len(self.labels)
@@ -581,14 +608,23 @@ def build_neural_dataset(
     history: int = 8,
     max_samples: Optional[int] = None,
     min_episode_reward: Optional[float] = None,
+    stream_profile: str = NEURAL_FULL,
 ) -> NeuralDataset:
     """Walk recorded sessions and emit (pixels, non_vision, motor, action) samples.
 
     Requires the pixel frames to be present in the log (record with
     ``--record-frames``); a session that elided them cannot train pixel vision
     and raises rather than training on blank frames.
+
+    ``stream_profile`` (issue #32) selects the non-vision companion vector's
+    ablation: ``"full"`` (default) is "pixels + semantics" -- every non-vision
+    stream the generic registry fuses, including hand-computed semantic
+    scalars; ``"raw"`` is "pixel only" -- the non-vision vector is restricted
+    to streams the Minecraft stream registry classifies ``agent_input``
+    (body/reward/spatial proprioception), dropping semantic aux/debug slots
+    like ``world.front_block``/``world.sheltered``.
     """
-    dataset = NeuralDataset()
+    dataset = NeuralDataset(stream_profile=stream_profile)
     key_to_label = {key: i for i, key in enumerate(ACTION_KEYS)}
     fusion: Optional[TemporalFusion] = None
     pixels_were_elided = False
@@ -598,7 +634,7 @@ def build_neural_dataset(
             raise FileNotFoundError(f"session directory not found: {session_dir}")
         metadata = load_session_metadata(session_dir)
         require_streams_v2(metadata)
-        session_fusion = _non_vision_fusion(metadata)
+        session_fusion = _non_vision_fusion(metadata, stream_profile)
         if fusion is None:
             fusion = session_fusion
             dataset.non_vision_names = list(fusion.feature_names())

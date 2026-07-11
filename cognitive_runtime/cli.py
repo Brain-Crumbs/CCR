@@ -50,6 +50,19 @@ DEFAULT_MODEL_OUT = "models/bc.json"
 DEFAULT_ONLINE_MODEL_OUT = "models/online-q.json"
 DEFAULT_ACTOR_CRITIC_MODEL_OUT = "models/actor-critic.pt"
 
+#: Issue #32 "raw input" ablation: which stream classifications the online
+#: policy's fused state is built from. "full" preserves the pre-#32 behavior
+#: (encoders=None -> default_encoder_registry()); "raw" restricts fusion to
+#: MINECRAFT_STREAM_REGISTRY streams classified agent_input, so hand-computed
+#: semantic streams keep publishing/recording but stop reaching the policy.
+INPUT_PROFILES = {"full", "raw"}
+
+
+def _encoders_for_input_profile(profile: str):
+    if profile == "full":
+        return None
+    return MINECRAFT_STREAM_REGISTRY.to_encoder_registry(classifications={"agent_input"})
+
 
 #: Historical CLI defaults for the world knobs a curriculum preset can also
 #: set (issue #30).  `_add_world_args` leaves these unset (`None`) so a
@@ -164,11 +177,11 @@ def _add_entity_persistence_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def _make_online_policy_and_learner(
-    args: argparse.Namespace, program: MinecraftSurvivalBox
+    args: argparse.Namespace, program: MinecraftSurvivalBox, encoders=None
 ) -> tuple[OnlineQPolicy, OnlineQLearner]:
     action_space = list(program.metadata().action_space)
     action_keys = [action.key() for action in action_space]
-    fusion = TemporalFusion(program.stream_catalog(), default_encoder_registry())
+    fusion = TemporalFusion(program.stream_catalog(), encoders or default_encoder_registry())
     model_path = args.online_model
     try:
         if os.path.exists(model_path):
@@ -211,7 +224,7 @@ def _make_online_policy_and_learner(
 
 
 def _make_actor_critic_policy_and_learner(
-    args: argparse.Namespace, program: MinecraftSurvivalBox
+    args: argparse.Namespace, program: MinecraftSurvivalBox, encoders=None
 ):
     """``--policy actor-critic``: the neural actor/critic online policy
     (issue #29, docs/neural-stream-agent.md Phase E), wired the same way
@@ -240,7 +253,7 @@ def _make_actor_critic_policy_and_learner(
 
     action_space = list(program.metadata().action_space)
     action_keys = [action.key() for action in action_space]
-    fusion = TemporalFusion(program.stream_catalog(), default_encoder_registry())
+    fusion = TemporalFusion(program.stream_catalog(), encoders or default_encoder_registry())
     model_path = args.actor_critic_model
 
     arch: Dict[str, Any] = {
@@ -483,11 +496,12 @@ def cmd_run(args: argparse.Namespace) -> None:
     program = MinecraftSurvivalBox(
         config=program_config, reward_config=_reward_config_for(args), backend=args.backend
     )
+    encoders = _encoders_for_input_profile(args.input_profile)
     learner = None
     if args.policy == "online":
-        policy, learner = _make_online_policy_and_learner(args, program)
+        policy, learner = _make_online_policy_and_learner(args, program, encoders)
     elif args.policy == "actor-critic":
-        policy, learner = _make_actor_critic_policy_and_learner(args, program)
+        policy, learner = _make_actor_critic_policy_and_learner(args, program, encoders)
     else:
         policy = _make_policy(args.policy, args)
     world_model = _make_world_model(args, program)
@@ -517,6 +531,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         world_model=world_model,
         entity_persistence=entity_persistence,
         stream_registry=MINECRAFT_STREAM_REGISTRY,
+        encoders=encoders,
     )
     try:
         summaries = runtime.run()
@@ -626,11 +641,13 @@ def _train_neural(args: argparse.Namespace) -> None:
         history=args.history,
         max_samples=args.max_samples,
         min_episode_reward=args.min_reward,
+        stream_profile=args.stream_profile,
     )
     if len(dataset) == 0:
         sys.exit("no pixel training samples found (record sessions with --record-frames)")
     print(f"dataset: {len(dataset)} pixel samples from {len(dataset.sources)} episodes "
-          f"(frame={dataset.pixel_shape}, non-vision dim={len(dataset.non_vision_names)})")
+          f"(frame={dataset.pixel_shape}, non-vision dim={len(dataset.non_vision_names)}, "
+          f"stream_profile={dataset.stream_profile})")
     model, metrics = train_neural_bc(
         dataset,
         epochs=args.epochs,
@@ -996,6 +1013,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--policy", default="scripted",
                        choices=["null", "random", "scripted", "learned", "neural", "online",
                                 "actor-critic", "human"])
+    p_run.add_argument("--input-profile", default="full", choices=sorted(INPUT_PROFILES),
+                       help="issue #32: 'full' (default) fuses every stream the legacy "
+                            "encoder registry binds, including hand-computed semantic "
+                            "streams (world.front_block, world.sheltered, vision.entities, "
+                            "event.* marks); 'raw' restricts the fused policy state to "
+                            "streams the stream registry classifies agent_input -- "
+                            "semantic streams still publish/record for debugging and aux "
+                            "losses, they just stop reaching the policy")
     p_run.add_argument("--episodes", type=int, default=1)
     p_run.add_argument("--tick-rate", type=float, default=20.0)
     p_run.add_argument("--realtime", action="store_true",
@@ -1138,6 +1163,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--neural-lr", type=float, default=1e-3, help="neural-model learning rate")
     p_train.add_argument("--batch-size", type=int, default=32)
     p_train.add_argument("--history", type=int, default=8)
+    p_train.add_argument("--stream-profile", default="full", choices=["full", "raw"],
+                         help="--model-type neural only (issue #32): the non-vision companion "
+                              "vector's ablation. 'full' (default) is pixels + semantics "
+                              "(every non-vision stream the registry fuses); 'raw' is pixel "
+                              "only (restricts the non-vision vector to agent_input-classified "
+                              "body/reward/spatial proprioception, dropping hand-computed "
+                              "semantic scalars)")
     p_train.add_argument("--encoder-init", default=None,
                          help="pixel-encoder checkpoint bundle used to initialize neural BC")
     p_train.add_argument("--latent-width", type=int, default=64,

@@ -51,7 +51,9 @@ def test_generic_registry_alone_is_missing_minecraft_specific_streams():
 
 
 def test_assert_complete_raises_with_missing_stream_ids():
-    registry = StreamRegistry([StreamDeclaration("body.health", ScalarEncoder)])
+    registry = StreamRegistry(
+        [StreamDeclaration("body.health", ScalarEncoder, classification="aux_debug")]
+    )
     catalog = [
         StreamSpec("body.health", "body"),
         StreamSpec("body.hunger", "body"),

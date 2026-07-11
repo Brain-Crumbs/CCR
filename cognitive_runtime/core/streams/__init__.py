@@ -36,8 +36,11 @@ from cognitive_runtime.core.streams.encoder_registry import (
     StreamEncoderRegistry,
 )
 from cognitive_runtime.core.streams.registry import (
+    ATTENTION_COMPUTE_COSTS,
     DEFAULT_STREAM_REGISTRY,
+    STREAM_CLASSIFICATIONS,
     TRAIN_EVAL_BEHAVIORS,
+    AttentionMetadata,
     StreamDeclaration,
     StreamRegistry,
 )
@@ -94,6 +97,9 @@ __all__ = [
     "StreamEncoderRegistry",
     "DEFAULT_STREAM_REGISTRY",
     "TRAIN_EVAL_BEHAVIORS",
+    "STREAM_CLASSIFICATIONS",
+    "ATTENTION_COMPUTE_COSTS",
+    "AttentionMetadata",
     "StreamDeclaration",
     "StreamRegistry",
     "TrainableStreamModule",

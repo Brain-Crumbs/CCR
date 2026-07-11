@@ -6,11 +6,14 @@
   "license": "MIT",
   "main": "index.js",
   "scripts": {
-    "check": "node --check index.js && node --check world.js && node --check actions.js && node --check observation.js && node --check blocks.js"
+    "check": "node --check index.js && node --check world.js && node --check actions.js && node --check observation.js && node --check blocks.js && node --check pixels.js"
   },
   "dependencies": {
     "mineflayer": "^4.20.0",
     "vec3": "^0.1.10"
+  },
+  "optionalDependencies": {
+    "prismarine-viewer": "^1.29.0"
   },
   "engines": {
     "node": ">=18"
