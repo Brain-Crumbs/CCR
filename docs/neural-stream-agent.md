@@ -389,6 +389,41 @@ per-stage components: learning progress + risk-gated novelty − predicted
 risk.  Nursery stages (#62) may run intrinsic-only; quest stages run mostly
 extrinsic.  See "Motivation: safe surprise" above for the design rationale.
 
+*Status: landed. `core.modulation.safe_gate(risk, risk_threshold,
+temperature)` (a sigmoid gate) and three derived `internal.*` streams --
+`internal.risk_gate`, `internal.safe_novelty` (`novelty * risk_gate`) and
+`internal.predicted_risk_aversion` (`-risk`, already sign-flipped) -- are
+computed by `ModulationTracker` alongside #58's five raw signals, every
+tick, never recomputed reward-side. A reward profile's `intrinsic` slots
+(#41) wire them into weighted, capped components exactly like any other
+`internal.*` stream (`goals/intrinsic_only.yaml` -- the nursery,
+tiers-empty example; `goals/ender_dragon.yaml` -- all three slots mixed
+into the full compass). `RuntimeConfig.intrinsic_risk_threshold`/
+`intrinsic_risk_temperature` (`--intrinsic-risk-threshold`/
+`--intrinsic-risk-temperature`, defaults `0.5`/`0.15`) shape the gate and
+are recorded into session metadata's `intrinsic_modulation` field,
+alongside each intrinsic slot's stream/weight/cap
+(`reward_profile.metadata()`'s `intrinsic` field), so #44's harness can
+compare drives tuned differently across runs. `tests/test_intrinsic_drive.py`
+covers the risk gate's sigmoid shape, the noisy-TV self-extinguishing
+property, predicted-risk aversion firing before any damage event, and the
+three-region occupancy test this doc's success criteria name below.
+
+Landing this surfaced a real wiring gap predating #61: a Program's own
+reward evaluation only ever saw its own tick events, never the
+runtime-computed `internal.*` streams `CognitiveRuntime` publishes after
+`step()` runs -- so an `intrinsic` slot could load and validate but would
+never actually fire in a live run, and (once it did) `ccr replay` would
+silently re-score `reward.scalar` against the default `SurvivalReward`
+instead of the recorded profile. Both are fixed:
+`Program.observe_external_streams()` (implemented by
+`MinecraftSurvivalBox`, called by `CognitiveRuntime` right after it
+publishes each tick's `internal.*` payloads) primes the *next* tick's
+reward evaluation, the same one-tick lag the streams already have; and
+`ccr replay --reward-profile <path>` (rejecting a missing or
+content-hash-mismatched profile) replays that priming from the recorded
+log instead of trying to recompute a world model replay never had.*
+
 ## What To Remove Or Deprecate
 
 Remove only after replacement tests exist.  Some current pieces are useful

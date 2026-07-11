@@ -168,6 +168,18 @@ class ReplayResult:
     notes: List[str] = field(default_factory=list)
 
 
+def _recorded_internal_payloads(sensory_records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """``{stream_id: payload}`` for this tick's recorded ``internal.*``
+    records (issue #61), skipping elided lines -- a record excluded from
+    recording (``--exclude-streams``) has no payload to replay with, the
+    same tolerated gap frame elision already has."""
+    return {
+        record["stream_id"]: record["payload"]
+        for record in sensory_records
+        if record.get("stream_id", "").startswith("internal.") and not record.get("elided")
+    }
+
+
 def _window_reward(events: List[Any]) -> float:
     """Sum ``reward.scalar`` values over freshly regenerated stream events."""
     total = 0.0
@@ -209,6 +221,16 @@ def replay_episode(
     catalog_stream_ids = {
         entry.get("stream_id") for entry in metadata.get("stream_catalog", [])
     }
+    # `reward.scalar` *is* in the Program's own catalog (part of the
+    # byte-for-byte check above) but, when a reward profile's `intrinsic`
+    # slots are active (issue #61), its value also depends on the
+    # previous tick's `internal.*` payloads that `CognitiveRuntime` primes
+    # via `Program.observe_external_streams` -- payloads this replay can
+    # never recompute (that would mean re-deriving the run's world model).
+    # They *are* fully recorded, though (excluded only from the
+    # re-simulation check above, per the comment there), so priming from
+    # the log reproduces the exact same reward instead.
+    observe_external_streams = getattr(program, "observe_external_streams", None)
 
     sensory_bus, motor_bus = SensoryStreamBus(), MotorStreamBus()
     program.attach_buses(sensory_bus, motor_bus)
@@ -227,6 +249,14 @@ def replay_episode(
     for decision, sensory_records, motor_records in iter_cognitive_ticks(
         session_dir, episode_id
     ):
+        # This tick's *own* recorded sensory records already carry whatever
+        # `internal.*` payload was live during the original run's
+        # `program.step()` this tick (the one-tick-lagged values published
+        # at the end of the *previous* cognitive tick) -- prime it before
+        # stepping so a profile-driven reward engine's intrinsic components
+        # reproduce exactly.
+        if callable(observe_external_streams):
+            observe_external_streams(_recorded_internal_payloads(sensory_records))
         for _ in range(ratio):
             program.step()
         regenerated = sensory_bus.drain()

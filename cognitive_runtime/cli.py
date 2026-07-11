@@ -534,6 +534,12 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
                              "goals/ender_dragon.yaml); overrides --curriculum's reward weights "
                              "with a profile-driven reward engine (docs/reward_profiles.md). "
                              "Malformed profiles fail immediately with a diagnosis.")
+    parser.add_argument("--intrinsic-risk-threshold", type=float, default=0.5,
+                        help="risk-gated intrinsic drive (issue #61): the internal.risk level "
+                             "at which internal.safe_novelty's gate is cut in half (default: 0.5)")
+    parser.add_argument("--intrinsic-risk-temperature", type=float, default=0.15,
+                        help="risk-gated intrinsic drive (issue #61): softness of the risk-gate "
+                             "sigmoid around --intrinsic-risk-threshold (default: 0.15)")
 
 
 #: Online-learning policies whose model path needs a checkpoint-or-`--fresh`
@@ -607,6 +613,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         curriculum=args.curriculum,
         attention_mode=getattr(args, "attention", "off"),
         reflex_mode=getattr(args, "reflex", "on"),
+        intrinsic_risk_threshold=getattr(args, "intrinsic_risk_threshold", 0.5),
+        intrinsic_risk_temperature=getattr(args, "intrinsic_risk_temperature", 0.15),
     )
     runtime = CognitiveRuntime(
         program=program,
@@ -1200,10 +1208,16 @@ def cmd_trainer(args: argparse.Namespace) -> None:
 
 
 def cmd_replay(args: argparse.Namespace) -> None:
+    reward_profile = _reward_profile_for(args)
     try:
-        results = replay_session(args.session, episode_id=args.episode, verify=not args.no_verify)
+        results = replay_session(
+            args.session, episode_id=args.episode, verify=not args.no_verify,
+            reward_profile=reward_profile,
+        )
     except NonDeterministicSessionError as exc:
         sys.exit(f"replay skipped: {exc}")
+    except ValueError as exc:
+        sys.exit(str(exc))
     print(format_results(results))
     if any(not r.matched for r in results):
         sys.exit(1)
@@ -1678,6 +1692,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_replay.add_argument("--session", required=True)
     p_replay.add_argument("--episode", default=None)
     p_replay.add_argument("--no-verify", action="store_true")
+    p_replay.add_argument("--reward-profile", default=None,
+                          help="the reward profile the session was recorded with (required to "
+                               "replay a session recorded with --reward-profile; must match by "
+                               "content -- see docs/reward_profiles.md)")
     p_replay.set_defaults(func=cmd_replay)
 
     p_view = sub.add_parser("view", help="inspect a recorded episode")

@@ -14,6 +14,14 @@ ccr run --reward-profile goals/ender_dragon.yaml ...
 A malformed profile fails immediately with a diagnosis naming the exact
 field -- never mid-run.
 
+`ccr replay --session ...` needs the exact same profile a session was
+recorded with: pass it again via `--reward-profile` (`replay_session`'s
+`reward_profile=` in code). Session metadata's `reward_profile` field
+records `{name, content_hash, ...}`, so replay fails loudly -- rather than
+silently re-scoring `reward.scalar` against the default `SurvivalReward` --
+whenever a `--reward-profile` is missing or its content hash doesn't match
+the session's recorded one.
+
 ## The compass: tiers
 
 Components are grouped into named **tiers**. The recommended shape is a
@@ -100,8 +108,9 @@ guaranteed compatible across profiles.
 
 A separate `intrinsic` section holds named, pluggable intrinsic-drive
 components -- `learning_progress`, `safe_novelty`, `predicted_risk_aversion`
-(the terms themselves are specified and implemented in issue #61; this
-schema only supplies the slot they plug into):
+(the terms themselves are computed by issue #61's `core/modulation.py` from
+the `internal.*` streams #58 publishes; this schema just supplies the slot
+they plug into):
 
 ```yaml
 intrinsic:
@@ -119,12 +128,48 @@ component -- it never recomputes a signal itself. Deliberately **not**
 supported here: raw world-model prediction error or raw prediction
 accuracy as a reward. Raw error rewards irreducible noise and can walk an
 agent off cliffs chasing unpredictable inputs; raw accuracy rewards
-wall-staring at an already-predictable static scene. The actual intrinsic
-terms avoid both failure modes; see issue #61.
+wall-staring at an already-predictable static scene.
+
+### The three intrinsic terms (issue #61)
+
+```
+intrinsic =
+    + w_lp   * learning_progress          # internal.learning_progress: error is IMPROVING here
+    + w_nov  * safe_novelty                # internal.safe_novelty = novelty * risk_gate
+    + w_risk * predicted_risk_aversion     # internal.predicted_risk_aversion = -risk
+```
+
+`cognitive_runtime/core/modulation.py` computes all three as `internal.*`
+streams every tick, alongside the five raw signals #58 publishes:
+
+- **`internal.learning_progress`** -- already published by #58
+  (`LearningProgressTracker`): positive while prediction error is
+  *improving*, near zero on both mastered scenes and irreducible noise (the
+  noisy-TV problem self-extinguishes here, not via a cap).
+- **`internal.risk_gate`** -- `safe_gate(risk) = sigmoid(-(risk -
+  risk_threshold) / temperature)`: `1.0` well below `risk_threshold` (safe
+  to be curious), `0.0` well above it ("surprising but painful is not
+  curiosity, it is a warning"), `0.5` exactly at the threshold. Logged as
+  its own stream mainly for dashboards/debugging the gate itself; a
+  profile does not normally wire it into a reward component directly.
+- **`internal.safe_novelty`** -- `internal.novelty * internal.risk_gate`:
+  surprise sought only when it doesn't forecast suffering.
+- **`internal.predicted_risk_aversion`** -- `-internal.risk`, already
+  sign-flipped, so a *positive* `weight` on this slot (as in the shipped
+  profiles) amplifies an aversive (negative) shaping term proportional to
+  predicted risk -- avoidance happens before damage, not after.
+
+`risk_threshold`/`temperature` are run-level config
+(`RuntimeConfig.intrinsic_risk_threshold`/`intrinsic_risk_temperature`,
+`--intrinsic-risk-threshold`/`--intrinsic-risk-temperature` on the CLI;
+defaults `0.5`/`0.15`), recorded into session metadata's
+`intrinsic_modulation` field alongside each intrinsic slot's
+stream/weight/cap (`reward_profile.metadata()`'s `intrinsic` field) so #44's
+harness can compare drives tuned differently across runs.
 
 A profile can be intrinsic-only (nursery stages, issue #62) by leaving
-`tiers` mostly or entirely empty, or extrinsic-only by leaving `intrinsic`
-empty -- both sections are optional.
+`tiers` mostly or entirely empty (see `goals/intrinsic_only.yaml`), or
+extrinsic-only by leaving `intrinsic` empty -- both sections are optional.
 
 ## Two-scale rewards: raw vs training value
 
@@ -157,9 +202,11 @@ ever profile-driven.
 `RewardProfile.content_hash` is a stable SHA-1 over the profile's full
 content (independent of file path). Session metadata (`session.json`'s
 `"reward_profile"` field, when a profile is active) carries `{name,
-content_hash}`, so `cognitive_runtime dashboard` groups runs by *exact*
-profile content rather than by filename -- two files with the same content
-hash the same; the same filename edited between runs hashes differently.
+content_hash, intrinsic}` (`intrinsic` spelling out each intrinsic slot's
+stream/weight/cap/disabled), so `cognitive_runtime dashboard` groups runs by
+*exact* profile content rather than by filename -- two files with the same
+content hash the same; the same filename edited between runs hashes
+differently.
 
 ## Shipped profiles
 
@@ -175,6 +222,10 @@ hash the same; the same filename edited between runs hashes differently.
   backend does not emit yet (village/Nether/dragon progression); the
   components simply never fire until a backend does, which is harmless --
   the file documents the target schema shape for a richer backend.
+- `goals/intrinsic_only.yaml` -- the nursery example (issue #61/#62): no
+  `tiers` at all, just the three intrinsic slots. A newborn agent's only
+  reward is curiosity -- want to predict the world, seek safe surprise,
+  avoid predicted pain.
 
 ## Adding your own
 

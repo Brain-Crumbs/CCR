@@ -90,6 +90,14 @@ class RuntimeConfig:
     reflex_left_action: str = "LOOK_LEFT"
     reflex_right_action: str = "LOOK_RIGHT"
 
+    #: Risk-gated intrinsic drive (issue #61): the ``internal.risk`` level at
+    #: which ``internal.safe_novelty``'s gate is cut in half, and the
+    #: sigmoid's softness around that cutover -- see
+    #: ``core.modulation.safe_gate``. Recorded into session metadata for
+    #: provenance so #44's harness can compare drives across runs.
+    intrinsic_risk_threshold: float = 0.5
+    intrinsic_risk_temperature: float = 0.15
+
     def effective_exclude_streams(self) -> List[str]:
         """exclude_streams plus the frame streams when frames are opted out."""
         excluded = list(self.exclude_streams)
