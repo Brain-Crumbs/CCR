@@ -215,6 +215,7 @@ function buildObservation(bot, tick, config, spawn) {
     hotbar: hotbarSlots(bot),
     inventory: inventorySummary(bot),
     inventory_exact: inventoryExactSummary(bot),
+    inventory_open: Boolean(bot._ccrInventoryOpen),
     nearby_blocks: nearbyBlocks(bot, 2),
     nearby_blocks_exact: nearbyBlocksExact(bot, 2),
     front_block: frontBlock(bot),

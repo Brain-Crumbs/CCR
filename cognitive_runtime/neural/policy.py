@@ -13,7 +13,7 @@ No concrete policy architecture is implemented here.
 from __future__ import annotations
 
 import abc
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence
 
 import torch
 from torch import nn
@@ -155,3 +155,71 @@ class MLPPolicyModel(PolicyModel):
             "layout_hash": self.layout_hash,
             "action_keys": self.action_keys,
         }
+
+    def load_state_dict_with_action_growth(
+        self,
+        old_state: Mapping[str, torch.Tensor],
+        old_action_keys: Sequence[str],
+        new_action_keys: Sequence[str],
+    ) -> None:
+        """Load a checkpoint trained on a smaller, ordered-prefix action space
+        into this (already larger) model in place (issue #42's action-space
+        growth story): every weight/bias row or column that already existed
+        under ``old_action_keys`` is copied verbatim; the rows/columns this
+        model added for the new tail actions keep their own fresh
+        initialization instead of being overwritten by garbage or zeros.
+
+        Only ``logits_head`` (grows by output row per new action) and
+        ``trunk.0`` (grows by input column: ``world_feature_width`` appends
+        the motor-history one-hot at its tail, see
+        ``cognitive_runtime.policies.actor_critic.world_feature_width``) can
+        legitimately change shape; any other shape mismatch is a real
+        incompatibility (a different ``hidden_dim``/``depth``/``fused_width``),
+        not action-space growth, and is raised rather than silently patched.
+        """
+        old_keys = list(old_action_keys)
+        new_keys = list(new_action_keys)
+        if not old_keys or new_keys[: len(old_keys)] != old_keys:
+            raise ValueError(
+                "action-space growth requires old_action_keys to be a "
+                f"non-empty ordered prefix of new_action_keys; old={old_keys} "
+                f"new={new_keys}"
+            )
+        if len(new_keys) <= len(old_keys):
+            raise ValueError(
+                "load_state_dict_with_action_growth expects a strict "
+                f"superset; old has {len(old_keys)} actions, new has "
+                f"{len(new_keys)}"
+            )
+        if self.n_actions != len(new_keys):
+            raise ValueError(
+                f"model is sized for {self.n_actions} actions, but "
+                f"new_action_keys has {len(new_keys)}"
+            )
+        merged = dict(self.state_dict())
+        for key, old_tensor in old_state.items():
+            if key not in merged:
+                continue
+            new_tensor = merged[key]
+            if tuple(old_tensor.shape) == tuple(new_tensor.shape):
+                merged[key] = old_tensor
+            elif key == "logits_head.weight":
+                grown = new_tensor.clone()
+                grown[: old_tensor.shape[0], :] = old_tensor
+                merged[key] = grown
+            elif key == "logits_head.bias":
+                grown = new_tensor.clone()
+                grown[: old_tensor.shape[0]] = old_tensor
+                merged[key] = grown
+            elif key == "trunk.0.weight":
+                grown = new_tensor.clone()
+                grown[:, : old_tensor.shape[1]] = old_tensor
+                merged[key] = grown
+            else:
+                raise ValueError(
+                    f"cannot grow action space: unexpected shape change in "
+                    f"{key!r} ({tuple(old_tensor.shape)} -> "
+                    f"{tuple(new_tensor.shape)})"
+                )
+        self.load_state_dict(merged, strict=True)
+        self.action_keys = new_keys

@@ -3,6 +3,7 @@
 import json
 import os
 
+from cognitive_runtime.core.action_space import action_space_hash
 from cognitive_runtime.policies import NullPolicy, RandomPolicy, ScriptedSurvivalPolicy
 from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
 from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
@@ -85,6 +86,11 @@ def test_recorder_writes_streams_decisions_and_summaries(tmp_path):
     assert meta["program"] == "MinecraftSurvivalBox"
     assert meta["format"] == "streams-v2"
     assert meta["stream_catalog"]  # catalog embedded so tools need no program
+    # Issue #42: action space is versioned alongside the recorded keys, so a
+    # later curriculum step that grows ACTION_SPACE is detectable from
+    # session metadata alone.
+    assert meta["action_space"] == [a.key() for a in ACTION_SPACE]
+    assert meta["action_space_hash"] == action_space_hash(meta["action_space"])
 
 
 def test_recorded_lines_round_trip_to_stream_events(tmp_path):

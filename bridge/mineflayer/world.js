@@ -138,6 +138,7 @@ class WorldSession {
     this.tick = 0;
     this.dead = (this.bot.health != null && this.bot.health <= 0);
     this.deathReason = null;
+    this.bot._ccrInventoryOpen = false;
     this._pending = [];
     this._seenItems = new Set();
     this._prevHealth = this.bot.health == null ? 20 : this.bot.health;
@@ -197,6 +198,9 @@ class WorldSession {
       },
       onCrafted: (recipe, inputs, outputs) => {
         this._pending.push(`crafted:${JSON.stringify({ recipe, inputs, outputs })}`);
+      },
+      onRejected: (reason) => {
+        this._pending.push(`action_rejected:${reason}`);
       },
     };
 

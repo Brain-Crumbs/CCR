@@ -223,6 +223,115 @@ def test_neural_checkpoint_mismatched_action_space_hash_raises(tmp_path):
         _manager(path, _modules(seed=6), action_keys=["NULL", "ATTACK"]).load()
 
 
+# ------------------------------------------------ action-space growth (#42)
+
+
+def _mlp_pair(action_keys, *, fused_width=3, hidden_dim=6, seed=0):
+    from cognitive_runtime.neural import MLPPolicyModel, MLPValueModel
+
+    torch.manual_seed(seed)
+    world_feature_width = 4 + len(action_keys)  # WORLD_FEATURE_BASE_WIDTH + n_actions
+    policy = MLPPolicyModel(
+        fused_width, world_feature_width, len(action_keys),
+        hidden_dim=hidden_dim, depth=1, action_keys=action_keys,
+    )
+    critic = MLPValueModel(
+        fused_width, world_feature_width, hidden_dim=hidden_dim, depth=1,
+        action_keys=action_keys,
+    )
+    return policy, critic, fused_width, world_feature_width
+
+
+def test_neural_checkpoint_action_space_growth_preserves_old_weights_and_inits_new(tmp_path):
+    old_keys = ["NULL", "JUMP"]
+    new_keys = ["NULL", "JUMP", "CRAFT:recipe=log_to_planks"]
+    path = tmp_path / "agent.pt"
+
+    old_policy, old_critic, fused_width, old_wfw = _mlp_pair(old_keys, seed=1)
+    NeuralAgentCheckpoint(
+        str(path), layout_hash=LAYOUT_HASH, action_keys=old_keys,
+        policy=old_policy, critic=old_critic,
+    ).save(reason="pre-growth")
+
+    new_policy, new_critic, _, new_wfw = _mlp_pair(new_keys, fused_width=fused_width, seed=2)
+    # Snapshot the live model's own fresh init for the newly-added rows/columns
+    # *before* loading, so we can prove the migration leaves them alone.
+    fresh_logits_tail = new_policy.logits_head.weight[len(old_keys):].clone()
+    fresh_trunk_tail = new_policy.trunk[0].weight[:, fused_width + old_wfw:].clone()
+
+    new_manager = NeuralAgentCheckpoint(
+        str(path), layout_hash=LAYOUT_HASH, action_keys=new_keys,
+        policy=new_policy, critic=new_critic,
+    )
+    metadata = new_manager.load(allow_action_space_growth=True)
+
+    assert metadata["action_keys"] == old_keys  # what the checkpoint itself held
+    assert new_manager.action_keys == new_keys  # migrated to the live action space
+
+    # Existing action rows/columns carry over exactly.
+    assert torch.allclose(new_policy.logits_head.weight[: len(old_keys)], old_policy.logits_head.weight)
+    assert torch.allclose(new_policy.logits_head.bias[: len(old_keys)], old_policy.logits_head.bias)
+    assert torch.allclose(
+        new_policy.trunk[0].weight[:, : fused_width + old_wfw], old_policy.trunk[0].weight
+    )
+    assert torch.allclose(
+        new_critic.trunk[0].weight[:, : fused_width + old_wfw], old_critic.trunk[0].weight
+    )
+
+    # New action rows/columns keep the live model's own fresh init untouched
+    # (not zeroed, not garbage from a shape-mismatched load).
+    assert torch.allclose(new_policy.logits_head.weight[len(old_keys):], fresh_logits_tail)
+    assert torch.allclose(new_policy.trunk[0].weight[:, fused_width + old_wfw:], fresh_trunk_tail)
+
+    # The migrated modules are usable at the new size.
+    logits = new_policy(torch.zeros(1, fused_width), torch.zeros(1, new_wfw))
+    assert logits.shape == (1, len(new_keys))
+    value = new_critic(torch.zeros(1, fused_width), torch.zeros(1, new_wfw))
+    assert value.shape == (1,)
+
+
+def test_neural_checkpoint_action_space_growth_requires_opt_in(tmp_path):
+    old_keys = ["NULL", "JUMP"]
+    new_keys = ["NULL", "JUMP", "ATTACK"]
+    path = tmp_path / "agent.pt"
+
+    old_policy, old_critic, fused_width, _ = _mlp_pair(old_keys, seed=3)
+    NeuralAgentCheckpoint(
+        str(path), layout_hash=LAYOUT_HASH, action_keys=old_keys,
+        policy=old_policy, critic=old_critic,
+    ).save()
+
+    new_policy, new_critic, _, _ = _mlp_pair(new_keys, fused_width=fused_width, seed=4)
+    new_manager = NeuralAgentCheckpoint(
+        str(path), layout_hash=LAYOUT_HASH, action_keys=new_keys,
+        policy=new_policy, critic=new_critic,
+    )
+    with pytest.raises(CheckpointCompatibilityError, match="action-space.*allow_action_space_growth"):
+        new_manager.load()  # allow_action_space_growth defaults to False
+
+
+def test_neural_checkpoint_action_space_growth_rejects_non_prefix_change(tmp_path):
+    """A reordered/non-superset action space is not a growth case, even with
+    the opt-in -- it still fails loudly rather than silently mis-migrating."""
+    old_keys = ["NULL", "JUMP"]
+    reordered_keys = ["JUMP", "NULL", "ATTACK"]
+    path = tmp_path / "agent.pt"
+
+    old_policy, old_critic, fused_width, _ = _mlp_pair(old_keys, seed=5)
+    NeuralAgentCheckpoint(
+        str(path), layout_hash=LAYOUT_HASH, action_keys=old_keys,
+        policy=old_policy, critic=old_critic,
+    ).save()
+
+    new_policy, new_critic, _, _ = _mlp_pair(reordered_keys, fused_width=fused_width, seed=6)
+    new_manager = NeuralAgentCheckpoint(
+        str(path), layout_hash=LAYOUT_HASH, action_keys=reordered_keys,
+        policy=new_policy, critic=new_critic,
+    )
+    with pytest.raises(CheckpointCompatibilityError):
+        new_manager.load(allow_action_space_growth=True)
+
+
 def test_neural_checkpoint_sidecar_is_json_inspectable_without_torch_load(tmp_path):
     path = tmp_path / "agent.pt"
     _manager(path, _modules(seed=7)).save(reason="episode_end")

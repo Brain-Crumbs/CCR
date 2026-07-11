@@ -25,24 +25,24 @@ import numpy as np
 import torch
 from torch import nn
 
+from cognitive_runtime.core.action_space import action_space_hash
 from cognitive_runtime.core.hashing import canonical_json
 
 FORMAT_VERSION = "neural-agent-checkpoint-v1"
-ACTION_SPACE_HASH_VERSION = "action-space-v1"
 COMPATIBILITY_HASH_VERSION = "neural-agent-compat-v1"
-
 
 class CheckpointCompatibilityError(ValueError):
     """Raised when a checkpoint belongs to a different layout/action space."""
 
 
-def action_space_hash(action_keys: Sequence[str]) -> str:
-    """Stable hash for the ordered action space a policy head was trained on."""
+def _is_action_space_growth(old_keys: Sequence[str], new_keys: Sequence[str]) -> bool:
+    """True when ``new_keys`` is a strict, ordered superset of ``old_keys``
+    (existing actions kept in place, new ones appended at the tail) -- the
+    only shape a weight-preserving head-expansion migration can handle."""
 
-    import hashlib
-
-    blob = canonical_json([ACTION_SPACE_HASH_VERSION, list(action_keys)])
-    return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+    old = list(old_keys)
+    new = list(new_keys)
+    return bool(old) and len(new) > len(old) and new[: len(old)] == old
 
 
 def compatibility_hash(layout_hash: str, action_hash: str) -> str:
@@ -250,19 +250,54 @@ class NeuralAgentCheckpoint:
         map_location: Optional[str | torch.device] = None,
         strict: bool = True,
         restore_rng: bool = True,
+        allow_action_space_growth: bool = False,
     ) -> Dict[str, Any]:
+        """Load a checkpoint; ``expected_action_keys`` (default: this
+        instance's own ``self.action_keys``, i.e. the *live* Program's
+        current action space) is what the checkpoint's ``action_keys`` are
+        checked against.
+
+        ``allow_action_space_growth=True`` (issue #42) additionally accepts a
+        checkpoint whose ``action_keys`` are a strict, ordered prefix of
+        ``expected_action_keys`` -- a curriculum step that grew the action
+        space -- instead of raising :class:`CheckpointCompatibilityError`.
+        In that case ``policy``/``critic`` (or any module implementing
+        ``load_state_dict_with_action_growth``) are migrated in place:
+        weights for already-known actions are preserved, weights for newly
+        added actions keep the live model's own fresh initialization. Any
+        other mismatch (reordering, removal, an unrelated action set) still
+        raises loudly, matching #20's "fail loudly, never silently
+        mis-predict" contract.
+        """
         source = path or self.path
         payload = _torch_load(source, map_location=map_location)
+        expected_keys = (
+            list(expected_action_keys) if expected_action_keys is not None
+            else list(self.action_keys)
+        )
         metadata = self._validate_payload_metadata(
             payload,
             expected_layout_hash=expected_layout_hash or self.layout_hash,
-            expected_action_keys=expected_action_keys or self.action_keys,
+            expected_action_keys=expected_keys,
             expected_action_space_hash=expected_action_space_hash,
+            allow_action_space_growth=allow_action_space_growth,
         )
         state = payload.get("state")
         if not isinstance(state, Mapping):
             raise ValueError(f"neural checkpoint {source!r} is missing a state payload")
-        self._load_state_payload(state, strict=strict)
+        checkpoint_action_keys = list(metadata.get("action_keys", []))
+        growth = (
+            allow_action_space_growth
+            and checkpoint_action_keys != expected_keys
+            and _is_action_space_growth(checkpoint_action_keys, expected_keys)
+        )
+        self._load_state_payload(
+            state,
+            strict=strict,
+            action_growth=(checkpoint_action_keys, expected_keys) if growth else None,
+        )
+        if growth:
+            self.action_keys = expected_keys
         self.training_ticks = int(metadata.get("training_ticks", self.training_ticks))
         self.training_stats = dict(metadata.get("training_stats", self.training_stats))
         self.replay_metadata = dict(metadata.get("replay_metadata", self.replay_metadata))
@@ -348,13 +383,24 @@ class NeuralAgentCheckpoint:
             "critic": self.critic,
         }
 
-    def _load_state_payload(self, state: Mapping[str, Any], *, strict: bool) -> None:
+    def _load_state_payload(
+        self,
+        state: Mapping[str, Any],
+        *,
+        strict: bool,
+        action_growth: Optional[tuple[list, list]] = None,
+    ) -> None:
         self._load_named_modules("encoders", self.encoders, state.get("encoders", {}), strict=strict)
         for key, module in self._singleton_modules().items():
             if module is not None:
                 if key not in state:
                     raise ValueError(f"neural checkpoint is missing {key!r} module state")
-                module.load_state_dict(state[key], strict=strict)
+                grow = getattr(module, "load_state_dict_with_action_growth", None)
+                if action_growth is not None and callable(grow):
+                    old_keys, new_keys = action_growth
+                    grow(state[key], old_keys, new_keys)
+                else:
+                    module.load_state_dict(state[key], strict=strict)
 
         optimizer_state = state.get("optimizers", {})
         if not isinstance(optimizer_state, Mapping):
@@ -395,6 +441,7 @@ class NeuralAgentCheckpoint:
         expected_layout_hash: Optional[str],
         expected_action_keys: Optional[Sequence[str]],
         expected_action_space_hash: Optional[str],
+        allow_action_space_growth: bool = False,
     ) -> Dict[str, Any]:
         if payload.get("format") != FORMAT_VERSION:
             raise ValueError(
@@ -426,12 +473,21 @@ class NeuralAgentCheckpoint:
         got_hash = metadata.get("action_space_hash")
         if expected_hash is not None and got_hash != expected_hash:
             expected_keys = list(expected_action_keys) if expected_action_keys is not None else None
-            raise CheckpointCompatibilityError(
-                "neural checkpoint action-space mismatch: checkpoint has "
-                f"hash {got_hash!r} action_keys={got_action_keys}, but runtime "
-                f"expects hash {expected_hash!r} action_keys={expected_keys}; "
-                "use the same ordered Program action space or train a new "
-                "checkpoint"
+            growable = (
+                allow_action_space_growth
+                and expected_keys is not None
+                and _is_action_space_growth(got_action_keys, expected_keys)
             )
+            if not growable:
+                raise CheckpointCompatibilityError(
+                    "neural checkpoint action-space mismatch: checkpoint has "
+                    f"hash {got_hash!r} action_keys={got_action_keys}, but runtime "
+                    f"expects hash {expected_hash!r} action_keys={expected_keys}; "
+                    "use the same ordered Program action space or train a new "
+                    "checkpoint (or pass allow_action_space_growth=True if the "
+                    "checkpoint's action_keys are an ordered prefix of the "
+                    "runtime's, e.g. after a curriculum step grew the action "
+                    "space)"
+                )
         return dict(metadata)
 
