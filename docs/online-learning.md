@@ -119,6 +119,50 @@ The gate report lands in the checkpoint bundle's training stats under
 `evaluation_gates` (issue #20), so `read_checkpoint_metadata(path)` recovers the
 gate booleans, per-policy eval reward/ticks, and the seeds used.
 
+## Statistical Evaluation Harness
+
+Deterministic replay (`docs/streams.md`'s determinism contract) proves
+plumbing correctness by re-simulating one episode bit-for-bit; it cannot be
+the regression story once weights mutate mid-episode (neural online
+training) or the backend is non-deterministic (`--backend remote`). Issue
+#44 re-scopes replay + the simulated backend down to a fast CI smoke test of
+loop/stream/recorder plumbing, and adds
+`cognitive_runtime.training.statistical_evaluation`: run N episodes per
+policy/checkpoint on matched conditions (same curriculum stage; same seed
+set in sim; same server/time budget live) and report **mean +/- confidence
+interval** on survival ticks, total reward, reward by tier (issue #41),
+exploration coverage, world-model prediction error/novelty (issue #39), and
+death causes. A candidate is flagged as a regression on a metric only when
+its confidence interval no longer overlaps the baseline's, on the worse
+side -- an incidental one-episode dip does not fail a gate, but a
+consistently, significantly worse checkpoint does.
+
+`evaluation-gates` (issue #31) reports this alongside gates 1-2's single-run
+"beats" ordering (`EvaluationGateResult.statistics`/`gate1_comparisons`/
+`gate2_comparisons`); a standalone `statistical-evaluate` subcommand runs it
+directly, either fresh in sim or against already-recorded sessions:
+
+```bash
+# Fresh sim run, N=20 episodes per policy, flag regressions against random:
+python -m cognitive_runtime statistical-evaluate \
+  --policies random,scripted,online --episodes 20 --baseline random
+
+# From already-recorded sessions, grouped by (curriculum, policy):
+python -m cognitive_runtime statistical-evaluate --from-sessions sessions
+
+# The plain-mean dashboard can append the same report:
+python -m cognitive_runtime dashboard --record-dir sessions --statistical
+```
+
+What determinism still promises: given the same seed and action sequence,
+the *simulated* backend reproduces byte-identical observations/rewards
+(`replay`'s smoke test), and a checkpoint's saved RNG state (Python, NumPy,
+torch, plus torch's deterministic-algorithm/cuDNN flags) lets a single run be
+reconstructed for debugging. What it does not promise: that two training
+runs (sim or live) produce the same weights, or that a live run reproduces
+at all -- regressions there are a statistical question, answered by this
+harness, not a bit-comparison one.
+
 ## Live Mineflayer Rollout
 
 Install and configure the bridge as described in
