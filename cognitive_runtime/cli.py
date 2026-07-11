@@ -63,6 +63,13 @@ DEFAULT_ACTOR_CRITIC_MODEL_OUT = "models/actor-critic.pt"
 #: semantic streams keep publishing/recording but stop reaching the policy.
 INPUT_PROFILES = {"full", "raw"}
 
+#: Issue #57 "learned fusion primary" bridge: which fusion path
+#: `--policy actor-critic` reads its fused agent state from. "fixed" is the
+#: `TemporalFusion` concatenation of hand-written encoders (the default,
+#: unchanged); "learned" runs trainable stream encoders + `LatentFusionModel`
+#: in the live tick (`cognitive_runtime.neural.live_fusion.LiveLearnedFusion`).
+FUSION_MODES = {"fixed", "learned"}
+
 
 def _encoders_for_input_profile(profile: str):
     if profile == "full":
@@ -275,6 +282,9 @@ def _make_actor_critic_policy_and_learner(
     action_keys = [action.key() for action in action_space]
     fusion = TemporalFusion(program.stream_catalog(), encoders or default_encoder_registry())
     model_path = args.actor_critic_model
+    fusion_mode = getattr(args, "fusion", "fixed")
+    if fusion_mode not in FUSION_MODES:
+        sys.exit(f"unknown --fusion {fusion_mode!r}; expected one of {sorted(FUSION_MODES)}")
 
     arch: Dict[str, Any] = {
         "fused_width": fusion.width,
@@ -282,34 +292,67 @@ def _make_actor_critic_policy_and_learner(
         "n_actions": len(action_keys),
         "hidden_dim": args.actor_critic_hidden_dim,
         "has_world_model": args.actor_critic_world_model_loss,
+        "fusion_mode": fusion_mode,
     }
     if os.path.exists(model_path):
         saved_arch = read_checkpoint_metadata(model_path).get("extra", {}).get("actor_critic")
         if saved_arch:
             arch = saved_arch
+            saved_fusion_mode = arch.get("fusion_mode", "fixed")
+            if saved_fusion_mode != fusion_mode:
+                sys.exit(
+                    f"checkpoint {model_path!r} was trained with --fusion "
+                    f"{saved_fusion_mode!r}, but this run requested --fusion "
+                    f"{fusion_mode!r}; use the matching flag, or --fresh to start a new "
+                    "checkpoint (issue #57: fusion mode is not silently interchangeable)"
+                )
+
+    if fusion_mode == "learned" and getattr(args, "actor_critic_async", False):
+        sys.exit(
+            "--fusion learned does not support --async-trainer yet (issue #37's async "
+            "trainer only knows the fixed fused-latent transition shape); drop one of "
+            "the two flags"
+        )
+
+    live_fusion = None
+    if fusion_mode == "learned":
+        from cognitive_runtime.neural.live_fusion import LiveLearnedFusion
+
+        live_fusion = LiveLearnedFusion(
+            program.stream_catalog(),
+            MINECRAFT_STREAM_REGISTRY,
+            base_layout_hash=fusion.layout_hash,
+            fused_width=arch.get("fused_width"),
+            hidden_dim=arch["hidden_dim"],
+            lr=args.actor_critic_lr,
+        )
+        arch["fused_width"] = live_fusion.fused_width()
+        layout_hash = live_fusion.layout_hash
+    else:
+        layout_hash = fusion.layout_hash
 
     if getattr(args, "actor_critic_async", False):
         return _make_async_actor_critic_policy_and_learner(
             args, arch=arch, model_path=model_path,
-            layout_hash=fusion.layout_hash, action_keys=action_keys, action_space=action_space,
-        )
+            layout_hash=layout_hash, action_keys=action_keys, action_space=action_space,
+        ) + (None,)
 
     # Deterministic weight init: ActorCriticOptimizer's own `seed` only covers
     # its later stochastic ops, not construction, which happens before it exists.
     torch.manual_seed(args.seed)
     policy_model = MLPPolicyModel(
         arch["fused_width"], arch["world_feature_width"], arch["n_actions"],
-        hidden_dim=arch["hidden_dim"], layout_hash=fusion.layout_hash, action_keys=action_keys,
+        hidden_dim=arch["hidden_dim"], layout_hash=layout_hash, action_keys=action_keys,
     )
     critic_model = MLPValueModel(
         arch["fused_width"], arch["world_feature_width"],
-        hidden_dim=arch["hidden_dim"], layout_hash=fusion.layout_hash, action_keys=action_keys,
+        hidden_dim=arch["hidden_dim"], layout_hash=layout_hash, action_keys=action_keys,
     )
     world_model = None
     if arch["has_world_model"]:
         world_model = MLPWorldModel(
             arch["fused_width"], arch["n_actions"],
-            hidden_dim=arch["hidden_dim"], layout_hash=fusion.layout_hash, action_keys=action_keys,
+            hidden_dim=arch["hidden_dim"], layout_hash=layout_hash, action_keys=action_keys,
         )
 
     optimizer = ActorCriticOptimizer(
@@ -323,13 +366,17 @@ def _make_actor_critic_policy_and_learner(
         seed=args.seed,
     )
 
-    checkpoint = NeuralAgentCheckpoint(
-        model_path,
-        layout_hash=fusion.layout_hash,
+    checkpoint_kwargs: Dict[str, Any] = dict(
+        layout_hash=layout_hash,
         action_keys=action_keys,
         online_optimizer=optimizer,
         extra_metadata={"actor_critic": arch},
     )
+    if live_fusion is not None:
+        checkpoint_kwargs["encoders"] = live_fusion.encoders
+        checkpoint_kwargs["fusion"] = live_fusion.module
+        checkpoint_kwargs["optimizers"] = {"live_fusion": live_fusion.optimizer}
+    checkpoint = NeuralAgentCheckpoint(model_path, **checkpoint_kwargs)
     if os.path.exists(model_path):
         try:
             checkpoint.load()
@@ -340,6 +387,8 @@ def _make_actor_critic_policy_and_learner(
         policy_model, critic_model, action_keys, action_space=action_space,
         history=args.actor_critic_history, training=args.actor_critic_train, seed=args.seed,
     )
+    if live_fusion is not None:
+        (live_fusion.train_mode if args.actor_critic_train else live_fusion.eval_mode)()
     replay_buffer = ReplayBuffer()
     learner = ActorCriticLearner(
         optimizer,
@@ -350,8 +399,9 @@ def _make_actor_critic_policy_and_learner(
         replay_buffer=replay_buffer,
         mixed_schedule=MixedTrainingSchedule(replay_every_n_ticks=args.actor_critic_replay_every),
         replay_batch_size=args.actor_critic_replay_batch_size,
+        live_fusion=live_fusion,
     )
-    return policy, learner
+    return policy, learner, live_fusion
 
 
 def _make_async_actor_critic_policy_and_learner(
@@ -527,10 +577,11 @@ def cmd_run(args: argparse.Namespace) -> None:
     )
     encoders = _encoders_for_input_profile(args.input_profile)
     learner = None
+    learned_fusion = None
     if args.policy == "online":
         policy, learner = _make_online_policy_and_learner(args, program, encoders)
     elif args.policy == "actor-critic":
-        policy, learner = _make_actor_critic_policy_and_learner(args, program, encoders)
+        policy, learner, learned_fusion = _make_actor_critic_policy_and_learner(args, program, encoders)
     else:
         policy = _make_policy(args.policy, args)
     world_model = _make_world_model(args, program)
@@ -561,6 +612,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         entity_persistence=entity_persistence,
         stream_registry=MINECRAFT_STREAM_REGISTRY,
         encoders=encoders,
+        learned_fusion=learned_fusion,
     )
     try:
         summaries = runtime.run()
@@ -1326,6 +1378,12 @@ def build_parser() -> argparse.ArgumentParser:
                             "--backend remote with no existing checkpoint (issue #33)")
     p_run.add_argument("--actor-critic-model", default=DEFAULT_ACTOR_CRITIC_MODEL_OUT,
                        help="actor-critic checkpoint bundle path (.pt)")
+    p_run.add_argument("--fusion", choices=sorted(FUSION_MODES), default="fixed",
+                       help="actor-critic's fused-state source (issue #57): 'fixed' (default) "
+                            "is TemporalFusion's hand-written concatenation; 'learned' runs "
+                            "trainable stream encoders + LatentFusionModel in the tick's "
+                            "inference path instead. A checkpoint trained under one mode "
+                            "fails loudly if resumed under the other.")
     p_run.add_argument("--actor-critic-save-every", type=int, default=1000,
                        help="save the actor-critic checkpoint every N gradient steps")
     p_run.add_argument("--actor-critic-lr", type=float, default=1e-3)

@@ -245,6 +245,7 @@ class ActorCriticLearner(Learner):
         replay_buffer: Optional[ReplayBuffer] = None,
         mixed_schedule: Optional[MixedTrainingSchedule] = None,
         replay_batch_size: int = 32,
+        live_fusion: Optional[Any] = None,
     ):
         if policy.policy_model is not optimizer.policy or policy.critic_model is not optimizer.critic:
             raise ValueError(
@@ -259,6 +260,11 @@ class ActorCriticLearner(Learner):
         self.replay_buffer = replay_buffer
         self.mixed_schedule = mixed_schedule or MixedTrainingSchedule()
         self.replay_batch_size = replay_batch_size
+        #: The live ``--fusion learned`` pipeline (issue #57), if any -- kept
+        #: here only for stats/checkpoint visibility. The runtime loop
+        #: (``runtime/loop.py``) owns calling ``.fuse()``/``.maybe_train_step()``
+        #: on the *same* instance every tick; this learner never drives it.
+        self.live_fusion = live_fusion
         self.n_actions = len(policy.action_keys)
         self.world_feature_width = world_feature_width(policy.action_keys)
 
@@ -279,10 +285,14 @@ class ActorCriticLearner(Learner):
     def train_mode(self) -> None:
         self.training = True
         self.policy.train_mode()
+        if self.live_fusion is not None:
+            self.live_fusion.train_mode()
 
     def eval_mode(self) -> None:
         self.training = False
         self.policy.eval_mode()
+        if self.live_fusion is not None:
+            self.live_fusion.eval_mode()
 
     def update(self, window: TickWindow) -> None:
         reward = window_training_reward(window)
@@ -367,6 +377,9 @@ class ActorCriticLearner(Learner):
             "skipped_updates": self.skipped_updates,
             "last_checkpoint_reason": self._last_checkpoint_reason,
             "last_metrics": dict(self._last_metrics),
+            "live_fusion_metrics": (
+                dict(self.live_fusion.last_metrics) if self.live_fusion is not None else None
+            ),
         }
 
     def checkpoint_metadata(self) -> Dict[str, Any]:

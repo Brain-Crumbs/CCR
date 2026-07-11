@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional
 
 from cognitive_runtime.core.action_space import action_space_hash
 from cognitive_runtime.core.entity_persistence import EntityPersistence, NullEntityPersistence
-from cognitive_runtime.core.learner import Learner, NullLearner, window_reward
+from cognitive_runtime.core.learner import Learner, NullLearner, window_reward, window_training_reward
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.novelty import combine_novelty
 from cognitive_runtime.core.perception import State
@@ -106,6 +106,7 @@ class CognitiveRuntime:
         recorder: Optional[Recorder] = None,
         encoders: Optional[StreamEncoderRegistry] = None,
         stream_registry: Optional[StreamRegistry] = None,
+        learned_fusion: Optional[Any] = None,
     ):
         self.program = program
         self.policy = policy
@@ -114,6 +115,12 @@ class CognitiveRuntime:
         self.entity_persistence = entity_persistence or NullEntityPersistence()
         self.learner = learner or NullLearner()
         self.encoders = encoders or default_encoder_registry()
+        #: The live ``--fusion learned`` pipeline (issue #57,
+        #: `cognitive_runtime.neural.live_fusion.LiveLearnedFusion`), or
+        #: `None` for the default fixed `TemporalFusion` path below. Kept as
+        #: a duck-typed `Any` (not imported at module scope) so this module
+        #: -- and every non-neural policy that uses it -- stays torch-free.
+        self.learned_fusion = learned_fusion
         #: Per-stream schema declarations (issue #21): shape/rate come from
         #: the Program's `StreamSpec` catalog, the rest -- encoder binding,
         #: trainable/fixed-stub, latent width, checkpoint key, train/eval
@@ -284,7 +291,10 @@ class CognitiveRuntime:
             decide_start = time.perf_counter()
             window = self.synchronizer.collect(self.sensory_bus)
             self.memory.update(window)
-            self.memory.set_fused_latent(self.fusion.fuse(None, self.memory.buffer))
+            if self.learned_fusion is not None:
+                self.memory.set_fused_latent(self.learned_fusion.fuse(window, self.memory.buffer))
+            else:
+                self.memory.set_fused_latent(self.fusion.fuse(None, self.memory.buffer))
             # The policy's State is derived from stream state, not pulled from
             # the Program: the latest value each stream has published, shaped
             # like an Observation for observation-based policies.
@@ -330,6 +340,10 @@ class CognitiveRuntime:
             motor_emissions += len(motor_events)
             self.memory.record_actions(emissions)
             self.learner.update(window)
+            if self.learned_fusion is not None:
+                self.learned_fusion.maybe_train_step(
+                    window, self.memory.buffer, reward=window_training_reward(window)
+                )
 
             reward_value = window_reward(window)
             total_reward += reward_value
