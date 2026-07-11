@@ -79,6 +79,23 @@ def _realtime_health(summaries: List[EpisodeSummary]) -> str:
     return "\n".join(lines)
 
 
+def _attention_focus_table(summaries: List[EpisodeSummary]) -> str:
+    """Total ticks each stream held the hysteresis-protected focus, across
+    every `attention="budgeted"` episode (issue #59)."""
+    totals: Dict[str, int] = {}
+    for summary in summaries:
+        if summary.attention_mode != "budgeted":
+            continue
+        for stream_id, count in (summary.attention_focus_counts or {}).items():
+            totals[stream_id] = totals.get(stream_id, 0) + int(count)
+    if not totals:
+        return ""
+    lines = ["", "attention focus totals (issue #59, budgeted episodes):"]
+    for stream_id in sorted(totals, key=lambda s: -totals[s]):
+        lines.append(f"  {stream_id}: {totals[stream_id]}")
+    return "\n".join(lines)
+
+
 #: Dashboard comparison columns: curriculum + policy identify the group,
 #: everything else is `evaluation.comparison_table`'s default set.
 _DASHBOARD_COLUMNS = [
@@ -87,6 +104,7 @@ _DASHBOARD_COLUMNS = [
     "avg_unique_items", "avg_blocks_placed", "null_action_rate",
     "avg_max_distance", "avg_decision_latency_ms", "stream_events_per_sec",
     "avg_risk", "avg_prediction_error", "avg_novelty",
+    "attention_mode", "avg_attention_budget_used",
 ]
 
 
@@ -137,6 +155,7 @@ def dashboard(record_dir: str, statistical: bool = False) -> str:
         + "\n"
         + _per_stream_rate_table(all_summaries)
         + _realtime_health(all_summaries)
+        + _attention_focus_table(all_summaries)
     )
     if statistical:
         out += "\n" + _statistical_section(by_group)

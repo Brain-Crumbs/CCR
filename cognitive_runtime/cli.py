@@ -18,6 +18,7 @@ import os
 import sys
 from typing import Any, Callable, Dict, Optional
 
+from cognitive_runtime.core.attention import ATTENTION_MODES
 from cognitive_runtime.core.policy import Policy
 from cognitive_runtime.core.streams import TemporalFusion, default_encoder_registry
 from cognitive_runtime.models.online_q import OnlineQModel
@@ -602,6 +603,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         session_id=args.session_id,
         program_config=program_config,
         curriculum=args.curriculum,
+        attention_mode=getattr(args, "attention", "off"),
     )
     runtime = CognitiveRuntime(
         program=program,
@@ -1384,6 +1386,13 @@ def build_parser() -> argparse.ArgumentParser:
                             "trainable stream encoders + LatentFusionModel in the tick's "
                             "inference path instead. A checkpoint trained under one mode "
                             "fails loudly if resumed under the other.")
+    p_run.add_argument("--attention", choices=sorted(ATTENTION_MODES), default="off",
+                       help="deterministic attention controller (issue #59): 'off' (default) "
+                            "gives every agent-input stream uniform weight 1.0, reproducing "
+                            "the pre-#59 fused output exactly; 'budgeted' scores every "
+                            "agent-input stream's salience each tick and gates the fused "
+                            "state under a hard budget, recording an AttentionState (weights, "
+                            "focus stream, reason breakdown) every tick.")
     p_run.add_argument("--actor-critic-save-every", type=int, default=1000,
                        help="save the actor-critic checkpoint every N gradient steps")
     p_run.add_argument("--actor-critic-lr", type=float, default=1e-3)

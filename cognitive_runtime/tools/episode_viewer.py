@@ -35,6 +35,7 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
             "termination_reason", "null_action_ticks", "avg_latency_ms",
             "ticks_per_second", "program_ticks_per_cognitive_tick",
             "avg_risk", "avg_prediction_error", "avg_novelty",
+            "attention_mode", "avg_attention_budget_used",
         ):
             lines.append(f"  {key}: {summary.get(key)}")
         program_stats = summary.get("program_stats") or {}
@@ -42,6 +43,11 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
             lines.append("  program_stats:")
             for key, value in program_stats.items():
                 lines.append(f"    {key}: {value}")
+        focus_counts = summary.get("attention_focus_counts") or {}
+        if focus_counts:
+            lines.append("  attention focus (ticks held, issue #59):")
+            for stream_id, count in sorted(focus_counts.items(), key=lambda kv: -kv[1]):
+                lines.append(f"    {stream_id}: {count}")
 
     # Per-stream event counts and rates.
     counts = summary.get("stream_event_counts") or {}
@@ -86,6 +92,8 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
     novelty = None
     value_estimate = None
     internal_values: Dict[str, float] = {}
+    attention_timeline: List[str] = []
+    last_focus_stream = object()  # sentinel: always logs the first tick's focus
     for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
         for record in sensory:
             if record.get("elided"):
@@ -125,6 +133,19 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
         for stream_id in INTERNAL_MODULATION_STREAM_IDS:
             if stream_id in internal_values:
                 line += f" {stream_id}={internal_values[stream_id]}"
+        attention = decision.get("attention")
+        if isinstance(attention, dict) and attention.get("mode") == "budgeted":
+            focus_stream = attention.get("focus_stream")
+            line += f" attention_focus={focus_stream} budget={attention.get('budget_used')}"
+            if focus_stream != last_focus_stream:
+                reason = (attention.get("reasons") or {}).get(focus_stream, {})
+                components = reason.get("components", {})
+                top = sorted(components.items(), key=lambda kv: -abs(kv[1]))[:3]
+                why = ", ".join(f"{name}={round(value, 3)}" for name, value in top)
+                attention_timeline.append(
+                    f"t={decision.get('tick_index')}: focus -> {focus_stream} ({why})"
+                )
+                last_focus_stream = focus_stream
         recent.append(line)
 
     lines.append("  action distribution:")
@@ -134,6 +155,10 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
     if event_timeline:
         lines.append(f"  events ({len(event_timeline)} shown):")
         lines.extend(f"    {e}" for e in event_timeline)
+
+    if attention_timeline:
+        lines.append(f"  attention timeline (issue #59, {len(attention_timeline)} focus changes):")
+        lines.extend(f"    {e}" for e in attention_timeline)
 
     if recent and tail > 0:
         lines.append(f"  last {min(tail, len(recent))} decisions:")

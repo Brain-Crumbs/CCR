@@ -30,6 +30,7 @@ class LatentFusionInputs:
     presence_mask: torch.Tensor
     recency: torch.Tensor
     staleness: torch.Tensor
+    attention: torch.Tensor
     layout_hash: str
     stream_ids: List[str]
 
@@ -247,14 +248,18 @@ def latent_fusion_inputs_from_buffer(
     tick_window: Optional[TickWindow] = None,
     present_stream_ids: Optional[Iterable[str]] = None,
     stale_streams: Optional[Iterable[str]] = None,
+    attention_weights: Optional[Mapping[str, float]] = None,
 ) -> LatentFusionInputs:
     """Build the mask/recency tensors for learned fusion from stream time.
 
     ``TemporalFusion`` still owns the fixed vector and layout hash.  This
     helper adds the learned path's extra channels: which streams arrived in
-    the current tick, how recently each stream last fired, and a normalized
-    staleness scalar.  Stale streams reported by ``TickSynchronizer`` override
-    the scalar to 1.0.
+    the current tick, how recently each stream last fired, a normalized
+    staleness scalar, and -- the attention-controller hook (issue #59) --
+    each stream's attention weight, defaulting to ``1.0`` (uniform, byte-
+    equivalent to no attention controller) for any stream `attention_weights`
+    doesn't mention. Stale streams reported by ``TickSynchronizer`` override
+    the staleness scalar to 1.0.
     """
 
     latent = fusion.fuse(None, temporal_buffer)
@@ -264,10 +269,12 @@ def latent_fusion_inputs_from_buffer(
         present = set(present_stream_ids or [])
     stale = set(stale_streams or [])
     reference_time = fusion._reference_time(temporal_buffer)
+    attention_weights = attention_weights or {}
 
     mask: List[float] = []
     recency: List[float] = []
     staleness: List[float] = []
+    attention: List[float] = []
     for entry in fusion.layout:
         latest = temporal_buffer.latest(entry.stream_id)
         recent = (
@@ -278,12 +285,14 @@ def latent_fusion_inputs_from_buffer(
         mask.append(1.0 if entry.stream_id in present else 0.0)
         recency.append(float(recent))
         staleness.append(1.0 if entry.stream_id in stale else 1.0 - float(recent))
+        attention.append(float(attention_weights.get(entry.stream_id, 1.0)))
 
     return LatentFusionInputs(
         latents=torch.tensor([latent.vector], dtype=torch.float32),
         presence_mask=torch.tensor([mask], dtype=torch.float32),
         recency=torch.tensor([recency], dtype=torch.float32),
         staleness=torch.tensor([staleness], dtype=torch.float32),
+        attention=torch.tensor([attention], dtype=torch.float32),
         layout_hash=latent.layout_hash,
         stream_ids=[entry.stream_id for entry in fusion.layout],
     )

@@ -77,6 +77,19 @@ def summarize_episodes(summaries: List[EpisodeSummary]) -> Dict[str, Any]:
             if any(s.avg_novelty is not None for s in summaries)
             else None
         ),
+        # Deterministic attention controller (issue #59).
+        "attention_mode": summaries[0].attention_mode,
+        "avg_attention_budget_used": (
+            round(
+                _mean(
+                    [s.avg_attention_budget_used for s in summaries
+                     if s.avg_attention_budget_used is not None]
+                ),
+                4,
+            )
+            if any(s.avg_attention_budget_used is not None for s in summaries)
+            else None
+        ),
         # Runtime health.
         "avg_decision_latency_ms": round(_mean([s.avg_latency_ms for s in summaries]), 3),
         "avg_ticks_per_second": round(_mean([s.ticks_per_second for s in summaries]), 1),

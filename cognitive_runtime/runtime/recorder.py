@@ -75,6 +75,13 @@ class DecisionRecord:
     risk: float = 0.0
     p_death: Optional[float] = None
     prediction_error: Optional[float] = None
+    # Deterministic attention controller (issue #59): the tick's full
+    # `AttentionState.to_dict()` (mode, per-stream weights, selected streams,
+    # focus stream, budget used/total, per-stream reason breakdown), or
+    # `None` for every session recorded before this field existed. The
+    # reason breakdown is what makes attention debuggable -- it is recorded
+    # here rather than reconstructed after the fact.
+    attention: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -132,6 +139,17 @@ class EpisodeSummary:
     # world model and no occluded tracked entities), and for every episode
     # recorded before this field existed.
     avg_novelty: Optional[float] = None
+    # Deterministic attention controller (issue #59), averaged/counted over
+    # ticks where attention ran in "budgeted" mode; `None`/empty for
+    # `attention="off"` runs and for episodes recorded before this field
+    # existed.
+    avg_attention_budget_used: Optional[float] = None
+    #: stream_id -> number of ticks it held the hysteresis-protected focus
+    #: this episode -- the attention timeline's per-episode summary.
+    attention_focus_counts: Dict[str, int] = field(default_factory=dict)
+    #: "off" or "budgeted" (issue #59); "off" for every episode recorded
+    #: before this field existed.
+    attention_mode: str = "off"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -16,6 +16,7 @@ from collections import deque
 from typing import Deque, Dict, List, Optional, Set
 
 from cognitive_runtime.core.action import NULL_ACTION, Action
+from cognitive_runtime.core.attention import AttentionState
 from cognitive_runtime.core.hashing import canonical_json, hash_payload
 from cognitive_runtime.core.streams.encoder_registry import LatentToken
 from cognitive_runtime.core.streams.fusion import LatentState
@@ -57,6 +58,7 @@ class Memory:
         self._novel_last_update = True
         self._latent_tokens: List[LatentToken] = []
         self._latent_state: Optional[LatentState] = None
+        self._attention_state: Optional[AttentionState] = None
 
     def reset(self) -> None:
         self.buffer.reset()
@@ -66,6 +68,7 @@ class Memory:
         self._novel_last_update = True
         self._latent_tokens = []
         self._latent_state = None
+        self._attention_state = None
 
     # ------------------------------------------------------------- updates
 
@@ -102,6 +105,14 @@ class Memory:
     def fused_latent(self) -> Optional[LatentState]:
         """The most recent fused :class:`LatentState`, if the loop computed one."""
         return self._latent_state
+
+    def set_attention_state(self, state: AttentionState) -> None:
+        """Store the tick's :class:`AttentionState` (issue #59)."""
+        self._attention_state = state
+
+    def attention_state(self) -> Optional[AttentionState]:
+        """The most recent :class:`AttentionState`, if the loop computed one."""
+        return self._attention_state
 
     def last_actions(self, n: int) -> List[Action]:
         return list(self.actions)[-n:]

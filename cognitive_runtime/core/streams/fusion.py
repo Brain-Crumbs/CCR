@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 from cognitive_runtime.core.streams.encoder_registry import (
     LatentToken,
@@ -147,6 +147,7 @@ class TemporalFusion:
         self,
         tokens: Optional[List[LatentToken]],
         temporal_buffer: TemporalBuffer,
+        attention_weights: Optional[Mapping[str, float]] = None,
     ) -> LatentState:
         """Assemble the fixed-width latent vector from recent stream history.
 
@@ -154,6 +155,13 @@ class TemporalFusion:
         rebuilt from `temporal_buffer` so a silent stream carries its last
         value and online/offline paths that feed identical buffers produce
         identical vectors.
+
+        `attention_weights` (issue #59), when given, scales each stream's
+        slice by its per-stream weight (a stream absent from the mapping is
+        left at its plain value -- e.g. an aux/debug stream the attention
+        controller never scores). `None` -- every existing caller -- and a
+        uniform all-``1.0`` mapping (the `attention="off"` ablation) are both
+        exactly the pre-#59 vector: multiplying by `1.0` changes no float.
         """
         reference_time = self._reference_time(temporal_buffer)
         vector: List[float] = []
@@ -173,6 +181,9 @@ class TemporalFusion:
                     f"{entry.stream_id}: encoder produced width {len(vec)}, "
                     f"layout expects {entry.width}"
                 )
+            if attention_weights is not None and entry.stream_id in attention_weights:
+                weight = attention_weights[entry.stream_id]
+                vec = [v * weight for v in vec]
             slices[entry.stream_id] = (len(vector), len(vector) + entry.width)
             vector.extend(vec)
         return LatentState(vector=vector, slices=slices, layout_hash=self.layout_hash)

@@ -204,14 +204,28 @@ class LiveLearnedFusion:
             eval_mode = getattr(module, "eval_mode", None)
             (eval_mode or module.eval)()
 
-    def fuse(self, window: Optional[TickWindow], buffer: TemporalBuffer) -> LatentState:
+    def fuse(
+        self,
+        window: Optional[TickWindow],
+        buffer: TemporalBuffer,
+        attention_weights: Optional[Dict[str, float]] = None,
+    ) -> LatentState:
         """Fused agent state for the current tick (no gradient -- inference
-        only; see :meth:`maybe_train_step` for the online update)."""
-        inputs = latent_fusion_inputs_from_buffer(self.temporal_fusion, buffer, tick_window=window)
+        only; see :meth:`maybe_train_step` for the online update).
+
+        `attention_weights` (issue #59) is the same per-stream hook
+        `LatentFusionModel.forward` takes; omitting it defaults every stream
+        to `1.0` (uniform), byte-equivalent to no attention controller.
+        """
+        inputs = latent_fusion_inputs_from_buffer(
+            self.temporal_fusion, buffer, tick_window=window, attention_weights=attention_weights
+        )
         was_training = self.module.training
         self.module.eval()
         with torch.no_grad():
-            fused = self.module(inputs.latents, inputs.presence_mask, inputs.recency, inputs.staleness)
+            fused = self.module(
+                inputs.latents, inputs.presence_mask, inputs.recency, inputs.staleness, inputs.attention
+            )
         if was_training:
             self.module.train()
         return LatentState(vector=fused[0].tolist(), slices={}, layout_hash=self.layout_hash)
@@ -246,7 +260,12 @@ class LiveLearnedFusion:
         return torch.cat(parts).unsqueeze(0)
 
     def maybe_train_step(
-        self, window: Optional[TickWindow], buffer: TemporalBuffer, *, reward: float
+        self,
+        window: Optional[TickWindow],
+        buffer: TemporalBuffer,
+        *,
+        reward: float,
+        attention_weights: Optional[Dict[str, float]] = None,
     ) -> Dict[str, float]:
         """One synchronous online gradient step (issue #57's stand-in for the
         async trainer, #37): regress the reward-prediction head over the
@@ -257,10 +276,12 @@ class LiveLearnedFusion:
         """
         if not self.training:
             return {}
-        inputs = latent_fusion_inputs_from_buffer(self.temporal_fusion, buffer, tick_window=window)
+        inputs = latent_fusion_inputs_from_buffer(
+            self.temporal_fusion, buffer, tick_window=window, attention_weights=attention_weights
+        )
         latents = self._grad_latents(buffer)
         self.module.train()
-        fused = self.module(latents, inputs.presence_mask, inputs.recency, inputs.staleness)
+        fused = self.module(latents, inputs.presence_mask, inputs.recency, inputs.staleness, inputs.attention)
         reward_pred = self.module.reward_head(fused).squeeze(-1)
         target = torch.tensor([reward], dtype=torch.float32)
         loss = F.mse_loss(reward_pred, target)

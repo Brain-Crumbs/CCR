@@ -60,6 +60,14 @@ class RuntimeConfig:
     #: Bulky frame streams elided from the log unless ``record_frames`` is set.
     FRAME_STREAMS = ("vision.frame.grid", "vision.frame.pixels")
 
+    #: Attention ablation (issue #59): ``"off"`` gives every agent-input
+    #: stream uniform weight ``1.0`` (the pre-#59 behavior, byte-identical
+    #: fused output); ``"budgeted"`` runs the deterministic
+    #: ``AttentionController`` scoring under a hard budget. Defaults to
+    #: ``"off"`` so existing sessions/checkpoints are unaffected unless a
+    #: caller opts in.
+    attention_mode: str = "off"
+
     def effective_exclude_streams(self) -> List[str]:
         """exclude_streams plus the frame streams when frames are opted out."""
         excluded = list(self.exclude_streams)
