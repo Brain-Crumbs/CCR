@@ -17,6 +17,7 @@ from cognitive_runtime.core.attention import (
     AttentionState,
     StimulusDirection,
 )
+from cognitive_runtime.core.learner import Learner
 from cognitive_runtime.core.observation import Observation
 from cognitive_runtime.core.orienting_reflex import (
     REFLEX_MODES,
@@ -42,7 +43,13 @@ _REGISTRY = ActionRegistry(
     [
         ActionDeclaration("LOOK_LEFT", world_changing=False, information_gathering=True),
         ActionDeclaration("LOOK_RIGHT", world_changing=False, information_gathering=True),
+        # "Both": routine locomotion -- must NOT veto the reflex (issue #60's
+        # own "walking does both" example; see
+        # OrientingReflex._is_survival_critical).
         ActionDeclaration("MOVE_FORWARD", world_changing=True, information_gathering=True),
+        # Purely world-changing: a stand-in for a survival-critical response
+        # (fleeing via SPRINT, eating via USE) -- MUST veto the reflex.
+        ActionDeclaration("ATTACK", world_changing=True, information_gathering=False),
         ActionDeclaration("NULL", world_changing=False, information_gathering=True),
     ]
 )
@@ -168,12 +175,23 @@ def test_high_risk_vetoes_the_reflex():
     assert reflex.decide(_state(), risk=0.5, policy_actions=[]) is not None
 
 
-def test_world_changing_policy_action_blocks_the_reflex():
-    """The issue's own example: fleeing (movement, world-changing) must
-    never be suppressed by the reflex."""
+def test_purely_world_changing_policy_action_blocks_the_reflex():
+    """The issue's own example: a survival-critical response (fleeing,
+    eating) -- purely world-changing, not also information-gathering --
+    must never be suppressed by the reflex."""
     reflex = OrientingReflex(action_registry=_REGISTRY)
-    flee = [Action("MOVE_FORWARD")]
-    assert reflex.decide(_state(), risk=0.0, policy_actions=flee) is None
+    attack = [Action("ATTACK")]
+    assert reflex.decide(_state(), risk=0.0, policy_actions=attack) is None
+
+
+def test_locomotion_does_not_block_the_reflex():
+    """Locomotion is classified world_changing=True *and*
+    information_gathering=True ("walking does both") -- unlike a purely
+    world-changing action, it must NOT veto the reflex, or ordinary
+    wandering would starve the reflex of any chance to ever fire."""
+    reflex = OrientingReflex(action_registry=_REGISTRY)
+    wander = [Action("MOVE_FORWARD")]
+    assert reflex.decide(_state(), risk=0.0, policy_actions=wander) is not None
 
 
 def test_information_gathering_or_null_policy_action_does_not_block():
@@ -183,7 +201,10 @@ def test_information_gathering_or_null_policy_action_does_not_block():
     assert reflex.decide(_state(), risk=0.0, policy_actions=[Action("LOOK_LEFT")]) is not None
 
 
-def test_undeclared_action_is_conservatively_treated_as_world_changing():
+def test_undeclared_action_is_conservatively_treated_as_survival_critical():
+    """An undeclared action defaults world_changing=True,
+    information_gathering=False (`ActionRegistry`'s conservative defaults),
+    so it is treated as purely world-changing and blocks the reflex."""
     reflex = OrientingReflex(action_registry=_REGISTRY)
     assert reflex.decide(_state(), risk=0.0, policy_actions=[Action("SOME_UNKNOWN_VERB")]) is None
 
@@ -211,13 +232,13 @@ def test_hold_lasts_exactly_hold_ticks_then_reconsiders():
     assert fourth is None
 
 
-def test_hold_is_cut_short_by_a_world_changing_policy_action():
+def test_hold_is_cut_short_by_a_survival_critical_policy_action():
     reflex = OrientingReflex(
         config=OrientingReflexConfig(hold_ticks=5), action_registry=_REGISTRY,
     )
     reflex.decide(_state(bearing_deg=30.0), risk=0.0, policy_actions=[])
     held_state = _state(bearing_deg=30.0, bottom_up_capture=False)
-    interrupted = reflex.decide(held_state, risk=0.0, policy_actions=[Action("MOVE_FORWARD")])
+    interrupted = reflex.decide(held_state, risk=0.0, policy_actions=[Action("ATTACK")])
     assert interrupted is None
     # The hold was reset, not merely skipped one tick.
     resumed = reflex.decide(_state(bearing_deg=30.0), risk=0.0, policy_actions=[])
@@ -323,7 +344,9 @@ _STIMULUS_STREAM_REGISTRY = StreamRegistry(
 ).extend(DEFAULT_STREAM_REGISTRY.declarations)
 
 
-def _run_stimulus_scenario(tmp_path, session_id: str, reflex_mode: str, spike_tick: int = 5):
+def _run_stimulus_scenario(
+    tmp_path, session_id: str, reflex_mode: str, spike_tick: int = 5, learner=None,
+):
     runtime_config = RuntimeConfig(
         episodes=1,
         seed=0,
@@ -341,6 +364,7 @@ def _run_stimulus_scenario(tmp_path, session_id: str, reflex_mode: str, spike_ti
         stream_registry=_STIMULUS_STREAM_REGISTRY,
         encoders=_STIMULUS_STREAM_REGISTRY.to_encoder_registry(),
         action_registry=_REGISTRY,
+        learner=learner,
     ).run()[0]
     return summary, str(tmp_path / session_id)
 
@@ -374,6 +398,28 @@ def test_simulated_scenario_agent_turns_toward_a_newly_appearing_stimulus(tmp_pa
 def test_ablation_reflex_off_never_activates(tmp_path):
     summary, session_dir = _run_stimulus_scenario(tmp_path, "reflex-off-session", reflex_mode="off")
     assert summary.reflex_mode == "off"
+    assert summary.reflex_activations == 0
+    for decision, _sensory, _motor in iter_cognitive_ticks(session_dir, "episode_00000"):
+        assert decision.get("reflex") is None
+
+
+class _StubLearner(Learner):
+    """A minimal non-null `Learner` double. Exists only to verify the
+    reflex is gated off whenever a real learner is attached: substituting
+    the emitted action would silently corrupt an online learner's credit
+    assignment (`ActorCriticLearner`/`OnlineQPolicy.update()` pair
+    `policy.latest_decision` -- the policy's *intended*, un-substituted
+    action -- with the reward the *actually executed*, possibly
+    reflex-substituted, action produced)."""
+
+    def update(self, window) -> None:
+        pass
+
+
+def test_reflex_is_inert_when_a_real_learner_is_attached(tmp_path):
+    summary, session_dir = _run_stimulus_scenario(
+        tmp_path, "reflex-with-learner-session", reflex_mode="on", learner=_StubLearner(),
+    )
     assert summary.reflex_activations == 0
     for decision, _sensory, _motor in iter_cognitive_ticks(session_dir, "episode_00000"):
         assert decision.get("reflex") is None

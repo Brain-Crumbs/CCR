@@ -10,8 +10,9 @@ Generic, Program-agnostic core: the reflex only ever sees an
 policy's own emitted actions (classified by a Program-supplied
 `ActionRegistry`, issue #60's action-registry half). Which concrete action
 name means "turn left"/"turn right" is Program-specific and is supplied
-through `OrientingReflexConfig`, exactly like `AttentionMetadata` keeps
-Minecraft stream ids out of `core.attention`.
+through `OrientingReflexConfig` -- the one place, like `RuntimeConfig`'s
+other Minecraft-flavored defaults (e.g. `pin_on_streams`), where this repo's
+only current Program leaks into an otherwise generic default.
 
 Precedence, highest to lowest:
 
@@ -20,10 +21,15 @@ Precedence, highest to lowest:
 2. `risk >= risk_veto_threshold` -- a high predicted-risk reading
    (`internal.risk`, issue #58) vetoes the reflex outright, in favor of
    whatever response the policy comes up with.
-3. The policy already emitted a world-changing action this tick -- the
-   reflex must never suppress a survival-critical response (fleeing, eating
-   at critical hunger are both world-changing); it only ever substitutes
-   for an empty or purely-perceptual tick.
+3. The policy already emitted a *purely* world-changing action this tick
+   (`world_changing=True`, `information_gathering=False`) -- the reflex must
+   never suppress a survival-critical response (fleeing via SPRINT, eating
+   via SELECT_HOTBAR_SLOT/USE are both pure world-changing in Minecraft's
+   registry). Locomotion classified `world_changing=True` *and*
+   `information_gathering=True` ("walking does both", the issue's own
+   example) does *not* veto -- routine wandering already gathers a view, so
+   substituting a sharper look toward a fresh stimulus isn't suppressing
+   anything the tick wasn't already halfway doing.
 4. No bottom-up capture landed this tick, or the captured stream carries no
    direction hint, or the bearing is within the dead zone -- nothing to
    orient toward.
@@ -142,7 +148,7 @@ class OrientingReflex:
         if risk >= self.config.risk_veto_threshold:
             self.reset()
             return None
-        if any(self.action_registry.is_world_changing(a) for a in policy_actions):
+        if any(self._is_survival_critical(a) for a in policy_actions):
             self.reset()
             return None
 
@@ -183,3 +189,12 @@ class OrientingReflex:
             return None
         name = self.config.right_action if bearing_deg > 0 else self.config.left_action
         return Action(name)
+
+    def _is_survival_critical(self, action: Action) -> bool:
+        """`True` for a *purely* world-changing action (fleeing via SPRINT,
+        eating via SELECT_HOTBAR_SLOT/USE) -- `False` for one that is *also*
+        information-gathering (locomotion: "walking does both", issue #60's
+        own example), so routine wandering doesn't block every reflex tick."""
+        return self.action_registry.is_world_changing(
+            action
+        ) and not self.action_registry.is_information_gathering(action)

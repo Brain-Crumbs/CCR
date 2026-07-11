@@ -306,7 +306,13 @@ class SurvivalStreamPublisher:
                 pub(PIXEL_STREAM, observation.pixels, force=True)
         mobs = data["mobs"]
         pub("vision.entities", mobs, force=bool(mobs))
-        pub("world.entity_bearing", _entity_bearing_payload(mobs))
+        # force=bool(mobs): a stationary mob at melee range (dist <=
+        # ZOMBIE_REACH stops closing, world.py:840) repeats the identical
+        # salience/bearing payload tick after tick; without forcing, the
+        # delta publisher would drop every event after the first, leaving
+        # the attention controller scoring a stale timestamp and the
+        # orienting reflex blind to an entity that is actively attacking.
+        pub("world.entity_bearing", _entity_bearing_payload(mobs), force=bool(mobs))
         pub("body.health", data["health"], force=heartbeat)
         pub("body.hunger", data["hunger"], force=heartbeat)
         pub("body.oxygen", data["oxygen"], force=heartbeat)

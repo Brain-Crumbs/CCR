@@ -515,8 +515,11 @@ DEFAULT_STREAM_REGISTRY = StreamRegistry(
                 "bound in the legacy scalar TemporalFusion layout -- it is "
                 "reserved for a trainable PixelStreamEncoder "
                 "(docs/neural-stream-agent.md Phase B, cognitive_runtime.neural). "
-                "The one raw-ish stream; a frame region maps to a look direction, "
-                "so it is the only stream with a localization hint (issue #32)."
+                "The one raw-ish stream in this *generic* registry; a frame "
+                "region maps to a look direction, so it is the only "
+                "localization_hint stream declared here (issue #32) -- a "
+                "Program can declare its own (e.g. Minecraft's "
+                "world.entity_bearing, issue #60)."
             ),
         ),
         StreamDeclaration(

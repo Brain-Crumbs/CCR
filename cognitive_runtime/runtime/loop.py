@@ -439,16 +439,29 @@ class CognitiveRuntime:
             emissions = self.policy.emit(state, self.memory, prediction)
             # Scripted orienting reflex (issue #60): may substitute a
             # look/turn action for the policy's this tick -- never when the
-            # policy already emitted a world-changing (survival-critical)
-            # action, and never above the risk-veto threshold.
-            reflex_decision = self.reflex.decide(
-                attention_state=attention_state,
-                risk=prediction.risk,
-                policy_actions=emissions,
+            # policy already emitted a "pure" world-changing (not also
+            # information-gathering) action -- i.e. a survival-critical
+            # response like fleeing/eating, not routine "both" locomotion --
+            # and never above the risk-veto threshold. Gated on `NullLearner`:
+            # substituting the emitted action would silently corrupt an
+            # online learner's credit assignment, since ActorCriticLearner/
+            # OnlineQPolicy.update() pair `policy.latest_decision` (the
+            # policy's *intended* action, untouched by the reflex) with the
+            # reward this tick's *actual* (possibly reflex-substituted)
+            # action produced -- issue #60 explicitly scopes "learning the
+            # orienting behavior" out, so a training run defers to
+            # `reflex_mode="off"`/`"learned-only"` instead.
+            reflex_decision = (
+                self.reflex.decide(
+                    attention_state=attention_state,
+                    risk=prediction.risk,
+                    policy_actions=emissions,
+                )
+                if isinstance(self.learner, NullLearner)
+                else None
             )
             if reflex_decision is not None:
                 emissions = [reflex_decision.action]
-                reflex_activations += 1
             policy_decision = getattr(self.policy, "latest_decision", None)
             value_estimate = getattr(policy_decision, "value_estimate", None)
             if value_estimate is not None:
@@ -463,6 +476,8 @@ class CognitiveRuntime:
                 self._stop_requested = True
                 break
 
+            if reflex_decision is not None:
+                reflex_activations += 1
             motor_events = [
                 publish_motor_command(self.motor_bus, action, window.ended_at)
                 for action in emissions
