@@ -97,6 +97,7 @@ def test_stream_catalog_covers_the_survival_taxonomy():
         "event.entered_shelter", "event.survived_night", "event.died",
         "event.action_rejected",
         "reward.scalar",
+        "input.mouse_look",
     }
     assert set(specs) == expected
     for spec in specs.values():  # ids/modalities pass Phase-0 validation
@@ -238,6 +239,38 @@ def test_malformed_motor_events_reject_but_the_world_still_steps():
     assert len(rejected) == 1 and "superseded" in rejected[0].payload["reason"]
     rotation = [e for e in events if e.stream_id == "spatial.rotation"]
     assert rotation and rotation[0].payload["yaw"] == 15.0  # LOOK_RIGHT applied
+
+
+# ------------------------------------------------------- mouse/look motor stream (issue #32)
+
+
+def test_mouse_look_stream_reports_the_look_action_delta():
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    publish_motor_command(motor, Action("LOOK_RIGHT"), timestamp=0.0)
+    program.step()
+    look = [e for e in sensory.drain() if e.stream_id == "input.mouse_look"]
+    assert len(look) == 1
+    assert look[0].payload == {"d_yaw": 15.0, "d_pitch": 0.0}
+
+
+def test_mouse_look_stream_is_zero_for_non_look_actions():
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    publish_motor_command(motor, Action("MOVE_FORWARD"), timestamp=0.0)
+    program.step()
+    look = [e for e in sensory.drain() if e.stream_id == "input.mouse_look"]
+    assert len(look) == 1
+    assert look[0].payload == {"d_yaw": 0.0, "d_pitch": 0.0}
+
+
+def test_mouse_look_stream_reports_pitch_deltas():
+    program, sensory, motor = _stream_program(0)
+    sensory.drain()
+    publish_motor_command(motor, Action("LOOK_DOWN"), timestamp=0.0)
+    program.step()
+    look = [e for e in sensory.drain() if e.stream_id == "input.mouse_look"]
+    assert look[0].payload == {"d_yaw": 0.0, "d_pitch": 10.0}
 
 
 def test_bumped_and_mob_killed_events_are_published_in_sim_sessions():

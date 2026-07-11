@@ -165,3 +165,27 @@ def test_build_neural_dataset_requires_frames(tmp_path):
     ).run()
     with pytest.raises(ValueError, match="hash-only"):
         build_neural_dataset([os.path.join(str(tmp_path), "noframes")])
+
+
+# ------------------------------------------------------ input-profile ablation (issue #32)
+
+
+def test_stream_profile_raw_narrows_the_non_vision_companion_vector(tmp_path):
+    session_dir = _record(tmp_path, "profile-session", episodes=1)
+    full = build_neural_dataset([session_dir])
+    raw = build_neural_dataset([session_dir], stream_profile="raw")
+
+    assert full.stream_profile == "full"
+    assert raw.stream_profile == "raw"
+    assert len(raw.non_vision_names) < len(full.non_vision_names)
+    assert len(full) == len(raw) > 0  # same samples, narrower per-sample vector
+
+    # semantic scalar names (e.g. world.front_block's one-hot slots) are gone
+    assert not any(name.startswith("world.front_block") for name in raw.non_vision_names)
+    assert any(name.startswith("body.health") for name in raw.non_vision_names)
+
+
+def test_stream_profile_rejects_unknown_value(tmp_path):
+    session_dir = _record(tmp_path, "profile-session-bad", episodes=1)
+    with pytest.raises(ValueError, match="stream_profile"):
+        build_neural_dataset([session_dir], stream_profile="bogus")

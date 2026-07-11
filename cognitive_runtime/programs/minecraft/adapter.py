@@ -31,9 +31,11 @@ from cognitive_runtime.programs.minecraft.remote import RemoteMinecraftBackend
 from cognitive_runtime.programs.minecraft.rewards import SurvivalReward, SurvivalRewardConfig
 from cognitive_runtime.programs.minecraft.streams import (
     BODY_HEARTBEAT_KEY,
+    MOUSE_LOOK_STREAM,
     VISION_STREAM,
     SurvivalStreamPublisher,
     build_survival_stream_specs,
+    mouse_look_delta,
 )
 
 _VALID_ACTION_NAMES = {a.name for a in ACTION_SPACE}
@@ -232,6 +234,9 @@ class MinecraftSurvivalBox(Program):
             "reward.scalar",
             {"value": signal.value, "components": dict(signal.components)},
             observation.timestamp,
+        )
+        self._sensory_bus.publish(
+            MOUSE_LOOK_STREAM, mouse_look_delta(action.name), observation.timestamp
         )
         self._last_action = action
         self._last_reward = signal

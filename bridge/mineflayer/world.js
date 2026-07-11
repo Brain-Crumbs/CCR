@@ -12,6 +12,10 @@ const {
 } = require('./blocks');
 const { applyAction, clearControls } = require('./actions');
 const { buildObservation, isSheltered, timeState } = require('./observation');
+const { PixelViewer } = require('./pixels');
+
+// issue #32: opt in to higher-fidelity rendered pixels (see README).
+const PIXEL_SOURCE_ENV = process.env.CCR_MINECRAFT_PIXELS;
 
 function log(...args) {
   process.stderr.write('[mc-bridge] ' + args.join(' ') + '\n');
@@ -44,6 +48,9 @@ class WorldSession {
     this._seenAdvancements = new Set();
     this._discoveredStructures = new Set();
     this._advancementsWired = false;
+    // issue #32: optional higher-fidelity pixel capture, off unless the
+    // config/env explicitly asks for it (see README "Higher-fidelity pixels").
+    this._pixelViewer = null;
   }
 
   // -- connection ----------------------------------------------------------
@@ -143,7 +150,23 @@ class WorldSession {
     this._prevBiome = biomeToVocab(biomeBlock && biomeBlock.biome ? biomeBlock.biome.name : null);
     this._prevDimension = this.bot.game ? this.bot.game.dimension : 'overworld';
     this._discoveredStructures = new Set();
+    await this._maybeStartPixelViewer();
     return this._status();
+  }
+
+  // issue #32: opt-in higher-fidelity pixels via prismarine-viewer's headless
+  // renderer. Enabled by `config.pixel_source === 'viewer'` or
+  // `$CCR_MINECRAFT_PIXELS=viewer`; best-effort and never throws -- a missing
+  // optional dependency or a host with no headless-GL support just leaves
+  // `observe()` to keep using the colorized semantic-grid fallback it already
+  // has (`RemoteMinecraftBackend.observe()` on the Python side).
+  async _maybeStartPixelViewer() {
+    const wantsViewer = (this.config.pixel_source || PIXEL_SOURCE_ENV) === 'viewer';
+    if (!wantsViewer || this._pixelViewer) return;
+    this._pixelViewer = new PixelViewer();
+    try {
+      await this._pixelViewer.start(this.bot);
+    } catch (e) { /* PixelViewer.start() already swallows its own errors */ }
   }
 
   async step(action) {
@@ -275,10 +298,21 @@ class WorldSession {
   observe(timestamp) {
     if (!this.bot) throw new Error('observe before reset');
     const obs = buildObservation(this.bot, this.tick, this.config, this.spawn);
+    // issue #32: a real rendered frame, when the (optional) pixel viewer is
+    // enabled and working; otherwise omitted, and the Python-side
+    // `RemoteMinecraftBackend.observe()` colorizes `obs.frame` instead.
+    if (this._pixelViewer && this._pixelViewer.available()) {
+      const pixels = this._pixelViewer.capture();
+      if (pixels) obs.pixels = pixels;
+    }
     return { ok: true, observation: obs };
   }
 
   close() {
+    if (this._pixelViewer) {
+      this._pixelViewer.close();
+      this._pixelViewer = null;
+    }
     if (this.bot) {
       try { this.bot.quit(); } catch (e) { /* ignore */ }
       this.bot = null;

@@ -159,7 +159,13 @@ Every stream needs:
   #60)
 
 *Status: registry landed (#21); the raw-vs-aux-vs-privileged classification
-and attention metadata are #32.*
+and attention metadata landed (#32) -- every `StreamDeclaration` carries a
+`classification` (agent_input/aux_debug/privileged) and every agent-input
+declaration an `AttentionMetadata` (modality, expected sample rate, relative
+compute cost, localization hint); `ccr run --input-profile raw` and
+`training.datasets.build_neural_dataset(..., stream_profile="raw")` fuse only
+the agent-input subset for pixel-only-vs-pixels+semantics ablations
+(docs/streams.md "Stream classification and attention metadata").*
 
 ### 3. Replace Fixed Fusion With Learned Fusion
 
@@ -254,9 +260,18 @@ scripted intelligence:
   childhood: the world model learns that the world is lawful before the
   policy learns to survive in it.
 
-The backend should expose raw/near-raw streams where possible (#32).  Semantic
-streams are useful for debugging and auxiliary losses, but the core agent
-should not depend on hand-written survival heuristics.
+The backend exposes raw/near-raw streams where possible (landed, #32): every
+published stream is classified agent_input/aux_debug/privileged in the
+stream registry, `input.mouse_look` (mouse/look control history) is now a
+published motor stream on both backends, and the Mineflayer bridge can
+optionally capture real rendered pixels via prismarine-viewer
+(`bridge/mineflayer/pixels.js`, best-effort, resized to the fixed pixel
+shape) instead of the colorized semantic-grid fallback.  Semantic streams
+(`world.front_block`, `world.sheltered`, `vision.entities`, `event.*`) are
+useful for debugging and auxiliary losses and stay classified `aux_debug`,
+but `ccr run --input-profile raw` excludes them from the online/actor-critic
+policy's fused state so the core agent does not depend on hand-written
+survival heuristics.
 
 ### 8. Add Internal Modulation (The Dopamine Analog)
 

@@ -266,3 +266,39 @@ path uses `StreamEncoderModule`s in `cognitive_runtime.neural`.
 The reserved `audio.*` declaration is intentionally a fixed neural stub:
 `AudioEncoder` emits a stable zero latent and checkpoints its stub state, but
 no Program publishes audio and no capture/spectrogram backend exists yet.
+
+### Stream classification and attention metadata (issue #32)
+
+Every `StreamDeclaration` also carries a `classification` -- **agent_input**
+(raw/near-raw sensory, proprioceptive, motor, reward and interoceptive
+(`internal.*`) streams the policy should actually consume), **aux_debug**
+(hand-computed semantic summaries -- `world.front_block`, `world.sheltered`,
+`vision.entities`, `event.*` narrations -- useful for dashboards/replay and
+auxiliary-loss targets, but not raw policy input), or **privileged**
+(exact ground-truth simulator state -- the unbounded-vocabulary `_exact`
+mirrors of *world* facts like `world.nearby_blocks_exact` -- recorded for
+replay fidelity only, excluded from both policy input and aux-loss targets).
+`StreamRegistry.assert_complete`/`missing` already fail loudly on an
+undeclared stream, so requiring `classification` on every `StreamDeclaration`
+(`StreamDeclaration.__post_init__`) makes the audit complete by construction;
+`tests/test_stream_classification.py` covers it end to end.
+
+Every `agent_input` declaration additionally carries an `AttentionMetadata`
+(modality, expected sample rate, relative encoding compute cost, and whether
+the stream can carry a direction/region localization hint) -- the per-stream
+metadata the attention controller (#59) will score against and the orienting
+reflex (#60) will consume for localizable streams; this issue only publishes
+the data, no scoring logic lives here. `describe()` includes both the
+classification and the attention fields in session metadata, so a recorded
+session is self-describing about which streams the policy consumed.
+
+`StreamRegistry.to_encoder_registry(classifications={"agent_input"})` builds
+a fusion registry restricted to agent-input streams -- the "raw input"
+profile: `ccr run --input-profile raw` fuses only that subset into the
+online/actor-critic policy's state, while aux/debug and privileged streams
+keep publishing and recording exactly as before (nothing about *what gets
+recorded* changes, only what reaches the policy). The neural pixel-BC
+pipeline has the analogous ablation via
+`training.datasets.build_neural_dataset(..., stream_profile="raw")`: "pixel
+only" (pixels + minimal agent-input proprioception) vs the default "full"
+("pixels + semantics").
