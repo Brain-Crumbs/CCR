@@ -55,7 +55,7 @@ generic: Minecraft health, a Linux battery and robot joint stress are all
 | `input` | Raw human input (demos) | `input.keypress` |
 | `world` | Global world state | `world.time`, `world.nearby_blocks` |
 | `motor` | Actions, the other direction | `motor.command` |
-| `internal` | Interoception: the runtime's own modulation signals, published back onto the bus (issue #58) | `internal.prediction_error`, `internal.reward_prediction_error`, `internal.learning_progress`, `internal.novelty`, `internal.risk` (published every tick, `core/modulation.py`); `internal.attention.weights` (planned, issue #59) |
+| `internal` | Interoception: the runtime's own modulation signals, published back onto the bus (issue #58) | `internal.prediction_error`, `internal.reward_prediction_error`, `internal.learning_progress`, `internal.novelty`, `internal.risk` (published every tick, `core/modulation.py`); `internal.attention.weights` (published every tick by the deterministic attention controller, issue #59, `core/attention.py`) |
 
 The `internal` modality is the biological-modulation analog (dopamine as
 reward-prediction-error, etc.): the agent's own error, progress, novelty and
@@ -349,11 +349,49 @@ undeclared stream, so requiring `classification` on every `StreamDeclaration`
 Every `agent_input` declaration additionally carries an `AttentionMetadata`
 (modality, expected sample rate, relative encoding compute cost, and whether
 the stream can carry a direction/region localization hint) -- the per-stream
-metadata the attention controller (#59) will score against and the orienting
-reflex (#60) will consume for localizable streams; this issue only publishes
-the data, no scoring logic lives here. `describe()` includes both the
-classification and the attention fields in session metadata, so a recorded
-session is self-describing about which streams the policy consumed.
+metadata the attention controller (#59) scores against and the orienting
+reflex (#60) will consume for localizable streams. `describe()` includes both
+the classification and the attention fields in session metadata, so a
+recorded session is self-describing about which streams the policy consumed.
+
+### Deterministic attention controller (issue #59)
+
+`cognitive_runtime/core/attention.py` turns the `AttentionMetadata` above
+into an actual per-tick allocation: every `agent_input`-classified stream
+(including `internal.*`) gets an `AttentionSignal` from nothing but its own
+recent history in the `TemporalBuffer` --
+
+- `novelty` — did this tick's payload hash change from the last one?
+- `prediction_error` — magnitude of a numeric stream's short-window trend.
+- `reward_relevance` — |Pearson correlation| between the stream's recent
+  numeric values and the catalog's `reward.*` stream over the same window.
+- `risk` — the current `internal.risk` value, shared across every stream's
+  signal this tick (a global "how dangerous is it right now" term).
+- `recency` — the same half-life decay `TemporalFusion` uses for silent
+  streams.
+- `boredom` — fraction of the recent window repeating the same value.
+- `compute_cost` — the registry's low/medium/high cost, as a penalty.
+
+`AttentionController.compute()` blends these into a score per
+`AttentionCoefficients`, then `AttentionBudget` forces a choice: only the
+top `max_streams` streams (by score) get nonzero weight, capped at
+`max_total_weight` in total. A hysteresis/dwell rule protects the selected
+"focus" stream from thrashing between near-equal spikes (`dwell_ticks`
+minimum persistence), while a challenger that clears `displacement_margin`
+above the focus's captured score still captures it immediately -- bottom-up
+capture. `attention="off"` (the CLI/`RuntimeConfig` default) instead gives
+every stream weight `1.0`, byte-identical to no attention controller at all.
+
+The runtime loop computes one `AttentionState` per tick
+(`CognitiveRuntime.attention`), stores it on `Memory.attention_state()`,
+publishes it as `internal.attention.weights`, folds its per-stream reason
+breakdown into `DecisionRecord.attention`, and feeds its weights into both
+`TemporalFusion.fuse(attention_weights=...)` (gating stream slices) and
+`LiveLearnedFusion.fuse`/`maybe_train_step` (issue #57's
+`LatentFusionModel.forward(attention_weights=...)` hook). `--attention
+{off,budgeted}` selects the mode; `tools.episode_viewer` renders the focus
+timeline with its reason breakdown, and `tools.metrics_dashboard` reports
+per-stream focus totals and average budget spent across budgeted episodes.
 
 `StreamRegistry.to_encoder_registry(classifications={"agent_input"})` builds
 a fusion registry restricted to agent-input streams -- the "raw input"

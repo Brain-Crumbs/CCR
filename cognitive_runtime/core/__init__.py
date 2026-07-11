@@ -18,6 +18,15 @@ from cognitive_runtime.core.entity_persistence import (
 )
 from cognitive_runtime.core.novelty import combine_novelty
 from cognitive_runtime.core.learner import Learner, NullLearner
+from cognitive_runtime.core.attention import (
+    AttentionBudget,
+    AttentionCoefficients,
+    AttentionConfig,
+    AttentionController,
+    AttentionReason,
+    AttentionSignal,
+    AttentionState,
+)
 
 __all__ = [
     "Action",
@@ -40,4 +49,11 @@ __all__ = [
     "combine_novelty",
     "Learner",
     "NullLearner",
+    "AttentionSignal",
+    "AttentionState",
+    "AttentionController",
+    "AttentionBudget",
+    "AttentionCoefficients",
+    "AttentionConfig",
+    "AttentionReason",
 ]

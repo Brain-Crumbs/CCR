@@ -35,6 +35,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from cognitive_runtime.core.action_space import action_space_hash
+from cognitive_runtime.core.attention import ATTENTION_MODES, AttentionController
 from cognitive_runtime.core.entity_persistence import EntityPersistence, NullEntityPersistence
 from cognitive_runtime.core.learner import Learner, NullLearner, window_reward, window_training_reward
 from cognitive_runtime.core.memory import Memory
@@ -95,6 +96,19 @@ VALUE_ESTIMATE_STREAM_SPEC = StreamSpec(
     "The policy's critic value estimate for the current fused state, when "
     "the policy exposes one.",
     payload_schema="{value_estimate}",
+)
+
+#: Deterministic attention controller (issue #59): the runtime's own
+#: per-tick allocation, published so it is recorded/replayable/visible like
+#: any other stream. "event" is the same modality stand-in `internal.*`
+#: (issue #58) and `model.novelty` already use for a runtime-computed,
+#: non-sensory signal.
+ATTENTION_WEIGHTS_STREAM = "internal.attention.weights"
+ATTENTION_WEIGHTS_STREAM_SPEC = StreamSpec(
+    ATTENTION_WEIGHTS_STREAM, "event",
+    "The attention controller's per-stream weights, selected streams, focus "
+    "stream and budget spent this tick (issue #59).",
+    payload_schema="{mode, weights, selected_streams, focus_stream, budget_used, budget_total}",
 )
 
 
@@ -178,6 +192,7 @@ class CognitiveRuntime:
         # still be published/recorded/replayed like any other stream.
         self.sensory_bus.register(NOVELTY_STREAM_SPEC)
         self.sensory_bus.register(VALUE_ESTIMATE_STREAM_SPEC)
+        self.sensory_bus.register(ATTENTION_WEIGHTS_STREAM_SPEC)
         for spec in INTERNAL_MODULATION_STREAM_SPECS:
             self.sensory_bus.register(spec)
         #: Interoceptive modulation signals (issue #58): prediction error,
@@ -187,6 +202,27 @@ class CognitiveRuntime:
         #: skill (learning_progress's EMA state) is a property of the model,
         #: not of any one episode.
         self.modulation = ModulationTracker()
+        attention_mode = self.config.attention_mode
+        if attention_mode not in ATTENTION_MODES:
+            raise ValueError(
+                f"unknown attention_mode {attention_mode!r}; expected one of "
+                f"{sorted(ATTENTION_MODES)}"
+            )
+        #: Deterministic attention controller (issue #59): budgeted,
+        #: registry-metadata-driven salience scoring over every agent-input
+        #: stream, including the internal.* modulation streams above --
+        #: "off" (the default) reproduces the pre-#59 fused output exactly.
+        self.attention = AttentionController(
+            catalog=[
+                *self.program.stream_catalog(),
+                NOVELTY_STREAM_SPEC,
+                VALUE_ESTIMATE_STREAM_SPEC,
+                ATTENTION_WEIGHTS_STREAM_SPEC,
+                *INTERNAL_MODULATION_STREAM_SPECS,
+            ],
+            stream_registry=self.stream_registry,
+            mode=attention_mode,
+        )
         self._stop_requested = False
 
     def stop(self) -> None:
@@ -266,6 +302,7 @@ class CognitiveRuntime:
         self.learner.reset()
         self.synchronizer.reset()
         self.scheduler.reset()
+        self.attention.reset()
         episode_id = self.recorder.start_episode(episode_index)
 
         ratio = self.config.program_ticks_per_cognitive_tick
@@ -280,6 +317,9 @@ class CognitiveRuntime:
         prediction_error_ticks = 0
         novelty_total = 0.0
         novelty_ticks = 0
+        attention_budget_total = 0.0
+        attention_budget_ticks = 0
+        attention_focus_counts: Dict[str, int] = {}
         recoverable_error: Optional[str] = None
 
         while not self._stop_requested:
@@ -304,10 +344,40 @@ class CognitiveRuntime:
             decide_start = time.perf_counter()
             window = self.synchronizer.collect(self.sensory_bus)
             self.memory.update(window)
+            attention_state = self.attention.compute(window.tick_index, self.memory.buffer)
+            self.memory.set_attention_state(attention_state)
+            self.sensory_bus.publish(
+                ATTENTION_WEIGHTS_STREAM,
+                {
+                    "mode": attention_state.mode,
+                    "weights": {k: round(v, 6) for k, v in attention_state.weights.items()},
+                    "selected_streams": list(attention_state.selected_streams),
+                    "focus_stream": attention_state.focus_stream,
+                    "budget_used": round(attention_state.budget_used, 6),
+                    "budget_total": round(attention_state.budget_total, 6),
+                },
+                window.ended_at,
+                source="model",
+            )
+            if attention_state.mode == "budgeted":
+                attention_budget_total += attention_state.budget_used
+                attention_budget_ticks += 1
+                if attention_state.focus_stream is not None:
+                    attention_focus_counts[attention_state.focus_stream] = (
+                        attention_focus_counts.get(attention_state.focus_stream, 0) + 1
+                    )
             if self.learned_fusion is not None:
-                self.memory.set_fused_latent(self.learned_fusion.fuse(window, self.memory.buffer))
+                self.memory.set_fused_latent(
+                    self.learned_fusion.fuse(
+                        window, self.memory.buffer, attention_weights=attention_state.weights
+                    )
+                )
             else:
-                self.memory.set_fused_latent(self.fusion.fuse(None, self.memory.buffer))
+                self.memory.set_fused_latent(
+                    self.fusion.fuse(
+                        None, self.memory.buffer, attention_weights=attention_state.weights
+                    )
+                )
             # The policy's State is derived from stream state, not pulled from
             # the Program: the latest value each stream has published, shaped
             # like an Observation for observation-based policies.
@@ -355,7 +425,10 @@ class CognitiveRuntime:
             self.learner.update(window)
             if self.learned_fusion is not None:
                 self.learned_fusion.maybe_train_step(
-                    window, self.memory.buffer, reward=window_training_reward(window)
+                    window,
+                    self.memory.buffer,
+                    reward=window_training_reward(window),
+                    attention_weights=attention_state.weights,
                 )
 
             reward_value = window_reward(window)
@@ -400,6 +473,7 @@ class CognitiveRuntime:
                         if prediction.prediction_error is not None
                         else None
                     ),
+                    attention=attention_state.to_dict(),
                 ),
             )
 
@@ -452,6 +526,13 @@ class CognitiveRuntime:
             avg_novelty=(
                 round(novelty_total / novelty_ticks, 6) if novelty_ticks else None
             ),
+            avg_attention_budget_used=(
+                round(attention_budget_total / attention_budget_ticks, 6)
+                if attention_budget_ticks
+                else None
+            ),
+            attention_focus_counts=dict(sorted(attention_focus_counts.items())),
+            attention_mode=self.attention.mode,
         )
         self.recorder.write_summary(summary)
         self.recorder.end_episode_file()

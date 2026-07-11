@@ -123,8 +123,20 @@ Important limitations:
   encoding is out of scope (`vision.frame.pixels` stays a deliberate raw
   stub in both fusion modes) pending a trainable `PixelStreamEncoder`
   binding.
-- There is no attention system: every stream contributes equally to the
-  fused state every tick, and nothing records what mattered (issue #59).
+- Deterministic attention (issue #59, `cognitive_runtime/core/attention.py`)
+  scores every `agent_input`-classified stream's salience each tick
+  (novelty, prediction-error-like trend, reward relevance, risk, recency,
+  boredom, compute cost) and allocates a hard per-tick budget across them,
+  with bottom-up capture and dwell/hysteresis against thrash. `attention="off"`
+  (the default) gives every stream uniform weight `1.0` -- byte-identical to
+  no attention controller; `attention="budgeted"` gates `TemporalFusion`'s
+  stream slices and feeds `LatentFusionModel`'s `attention_weights` hook
+  (#57). The resulting `AttentionState` (weights, focus stream, budget
+  spent, per-stream reason breakdown) is recorded every tick, published as
+  `internal.attention.weights`, and rendered in the episode viewer's
+  attention timeline and the dashboard's focus totals. Neural/learned
+  attention scoring (issue #63) and the orienting-reflex motor reaction
+  (issue #60) stay out of scope here.
 
 ## Necessary Changes
 
@@ -329,6 +341,19 @@ via the orienting reflex — where the sensors move next.
   milestone is *observability*: every tick can explain what the agent
   attended to and why.
 - Weights feed learned fusion (#57's hook) and the policy's context.
+
+*Status: the deterministic controller landed (#59,
+`cognitive_runtime/core/attention.py`): `AttentionSignal`/`AttentionState`/
+`AttentionController`/`AttentionBudget`, config-driven coefficients, a
+hard per-tick budget (top-k streams and/or a total-weight cap), and
+dwell/hysteresis-protected focus. `--attention {off,budgeted}` (default
+`off`) controls it end to end -- `TemporalFusion.fuse` and
+`LiveLearnedFusion.fuse`/`maybe_train_step` both take the resulting
+per-stream weights, `Memory.attention_state()` holds the tick's state,
+`DecisionRecord.attention` and `internal.attention.weights` record it, and
+`tools.episode_viewer`/`tools.metrics_dashboard` render the focus timeline
+and per-stream focus totals. Neural attention (#63) and the orienting
+reflex (#60) are not built yet.*
 
 ### 10. Add The Orienting Reflex And Active Perception
 
