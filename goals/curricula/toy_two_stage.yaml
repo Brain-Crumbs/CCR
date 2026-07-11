@@ -1,0 +1,49 @@
+# Toy two-stage curriculum (issue #43): the curriculum runner's own
+# acceptance fixture -- small enough to train+evaluate unattended in CI, but
+# exercising the real promotion/hold/resume mechanics.
+#
+# Both stages share `world_size` so the stream layout (and therefore the
+# actor/critic checkpoint) is identical across the stage boundary -- see
+# `curriculum_runner.load_curriculum_definition`'s layout-consistency check.
+#
+# See docs/curriculum.md for the schema reference and CLI usage.
+
+name: toy-two-stage
+description: >
+  Stage 1: no mobs, easy to survive the full (short) episode -- promotion
+  just confirms the brain reliably reaches the end. Stage 2: turns on a
+  short day/night cycle and a couple of mobs, gated on survival rate.
+
+stages:
+  - name: flat-safe-toy
+    world_config:
+      world_size: 32
+      episode_ticks: 300
+      day_length: 24000
+      difficulty: 0.0
+      max_mobs: 0
+    reward_config:
+      tick_alive: 0.02
+    train_episodes: 2
+    promotion:
+      metric: average_ticks
+      threshold: 250
+      sample_size: 2
+    max_attempts: 2
+
+  - name: night-survival-toy
+    world_config:
+      world_size: 32
+      episode_ticks: 300
+      day_length: 400
+      start_time: 0
+      difficulty: 1.0
+      max_mobs: 2
+    reward_config:
+      survived_night: 2.0
+    train_episodes: 2
+    promotion:
+      metric: survival_rate
+      threshold: 0.0
+      sample_size: 2
+    max_attempts: 2

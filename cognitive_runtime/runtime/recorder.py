@@ -99,6 +99,11 @@ class EpisodeSummary:
     #: Named curriculum preset (issue #30), if the run used one; `None` for a
     #: plain run and for episode summaries recorded before this field existed.
     curriculum: Optional[str] = None
+    #: Ordered stage position within the curriculum runner's definition
+    #: (issue #43), if any; `None` for a plain run, a bare `--curriculum`
+    #: preset run, and every episode summary recorded before this field
+    #: existed.
+    curriculum_stage_index: Optional[int] = None
     # Runtime health: events/sec per stream_id, total counts, and streams that
     # fell silent.
     stream_event_rates: Dict[str, float] = field(default_factory=dict)

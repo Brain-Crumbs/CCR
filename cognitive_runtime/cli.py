@@ -1139,6 +1139,56 @@ def cmd_evaluation_gates(args: argparse.Namespace) -> None:
         print(f"\ngate results written to checkpoint training stats: {args.checkpoint}")
 
 
+def cmd_curriculum_run(args: argparse.Namespace) -> None:
+    """The curriculum runner (issue #43): train/evaluate/promote (or hold) an
+    actor/critic checkpoint through an ordered list of staged world/reward
+    configs, unattended. See docs/curriculum.md for the definition schema."""
+    try:
+        from cognitive_runtime.training.curriculum_runner import (
+            CurriculumDefinitionError,
+            load_curriculum_definition,
+            run_curriculum,
+        )
+    except ImportError as exc:  # torch not installed
+        sys.exit(f"the curriculum runner needs PyTorch ({exc}); install '.[neural]'.")
+
+    try:
+        definition = load_curriculum_definition(args.curriculum_file)
+    except CurriculumDefinitionError as exc:
+        sys.exit(str(exc))
+
+    try:
+        result = run_curriculum(
+            definition,
+            checkpoint_path=args.checkpoint,
+            model_seed=args.model_seed,
+            train_seed=args.train_seed,
+            eval_seed=args.eval_seed,
+            start_stage=args.stage,
+            force_promote=args.force_promote,
+            fresh=args.fresh,
+            record_dir=None if args.no_record else args.record_dir,
+        )
+    except (CurriculumDefinitionError, ValueError) as exc:
+        sys.exit(str(exc))
+
+    print(f"curriculum: {definition.name}  ({'resumed' if result.resumed else 'fresh start'})")
+    print(f"status: {result.status}")
+    if result.completed:
+        print(f"all {len(definition.stages)} stage(s) promoted through.")
+    else:
+        print(f"held at stage {result.state.stage_index} ({definition.stages[result.state.stage_index].name!r}):")
+        print(f"  {result.state.hold_reason}")
+    print("\nattempt history:")
+    for entry in result.state.history:
+        print(
+            f"  stage={entry['stage']!r} attempt={entry['attempt']} "
+            f"{entry['metric']}={entry['value']!r} threshold={entry['threshold']!r} "
+            f"promoted={entry['promoted']}{' (forced)' if entry['forced'] else ''}"
+        )
+    print(f"\ncurriculum state written to checkpoint training stats: {args.checkpoint}")
+
+
 def cmd_dashboard(args: argparse.Namespace) -> None:
     print(dashboard(args.record_dir))
 
@@ -1295,6 +1345,43 @@ def build_parser() -> argparse.ArgumentParser:
                          help="write the trained actor/critic bundle here with the gate "
                               "results in its training stats (issue #20)")
     p_gates.set_defaults(func=cmd_evaluation_gates)
+
+    p_curriculum_run = sub.add_parser(
+        "curriculum-run",
+        help="run/resume a staged curriculum with metric-gated promotion (issue #43)",
+    )
+    p_curriculum_run.add_argument(
+        "--curriculum-file", default="goals/curricula/toy_two_stage.yaml",
+        help="curriculum definition YAML/JSON: ordered stages, each a world/reward "
+             "config plus promotion criteria (docs/curriculum.md)",
+    )
+    p_curriculum_run.add_argument(
+        "--checkpoint", required=True,
+        help="actor/critic checkpoint bundle carried across stage boundaries; curriculum "
+             "progress (stage, attempts, promotion history) lives in its training stats",
+    )
+    p_curriculum_run.add_argument(
+        "--stage", type=int, default=None,
+        help="override the stage to (re)start from, by index (default: resume from the "
+             "checkpoint's saved progress, or stage 0 with no checkpoint/--fresh)",
+    )
+    p_curriculum_run.add_argument(
+        "--force-promote", action="store_true",
+        help="promote past the very next evaluation regardless of its metric value "
+             "(manual override for experimentation)",
+    )
+    p_curriculum_run.add_argument(
+        "--fresh", action="store_true",
+        help="ignore any existing checkpoint and start stage 0 with fresh weights",
+    )
+    p_curriculum_run.add_argument("--model-seed", type=int, default=1)
+    p_curriculum_run.add_argument("--train-seed", type=int, default=100)
+    p_curriculum_run.add_argument("--eval-seed", type=int, default=500)
+    p_curriculum_run.add_argument("--record-dir", default="sessions",
+                                   help="record train/eval sessions here")
+    p_curriculum_run.add_argument("--no-record", action="store_true",
+                                   help="skip recording sessions")
+    p_curriculum_run.set_defaults(func=cmd_curriculum_run)
 
     p_train = sub.add_parser("train", help="train a behavioral-cloning policy from sessions")
     p_train.add_argument("--sessions", nargs="+", required=True,
