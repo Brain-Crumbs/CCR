@@ -79,6 +79,15 @@ RECIPES: Dict[str, List[Tuple[str, Dict[str, int], Dict[str, int]]]] = {
     ],
 }
 
+#: recipe id -> container it requires, derived from RECIPES so a CRAFT(recipe)
+#: action (issue #42) can validate placement without duplicating the table.
+RECIPE_CONTAINER: Dict[str, str] = {
+    name: container for container, recipes in RECIPES.items() for name, _, _ in recipes
+}
+#: Stable (insertion) order of every recipe id, for enumerating CRAFT(recipe)
+#: as a discrete action per recipe.
+RECIPE_NAMES: Tuple[str, ...] = tuple(RECIPE_CONTAINER)
+
 BLOCK_IDS = {
     "grass": 1, "dirt": 2, "sand": 3, "water": 4, "tree": 5,
     "stone": 6, "coal_ore": 7, "berry_bush": 8, "placed_block": 9, "barrier": 10,
@@ -217,6 +226,7 @@ class SimulatedWorld:
         self.inventory: Dict[str, int] = {}
         self.hotbar: List[Optional[str]] = [None] * 9
         self.selected_slot = 0
+        self.inventory_open = False
         self.mobs: List[Dict[str, Any]] = []
         self._mob_serial = 0
         self.dead = False
@@ -453,6 +463,24 @@ class SimulatedWorld:
             slot = int(action.param("slot", 0))
             if 0 <= slot < len(self.hotbar):
                 self.selected_slot = slot
+        elif name == "INTERACT":
+            self._interact(events)
+        elif name == "OPEN_INVENTORY":
+            self._open_inventory(events)
+        elif name == "CLOSE_INVENTORY":
+            self._close_inventory(events)
+        elif name == "EQUIP_ITEM":
+            self._equip_item(int(action.param("slot", -1)), events)
+        elif name == "PLACE_BLOCK":
+            self._place_block(int(action.param("slot", -1)), events)
+        elif name == "USE_ITEM":
+            self._use_item(int(action.param("slot", -1)), events)
+        elif name == "MOVE_INVENTORY_ITEM":
+            self._move_inventory_item(
+                int(action.param("from_slot", -1)), int(action.param("to_slot", -1)), events
+            )
+        elif name == "CRAFT":
+            self._craft(str(action.param("recipe", "")), events)
 
     def _move(self, name: str, events: List[str]) -> None:
         fx, fz = self._facing_vector()
@@ -565,22 +593,153 @@ class SimulatedWorld:
                         # sim-side trigger.
                         events.append("created_light_source")
 
+    def _reject(self, reason: str, events: List[str]) -> None:
+        """Record an ``event.action_rejected`` cause (issue #42): the agent
+        gets feedback instead of silence for an invalid parameterized action
+        (craft without materials, equip an empty slot, place/use out of
+        range, ...)."""
+        events.append(f"action_rejected:{reason}")
+
+    def _interact(self, events: List[str]) -> None:
+        """Generic interaction with whatever is directly in front: a
+        container in the simulated world (chest/furnace/crafting table --
+        same event as USE's container branch, but never auto-crafts; CRAFT
+        is the explicit trigger for that).  Doors/villagers have no
+        sim-side model yet; a live server supplies them via the mineflayer
+        bridge."""
+        bx, bz = self._front_cell()
+        if 0 < bx < self.size - 1 and 0 < bz < self.size - 1:
+            front = self.terrain[bx][bz]
+            if front in CONTAINER_BLOCKS:
+                events.append(
+                    "container_interact:" + json.dumps(
+                        {"container": front, "position": {"x": bx, "y": 64.0, "z": bz}}
+                    )
+                )
+                return
+        self._reject("nothing to interact with", events)
+
+    def _open_inventory(self, events: List[str]) -> None:
+        if self.inventory_open:
+            self._reject("inventory already open", events)
+            return
+        self.inventory_open = True
+
+    def _close_inventory(self, events: List[str]) -> None:
+        if not self.inventory_open:
+            self._reject("inventory already closed", events)
+            return
+        self.inventory_open = False
+
+    def _equip_item(self, slot: int, events: List[str]) -> None:
+        if not 0 <= slot < len(self.hotbar):
+            self._reject(f"invalid slot {slot}", events)
+            return
+        if self.hotbar[slot] is None:
+            self._reject(f"cannot equip empty slot {slot}", events)
+            return
+        self.selected_slot = slot
+
+    def _place_block(self, slot: int, events: List[str]) -> None:
+        if not 0 <= slot < len(self.hotbar):
+            self._reject(f"invalid slot {slot}", events)
+            return
+        item = self.hotbar[slot]
+        if item is None or self.inventory.get(item, 0) <= 0:
+            self._reject(f"no item to place in slot {slot}", events)
+            return
+        if item not in PLACEABLE_ITEMS:
+            self._reject(f"{item} is not placeable", events)
+            return
+        bx, bz = self._front_cell()
+        if not (0 < bx < self.size - 1 and 0 < bz < self.size - 1):
+            self._reject("cannot place block out of bounds", events)
+            return
+        if self.terrain[bx][bz] not in PASSABLE or (bx, bz) == (int(self.x), int(self.z)):
+            self._reject("target cell is not placeable", events)
+            return
+        self.terrain[bx][bz] = "placed_block"
+        self._remove_item(item)
+        self.stats["blocks_placed"] += 1
+        events.append("placed_block")
+        events.append(
+            "block_placed_exact:" + json.dumps(
+                {"block": item, "position": {"x": bx, "y": 64.0, "z": bz}}
+            )
+        )
+        if item == "torch":
+            events.append("created_light_source")
+
+    def _use_item(self, slot: int, events: List[str]) -> None:
+        if not 0 <= slot < len(self.hotbar):
+            self._reject(f"invalid slot {slot}", events)
+            return
+        item = self.hotbar[slot]
+        if item is None or self.inventory.get(item, 0) <= 0:
+            self._reject(f"no item to use in slot {slot}", events)
+            return
+        if item not in FOOD_ITEMS:
+            self._reject(f"{item} is not usable", events)
+            return
+        self.hunger = min(20.0, self.hunger + FOOD_ITEMS[item])
+        self._remove_item(item)
+        self.stats["food_consumed"] += 1
+        events.append("ate_food")
+
+    def _move_inventory_item(self, from_slot: int, to_slot: int, events: List[str]) -> None:
+        if not (0 <= from_slot < len(self.hotbar) and 0 <= to_slot < len(self.hotbar)):
+            self._reject(f"invalid slots {from_slot},{to_slot}", events)
+            return
+        if from_slot == to_slot:
+            self._reject("cannot move a slot onto itself", events)
+            return
+        if self.hotbar[from_slot] is None and self.hotbar[to_slot] is None:
+            self._reject(f"both slots {from_slot},{to_slot} are empty", events)
+            return
+        self.hotbar[from_slot], self.hotbar[to_slot] = self.hotbar[to_slot], self.hotbar[from_slot]
+
+    def _craft(self, recipe: str, events: List[str]) -> None:
+        """Craft a specific recipe by id (issue #42), parameterized unlike
+        the implicit "USE a container" path -- rejected, not silently
+        skipped, when the container or materials aren't right."""
+        container = RECIPE_CONTAINER.get(recipe)
+        if container is None:
+            self._reject(f"unknown recipe {recipe!r}", events)
+            return
+        bx, bz = self._front_cell()
+        front = self.terrain[bx][bz] if 0 < bx < self.size - 1 and 0 < bz < self.size - 1 else None
+        if front != container:
+            self._reject(f"recipe {recipe!r} needs a {container}", events)
+            return
+        _, inputs, outputs = next(
+            (n, i, o) for n, i, o in RECIPES[container] if n == recipe
+        )
+        if not all(self.inventory.get(item, 0) >= count for item, count in inputs.items()):
+            self._reject(f"insufficient materials for {recipe!r}", events)
+            return
+        self._apply_recipe(recipe, inputs, outputs, events)
+
+    def _apply_recipe(
+        self, name: str, inputs: Dict[str, int], outputs: Dict[str, int], events: List[str]
+    ) -> None:
+        for item, count in inputs.items():
+            self._remove_item(item, count)
+        for item, count in outputs.items():
+            self._add_item(item, events, count)
+        events.append(
+            "crafted:" + json.dumps({"recipe": name, "inputs": inputs, "outputs": outputs})
+        )
+
     def _try_craft(self, container: str, events: List[str]) -> None:
         """Minimal deterministic crafting/smelting: fixed recipes per
-        container type, tried in order (see `RECIPES`).  Out of scope: a
-        CRAFT action to trigger this on demand -- USE against the container
-        is the trigger, consistent with issue #40 (new event streams, no new
-        actions)."""
+        container type, tried in order (see `RECIPES`).  This is USE's
+        implicit auto-craft (issue #40), kept for backward compatibility
+        with recorded sessions; CRAFT(recipe) (issue #42) is the explicit,
+        parameterized, rejection-on-failure alternative."""
         for name, inputs, outputs in RECIPES.get(container, []):
             if not all(self.inventory.get(item, 0) >= count for item, count in inputs.items()):
                 continue
-            for item, count in inputs.items():
-                self._remove_item(item, count)
-            for item, count in outputs.items():
-                self._add_item(item, events, count)
-            events.append(
-                "crafted:" + json.dumps({"recipe": name, "inputs": inputs, "outputs": outputs})
-            )
+            self._apply_recipe(name, inputs, outputs, events)
             return
 
     def _add_item(self, item: str, events: List[str], count: int = 1) -> None:
@@ -815,7 +974,8 @@ class SimulatedWorld:
 
     _SNAPSHOT_FIELDS = (
         "seed", "tick", "x", "z", "spawn", "yaw", "pitch", "health", "hunger",
-        "oxygen", "inventory", "hotbar", "selected_slot", "mobs", "_mob_serial",
+        "oxygen", "inventory", "hotbar", "selected_slot", "inventory_open",
+        "mobs", "_mob_serial",
         "dead", "death_reason", "_regen_counter", "_starve_counter",
         "_drown_counter", "_was_night", "_sheltered", "stats", "terrain",
         "dimension", "_biome", "_discovered_structures", "_advancements_earned",

@@ -45,6 +45,9 @@ def test_action_space_matches_mvp_plan():
         "NULL", "MOVE_FORWARD", "MOVE_BACKWARD", "MOVE_LEFT", "MOVE_RIGHT",
         "JUMP", "SNEAK", "SPRINT", "LOOK_LEFT", "LOOK_RIGHT", "LOOK_UP",
         "LOOK_DOWN", "ATTACK", "USE", "SELECT_HOTBAR_SLOT",
+        # Issue #42: crafting, inventory, equip, targeted placement/use, interact.
+        "INTERACT", "OPEN_INVENTORY", "CLOSE_INVENTORY", "EQUIP_ITEM",
+        "PLACE_BLOCK", "USE_ITEM", "MOVE_INVENTORY_ITEM", "CRAFT",
     }
     assert names == expected
 
@@ -52,9 +55,22 @@ def test_action_space_matches_mvp_plan():
 def test_invalid_action_rejected():
     program = MinecraftSurvivalBox(config=FAST_CONFIG)
     program.reset(seed=0)
-    assert not program.act(Action("CRAFT")).ok
+    assert not program.act(Action("EXPLODE")).ok  # wholly unknown action name
+    assert not program.act(Action("CRAFT")).ok  # missing/unknown recipe param
     assert not program.act(Action.make("SELECT_HOTBAR_SLOT", slot=99)).ok
     assert program.act(NULL_ACTION).ok
+
+
+def test_world_level_action_rejected_events():
+    """Actions that pass the adapter's shape check (a valid name/slot) but
+    are invalid given world state (empty slot, no materials, ...) still
+    apply -- ``ok=True`` -- but surface an ``action_rejected:`` event
+    (issue #42), the same pattern crafting-without-materials already used."""
+    program = MinecraftSurvivalBox(config=FAST_CONFIG)
+    program.reset(seed=0)
+    result = program.act(Action.make("EQUIP_ITEM", slot=0))  # slot 0 starts empty
+    assert result.ok
+    assert any(e.startswith("action_rejected:") for e in result.info["events"])
 
 
 def test_snapshot_restore():

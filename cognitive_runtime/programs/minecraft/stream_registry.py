@@ -90,6 +90,24 @@ MINECRAFT_STREAM_REGISTRY: StreamRegistry = DEFAULT_STREAM_REGISTRY.extend(
             ),
         ),
         StreamDeclaration(
+            "body.inventory_open",
+            encoder_factory=None,
+            trainable=True,
+            train_eval_behavior="trainable",
+            neural_encoder="cognitive_runtime.neural.BodyStateEncoder",
+            neural_latent_width=8,
+            classification="agent_input",
+            attention=AttentionMetadata(modality="body", relative_compute_cost="low"),
+            note=(
+                "Inventory-open flag (issue #42's OPEN_INVENTORY/CLOSE_INVENTORY); "
+                "no legacy fusion slot is bound (Minecraft-specific, unlike the "
+                "generic body.alive/body.in_water booleans in the default "
+                "registry), neural path uses BodyStateEncoder like those. "
+                "Self-state (the agent's own UI state), not a privileged world "
+                "fact -- agent input."
+            ),
+        ),
+        StreamDeclaration(
             "body.inventory_exact",
             encoder_factory=None,
             trainable=True,

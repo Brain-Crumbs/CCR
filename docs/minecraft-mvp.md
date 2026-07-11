@@ -105,13 +105,45 @@ plus `biome`, `time_of_day`, `mobs` (distance/bearing), `front_block`,
 Future: audio, crafting state, tool durability, semantic events,
 long-range map memory.
 
-## Actions (MVP — kept small)
+## Actions
 
-`NULL`, `MOVE_FORWARD/BACKWARD/LEFT/RIGHT`, `JUMP`, `SNEAK`, `SPRINT`,
-`LOOK_LEFT/RIGHT/UP/DOWN`, `ATTACK`, `USE`, `SELECT_HOTBAR_SLOT(slot)`.
+MVP core: `NULL`, `MOVE_FORWARD/BACKWARD/LEFT/RIGHT`, `JUMP`, `SNEAK`,
+`SPRINT`, `LOOK_LEFT/RIGHT/UP/DOWN`, `ATTACK`, `USE`, `SELECT_HOTBAR_SLOT(slot)`.
 
-Later: `CRAFT`, `DROP_ITEM`, `OPEN_INVENTORY`, `MOVE_INVENTORY_ITEM`,
-`PLACE_BLOCK`, `EQUIP_ITEM`, `TYPE_COMMAND`.
+Issue #42 (quest-level play) added: `CRAFT(recipe)` (a specific recipe id
+from `world.RECIPES`, rejected — not silently skipped — without the right
+container or materials, unlike `USE`'s implicit "try every recipe" auto-craft
+which stays for backward compatibility), `OPEN_INVENTORY`/`CLOSE_INVENTORY`,
+`MOVE_INVENTORY_ITEM(from_slot, to_slot)` (swaps two hotbar slots — the sim
+has no inventory grid beyond the 9-slot hotbar), `EQUIP_ITEM(slot)` (like
+`SELECT_HOTBAR_SLOT` but rejects an empty slot instead of silently selecting
+it), `PLACE_BLOCK(slot)`/`USE_ITEM(slot)` (act on a specific hotbar slot,
+independent of what's currently selected), and `INTERACT` (containers, same
+as `USE`'s container branch but never auto-crafts; doors/villagers on the
+live backend only — see `bridge/mineflayer/README.md`'s smoke checklist).
+Every rejection publishes `event.action_rejected` with a reason (craft
+without materials, equip/place/use an empty slot, interact with nothing,
+...), so the agent gets feedback instead of silence.
+
+`pathing/navigation primitives` and `TYPE_COMMAND` remain out of scope.
+
+### Action-space versioning
+
+Growing `ACTION_SPACE` changes `cognitive_runtime.core.action_space.action_space_hash`
+(recorded in session metadata as `action_space_hash`, next to the existing
+`action_space` key list) and, for neural policies,
+`NeuralAgentCheckpoint.compatibility_hash`. Loading a checkpoint whose action
+keys don't match still fails loudly by default (issue #20's contract) —
+but `NeuralAgentCheckpoint.load(..., allow_action_space_growth=True)`
+additionally accepts a checkpoint whose action keys are an ordered *prefix*
+of the runtime's current action space (i.e. only new actions were appended,
+none removed or reordered): `MLPPolicyModel`/`MLPValueModel` implement
+`load_state_dict_with_action_growth`, which copies over every weight/bias
+row or column an existing action already had and leaves the newly-added
+rows/columns at the live model's own fresh initialization — a curriculum
+step that grows the action space does not discard a checkpoint trained on
+the smaller one. See `tests/test_neural_checkpoint.py`'s
+`test_neural_checkpoint_action_space_growth_*` tests for the exact contract.
 
 ## Reward design (`programs/minecraft/rewards.py`)
 

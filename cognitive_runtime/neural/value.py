@@ -10,7 +10,7 @@ No concrete value architecture is implemented here.
 from __future__ import annotations
 
 import abc
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence
 
 import torch
 from torch import nn
@@ -130,3 +130,49 @@ class MLPValueModel(ValueModel):
             "layout_hash": self.layout_hash,
             "action_keys": self.action_keys,
         }
+
+    def load_state_dict_with_action_growth(
+        self,
+        old_state: Mapping[str, torch.Tensor],
+        old_action_keys: Sequence[str],
+        new_action_keys: Sequence[str],
+    ) -> None:
+        """Critic counterpart of ``MLPPolicyModel.load_state_dict_with_action_growth``
+        (issue #42): the critic has no per-action output head, but its
+        ``trunk.0`` input still grows with ``world_feature_width`` (the
+        motor-history one-hot appended at the tail), so it needs the same
+        column-preserving surgery.
+        """
+        old_keys = list(old_action_keys)
+        new_keys = list(new_action_keys)
+        if not old_keys or new_keys[: len(old_keys)] != old_keys:
+            raise ValueError(
+                "action-space growth requires old_action_keys to be a "
+                f"non-empty ordered prefix of new_action_keys; old={old_keys} "
+                f"new={new_keys}"
+            )
+        if len(new_keys) <= len(old_keys):
+            raise ValueError(
+                "load_state_dict_with_action_growth expects a strict "
+                f"superset; old has {len(old_keys)} actions, new has "
+                f"{len(new_keys)}"
+            )
+        merged = dict(self.state_dict())
+        for key, old_tensor in old_state.items():
+            if key not in merged:
+                continue
+            new_tensor = merged[key]
+            if tuple(old_tensor.shape) == tuple(new_tensor.shape):
+                merged[key] = old_tensor
+            elif key == "trunk.0.weight":
+                grown = new_tensor.clone()
+                grown[:, : old_tensor.shape[1]] = old_tensor
+                merged[key] = grown
+            else:
+                raise ValueError(
+                    f"cannot grow action space: unexpected shape change in "
+                    f"{key!r} ({tuple(old_tensor.shape)} -> "
+                    f"{tuple(new_tensor.shape)})"
+                )
+        self.load_state_dict(merged, strict=True)
+        self.action_keys = new_keys

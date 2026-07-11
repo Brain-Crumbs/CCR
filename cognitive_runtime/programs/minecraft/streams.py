@@ -136,6 +136,9 @@ def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
                    payload_schema="{minecraft_item_name: count}"),
         StreamSpec("body.hotbar", "body", "Hotbar slots + selected, on change.",
                    payload_schema='{"slots": [item|null], "selected": int}'),
+        StreamSpec("body.inventory_open", "body",
+                   "Inventory-open flag (OPEN_INVENTORY/CLOSE_INVENTORY), on change.",
+                   payload_schema="bool"),
         StreamSpec("body.in_water", "body", "In-water flag, on change.",
                    payload_schema="bool"),
         StreamSpec("body.alive", "body", "Alive flag; flips once on death.",
@@ -289,6 +292,7 @@ class SurvivalStreamPublisher:
         if "inventory_exact" in data:
             pub("body.inventory_exact", data["inventory_exact"])
         pub("body.hotbar", {"slots": data["hotbar"], "selected": data["selected_slot"]})
+        pub("body.inventory_open", data["inventory_open"])
         pub("body.in_water", data["in_water"])
         pub("body.alive", not data["dead"])
         pub("spatial.position", data["position"])
@@ -346,6 +350,8 @@ class SurvivalStreamPublisher:
             return "event.structure_discovered", {"structure": event_string.split(":", 1)[1]}
         if event_string.startswith("container_interact:"):
             return "event.container_interaction", json.loads(event_string.split(":", 1)[1])
+        if event_string.startswith("action_rejected:"):
+            return "event.action_rejected", {"reason": event_string.split(":", 1)[1]}
         if event_string == "created_light_source":
             return "event.created_light_source", {}
         if event_string.startswith("used_tool:"):

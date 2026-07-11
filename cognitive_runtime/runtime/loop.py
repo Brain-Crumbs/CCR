@@ -34,6 +34,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
+from cognitive_runtime.core.action_space import action_space_hash
 from cognitive_runtime.core.entity_persistence import EntityPersistence, NullEntityPersistence
 from cognitive_runtime.core.learner import Learner, NullLearner, window_reward
 from cognitive_runtime.core.memory import Memory
@@ -190,6 +191,11 @@ class CognitiveRuntime:
             "curriculum": self.config.curriculum,
             "program_config": self.config.program_config,
             "action_space": [a.key() for a in meta.action_space],
+            # Versions the action space (issue #42) alongside it: a curriculum
+            # step that grows ACTION_SPACE changes this hash, which is what
+            # NeuralAgentCheckpoint.load(allow_action_space_growth=True)
+            # compares against to detect (and migrate) exactly that case.
+            "action_space_hash": action_space_hash([a.key() for a in meta.action_space]),
             "stream_catalog": [s.to_dict() for s in self.program.stream_catalog()],
             # Marks sessions whose ndarray-payload (frame) stream events hash
             # raw bytes rather than JSON -- see StreamEvent.hash() and

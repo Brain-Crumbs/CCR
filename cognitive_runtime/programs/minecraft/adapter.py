@@ -24,6 +24,7 @@ from cognitive_runtime.core.streams.motor import (
 )
 from cognitive_runtime.core.streams.pacer import RatePacer
 from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE, HOTBAR_SLOTS
+from cognitive_runtime.programs.minecraft.world import RECIPE_NAMES
 from cognitive_runtime.programs.minecraft.backend import SimulatedBackend, SurvivalBackend
 from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
 from cognitive_runtime.programs.minecraft.observations import OBSERVATION_KEYS
@@ -127,10 +128,24 @@ class MinecraftSurvivalBox(Program):
     def _validation_error(action: Action) -> Optional[str]:
         if action.name not in _VALID_ACTION_NAMES:
             return f"unknown action {action.name}"
-        if action.name == "SELECT_HOTBAR_SLOT":
+        if action.name in ("SELECT_HOTBAR_SLOT", "EQUIP_ITEM", "PLACE_BLOCK", "USE_ITEM"):
             slot = action.param("slot")
             if not isinstance(slot, int) or not 0 <= slot < HOTBAR_SLOTS:
                 return f"invalid slot {slot!r}"
+        elif action.name == "MOVE_INVENTORY_ITEM":
+            from_slot = action.param("from_slot")
+            to_slot = action.param("to_slot")
+            if (
+                not isinstance(from_slot, int) or not 0 <= from_slot < HOTBAR_SLOTS
+                or not isinstance(to_slot, int) or not 0 <= to_slot < HOTBAR_SLOTS
+            ):
+                return f"invalid slots {from_slot!r},{to_slot!r}"
+            if from_slot == to_slot:
+                return "from_slot and to_slot must differ"
+        elif action.name == "CRAFT":
+            recipe = action.param("recipe")
+            if recipe not in RECIPE_NAMES:
+                return f"unknown recipe {recipe!r}"
         return None
 
     def act(self, action: Action) -> ActionResult:

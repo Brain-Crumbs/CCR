@@ -80,6 +80,7 @@ def test_stream_catalog_covers_the_survival_taxonomy():
         "vision.frame.grid", "vision.frame.pixels", "vision.entities",
         "body.health", "body.hunger", "body.oxygen",
         "body.inventory", "body.inventory_exact", "body.hotbar",
+        "body.inventory_open",
         "body.in_water", "body.alive",
         "spatial.position", "spatial.rotation", "spatial.distance_from_spawn",
         "world.time", "world.biome", "world.nearby_blocks",
@@ -218,7 +219,8 @@ def test_malformed_motor_events_reject_but_the_world_still_steps():
         "not-a-dict",
         {"no_action": 1},
         {"action": 42},
-        {"action": "CRAFT"},                    # unknown action name
+        {"action": "EXPLODE"},                   # unknown action name
+        {"action": "CRAFT"},                    # missing/unknown recipe param
         {"action": "SELECT_HOTBAR_SLOT:slot=99"},  # invalid parameter
     ]
     for i, payload in enumerate(bad_payloads):
