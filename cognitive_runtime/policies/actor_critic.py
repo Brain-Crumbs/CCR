@@ -38,7 +38,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence
 import torch
 
 from cognitive_runtime.core.action import Action
-from cognitive_runtime.core.learner import Learner, window_reward
+from cognitive_runtime.core.learner import Learner, window_training_reward
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.perception import State
 from cognitive_runtime.core.policy import Policy
@@ -285,7 +285,7 @@ class ActorCriticLearner(Learner):
         self.policy.eval_mode()
 
     def update(self, window: TickWindow) -> None:
-        reward = window_reward(window)
+        reward = window_training_reward(window)
         self.total_reward += reward
         self.episode_reward += reward
         self.observed_ticks += 1
@@ -469,7 +469,7 @@ class AsyncActorCriticLearner(Learner):
         self._previous_decision = None
 
     def update(self, window: TickWindow) -> None:
-        reward = window_reward(window)
+        reward = window_training_reward(window)
         self.total_reward += reward
         self.episode_reward += reward
         self.observed_ticks += 1

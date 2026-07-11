@@ -1,0 +1,201 @@
+# Full reward-compass example (issue #41): survival foundation + capability
+# + quest/event tiers, plus pluggable intrinsic-drive slots.
+#
+# Quest-tier milestones name events the SurvivalBox simulated backend does
+# not emit yet (village/Nether/dragon progression) -- they document the
+# target schema shape ("the full compass") for a real-Minecraft backend or a
+# richer simulated world; until such events exist these components simply
+# never fire, which is harmless (see docs/reward_profiles.md).
+#
+# Load with: --reward-profile goals/ender_dragon.yaml
+
+name: ender_dragon
+description: >
+  The full reward compass: survival -> capability -> quest, tuned as
+  stepping stones toward the sparse `dragon` terminal goal instead of
+  leaving a newborn agent with no signal.
+
+tiers:
+  survival:
+    tick_alive:
+      kind: tick
+      value: 0.01
+    death:
+      kind: death
+      value: -10.0
+    damage_taken:
+      kind: event_count
+      value: -0.5
+      params:
+        event_prefix: damage
+    hunger_decrease:
+      kind: delta_decrease
+      value: -0.25
+      params:
+        field: hunger
+    critical_health:
+      kind: threshold_enter
+      value: -1.0
+      params:
+        field: health
+        threshold: 4.0
+    critical_hunger:
+      kind: threshold_enter
+      value: -1.0
+      params:
+        field: hunger
+        threshold: 4.0
+
+  capability:
+    # First log ever picked up: a big, one-off stepping stone.
+    first_log:
+      kind: once_event
+      value: 5.0
+      params:
+        event: "new_item:log"
+
+    # Anti-farming example (issue #41): repeatedly picking up common items
+    # still pays out, but each additional pickup of the *same* item is worth
+    # less (geometric decay), floored so it never hits exactly zero, and
+    # capped so grinding one item type can't dominate the return.
+    repeated_common_item:
+      kind: decaying_repeat
+      value: 0.2
+      decay: 0.5
+      decay_floor: 0.01
+      cap: 2.0
+      params:
+        source: "event:new_item"
+
+    new_block_type:
+      kind: capped_novelty
+      value: 0.1
+      cap: 3.0
+      params:
+        source: nearby_blocks
+
+    tool_used:
+      kind: capped_novelty
+      value: 0.3
+      cap: 3.0
+      params:
+        source: "event:used_tool"
+
+    craft_progress:
+      kind: capped_novelty
+      value: 0.5
+      cap: 4.0
+      params:
+        source: "event:crafted"
+
+    shelter:
+      kind: once_event
+      value: 1.0
+      params:
+        event: entered_shelter
+
+    light_source:
+      kind: once_event
+      value: 1.0
+      params:
+        event: created_light_source
+
+    survived_night:
+      kind: once_event
+      value: 1.5
+      params:
+        event: survived_night
+
+  quest:
+    # Milestone rewards persist per-brain (issue #41): a quest step already
+    # granted in an earlier life must not re-fire just because training was
+    # interrupted and resumed, or because the current life died and reset.
+    entered_village:
+      kind: once_event
+      value: 10.0
+      scope: brain
+      params:
+        event: entered_village
+
+    obtained_iron_armor:
+      kind: once_event
+      value: 25.0
+      scope: brain
+      params:
+        event: obtained_iron_armor
+
+    entered_nether:
+      kind: once_event
+      value: 50.0
+      scope: brain
+      params:
+        event: entered_nether
+
+    obtained_blaze_rod:
+      kind: once_event
+      value: 75.0
+      scope: brain
+      params:
+        event: obtained_blaze_rod
+
+    obtained_ender_pearl:
+      kind: once_event
+      value: 60.0
+      scope: brain
+      params:
+        event: obtained_ender_pearl
+
+    crafted_eye_of_ender:
+      kind: once_event
+      value: 100.0
+      scope: brain
+      params:
+        event: crafted_eye_of_ender
+
+    found_stronghold:
+      kind: once_event
+      value: 150.0
+      scope: brain
+      params:
+        event: found_stronghold
+
+    entered_end:
+      kind: once_event
+      value: 500.0
+      scope: brain
+      params:
+        event: entered_end
+
+    defeated_dragon:
+      kind: once_event
+      value: 1000000.0
+      scope: brain
+      params:
+        event: defeated_dragon
+
+# Pluggable intrinsic-drive slots (issue #41 schema; the components
+# themselves -- learning progress, risk-gated novelty, predicted-pain
+# aversion -- are specified and implemented in #61, reading from the
+# `internal.*` modulation streams #58 publishes).  Never raw world-model
+# prediction error or accuracy: those reward noise or wall-staring.
+intrinsic:
+  learning_progress:
+    stream: internal.learning_progress
+    weight: 1.0
+    cap: 1.0
+
+  safe_novelty:
+    stream: internal.safe_novelty
+    weight: 0.5
+    cap: 1.0
+
+  predicted_risk_aversion:
+    stream: internal.predicted_risk_aversion
+    weight: 1.0
+    cap: 0.5
+
+normalization:
+  method: running
+  clip: 10.0
+  epsilon: 0.0001
+  warmup_ticks: 100

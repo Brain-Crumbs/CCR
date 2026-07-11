@@ -1,0 +1,180 @@
+# Default reward profile (issue #41): the "survival foundation" tier only.
+#
+# This is the on-disk twin of `reward_profile.default_profile()` -- the same
+# values `SurvivalRewardConfig` has always shipped, expressed declaratively.
+# Load it explicitly with `--reward-profile goals/survival.yaml`, or rely on
+# `default_profile()` (used automatically when no --reward-profile is given).
+#
+# See docs/reward_profiles.md for the full schema reference.
+
+name: survival
+description: >
+  Survival foundation tier: stay alive, keep vitals up, learn basic
+  exploration/items/shelter without dying or stagnating.
+
+tiers:
+  survival:
+    tick_alive:
+      kind: tick
+      value: 0.01
+
+    death:
+      kind: death
+      value: -10.0
+
+    damage_taken:
+      kind: event_count
+      value: -0.5
+      params:
+        event_prefix: damage
+
+    health_maintained:
+      kind: periodic_no_event
+      value: 0.05
+      params:
+        event_prefix: damage
+        window: 100
+        min_field: health
+        min_value: 16.0
+
+    hunger_decrease:
+      kind: delta_decrease
+      value: -0.25
+      params:
+        field: hunger
+
+    critical_health:
+      kind: threshold_enter
+      value: -1.0
+      params:
+        field: health
+        threshold: 4.0
+
+    critical_hunger:
+      kind: threshold_enter
+      value: -1.0
+      params:
+        field: hunger
+        threshold: 4.0
+
+  capability:
+    new_block_type:
+      kind: capped_novelty
+      value: 0.1
+      cap: 2.0
+      params:
+        source: nearby_blocks
+
+    new_biome:
+      kind: capped_novelty
+      value: 0.2
+      cap: 1.0
+      params:
+        source: biome
+
+    distance:
+      kind: distance_ladder
+      value: 0.1
+      cap: 2.0
+      params:
+        unit: 10.0
+
+    new_chunk:
+      kind: capped_novelty
+      value: 0.1
+      cap: 2.0
+      params:
+        source: position_chunk
+        chunk_size: 8.0
+
+    new_item:
+      kind: capped_novelty
+      value: 0.5
+      cap: 5.0
+      params:
+        source: "event:new_item"
+
+    first_tool:
+      kind: once_predicate
+      value: 1.0
+      params:
+        source: "event:new_item"
+        predicate: is_tool
+
+    first_food:
+      kind: once_predicate
+      value: 1.0
+      params:
+        source: "event:new_item"
+        predicate: is_food
+
+    first_block_placed:
+      kind: once_event
+      value: 1.0
+      params:
+        event: placed_block
+
+    tool_used:
+      kind: capped_novelty
+      value: 0.3
+      cap: 1.5
+      params:
+        source: "event:used_tool"
+
+    craft_progress:
+      kind: capped_novelty
+      value: 0.5
+      cap: 2.0
+      params:
+        source: "event:crafted"
+
+    shelter:
+      kind: once_event
+      value: 1.0
+      params:
+        event: entered_shelter
+
+    light_source:
+      kind: once_event
+      value: 1.0
+      params:
+        event: created_light_source
+
+    survived_night:
+      kind: once_event
+      value: 1.0
+      params:
+        event: survived_night
+
+  shaping:
+    repeated_action:
+      kind: streak_penalty
+      value: -0.01
+      params:
+        threshold: 20
+
+    idle:
+      kind: idle_penalty
+      value: -0.05
+      params:
+        threshold: 40
+        low_health_threshold: 10.0
+
+    spinning:
+      kind: spinning_penalty
+      value: -0.1
+      params:
+        window: 24
+        actions: [LOOK_LEFT, LOOK_RIGHT]
+
+    no_novelty:
+      kind: no_novelty_penalty
+      value: -0.1
+      params:
+        ticks: 200
+
+normalization:
+  method: running
+  clip: 5.0
+  epsilon: 0.0001
+  warmup_ticks: 100

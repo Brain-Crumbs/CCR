@@ -11,8 +11,9 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 # numpy is core: pixel frames flow as arrays from the backend/bridge boundary
 # through fusion, the binary frame store and the recorder, whether or not
-# torch (the neural extra) is installed.
-dependencies = ["numpy>=1.23"]
+# torch (the neural extra) is installed.  PyYAML is core: reward profiles
+# (issue #41, --reward-profile) are the one place YAML is the primary format.
+dependencies = ["numpy>=1.23", "PyYAML>=6"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]

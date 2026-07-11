@@ -14,12 +14,35 @@ from cognitive_runtime.core.streams.synchronizer import TickWindow
 
 
 def window_reward(window: TickWindow) -> float:
-    """Sum the `reward.scalar` values published during this window."""
+    """Sum the raw `reward.scalar` `value`s published during this window.
+
+    This is the *logging*-facing scale (episode totals, dashboards, replay
+    verification) -- unclipped, un-normalized.  Learners that update from a
+    scalar reward should use :func:`window_training_reward` instead (issue
+    #41's two-scale rewards: huge raw magnitudes must never hit an optimizer
+    directly).
+    """
     total = 0.0
     for event in window.by_stream.get("reward.scalar", []):
         payload = event.payload
         if isinstance(payload, dict) and isinstance(payload.get("value"), (int, float)):
             total += float(payload["value"])
+    return total
+
+
+def window_training_reward(window: TickWindow) -> float:
+    """Sum the `training_value` (normalized/clipped when a reward profile is
+    active) published during this window, falling back to the raw `value`
+    for events that don't carry one -- e.g. non-Minecraft Programs, or the
+    legacy hard-coded SurvivalReward path."""
+    total = 0.0
+    for event in window.by_stream.get("reward.scalar", []):
+        payload = event.payload
+        if not isinstance(payload, dict):
+            continue
+        value = payload.get("training_value", payload.get("value"))
+        if isinstance(value, (int, float)):
+            total += float(value)
     return total
 
 
