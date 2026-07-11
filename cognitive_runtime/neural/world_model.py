@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -165,8 +165,7 @@ class MLPWorldModel(WorldModel):
                 f"{action_onehot.shape[0]}"
             )
 
-        x = torch.cat([fused_latent.float(), action_onehot.float()], dim=1)
-        hidden = self.trunk(x)
+        hidden = self._hidden(fused_latent, action_onehot)
         return WorldModelOutput(
             next_latent=self.next_latent_head(hidden),
             reward=self.reward_head(hidden).squeeze(-1),
@@ -174,6 +173,28 @@ class MLPWorldModel(WorldModel):
             risk=self.risk_head(hidden).squeeze(-1),
             prediction_error=F.softplus(self.prediction_error_head(hidden)).squeeze(-1),
         )
+
+    def _hidden(self, fused_latent: torch.Tensor, action_onehot: torch.Tensor) -> torch.Tensor:
+        """Shared trunk projection, split out of :meth:`forward` so subclasses
+        (:class:`MultiHorizonMLPWorldModel`) can add heads without
+        duplicating input validation."""
+        if fused_latent.ndim != 2 or fused_latent.shape[1] != self._fused_width:
+            raise ValueError(
+                f"fused_latent shape must be [batch, {self._fused_width}], got "
+                f"{tuple(fused_latent.shape)}"
+            )
+        if action_onehot.ndim != 2 or action_onehot.shape[1] != self.n_actions:
+            raise ValueError(
+                f"action_onehot shape must be [batch, {self.n_actions}], got "
+                f"{tuple(action_onehot.shape)}"
+            )
+        if fused_latent.shape[0] != action_onehot.shape[0]:
+            raise ValueError(
+                f"fused_latent batch {fused_latent.shape[0]} != action_onehot batch "
+                f"{action_onehot.shape[0]}"
+            )
+        x = torch.cat([fused_latent.float(), action_onehot.float()], dim=1)
+        return self.trunk(x)
 
     def checkpoint_metadata(self) -> Dict[str, object]:
         return {
@@ -185,3 +206,157 @@ class MLPWorldModel(WorldModel):
             "layout_hash": self.layout_hash,
             "action_keys": self.action_keys,
         }
+
+
+@dataclass(frozen=True)
+class HorizonPrediction:
+    """World-model prediction for one horizon step, ``h`` ticks ahead of the
+    input tick (issue #39). All fields are ``Tensor[batch, ...]``, same batch
+    as the model's input.
+
+    - ``next_latent``: ``Tensor[batch, fused_width]`` -- predicted mean fused
+      latent at ``t + h``.
+    - ``reward``: ``Tensor[batch]`` -- predicted reward accumulated over the
+      ``h`` steps from ``t`` to ``t + h``.
+    - ``terminal_logit``: ``Tensor[batch]`` -- pre-sigmoid logit for death/
+      episode-end occurring at or before ``t + h``.
+    - ``risk``: ``Tensor[batch]`` -- danger estimate at ``t + h``, model's own
+      learned units.
+    - ``prediction_error``: ``Tensor[batch]`` -- self-estimated realized MSE
+      of ``next_latent`` at this horizon (curiosity/novelty signal).
+    - ``uncertainty``: ``Tensor[batch]`` -- non-negative learned variance
+      estimate for ``next_latent`` at this horizon. This is the one contract
+      field every head funnels uncertainty through (docs/neural-stream-
+      agent.md): an ensemble-variance or MC-dropout implementation would
+      populate the same field without changing callers. Used both to
+      separate "surprising because novel" from "surprising because noisy"
+      (issue #61) and, downstream, as an attention signal (issue #59).
+    """
+
+    next_latent: torch.Tensor
+    reward: torch.Tensor
+    terminal_logit: torch.Tensor
+    risk: torch.Tensor
+    prediction_error: torch.Tensor
+    uncertainty: torch.Tensor
+
+
+@dataclass(frozen=True)
+class MultiHorizonWorldModelOutput:
+    """Predictions at every configured horizon, keyed by tick offset (e.g.
+    ``{1: ..., 5: ..., 20: ...}``)."""
+
+    horizons: Dict[int, HorizonPrediction]
+
+    def __getitem__(self, horizon: int) -> HorizonPrediction:
+        return self.horizons[horizon]
+
+
+class MultiHorizonMLPWorldModel(MLPWorldModel):
+    """Multi-horizon, uncertainty-aware extension of :class:`MLPWorldModel`
+    (issue #39): predicts ``(next_latent, reward, terminal, risk,
+    prediction_error, uncertainty)`` at every configured horizon (default
+    ``t+1, t+5, t+20``) from the *same* ``(fused_latent, action_onehot)``
+    input, via independent linear heads over one shared trunk -- a direct
+    multi-head reading of "the interface takes a horizon list so heads can
+    be added without contract changes", as opposed to iterated latent
+    rollout (also a valid reading per docs/neural-stream-agent.md; the
+    ego-motion canary in ``training/ego_motion_canary.py`` uses that
+    approach instead, at the pixel level).
+
+    ``horizons`` must include ``1``: horizon 1 reuses the base class's own
+    heads (no duplicate parameters), so ``forward()`` is inherited unchanged
+    and keeps returning a plain :class:`WorldModelOutput` for ``t+1`` --
+    every existing single-step caller (``ActorCriticOptimizer``,
+    ``NeuralWorldModel`` bridge, ``ccr train --model-type world-model``)
+    keeps working with no changes. :meth:`forward_horizons` is the new
+    multi-horizon entry point.
+    """
+
+    def __init__(
+        self,
+        fused_width: int,
+        n_actions: int,
+        *,
+        horizons: Sequence[int] = (1, 5, 20),
+        hidden_dim: int = 128,
+        depth: int = 2,
+        dropout: float = 0.0,
+        layout_hash: Optional[str] = None,
+        action_keys: Optional[Sequence[str]] = None,
+    ) -> None:
+        super().__init__(
+            fused_width,
+            n_actions,
+            hidden_dim=hidden_dim,
+            depth=depth,
+            dropout=dropout,
+            layout_hash=layout_hash,
+            action_keys=action_keys,
+        )
+        horizons_sorted = tuple(sorted({int(h) for h in horizons}))
+        if not horizons_sorted:
+            raise ValueError("horizons must be non-empty")
+        if horizons_sorted[0] <= 0:
+            raise ValueError(f"horizons must be positive tick offsets, got {horizons!r}")
+        if 1 not in horizons_sorted:
+            raise ValueError(
+                "horizons must include 1 (t+1) so WorldModel.forward() stays a valid "
+                f"single-step contract for existing callers, got {horizons!r}"
+            )
+        self.horizons_list: Tuple[int, ...] = horizons_sorted
+
+        self.uncertainty_heads = nn.ModuleDict(
+            {str(h): nn.Linear(hidden_dim, 1) for h in horizons_sorted}
+        )
+        self.horizon_heads = nn.ModuleDict(
+            {
+                str(h): nn.ModuleDict(
+                    {
+                        "next_latent": nn.Linear(hidden_dim, self._fused_width),
+                        "reward": nn.Linear(hidden_dim, 1),
+                        "terminal": nn.Linear(hidden_dim, 1),
+                        "risk": nn.Linear(hidden_dim, 1),
+                        "prediction_error": nn.Linear(hidden_dim, 1),
+                    }
+                )
+                for h in horizons_sorted
+                if h != 1
+            }
+        )
+
+    def forward_horizons(
+        self, fused_latent: torch.Tensor, action_onehot: torch.Tensor
+    ) -> MultiHorizonWorldModelOutput:
+        """Predict at every configured horizon in one forward pass."""
+        hidden = self._hidden(fused_latent, action_onehot)
+        predictions: Dict[int, HorizonPrediction] = {}
+        for h in self.horizons_list:
+            if h == 1:
+                next_latent = self.next_latent_head(hidden)
+                reward = self.reward_head(hidden).squeeze(-1)
+                terminal_logit = self.terminal_head(hidden).squeeze(-1)
+                risk = self.risk_head(hidden).squeeze(-1)
+                prediction_error = F.softplus(self.prediction_error_head(hidden)).squeeze(-1)
+            else:
+                heads = self.horizon_heads[str(h)]
+                next_latent = heads["next_latent"](hidden)
+                reward = heads["reward"](hidden).squeeze(-1)
+                terminal_logit = heads["terminal"](hidden).squeeze(-1)
+                risk = heads["risk"](hidden).squeeze(-1)
+                prediction_error = F.softplus(heads["prediction_error"](hidden)).squeeze(-1)
+            uncertainty = F.softplus(self.uncertainty_heads[str(h)](hidden)).squeeze(-1)
+            predictions[h] = HorizonPrediction(
+                next_latent=next_latent,
+                reward=reward,
+                terminal_logit=terminal_logit,
+                risk=risk,
+                prediction_error=prediction_error,
+                uncertainty=uncertainty,
+            )
+        return MultiHorizonWorldModelOutput(horizons=predictions)
+
+    def checkpoint_metadata(self) -> Dict[str, object]:
+        metadata = super().checkpoint_metadata()
+        metadata["horizons"] = list(self.horizons_list)
+        return metadata

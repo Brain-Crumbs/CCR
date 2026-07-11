@@ -6,6 +6,7 @@ from cognitive_runtime.policies.scripted import ScriptedSurvivalPolicy
 from cognitive_runtime.policies.human_demo import HumanDemoPolicy
 from cognitive_runtime.policies.learned import LearnedPolicy
 from cognitive_runtime.policies.online_q import OnlineQLearner, OnlineQPolicy
+from cognitive_runtime.policies.constant_action import ConstantActionPolicy
 
 __all__ = [
     "NullPolicy",
@@ -15,4 +16,5 @@ __all__ = [
     "LearnedPolicy",
     "OnlineQPolicy",
     "OnlineQLearner",
+    "ConstantActionPolicy",
 ]
