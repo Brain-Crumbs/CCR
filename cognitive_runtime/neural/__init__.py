@@ -79,7 +79,14 @@ from cognitive_runtime.neural.fusion import (
 from cognitive_runtime.neural.optimizer import ActorCriticOptimizer, OnlineOptimizer
 from cognitive_runtime.neural.policy import MLPPolicyModel, PolicyModel
 from cognitive_runtime.neural.value import MLPValueModel, ValueModel
-from cognitive_runtime.neural.world_model import MLPWorldModel, WorldModel, WorldModelOutput
+from cognitive_runtime.neural.world_model import (
+    HorizonPrediction,
+    MLPWorldModel,
+    MultiHorizonMLPWorldModel,
+    MultiHorizonWorldModelOutput,
+    WorldModel,
+    WorldModelOutput,
+)
 from cognitive_runtime.neural.entity_persistence import (
     DEFAULT_GAP_CAP_TICKS,
     ENTITY_PERSISTENCE_CHECKPOINT_KEY,
@@ -135,6 +142,9 @@ __all__ = [
     "WorldModel",
     "WorldModelOutput",
     "MLPWorldModel",
+    "MultiHorizonMLPWorldModel",
+    "MultiHorizonWorldModelOutput",
+    "HorizonPrediction",
     "EntityPersistenceModel",
     "EntityPersistenceOutput",
     "ENTITY_PERSISTENCE_CHECKPOINT_KEY",

@@ -128,7 +128,8 @@ Add first-class contracts for:
 
 These should be PyTorch-backed but isolated so the runtime can still import
 without torch unless a neural policy is selected.  *Status: contracts landed
-(#19); the multi-horizon/uncertainty extension of the world model is #39.*
+(#19); the multi-horizon/uncertainty extension of the world model landed
+(#39, `MultiHorizonMLPWorldModel`).*
 
 ### 2. Make Input Streams Explicit
 
@@ -201,7 +202,7 @@ the world.  Add losses for:
 This is where "baby learns objects" begins.  Object identity can start as a
 latent slot or entity-token prediction before becoming a full object-centric
 model.  *Status: first cuts landed (#23, #26, #27); the generative
-multi-horizon world model with uncertainty is #39.*
+multi-horizon world model with uncertainty landed (#39).*
 
 ### 5. Add Actor/Critic Online Learning
 
@@ -397,9 +398,36 @@ to be byte-reproducible.)
 ### Phase D: World Model And Object Permanence — first cut landed
 
 - Action-conditioned prediction (#26), entity persistence + novelty (#27).
-- The generative multi-horizon world model with uncertainty and the
-  ego-motion canary is issue #39; the nursery scenario suite that feeds and
-  benchmarks it is issue #62.
+- Multi-horizon, uncertainty-aware world model landed (#39):
+  `MultiHorizonMLPWorldModel` (`cognitive_runtime/neural/world_model.py`)
+  predicts `(next_latent, reward, terminal, risk, prediction_error)` at every
+  configured horizon (default t+1/t+5/t+20) over the fused agent-state
+  latent, each with a learned `uncertainty` field trained via a
+  heteroscedastic NLL loss (`ccr train --model-type
+  multi-horizon-world-model`); `next_latent` is checked per horizon against
+  copy-last-latent and mean-latent baselines
+  (`training.world_model.evaluate_multi_horizon_model`), and uncertainty is
+  checked against realized error (`uncertainty_calibration`). `forward()`
+  stays a plain single-step `WorldModelOutput` (horizon 1, no uncertainty)
+  so every existing caller (`ActorCriticOptimizer`, the `NeuralWorldModel`
+  loop bridge) is unaffected. The ego-motion canary
+  (`cognitive_runtime/training/ego_motion_canary.py`, `ccr
+  ego-motion-canary`) records `walk_forward` (constant `MOVE_FORWARD`,
+  optional action noise) episodes at multiple seeds via the simulated
+  backend, pretrains a pixel encoder/decoder/next-latent predictor on a
+  train-seed subset, fine-tunes it against a horizon-consistency loss (the
+  iterated-rollout alternative to dedicated per-horizon heads), and reports
+  per-horizon PSNR/SSIM against copy-last-frame/mean-frame baselines on
+  held-out seeds. In the current simulated backend the `vision.frame.pixels`
+  render changes very little tick to tick (the constant-forward walker
+  routinely stalls against terrain within the first few dozen ticks), which
+  makes copy-last an unusually strong baseline for any lossy encoder/decoder
+  to beat -- the canary harness and its held-out-seed evaluation are
+  complete and CLI-wired, but actually clearing the "beats both baselines"
+  bar needs either a more dynamic simulated render or the mineflayer remote
+  backend. The `walk_forward` scenario formally lands in the nursery suite
+  (#62), which owns tuning the environment for genuine motion; this module
+  is the reusable benchmark it is expected to call into.
 
 ### Phase E: Actor/Critic Policy — first cut landed
 

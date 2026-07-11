@@ -65,6 +65,19 @@ python -m cognitive_runtime train --model-type neural \
     --sessions sessions/<session-id> --out models/vision_bc.pt
 python -m cognitive_runtime evaluate --policies scripted,neural --model models/vision_bc.pt
 
+# Multi-horizon, uncertainty-aware world model (issue #39): predicts
+# next_latent/reward/terminal/risk at t+1/t+5/t+20 (configurable), each with
+# a learned uncertainty, and reports per-horizon copy-last/mean baselines.
+python -m cognitive_runtime train --model-type multi-horizon-world-model \
+    --sessions sessions/<session-id> --horizons 1 5 20 --out models/multi_horizon_world_model.pt
+
+# Ego-motion canary (issue #39): records walk_forward (constant MOVE_FORWARD)
+# episodes at multiple seeds, pretrains a next-frame predictor on a
+# train-seed subset only, and evaluates held-out-seed next-frame prediction
+# (PSNR/SSIM) against copy-last-frame/mean-frame baselines.
+python -m cognitive_runtime ego-motion-canary --record-dir sessions \
+    --train-seeds 6 --holdout-seeds 2
+
 # Evaluation gates (issue #31): train actor/critic + linear online-Q,
 # eval both plus scripted/random on identical seeds, and report the three
 # deprecation gates. Records eval sessions for the dashboard + writes the gate

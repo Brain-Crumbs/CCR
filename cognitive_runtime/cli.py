@@ -601,6 +601,9 @@ def cmd_train(args: argparse.Namespace) -> None:
     if args.model_type == "world-model":
         _train_world_model(args)
         return
+    if args.model_type == "multi-horizon-world-model":
+        _train_multi_horizon_world_model(args)
+        return
     if args.model_type == "entity-persistence":
         _train_entity_persistence(args)
         return
@@ -823,6 +826,62 @@ def _train_world_model(args: argparse.Namespace) -> None:
     print(f"checkpoint bundle saved to {out}")
 
 
+def _train_multi_horizon_world_model(args: argparse.Namespace) -> None:
+    """Offline multi-horizon, uncertainty-aware world-model training
+    (issue #39): predicts next_latent/reward/terminal/risk/prediction_error
+    at every ``--horizons`` tick offset, each with a learned uncertainty."""
+    try:
+        from cognitive_runtime.training.datasets import build_multi_horizon_world_model_dataset
+        from cognitive_runtime.training.world_model import (
+            MultiHorizonWorldModelTrainingConfig,
+            save_multi_horizon_world_model_checkpoint,
+            train_multi_horizon_world_model,
+        )
+    except ImportError as exc:  # torch not installed
+        sys.exit(
+            f"multi-horizon world-model training needs PyTorch ({exc}). Install it with "
+            "'pip install -e .[neural]'."
+        )
+    dataset = build_multi_horizon_world_model_dataset(
+        args.sessions,
+        horizons=args.horizons,
+        max_samples=args.max_samples,
+        min_episode_reward=args.min_reward,
+    )
+    if len(dataset) == 0:
+        sys.exit(
+            "no multi-horizon world-model training samples found (were the sessions "
+            "recorded as streams-v2, and long enough for the largest --horizons value?)"
+        )
+    print(
+        f"dataset: {len(dataset)} samples at horizons {dataset.horizons} from "
+        f"{len(dataset.sources)} episodes (dim={len(dataset.feature_names)})"
+    )
+    config = MultiHorizonWorldModelTrainingConfig(
+        epochs=args.epochs,
+        lr=args.neural_lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        hidden_dim=args.hidden_dim,
+        depth=args.fusion_depth,
+        dropout=args.fusion_dropout,
+    )
+    model, stats = train_multi_horizon_world_model(dataset, config)
+    out = args.out if args.out != DEFAULT_MODEL_OUT else "models/multi_horizon_world_model.pt"
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    save_multi_horizon_world_model_checkpoint(out, model, dataset, stats)
+    for h, entry in stats["evaluation"].items():
+        print(
+            f"  horizon t+{h}: model_mse={round(entry['model_mse'], 4)} "
+            f"copy_last_mse={round(entry['copy_last_mse'], 4)} "
+            f"mean_latent_mse={round(entry['mean_latent_mse'], 4)} "
+            f"beats_copy_last={entry['beats_copy_last']} "
+            f"beats_mean_latent={entry['beats_mean_latent']} "
+            f"uncertainty_error_correlation={round(entry['uncertainty_error_correlation'], 4)}"
+        )
+    print(f"checkpoint bundle saved to {out}")
+
+
 def _train_entity_persistence(args: argparse.Namespace) -> None:
     """Offline entity-persistence training (issue #27: object permanence).
 
@@ -869,6 +928,67 @@ def _train_entity_persistence(args: argparse.Namespace) -> None:
                 "baseline_mse", "model_mse", "beats_forget_baseline"):
         print(f"  {key}: {stats[key]}")
     print(f"checkpoint bundle saved to {out}")
+
+
+def cmd_ego_motion_canary(args: argparse.Namespace) -> None:
+    """``ccr ego-motion-canary`` (issue #39): generate ``walk_forward``
+    episodes at multiple seeds via the simulated backend, train a next-frame
+    predictor on a train-seed subset only, and evaluate held-out-seed
+    next-frame prediction (PSNR/SSIM, iterated rollout to every
+    ``--horizons`` tick offset) against copy-last-frame and mean-frame
+    baselines.
+    """
+    try:
+        from cognitive_runtime.training.ego_motion_canary import (
+            EgoMotionCanaryConfig,
+            run_ego_motion_canary,
+            save_ego_motion_canary_checkpoint,
+        )
+    except ImportError as exc:  # torch not installed
+        sys.exit(
+            f"the ego-motion canary needs PyTorch ({exc}). Install it with "
+            "'pip install -e .[neural]'."
+        )
+    train_seeds = list(range(args.train_seeds))
+    holdout_seeds = list(range(args.train_seeds, args.train_seeds + args.holdout_seeds))
+    config = EgoMotionCanaryConfig(
+        train_seeds=train_seeds,
+        holdout_seeds=holdout_seeds,
+        episode_ticks=args.episode_ticks,
+        world_size=args.world_size,
+        action_noise=args.action_noise,
+        horizons=args.horizons,
+        latent_width=args.latent_width,
+        hidden_dim=args.hidden_dim,
+        reconstruction_size=args.reconstruction_size,
+        epochs=args.epochs,
+        lr=args.neural_lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        consistency_epochs=args.consistency_epochs,
+    )
+    print(
+        f"recording {len(train_seeds)} train seeds {train_seeds} and "
+        f"{len(holdout_seeds)} held-out seeds {holdout_seeds} "
+        f"({config.episode_ticks} ticks each, world_size={config.world_size})"
+    )
+    model, report = run_ego_motion_canary(args.record_dir, config)
+    for h, entry in report.horizon_metrics.items():
+        print(
+            f"  horizon t+{h} (n={entry['n_samples']}): "
+            f"psnr model={round(entry['psnr_model'], 2)} "
+            f"copy_last={round(entry['psnr_copy_last'], 2)} "
+            f"mean_frame={round(entry['psnr_mean_frame'], 2)} | "
+            f"ssim model={round(entry['ssim_model'], 4)} "
+            f"copy_last={round(entry['ssim_copy_last'], 4)} "
+            f"mean_frame={round(entry['ssim_mean_frame'], 4)} | "
+            f"beats_copy_last={entry['beats_copy_last']} "
+            f"beats_mean_frame={entry['beats_mean_frame']}"
+        )
+    if args.out:
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        save_ego_motion_canary_checkpoint(args.out, model, report)
+        print(f"checkpoint bundle saved to {args.out}")
 
 
 def cmd_trainer(args: argparse.Namespace) -> None:
@@ -1153,11 +1273,16 @@ def build_parser() -> argparse.ArgumentParser:
                          help="output path; neural models default to models/vision_bc.pt")
     p_train.add_argument("--model-type",
                          choices=["linear", "neural", "pixel-encoder", "fusion", "world-model",
-                                  "entity-persistence"],
+                                  "multi-horizon-world-model", "entity-persistence"],
                          default="linear",
                          help="linear softmax head (default), pixel BC, pixel encoder pretrain, "
-                              "learned latent fusion, the action-conditioned world model, or "
+                              "learned latent fusion, the action-conditioned world model, the "
+                              "multi-horizon uncertainty-aware world model (issue #39), or "
                               "the entity-persistence (object permanence) model")
+    p_train.add_argument("--horizons", type=int, nargs="+", default=[1, 5, 20],
+                         help="--model-type multi-horizon-world-model only: tick offsets to "
+                              "predict at (action ticks, per build_multi_horizon_world_model_"
+                              "dataset; must include 1)")
     p_train.add_argument("--epochs", type=int, default=10)
     p_train.add_argument("--lr", type=float, default=0.5, help="linear-model learning rate")
     p_train.add_argument("--neural-lr", type=float, default=1e-3, help="neural-model learning rate")
@@ -1228,6 +1353,39 @@ def build_parser() -> argparse.ArgumentParser:
                            action="store_false")
     p_trainer.add_argument("--seed", type=int, default=0)
     p_trainer.set_defaults(func=cmd_trainer)
+
+    p_canary = sub.add_parser(
+        "ego-motion-canary",
+        help="issue #39: walk_forward next-frame prediction benchmark on held-out seeds, "
+             "vs. copy-last-frame and mean-frame baselines (PSNR/SSIM)",
+    )
+    p_canary.add_argument("--record-dir", default="sessions",
+                          help="directory to record the walk_forward train/holdout episodes into")
+    p_canary.add_argument("--train-seeds", type=int, default=6,
+                          help="number of train-seed episodes (seeds 0..N-1)")
+    p_canary.add_argument("--holdout-seeds", type=int, default=2,
+                          help="number of held-out-seed episodes (seeds N..N+M-1, never trained on)")
+    p_canary.add_argument("--episode-ticks", type=int, default=120)
+    p_canary.add_argument("--world-size", type=int, default=48)
+    p_canary.add_argument("--action-noise", type=float, default=0.0,
+                          help="probability each tick's action is a random action instead of "
+                               "MOVE_FORWARD")
+    p_canary.add_argument("--horizons", type=int, nargs="+", default=[1, 5, 20],
+                          help="tick offsets to evaluate next-frame prediction at")
+    p_canary.add_argument("--latent-width", type=int, default=32)
+    p_canary.add_argument("--hidden-dim", type=int, default=64)
+    p_canary.add_argument("--reconstruction-size", type=int, default=16,
+                          help="max side length for downsampled reconstruction targets")
+    p_canary.add_argument("--epochs", type=int, default=15,
+                          help="pixel encoder/decoder pretraining epochs")
+    p_canary.add_argument("--consistency-epochs", type=int, default=15,
+                          help="horizon-consistency fine-tuning epochs (0 skips it)")
+    p_canary.add_argument("--neural-lr", type=float, default=1e-3)
+    p_canary.add_argument("--batch-size", type=int, default=32)
+    p_canary.add_argument("--seed", type=int, default=0)
+    p_canary.add_argument("--out", default=None,
+                          help="checkpoint bundle path (.pt); omit to skip saving")
+    p_canary.set_defaults(func=cmd_ego_motion_canary)
 
     p_replay = sub.add_parser("replay", help="re-simulate a session and verify determinism")
     p_replay.add_argument("--session", required=True)
