@@ -94,7 +94,10 @@ Useful pieces already in CCR:
   action-conditioned MLP world model (#26), entity persistence and a
   combined novelty signal (#27), a prioritized replay buffer (#28), and an
   MLP actor/critic with an `OnlineOptimizer` behind `--policy actor-critic`
-  (#29).  Curriculum world/reward presets landed via #30.
+  (#29).  Curriculum world/reward presets landed via #30.  Prediction error,
+  reward-prediction error, learning progress, novelty and risk are recorded,
+  replayable `internal.*` streams (#58, `cognitive_runtime/core/modulation.py`),
+  read by `neural.replay_buffer.load_session_into_buffer` for prioritization.
 
 Important limitations:
 
@@ -120,9 +123,6 @@ Important limitations:
   encoding is out of scope (`vision.frame.pixels` stays a deliberate raw
   stub in both fusion modes) pending a trainable `PixelStreamEncoder`
   binding.
-- Per-tick prediction error and novelty are computed but only written into
-  decision records; they are not yet first-class `internal.*` streams
-  (issue #58).
 - There is no attention system: every stream contributes equally to the
   fused state every tick, and nothing records what mattered (issue #59).
 
@@ -293,9 +293,12 @@ survival heuristics.
 
 ### 8. Add Internal Modulation (The Dopamine Analog)
 
-Issue #58.  Model neuromodulation as *internal streams*, not hidden
-variables — the runtime already thinks in streams, so interoception should be
-recorded, replayed and consumed exactly like sensory input:
+Issue #58, landed.  Model neuromodulation as *internal streams*, not hidden
+variables — the runtime already thinks in streams, so interoception is
+recorded, replayed and consumed exactly like sensory input
+(`cognitive_runtime/core/modulation.py`, published every cognitive tick by
+`runtime/loop.py`; see [streams.md](streams.md)'s "Internal modulation
+streams" section for the full contract):
 
 - `internal.prediction_error` — world-model next-latent error.
 - `internal.reward_prediction_error` — actual minus predicted reward; the
@@ -304,6 +307,11 @@ recorded, replayed and consumed exactly like sensory input:
 - `internal.learning_progress` — is prediction error improving here?
 - `internal.novelty` — the combined novelty scalar, promoted to a stream.
 - `internal.risk` — predicted pain/injury/death, made visible.
+
+Using these signals for attention (#59) or intrinsic reward (#61) stays out
+of scope here; the reward engine's `intrinsic_stream` component kind can
+already read any of them by stream id when a reward profile opts in
+(`docs/reward_profiles.md`).
 
 ### 9. Add Attention As A Runtime Subsystem
 

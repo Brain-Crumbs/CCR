@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from cognitive_runtime.core.modulation import INTERNAL_MODULATION_STREAM_IDS
 from cognitive_runtime.core.streams.motor import MOTOR_COMMAND_STREAM
 from cognitive_runtime.runtime.replay import (
     iter_cognitive_ticks,
@@ -84,22 +85,28 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
     health = hunger = None
     novelty = None
     value_estimate = None
+    internal_values: Dict[str, float] = {}
     for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
         for record in sensory:
             if record.get("elided"):
                 continue
-            if record.get("stream_id") == "body.health":
+            stream_id = record.get("stream_id")
+            if stream_id == "body.health":
                 health = record.get("payload")
-            elif record.get("stream_id") == "body.hunger":
+            elif stream_id == "body.hunger":
                 hunger = record.get("payload")
-            elif record.get("stream_id") == "model.novelty":
+            elif stream_id == "model.novelty":
                 payload = record.get("payload")
                 if isinstance(payload, dict):
                     novelty = payload.get("novelty")
-            elif record.get("stream_id") == "model.value_estimate":
+            elif stream_id == "model.value_estimate":
                 payload = record.get("payload")
                 if isinstance(payload, dict):
                     value_estimate = payload.get("value_estimate")
+            elif stream_id in INTERNAL_MODULATION_STREAM_IDS:
+                payload = record.get("payload")
+                if isinstance(payload, dict) and isinstance(payload.get("value"), (int, float)):
+                    internal_values[stream_id] = payload["value"]
         action = _motor_label(motor)
         action_counts[action] = action_counts.get(action, 0) + 1
         line = (
@@ -115,6 +122,9 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
             line += f" novelty={novelty}"
         if value_estimate is not None:
             line += f" value_estimate={value_estimate}"
+        for stream_id in INTERNAL_MODULATION_STREAM_IDS:
+            if stream_id in internal_values:
+                line += f" {stream_id}={internal_values[stream_id]}"
         recent.append(line)
 
     lines.append("  action distribution:")

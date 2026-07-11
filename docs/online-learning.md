@@ -50,7 +50,7 @@ The intended upgrade path is incremental:
    linear online Q learner as the baseline and smoke-test target (first cut
    landed, #29; evaluation gates are #31).
 6. Publish internal modulation signals (prediction error, reward prediction
-   error, learning progress, novelty, risk) as `internal.*` streams (#58).
+   error, learning progress, novelty, risk) as `internal.*` streams (landed, #58).
 7. Add the budgeted attention controller between memory and fusion, with a
    recorded per-tick `AttentionState` (#59) and the orienting reflex (#60).
 8. Move gradient steps off the tick thread via the async actor/learner split

@@ -199,6 +199,16 @@ def replay_episode(
     # than flagged as tampering (see _verify_window).
     legacy_frame_hash = metadata.get("frame_hash_algorithm") != FRAME_HASH_ALGORITHM
     frame_store = open_frame_store(session_dir)
+    # Streams the Program itself publishes -- the only ones `program.step()`
+    # can regenerate here. Runtime/model-introspection streams (`model.novelty`,
+    # `model.value_estimate`, `internal.*` -- issue #58) are published directly
+    # onto the sensory bus by `CognitiveRuntime`, not by the Program, so
+    # replaying just the Program can never reproduce them; they stay fully
+    # recorded and readable via `iter_cognitive_ticks` (episode viewer, replay
+    # buffer), only excluded from this byte-for-byte re-simulation check.
+    catalog_stream_ids = {
+        entry.get("stream_id") for entry in metadata.get("stream_catalog", [])
+    }
 
     sensory_bus, motor_bus = SensoryStreamBus(), MotorStreamBus()
     program.attach_buses(sensory_bus, motor_bus)
@@ -221,10 +231,13 @@ def replay_episode(
             program.step()
         regenerated = sensory_bus.drain()
         tick_index = decision.get("tick_index", ticks)
+        catalog_sensory_records = [
+            r for r in sensory_records if r.get("stream_id") in catalog_stream_ids
+        ]
 
         if verify:
             divergence = _verify_window(
-                regenerated, sensory_records,
+                regenerated, catalog_sensory_records,
                 frame_store=frame_store, legacy_frame_hash=legacy_frame_hash,
             )
             if divergence is not None:

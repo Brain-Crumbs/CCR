@@ -627,11 +627,13 @@ DEFAULT_STREAM_REGISTRY = StreamRegistry(
                 modality="internal", expected_sample_rate_hz=20.0, relative_compute_cost="low"
             ),
             note=(
-                "Reserved id: interoceptive modulation streams (prediction "
-                "error, reward-prediction error, learning progress, novelty, "
-                "risk; issue #58) are not yet published by any Program. "
-                "Interoception is agent input (issue #32), even though it is "
-                "the runtime's own signal rather than external sensing."
+                "Interoceptive modulation streams (prediction error, "
+                "reward-prediction error, learning progress, novelty, risk; "
+                "issue #58): computed by core.modulation and published by "
+                "runtime.loop every cognitive tick, not part of any "
+                "Program's stream catalog. Interoception is agent input "
+                "(issue #32), even though it is the runtime's own signal "
+                "rather than external sensing."
             ),
         ),
         StreamDeclaration(
