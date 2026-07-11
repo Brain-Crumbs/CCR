@@ -36,6 +36,7 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
             "ticks_per_second", "program_ticks_per_cognitive_tick",
             "avg_risk", "avg_prediction_error", "avg_novelty",
             "attention_mode", "avg_attention_budget_used",
+            "reflex_mode", "reflex_activations",
         ):
             lines.append(f"  {key}: {summary.get(key)}")
         program_stats = summary.get("program_stats") or {}
@@ -93,6 +94,7 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
     value_estimate = None
     internal_values: Dict[str, float] = {}
     attention_timeline: List[str] = []
+    reflex_timeline: List[str] = []
     last_focus_stream = object()  # sentinel: always logs the first tick's focus
     for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
         for record in sensory:
@@ -146,6 +148,12 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
                     f"t={decision.get('tick_index')}: focus -> {focus_stream} ({why})"
                 )
                 last_focus_stream = focus_stream
+        reflex = decision.get("reflex")
+        if isinstance(reflex, dict):
+            reflex_timeline.append(
+                f"t={decision.get('tick_index')}: {reflex.get('stimulus_stream')} -> "
+                f"{action} (direction={reflex.get('direction')})"
+            )
         recent.append(line)
 
     lines.append("  action distribution:")
@@ -159,6 +167,10 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
     if attention_timeline:
         lines.append(f"  attention timeline (issue #59, {len(attention_timeline)} focus changes):")
         lines.extend(f"    {e}" for e in attention_timeline)
+
+    if reflex_timeline:
+        lines.append(f"  orienting reflex activations (issue #60, {len(reflex_timeline)}):")
+        lines.extend(f"    {e}" for e in reflex_timeline)
 
     if recent and tail > 0:
         lines.append(f"  last {min(tail, len(recent))} decisions:")

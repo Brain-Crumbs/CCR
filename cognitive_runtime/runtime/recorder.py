@@ -82,6 +82,13 @@ class DecisionRecord:
     # reason breakdown is what makes attention debuggable -- it is recorded
     # here rather than reconstructed after the fact.
     attention: Optional[Dict[str, Any]] = None
+    # Scripted orienting reflex (issue #60): `OrientingDecision.to_dict()`
+    # (`reason="orienting_reflex"`, the triggering stimulus stream, its
+    # direction hint, and ticks remaining in the hold) when the reflex fired
+    # this tick and substituted its look/turn action for the policy's;
+    # `None` on every other tick and for every session recorded before this
+    # field existed.
+    reflex: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -150,6 +157,13 @@ class EpisodeSummary:
     #: "off" or "budgeted" (issue #59); "off" for every episode recorded
     #: before this field existed.
     attention_mode: str = "off"
+    #: Scripted orienting reflex (issue #60): "on"/"off"/"learned-only";
+    #: "off" for every episode recorded before this field existed.
+    reflex_mode: str = "off"
+    #: Ticks the reflex substituted its look/turn action for the policy's
+    #: this episode; 0 for `reflex_mode != "on"` and for every episode
+    #: recorded before this field existed.
+    reflex_activations: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

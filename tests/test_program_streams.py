@@ -78,6 +78,7 @@ def test_stream_catalog_covers_the_survival_taxonomy():
     specs = {spec.stream_id: spec for spec in program.stream_catalog()}
     expected = {
         "vision.frame.grid", "vision.frame.pixels", "vision.entities",
+        "world.entity_bearing",
         "body.health", "body.hunger", "body.oxygen",
         "body.inventory", "body.inventory_exact", "body.hotbar",
         "body.inventory_open",

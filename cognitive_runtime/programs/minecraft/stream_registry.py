@@ -12,6 +12,7 @@ undeclared.
 
 from __future__ import annotations
 
+from cognitive_runtime.core.streams.encoders import ScalarEncoder
 from cognitive_runtime.core.streams.registry import (
     DEFAULT_STREAM_REGISTRY,
     AttentionMetadata,
@@ -28,6 +29,22 @@ from cognitive_runtime.core.streams.registry import (
 #: self-state the agent trivially has access to), so it stays agent input.
 MINECRAFT_STREAM_REGISTRY: StreamRegistry = DEFAULT_STREAM_REGISTRY.extend(
     [
+        StreamDeclaration(
+            "world.entity_bearing",
+            ScalarEncoder,
+            classification="agent_input",
+            attention=AttentionMetadata(
+                modality="world", relative_compute_cost="low", localization_hint=True,
+            ),
+            note=(
+                "Nearest visible entity's salience + bearing (issue #60's stimulus "
+                "localization contract): ScalarEncoder reads the {'value': ...} "
+                "leaf, and the attention controller reads the {'direction': "
+                "{'bearing_deg': ...}} leaf via `localization_hint=True`. Entity "
+                "presence/proximity, not identity -- proprioceptive-adjacent "
+                "salience, not the privileged ground truth vision.entities carries."
+            ),
+        ),
         StreamDeclaration(
             "world.time",
             encoder_factory=None,

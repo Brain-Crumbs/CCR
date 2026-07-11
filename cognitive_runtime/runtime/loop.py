@@ -34,6 +34,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
+from cognitive_runtime.core.action_registry import ActionRegistry, DEFAULT_ACTION_REGISTRY
 from cognitive_runtime.core.action_space import action_space_hash
 from cognitive_runtime.core.attention import ATTENTION_MODES, AttentionController
 from cognitive_runtime.core.entity_persistence import EntityPersistence, NullEntityPersistence
@@ -44,6 +45,11 @@ from cognitive_runtime.core.modulation import (
     ModulationTracker,
 )
 from cognitive_runtime.core.novelty import combine_novelty
+from cognitive_runtime.core.orienting_reflex import (
+    REFLEX_MODES,
+    OrientingReflex,
+    OrientingReflexConfig,
+)
 from cognitive_runtime.core.perception import State
 from cognitive_runtime.core.policy import Policy
 from cognitive_runtime.core.program import Program, RecoverableEpisodeError
@@ -125,6 +131,7 @@ class CognitiveRuntime:
         encoders: Optional[StreamEncoderRegistry] = None,
         stream_registry: Optional[StreamRegistry] = None,
         learned_fusion: Optional[Any] = None,
+        action_registry: Optional[ActionRegistry] = None,
     ):
         self.program = program
         self.policy = policy
@@ -223,6 +230,32 @@ class CognitiveRuntime:
             stream_registry=self.stream_registry,
             mode=attention_mode,
         )
+        #: Program-specific world_changing/information_gathering action
+        #: classification (issue #60); defaults to the empty
+        #: `DEFAULT_ACTION_REGISTRY`, under which every action counts as
+        #: world_changing (conservative: the reflex below never overrides a
+        #: policy whose actions aren't classified).
+        self.action_registry = action_registry or DEFAULT_ACTION_REGISTRY
+        reflex_mode = self.config.reflex_mode
+        if reflex_mode not in REFLEX_MODES:
+            raise ValueError(
+                f"unknown reflex_mode {reflex_mode!r}; expected one of {sorted(REFLEX_MODES)}"
+            )
+        #: Scripted orienting reflex (issue #60): turns toward a bottom-up
+        #: attention capture with a localizable direction hint, bounded and
+        #: vetoed by high risk / a survival-critical policy action. Inert
+        #: whenever `self.attention.mode == "off"` (no capture ever fires).
+        self.reflex = OrientingReflex(
+            config=OrientingReflexConfig(
+                mode=reflex_mode,
+                hold_ticks=self.config.reflex_hold_ticks,
+                risk_veto_threshold=self.config.reflex_risk_veto_threshold,
+                bearing_deadzone_deg=self.config.reflex_bearing_deadzone_deg,
+                left_action=self.config.reflex_left_action,
+                right_action=self.config.reflex_right_action,
+            ),
+            action_registry=self.action_registry,
+        )
         self._stop_requested = False
 
     def stop(self) -> None:
@@ -303,6 +336,7 @@ class CognitiveRuntime:
         self.synchronizer.reset()
         self.scheduler.reset()
         self.attention.reset()
+        self.reflex.reset()
         episode_id = self.recorder.start_episode(episode_index)
 
         ratio = self.config.program_ticks_per_cognitive_tick
@@ -320,6 +354,7 @@ class CognitiveRuntime:
         attention_budget_total = 0.0
         attention_budget_ticks = 0
         attention_focus_counts: Dict[str, int] = {}
+        reflex_activations = 0
         recoverable_error: Optional[str] = None
 
         while not self._stop_requested:
@@ -402,6 +437,31 @@ class CognitiveRuntime:
                     source="model",
                 )
             emissions = self.policy.emit(state, self.memory, prediction)
+            # Scripted orienting reflex (issue #60): may substitute a
+            # look/turn action for the policy's this tick -- never when the
+            # policy already emitted a "pure" world-changing (not also
+            # information-gathering) action -- i.e. a survival-critical
+            # response like fleeing/eating, not routine "both" locomotion --
+            # and never above the risk-veto threshold. Gated on `NullLearner`:
+            # substituting the emitted action would silently corrupt an
+            # online learner's credit assignment, since ActorCriticLearner/
+            # OnlineQPolicy.update() pair `policy.latest_decision` (the
+            # policy's *intended* action, untouched by the reflex) with the
+            # reward this tick's *actual* (possibly reflex-substituted)
+            # action produced -- issue #60 explicitly scopes "learning the
+            # orienting behavior" out, so a training run defers to
+            # `reflex_mode="off"`/`"learned-only"` instead.
+            reflex_decision = (
+                self.reflex.decide(
+                    attention_state=attention_state,
+                    risk=prediction.risk,
+                    policy_actions=emissions,
+                )
+                if isinstance(self.learner, NullLearner)
+                else None
+            )
+            if reflex_decision is not None:
+                emissions = [reflex_decision.action]
             policy_decision = getattr(self.policy, "latest_decision", None)
             value_estimate = getattr(policy_decision, "value_estimate", None)
             if value_estimate is not None:
@@ -416,6 +476,8 @@ class CognitiveRuntime:
                 self._stop_requested = True
                 break
 
+            if reflex_decision is not None:
+                reflex_activations += 1
             motor_events = [
                 publish_motor_command(self.motor_bus, action, window.ended_at)
                 for action in emissions
@@ -474,6 +536,7 @@ class CognitiveRuntime:
                         else None
                     ),
                     attention=attention_state.to_dict(),
+                    reflex=reflex_decision.to_dict() if reflex_decision is not None else None,
                 ),
             )
 
@@ -533,6 +596,8 @@ class CognitiveRuntime:
             ),
             attention_focus_counts=dict(sorted(attention_focus_counts.items())),
             attention_mode=self.attention.mode,
+            reflex_mode=self.reflex.config.mode,
+            reflex_activations=reflex_activations,
         )
         self.recorder.write_summary(summary)
         self.recorder.end_episode_file()

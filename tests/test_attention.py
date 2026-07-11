@@ -15,6 +15,10 @@ from cognitive_runtime.core.attention import (
     AttentionCoefficients,
     AttentionConfig,
     AttentionController,
+    AttentionReason,
+    AttentionSignal,
+    AttentionState,
+    StimulusDirection,
 )
 from cognitive_runtime.core.streams.events import StreamEvent, StreamSpec
 from cognitive_runtime.core.streams.fusion import TemporalFusion
@@ -266,3 +270,140 @@ def test_every_minecraft_agent_input_stream_is_attended_in_budgeted_mode():
     ctrl = AttentionController(catalog, MINECRAFT_STREAM_REGISTRY, mode="budgeted")
     agent_input_ids = set(MINECRAFT_STREAM_REGISTRY.ids_by_classification(catalog, "agent_input"))
     assert set(ctrl.stream_ids) == agent_input_ids
+
+
+# ------------------------------------------ stimulus localization contract (issue #60)
+
+#: `vision.frame.pixels` is DEFAULT_STREAM_REGISTRY's one `localization_hint=True`
+#: stream; feeding it a dict payload here (rather than its real ndarray shape)
+#: is enough to exercise the generic direction-extraction contract.
+_LOCALIZED_CATALOG = [
+    StreamSpec("body.health", "body", range=(0, 20)),
+    StreamSpec("vision.frame.pixels", "vision"),
+    StreamSpec("reward.scalar", "reward", range=(-2.0, 2.0)),
+    StreamSpec("internal.risk", "event"),
+]
+
+
+def test_stimulus_direction_requires_bearing_or_region():
+    with pytest.raises(ValueError, match="bearing_deg/region"):
+        StimulusDirection()
+
+
+def test_direction_hint_extracted_only_for_localization_hint_streams():
+    ctrl = AttentionController(_LOCALIZED_CATALOG, DEFAULT_STREAM_REGISTRY, mode="budgeted")
+    buffer = TemporalBuffer()
+    buffer.append(
+        StreamEvent(
+            "vision.frame.pixels", "vision", 0.05, 0,
+            {"value": 1.0, "direction": {"bearing_deg": 30.0}},
+        )
+    )
+    # body.health is not declared `localization_hint=True`; even though its
+    # payload has the same {"direction": ...} shape, it must be ignored.
+    buffer.append(
+        StreamEvent("body.health", "body", 0.05, 0, {"value": 20.0, "direction": {"bearing_deg": -90.0}})
+    )
+    buffer.append(StreamEvent("reward.scalar", "reward", 0.05, 0, {"value": 0.0}))
+    buffer.append(StreamEvent("internal.risk", "event", 0.05, 0, {"value": 0.0}))
+
+    state = ctrl.compute(0, buffer)
+    vision_reason = state.reasons["vision.frame.pixels"]
+    assert vision_reason.signal.direction == StimulusDirection(bearing_deg=30.0)
+    assert vision_reason.to_dict()["direction"] == {"bearing_deg": 30.0, "region": None}
+
+    health_reason = state.reasons["body.health"]
+    assert health_reason.signal.direction is None
+    assert health_reason.to_dict()["direction"] is None
+
+
+def test_direction_hint_ignores_malformed_payloads():
+    ctrl = AttentionController(_LOCALIZED_CATALOG, DEFAULT_STREAM_REGISTRY, mode="budgeted")
+    buffer = TemporalBuffer()
+    buffer.append(
+        StreamEvent("vision.frame.pixels", "vision", 0.05, 0, {"value": 1.0, "direction": "left"})
+    )
+    buffer.append(StreamEvent("body.health", "body", 0.05, 0, 20.0))
+    buffer.append(StreamEvent("reward.scalar", "reward", 0.05, 0, {"value": 0.0}))
+    buffer.append(StreamEvent("internal.risk", "event", 0.05, 0, {"value": 0.0}))
+    state = ctrl.compute(0, buffer)
+    assert state.reasons["vision.frame.pixels"].signal.direction is None
+
+
+# --------------------------------------------------- bottom-up capture flag (issue #60)
+
+
+def test_off_mode_never_reports_bottom_up_capture():
+    ctrl = AttentionController(_CATALOG, DEFAULT_STREAM_REGISTRY, mode="off")
+    buffer = TemporalBuffer()
+    _fill(buffer, 0.05, 0)
+    assert ctrl.compute(0, buffer).bottom_up_capture is False
+
+
+def test_bottom_up_capture_true_on_fresh_focus_false_while_held():
+    ctrl = AttentionController(_CATALOG, DEFAULT_STREAM_REGISTRY, mode="budgeted")
+    buffer = TemporalBuffer()
+    _fill(buffer, 0.05, 0, health=5.0, reward=-1.0, risk=0.8)
+    state = ctrl.compute(0, buffer)
+    assert state.bottom_up_capture is True
+    focus = state.focus_stream
+
+    _fill(buffer, 0.10, 1, health=5.0, reward=-1.0, risk=0.8)
+    state2 = ctrl.compute(1, buffer)
+    assert state2.focus_stream == focus
+    assert state2.bottom_up_capture is False
+
+
+def test_capture_bottom_up_flag_distinguishes_spike_from_dwell_handoff():
+    """White-box check of `_update_focus`'s three capture paths: a fresh
+    focus and a real over-margin spike are both bottom-up; a routine
+    dwell-expiry handoff to whichever stream currently scores best is not
+    -- this is exactly the distinction the orienting reflex (issue #60)
+    needs to fire only on genuine stimulus spikes."""
+    ctrl = AttentionController(
+        _CATALOG, DEFAULT_STREAM_REGISTRY, mode="budgeted",
+        config=AttentionConfig(dwell_ticks=1, displacement_margin=0.5),
+    )
+
+    def reason(score: float) -> AttentionReason:
+        signal = AttentionSignal(
+            stream_id="x", novelty=0.0, prediction_error=0.0, uncertainty=None,
+            reward_relevance=0.0, risk=0.0, recency=0.0, boredom=0.0, compute_cost=0.0,
+        )
+        return AttentionReason(signal=signal, score=score, components={})
+
+    # Fresh capture (focus was None): bottom-up.
+    ctrl._update_focus({"a": reason(1.0)})
+    assert ctrl._focus == "a" and ctrl._last_capture_was_bottom_up is True
+
+    # "b" edges ahead but not past the margin, and dwell hasn't expired:
+    # hysteresis holds "a" -- no capture at all.
+    ctrl._update_focus({"a": reason(1.0), "b": reason(1.2)})
+    assert ctrl._focus == "a" and ctrl._last_capture_was_bottom_up is False
+
+    # Dwell now expired: "b" takes over, but as a routine handoff, not a spike.
+    ctrl._update_focus({"a": reason(1.0), "b": reason(1.2)})
+    assert ctrl._focus == "b" and ctrl._last_capture_was_bottom_up is False
+
+    # A real spike on "a" (exceeds the displacement margin): bottom-up again.
+    ctrl._update_focus({"a": reason(5.0), "b": reason(1.2)})
+    assert ctrl._focus == "a" and ctrl._last_capture_was_bottom_up is True
+
+
+def test_reset_clears_bottom_up_capture_flag():
+    ctrl = AttentionController(_CATALOG, DEFAULT_STREAM_REGISTRY, mode="budgeted")
+    buffer = TemporalBuffer()
+    _fill(buffer, 0.05, 0, health=5.0, reward=-1.0)
+    ctrl.compute(0, buffer)
+    assert ctrl._last_capture_was_bottom_up is True
+    ctrl.reset()
+    assert ctrl._last_capture_was_bottom_up is False
+
+
+def test_attention_state_to_dict_includes_bottom_up_capture():
+    state = AttentionState(
+        tick_index=0, mode="budgeted", weights={}, selected_streams=(),
+        focus_stream=None, budget_used=0.0, budget_total=0.0, reasons={},
+        bottom_up_capture=True,
+    )
+    assert state.to_dict()["bottom_up_capture"] is True

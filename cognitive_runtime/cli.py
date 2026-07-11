@@ -19,6 +19,7 @@ import sys
 from typing import Any, Callable, Dict, Optional
 
 from cognitive_runtime.core.attention import ATTENTION_MODES
+from cognitive_runtime.core.orienting_reflex import REFLEX_MODES
 from cognitive_runtime.core.policy import Policy
 from cognitive_runtime.core.streams import TemporalFusion, default_encoder_registry
 from cognitive_runtime.models.online_q import OnlineQModel
@@ -41,6 +42,7 @@ from cognitive_runtime.programs.minecraft.reward_profile import (
     load_reward_profile,
 )
 from cognitive_runtime.programs.minecraft.rewards import SurvivalRewardConfig
+from cognitive_runtime.programs.minecraft.action_registry import MINECRAFT_ACTION_REGISTRY
 from cognitive_runtime.programs.minecraft.stream_registry import MINECRAFT_STREAM_REGISTRY
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
@@ -604,6 +606,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         program_config=program_config,
         curriculum=args.curriculum,
         attention_mode=getattr(args, "attention", "off"),
+        reflex_mode=getattr(args, "reflex", "on"),
     )
     runtime = CognitiveRuntime(
         program=program,
@@ -615,6 +618,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         stream_registry=MINECRAFT_STREAM_REGISTRY,
         encoders=encoders,
         learned_fusion=learned_fusion,
+        action_registry=MINECRAFT_ACTION_REGISTRY,
     )
     try:
         summaries = runtime.run()
@@ -1393,6 +1397,13 @@ def build_parser() -> argparse.ArgumentParser:
                             "agent-input stream's salience each tick and gates the fused "
                             "state under a hard budget, recording an AttentionState (weights, "
                             "focus stream, reason breakdown) every tick.")
+    p_run.add_argument("--reflex", choices=sorted(REFLEX_MODES), default="on",
+                       help="scripted orienting reflex (issue #60): 'on' (default) turns "
+                            "toward a bottom-up attention capture with a localizable "
+                            "direction hint, bounded and vetoed by high internal.risk or a "
+                            "survival-critical policy action; 'off' disables it (the "
+                            "ablation); 'learned-only' leaves orienting to the policy "
+                            "instead. Only fires when --attention=budgeted.")
     p_run.add_argument("--actor-critic-save-every", type=int, default=1000,
                        help="save the actor-critic checkpoint every N gradient steps")
     p_run.add_argument("--actor-critic-lr", type=float, default=1e-3)

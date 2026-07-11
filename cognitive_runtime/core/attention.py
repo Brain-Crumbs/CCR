@@ -77,6 +77,48 @@ def _scalar(payload: Any) -> Optional[float]:
 
 
 @dataclass(frozen=True)
+class StimulusDirection:
+    """A localized stimulus's direction/region hint (issue #60): generic
+    across every backend that can supply one -- a bearing angle (degrees,
+    signed, 0 = straight ahead, positive = right) for entity/damage
+    directions, a coarse frame region for vision novelty, or both. A backend
+    fills whichever it can measure; the other stays `None`."""
+
+    bearing_deg: Optional[float] = None
+    region: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.bearing_deg is None and self.region is None:
+            raise ValueError("StimulusDirection needs at least one of bearing_deg/region")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"bearing_deg": self.bearing_deg, "region": self.region}
+
+
+def _direction(payload: Any) -> Optional[StimulusDirection]:
+    """A stream event's optional stimulus-localization hint (issue #60): a
+    ``{"direction": {"bearing_deg": ..., "region": ...}}`` entry inside a
+    dict payload -- the same generic convention ``_scalar``'s ``"value"``
+    key uses. `None` when the payload carries no (or an invalid) hint."""
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("direction")
+    if not isinstance(raw, dict):
+        return None
+    bearing = raw.get("bearing_deg")
+    if isinstance(bearing, bool) or not isinstance(bearing, (int, float)):
+        bearing = None
+    else:
+        bearing = float(bearing)
+    region = raw.get("region")
+    if not isinstance(region, str):
+        region = None
+    if bearing is None and region is None:
+        return None
+    return StimulusDirection(bearing_deg=bearing, region=region)
+
+
+@dataclass(frozen=True)
 class AttentionSignal:
     """One stream's raw salience inputs for one tick."""
 
@@ -89,6 +131,10 @@ class AttentionSignal:
     recency: float
     boredom: float
     compute_cost: float
+    #: Stimulus localization hint (issue #60), or `None` when this stream
+    #: isn't declared `localization_hint=True` or carries no direction data
+    #: this tick.
+    direction: Optional[StimulusDirection] = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +199,7 @@ class AttentionReason:
         return {
             "score": round(self.score, 6),
             "components": {k: round(v, 6) for k, v in self.components.items()},
+            "direction": self.signal.direction.to_dict() if self.signal.direction else None,
         }
 
 
@@ -169,6 +216,13 @@ class AttentionState:
     budget_used: float
     budget_total: float
     reasons: Dict[str, AttentionReason]
+    #: True exactly on the tick a real bottom-up spike (over the dwell
+    #: hysteresis's displacement margin, or the first-ever focus) captured
+    #: `focus_stream` -- as opposed to a routine dwell-expiry handoff to
+    #: whichever stream currently scores best. The orienting reflex (issue
+    #: #60) fires only on this pulse, not on every tick focus is merely
+    #: held. Always `False` in `"off"` mode.
+    bottom_up_capture: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -180,6 +234,7 @@ class AttentionState:
             "budget_used": round(self.budget_used, 6),
             "budget_total": round(self.budget_total, 6),
             "reasons": {sid: reason.to_dict() for sid, reason in self.reasons.items()},
+            "bottom_up_capture": self.bottom_up_capture,
         }
 
 
@@ -232,19 +287,25 @@ class AttentionController:
             stream_registry.ids_by_classification(catalog, "agent_input")
         )
         self._compute_cost: Dict[str, float] = {}
+        self._localization_hint: Dict[str, bool] = {}
         for stream_id in self.stream_ids:
             decl = stream_registry.declaration_for(stream_id)
             metadata = decl.attention if decl is not None else None
             cost_label = metadata.relative_compute_cost if metadata is not None else "low"
             self._compute_cost[stream_id] = self.config.compute_cost_scale.get(cost_label, 0.1)
+            self._localization_hint[stream_id] = bool(
+                metadata.localization_hint if metadata is not None else False
+            )
         self._focus: Optional[str] = None
         self._captured_score: float = 0.0
         self._dwell_remaining: int = 0
+        self._last_capture_was_bottom_up: bool = False
 
     def reset(self) -> None:
         self._focus = None
         self._captured_score = 0.0
         self._dwell_remaining = 0
+        self._last_capture_was_bottom_up = False
 
     # ------------------------------------------------------------- scoring
 
@@ -289,6 +350,7 @@ class AttentionController:
                 reward_relevance=0.0, risk=risk, recency=0.0, boredom=1.0, compute_cost=0.0,
             )
         latest = events[-1]
+        direction = _direction(latest.payload) if self._localization_hint.get(stream_id) else None
         recency = self._recency(latest.timestamp, reference_time)
         hashes = [hash_payload(e.payload) for e in events]
         novelty = 1.0 if len(hashes) < 2 or hashes[-1] != hashes[-2] else 0.0
@@ -311,6 +373,7 @@ class AttentionController:
             recency=recency,
             boredom=boredom,
             compute_cost=self._compute_cost.get(stream_id, 0.1),
+            direction=direction,
         )
 
     def _score(self, signal: AttentionSignal) -> Tuple[float, Dict[str, float]]:
@@ -332,28 +395,32 @@ class AttentionController:
     def _update_focus(self, reasons: Dict[str, AttentionReason]) -> Optional[str]:
         if not reasons:
             self._focus = None
+            self._last_capture_was_bottom_up = False
             return None
         best_id = max(reasons, key=lambda sid: reasons[sid].score)
         best_score = reasons[best_id].score
         if self._focus is None or self._focus not in reasons:
-            self._capture(best_id, best_score)
+            self._capture(best_id, best_score, bottom_up=True)  # a fresh stimulus appears
             return self._focus
         if best_id == self._focus:
             self._captured_score = best_score
             self._dwell_remaining = self.config.dwell_ticks
+            self._last_capture_was_bottom_up = False
             return self._focus
         if best_score > self._captured_score + self.config.displacement_margin:
-            self._capture(best_id, best_score)  # bottom-up capture: a real spike wins now
+            self._capture(best_id, best_score, bottom_up=True)  # bottom-up capture: a real spike wins now
         elif self._dwell_remaining <= 0:
-            self._capture(best_id, best_score)  # dwell expired: hand off to the current best
+            self._capture(best_id, best_score, bottom_up=False)  # dwell expired: hand off to the current best
         else:
             self._dwell_remaining -= 1  # hysteresis: hold focus against a marginal challenger
+            self._last_capture_was_bottom_up = False
         return self._focus
 
-    def _capture(self, stream_id: str, score: float) -> None:
+    def _capture(self, stream_id: str, score: float, bottom_up: bool) -> None:
         self._focus = stream_id
         self._captured_score = score
         self._dwell_remaining = self.config.dwell_ticks
+        self._last_capture_was_bottom_up = bottom_up
 
     # ------------------------------------------------------------- budget
 
@@ -417,4 +484,5 @@ class AttentionController:
             budget_used=sum(weights.values()),
             budget_total=self.config.budget.max_total_weight,
             reasons=reasons,
+            bottom_up_capture=self._last_capture_was_bottom_up,
         )

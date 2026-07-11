@@ -105,6 +105,7 @@ _DASHBOARD_COLUMNS = [
     "avg_max_distance", "avg_decision_latency_ms", "stream_events_per_sec",
     "avg_risk", "avg_prediction_error", "avg_novelty",
     "attention_mode", "avg_attention_budget_used",
+    "reflex_mode", "reflex_activations",
 ]
 
 
