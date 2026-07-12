@@ -256,7 +256,7 @@ class MultiHorizonMLPWorldModel(MLPWorldModel):
     """Multi-horizon, uncertainty-aware extension of :class:`MLPWorldModel`
     (issue #39): predicts ``(next_latent, reward, terminal, risk,
     prediction_error, uncertainty)`` at every configured horizon (default
-    ``t+1, t+5, t+20``) from the *same* ``(fused_latent, action_onehot)``
+    ``t+1, t+10, t+100``) from the *same* ``(fused_latent, action_onehot)``
     input, via independent linear heads over one shared trunk -- a direct
     multi-head reading of "the interface takes a horizon list so heads can
     be added without contract changes", as opposed to iterated latent
@@ -278,7 +278,7 @@ class MultiHorizonMLPWorldModel(MLPWorldModel):
         fused_width: int,
         n_actions: int,
         *,
-        horizons: Sequence[int] = (1, 5, 20),
+        horizons: Sequence[int] = (1, 10, 100),
         hidden_dim: int = 128,
         depth: int = 2,
         dropout: float = 0.0,

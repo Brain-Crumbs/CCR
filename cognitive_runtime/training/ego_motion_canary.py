@@ -68,7 +68,7 @@ class EgoMotionCanaryConfig:
     #: Probability each tick's action is replaced by a random action instead
     #: of MOVE_FORWARD -- issue #39's "optional action noise".
     action_noise: float = 0.0
-    horizons: Sequence[int] = (1, 5, 20)
+    horizons: Sequence[int] = (1, 10, 100)
     latent_width: int = 32
     hidden_dim: int = 64
     reconstruction_size: int = 16

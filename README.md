@@ -66,10 +66,10 @@ python -m cognitive_runtime train --model-type neural \
 python -m cognitive_runtime evaluate --policies scripted,neural --model models/vision_bc.pt
 
 # Multi-horizon, uncertainty-aware world model (issue #39): predicts
-# next_latent/reward/terminal/risk at t+1/t+5/t+20 (configurable), each with
+# next_latent/reward/terminal/risk at t+1/t+10/t+100 (configurable), each with
 # a learned uncertainty, and reports per-horizon copy-last/mean baselines.
 python -m cognitive_runtime train --model-type multi-horizon-world-model \
-    --sessions sessions/<session-id> --horizons 1 5 20 --out models/multi_horizon_world_model.pt
+    --sessions sessions/<session-id> --horizons 1 10 100 --out models/multi_horizon_world_model.pt
 
 # Ego-motion canary (issue #39): records walk_forward (constant MOVE_FORWARD)
 # episodes at multiple seeds, pretrains a next-frame predictor on a
@@ -87,6 +87,10 @@ python -m cognitive_runtime ego-motion-canary --record-dir sessions \
 # baseline, and every held-out episode gets a rendered dream strip.
 python -m cognitive_runtime nursery list
 python -m cognitive_runtime nursery run all --record-dir sessions
+# With CCR_MINECRAFT_HOST set, nursery defaults to the remote backend; otherwise
+# pass it explicitly for live-server nursery recordings.
+CCR_MINECRAFT_HOST=localhost python -m cognitive_runtime nursery run walk_forward \
+    --backend remote --record-dir sessions --out-dir models/nursery
 
 # Evaluation gates (issue #31): train actor/critic + linear online-Q,
 # eval both plus scripted/random on identical seeds, and report the three

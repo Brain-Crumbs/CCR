@@ -30,7 +30,7 @@ Below the survival curriculum sits an "infant" stage,
 `walk_forward`, `turn_in_place`, `strafe_and_stop`, `object_permanence`,
 `day_night`, `approach_entity` — that each isolate one worldly regularity,
 generate clean recorded sessions, and benchmark the world model's
-multi-horizon prediction (t+1, t+5, t+20 by default) on held-out seeds
+multi-horizon prediction (t+1, t+10, t+100 by default) on held-out seeds
 against copy-last-frame/mean-frame baselines. No reward learning happens
 here; the point is that the world model learns the world is *lawful*
 (ego-motion produces optical flow, hidden objects persist, night follows
@@ -76,6 +76,13 @@ python -m cognitive_runtime nursery run walk_forward \
 
 # The whole suite, unattended:
 python -m cognitive_runtime nursery run all --record-dir sessions
+
+# Record nursery episodes through the live Mineflayer backend instead. When
+# CCR_MINECRAFT_HOST is set, `nursery run` defaults to `--backend remote`;
+# otherwise pass it explicitly. Remote nursery runs use the server's current
+# scene, so sim-only setup hooks for entity placement/occluders are skipped.
+CCR_MINECRAFT_HOST=localhost python -m cognitive_runtime nursery run walk_forward \
+    --backend remote --record-dir sessions --out-dir models/nursery
 ```
 
 An automated **curriculum runner** (issue #43,

@@ -27,7 +27,7 @@ internal signals      -> scalar MLP                        -> interoceptive late
 [all stream latents + memory state]
   -> attention controller (budgeted salience; selects what matters this tick)
   -> learned latent fusion model (weighted by attention)
-  -> learned world model (multi-horizon: t+1, t+5, t+20; with uncertainty)
+  -> learned world model (multi-horizon: t+1, t+10, t+100; with uncertainty)
   -> actor / critic policy heads (+ scripted orienting reflex below them)
   -> Minecraft action mapping
 ```
@@ -147,7 +147,7 @@ Add first-class contracts for:
 - `StreamEncoderModule`: trainable per-input encoder.
 - `LatentFusionModel`: maps per-stream latent slices into one agent state.
 - `WorldModel`: predicts next latent state, reward, terminal/death, risk, and
-  prediction error — at multiple horizons (t+1, t+5, t+20; issue #39), each
+  prediction error — at multiple horizons (t+1, t+10, t+100; issue #39), each
   with an uncertainty estimate.
 - `PolicyModel`: maps fused latent and world-model outputs to action logits.
 - `ValueModel` / critic: predicts expected return.
@@ -286,7 +286,7 @@ scripted intelligence:
   scripted micro-scenarios (`walk_forward`, `turn_in_place`,
   `strafe_and_stop`, `object_permanence`, `day_night`, `approach_entity`)
   that each isolate one worldly regularity, generate clean recorded
-  sessions, and benchmark multi-horizon prediction (t+1, t+5, t+20) on
+  sessions, and benchmark multi-horizon prediction (t+1, t+10, t+100) on
   held-out seeds — `cognitive_runtime/training/nursery.py`,
   `ccr nursery list`/`ccr nursery run`, see `docs/curriculum.md`.  This is
   stage zero of the childhood: the world model learns that the world is
@@ -515,7 +515,7 @@ to be byte-reproducible.)
 - Multi-horizon, uncertainty-aware world model landed (#39):
   `MultiHorizonMLPWorldModel` (`cognitive_runtime/neural/world_model.py`)
   predicts `(next_latent, reward, terminal, risk, prediction_error)` at every
-  configured horizon (default t+1/t+5/t+20) over the fused agent-state
+  configured horizon (default t+1/t+10/t+100) over the fused agent-state
   latent, each with a learned `uncertainty` field trained via a
   heteroscedastic NLL loss (`ccr train --model-type
   multi-horizon-world-model`); `next_latent` is checked per horizon against
@@ -644,7 +644,7 @@ The project is aligned with the target when:
 
 - each major input stream has a trainable encoder or a deliberate fixed stub
 - learned fusion is the primary policy input
-- the agent predicts next state/reward/death — at t+1, t+5 and t+20, with
+- the agent predicts next state/reward/death — at t+1, t+10 and t+100, with
   calibrated-enough uncertainty to tell novelty from noise
 - internal modulation (`internal.*`) is recorded every tick like any sense
 - every tick records what the agent attended to and why, and salient stimuli

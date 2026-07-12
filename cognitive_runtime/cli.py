@@ -76,6 +76,16 @@ INPUT_PROFILES = {"full", "raw"}
 FUSION_MODES = {"fixed", "learned"}
 
 
+def _default_nursery_backend() -> str:
+    """Use the live backend by default when live connection env is present."""
+    env_default = os.environ.get("CCR_NURSERY_BACKEND")
+    if env_default in BACKENDS:
+        return env_default
+    if os.environ.get("CCR_MINECRAFT_HOST"):
+        return "remote"
+    return "simulated"
+
+
 def _encoders_for_input_profile(profile: str):
     if profile == "full":
         return None
@@ -1199,6 +1209,8 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
         holdout_seeds=holdout_seeds,
         episode_ticks=args.episode_ticks,
         world_size=args.world_size,
+        backend=args.backend,
+        realtime=args.realtime or args.backend == "remote",
         horizons=args.horizons,
         latent_width=args.latent_width,
         hidden_dim=args.hidden_dim,
@@ -1213,8 +1225,14 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
     print(
         f"nursery: running {'all scenarios' if args.scenario == 'all' else args.scenario} "
         f"({len(train_seeds)} train seeds, {len(holdout_seeds)} held-out seeds, "
-        f"{config.episode_ticks} ticks each, world_size={config.world_size})"
+        f"{config.episode_ticks} ticks each, world_size={config.world_size}, "
+        f"backend={config.backend})"
     )
+    if config.backend != "simulated":
+        print(
+            "nursery: remote backend uses the server's current scene; sim-only "
+            "scenario setup hooks are skipped"
+        )
 
     report_payload: Dict[str, Any] = {}
     for name in scenario_names:
@@ -1699,7 +1717,7 @@ def build_parser() -> argparse.ArgumentParser:
                               "learned latent fusion, the action-conditioned world model, the "
                               "multi-horizon uncertainty-aware world model (issue #39), or "
                               "the entity-persistence (object permanence) model")
-    p_train.add_argument("--horizons", type=int, nargs="+", default=[1, 5, 20],
+    p_train.add_argument("--horizons", type=int, nargs="+", default=[1, 10, 100],
                          help="--model-type multi-horizon-world-model only: tick offsets to "
                               "predict at (action ticks, per build_multi_horizon_world_model_"
                               "dataset; must include 1)")
@@ -1790,7 +1808,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_canary.add_argument("--action-noise", type=float, default=0.0,
                           help="probability each tick's action is a random action instead of "
                                "MOVE_FORWARD")
-    p_canary.add_argument("--horizons", type=int, nargs="+", default=[1, 5, 20],
+    p_canary.add_argument("--horizons", type=int, nargs="+", default=[1, 10, 100],
                           help="tick offsets to evaluate next-frame prediction at")
     p_canary.add_argument("--latent-width", type=int, default=32)
     p_canary.add_argument("--hidden-dim", type=int, default=64)
@@ -1810,7 +1828,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery = sub.add_parser(
         "nursery",
         help="issue #62: nursery scenario suite -- scripted micro-scenarios "
-             "benchmarking multi-horizon (t+1/t+5/t+20) world-model prediction "
+             "benchmarking multi-horizon (t+1/t+10/t+100) world-model prediction "
              "against copy-last-frame/mean-frame baselines",
     )
     nursery_sub = p_nursery.add_subparsers(dest="nursery_command", required=True)
@@ -1830,9 +1848,17 @@ def build_parser() -> argparse.ArgumentParser:
                                help="number of train-seed episodes (seeds 0..N-1)")
     p_nursery_run.add_argument("--holdout-seeds", type=int, default=2,
                                help="number of held-out-seed episodes (seeds N..N+M-1, never trained on)")
-    p_nursery_run.add_argument("--episode-ticks", type=int, default=120)
+    p_nursery_run.add_argument("--episode-ticks", type=int, default=400)
     p_nursery_run.add_argument("--world-size", type=int, default=48)
-    p_nursery_run.add_argument("--horizons", type=int, nargs="+", default=[1, 5, 20],
+    p_nursery_run.add_argument("--backend", default=_default_nursery_backend(),
+                               choices=sorted(BACKENDS),
+                               help="backend used to record nursery episodes. Defaults to "
+                                    "remote when CCR_MINECRAFT_HOST is set, otherwise "
+                                    "simulated; CCR_NURSERY_BACKEND can override this.")
+    p_nursery_run.add_argument("--realtime", action="store_true",
+                               help="hold wall-clock tick pacing while recording nursery "
+                                    "episodes. Remote nursery recordings force realtime.")
+    p_nursery_run.add_argument("--horizons", type=int, nargs="+", default=[1, 10, 100],
                                help="tick offsets to evaluate next-frame prediction at")
     p_nursery_run.add_argument("--latent-width", type=int, default=32)
     p_nursery_run.add_argument("--hidden-dim", type=int, default=64)

@@ -2,7 +2,7 @@
 isolate one worldly regularity -- ego-motion, view rotation, motion
 onset/offset, object permanence, day/night, approach -- generate clean
 recorded sessions, and benchmark multi-horizon world-model prediction
-(t+1, t+5, t+20 by default) on held-out seeds against copy-last-frame and
+(t+1, t+10, t+100 by default) on held-out seeds against copy-last-frame and
 mean-frame baselines.
 
 Stage zero below the survival curriculum (issue #43): before the agent
@@ -36,7 +36,7 @@ from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
 from cognitive_runtime.policies.constant_action import ConstantActionPolicy
 from cognitive_runtime.policies.null_policy import NullPolicy
 from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy
-from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+from cognitive_runtime.programs.minecraft.adapter import BACKENDS, MinecraftSurvivalBox
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
 from cognitive_runtime.runtime.replay import list_episodes
@@ -78,9 +78,11 @@ _WALL_OFFSET = 3
 class NurseryConfig:
     train_seeds: Sequence[int] = (0, 1, 2, 3)
     holdout_seeds: Sequence[int] = (1000, 1001)
-    episode_ticks: int = 120
+    episode_ticks: int = 400
     world_size: int = 48
-    horizons: Sequence[int] = (1, 5, 20)
+    backend: str = "simulated"
+    realtime: bool = False
+    horizons: Sequence[int] = (1, 10, 100)
     latent_width: int = 32
     hidden_dim: int = 64
     reconstruction_size: int = 16
@@ -316,13 +318,17 @@ def _record_scenario_episode(
         record_dir=record_dir,
         session_id=session_id,
         program_config=program_config,
+        realtime=cfg.realtime,
         record_frames=True,
         curriculum=f"nursery/{scenario.name}",
     )
-    program = MinecraftSurvivalBox(config=program_config)
-    if recording.scene_setup is not None:
+    program = MinecraftSurvivalBox(config=program_config, backend=cfg.backend)
+    if recording.scene_setup is not None and cfg.backend == "simulated":
         recording.scene_setup(program)
-    CognitiveRuntime(program=program, policy=recording.policy, config=runtime_config).run()
+    try:
+        CognitiveRuntime(program=program, policy=recording.policy, config=runtime_config).run()
+    finally:
+        program.close()
     return os.path.join(record_dir, session_id)
 
 
@@ -346,6 +352,8 @@ def run_nursery_scenario(
         )
     scenario = NURSERY_SCENARIOS[scenario_name]
     cfg = config or NurseryConfig()
+    if cfg.backend not in BACKENDS:
+        raise ValueError(f"unknown nursery backend {cfg.backend!r}; choices: {sorted(BACKENDS)}")
     if not cfg.horizons:
         raise ValueError("horizons must be non-empty")
     if any(h <= 0 for h in cfg.horizons):

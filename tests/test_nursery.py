@@ -11,6 +11,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from cognitive_runtime.cli import main  # noqa: E402
+from cognitive_runtime.cli import build_parser  # noqa: E402
 from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy  # noqa: E402
 from cognitive_runtime.core.action import Action  # noqa: E402
 from cognitive_runtime.training.nursery import (  # noqa: E402
@@ -126,6 +127,12 @@ def test_run_nursery_scenario_rejects_overlapping_seeds():
         run_nursery_scenario("unused", "walk_forward", cfg)
 
 
+def test_run_nursery_scenario_rejects_unknown_backend():
+    cfg = NurseryConfig(backend="not-a-backend")
+    with pytest.raises(ValueError, match="unknown nursery backend"):
+        run_nursery_scenario("unused", "walk_forward", cfg)
+
+
 def test_run_nursery_scenario_rejects_unknown_name(tmp_path):
     with pytest.raises(ValueError, match="unknown nursery scenario"):
         run_nursery_scenario(str(tmp_path), "not_a_real_scenario", NurseryConfig())
@@ -206,3 +213,21 @@ def test_nursery_cli_list_and_run(tmp_path, capsys):
 
     with pytest.raises(SystemExit, match="unknown nursery scenario"):
         main(["nursery", "run", "not_a_scenario", "--record-dir", record_dir])
+
+
+def test_nursery_cli_backend_default_tracks_live_env(monkeypatch):
+    monkeypatch.delenv("CCR_NURSERY_BACKEND", raising=False)
+    monkeypatch.delenv("CCR_MINECRAFT_HOST", raising=False)
+    parser = build_parser()
+    args = parser.parse_args(["nursery", "run", "walk_forward"])
+    assert args.backend == "simulated"
+
+    monkeypatch.setenv("CCR_MINECRAFT_HOST", "localhost")
+    parser = build_parser()
+    args = parser.parse_args(["nursery", "run", "walk_forward"])
+    assert args.backend == "remote"
+
+    monkeypatch.setenv("CCR_NURSERY_BACKEND", "simulated")
+    parser = build_parser()
+    args = parser.parse_args(["nursery", "run", "walk_forward"])
+    assert args.backend == "simulated"
