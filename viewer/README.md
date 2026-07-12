@@ -21,25 +21,33 @@ Open http://localhost:8787 — pick a session and episode.
   frames (`--record-frames`); they are exactly the baselines
   `evaluate_ego_motion_holdout` benchmarks the model against.
 - **model** appears when a `predictions_<episode>.json` file sits next to the
-  episode's stream log. The nursery checkpoint only persists the pixel
-  *encoder*, so export predictions while the full model is in memory:
-
-```python
-from cognitive_runtime.training.nursery import run_nursery_scenario
-from viewer.export_predictions import export_prediction_file, save_full_visual_model
-
-model, report = run_nursery_scenario("shared", "walk_forward")
-for session_dir in report.train_sessions + report.holdout_sessions:
-    export_prediction_file(model, session_dir, "episode_00000", (1, 10, 100))
-save_full_visual_model(model, "walk_forward-full.pt")   # re-export later without retraining
-```
-
-or later, from a saved full-model bundle:
+  episode's stream log. `run_nursery_scenario` (and `ccr nursery run`) writes
+  these for every recorded session by default
+  (`NurseryConfig.export_predictions` / `--no-export-predictions`), because
+  the nursery checkpoint only persists the pixel *encoder* — predicted frames
+  are unrecoverable after the run unless exported. `nursery run --out-dir`
+  also saves `<scenario>-full.pt`, a full encoder+decoder+predictor bundle
+  for re-exporting later:
 
 ```bash
-python -m viewer.export_predictions --model walk_forward-full.pt \
+python -m cognitive_runtime.training.prediction_export \
+    --model out/walk_forward-full.pt \
     --session shared/nursery-walk_forward-train-0 --horizons 1,10,100
 ```
+
+or in code, while the trained model is in memory:
+
+```python
+from cognitive_runtime.training.prediction_export import (
+    export_prediction_file, save_full_visual_model,
+)
+
+export_prediction_file(model, session_dir, "episode_00000", (1, 10, 100))
+save_full_visual_model(model, "walk_forward-full.pt")
+```
+
+(`viewer/export_predictions.py` remains as a shim re-exporting the same
+functions.)
 
 Model predictions live in the decoder's downsampled reconstruction space
 (default 16×16), the same space the training losses and holdout PSNR/SSIM
