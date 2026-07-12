@@ -17,10 +17,20 @@ from cognitive_runtime.core.action import Action  # noqa: E402
 from cognitive_runtime.training.nursery import (  # noqa: E402
     NURSERY_SCENARIOS,
     NurseryConfig,
+    NurseryScenario,
+    ScenarioRecording,
+    _record_scenario_episode,
+    measure_recording_quality,
     render_dream_strip,
     run_nursery_scenario,
     run_nursery_suite,
     save_nursery_scenario_checkpoint,
+    validate_nursery_recordings,
+)
+from cognitive_runtime.training.prediction_export import (  # noqa: E402
+    export_prediction_file,
+    load_full_visual_model,
+    save_full_visual_model,
 )
 from cognitive_runtime.training.visual_representation import load_pretrained_pixel_encoder  # noqa: E402
 from cognitive_runtime.runtime.replay import list_episodes, load_session_metadata  # noqa: E402
@@ -231,3 +241,161 @@ def test_nursery_cli_backend_default_tracks_live_env(monkeypatch):
     parser = build_parser()
     args = parser.parse_args(["nursery", "run", "walk_forward"])
     assert args.backend == "simulated"
+
+
+# --------------------------------------------------------------------------- data-quality gate
+
+
+def _record_static_walk_session(tmp_path, session_id="static-walk"):
+    """Record a session whose agent never moves -- the recorded shape of the
+    first real walk_forward run (stuck agent on the remote backend's
+    persistent world), reproduced on the simulated backend with a null
+    policy."""
+    from cognitive_runtime.policies.null_policy import NullPolicy
+
+    stuck = NurseryScenario(
+        "walk_forward", "stuck-agent surrogate",
+        lambda seed, cfg: ScenarioRecording(policy=NullPolicy()),
+    )
+    cfg = _small_config()
+    return _record_scenario_episode(str(tmp_path), session_id, 0, stuck, cfg)
+
+
+def test_measure_recording_quality_sees_motion_and_unique_frames(tmp_path):
+    cfg = _small_config()
+    session_dir = _record_scenario_episode(
+        str(tmp_path), "healthy-walk", 0, NURSERY_SCENARIOS["walk_forward"], cfg
+    )
+    quality = measure_recording_quality(session_dir, list_episodes(session_dir)[0])
+    assert quality.n_frames > 0
+    assert quality.duration_ticks == cfg.episode_ticks
+    assert quality.blocks_per_tick >= NURSERY_SCENARIOS["walk_forward"].min_blocks_per_tick
+    assert (
+        quality.unique_frame_fraction
+        >= NURSERY_SCENARIOS["walk_forward"].min_unique_frame_fraction
+    )
+
+
+def test_validate_nursery_recordings_flags_a_static_session(tmp_path):
+    session_dir = _record_static_walk_session(tmp_path)
+    issues = validate_nursery_recordings([session_dir], NURSERY_SCENARIOS["walk_forward"])
+    assert issues
+    assert any("barely moved" in issue for issue in issues)
+
+
+def test_validate_nursery_recordings_passes_a_healthy_walk(tmp_path):
+    cfg = _small_config()
+    session_dir = _record_scenario_episode(
+        str(tmp_path), "healthy-walk", 0, NURSERY_SCENARIOS["walk_forward"], cfg
+    )
+    assert validate_nursery_recordings([session_dir], NURSERY_SCENARIOS["walk_forward"]) == []
+
+
+def test_run_nursery_scenario_gate_rejects_motionless_recordings(tmp_path, monkeypatch):
+    from cognitive_runtime.policies.null_policy import NullPolicy
+
+    stuck = NurseryScenario(
+        "walk_forward",
+        NURSERY_SCENARIOS["walk_forward"].description,
+        lambda seed, cfg: ScenarioRecording(policy=NullPolicy()),
+        min_blocks_per_tick=NURSERY_SCENARIOS["walk_forward"].min_blocks_per_tick,
+        min_unique_frame_fraction=NURSERY_SCENARIOS["walk_forward"].min_unique_frame_fraction,
+    )
+    monkeypatch.setitem(NURSERY_SCENARIOS, "walk_forward", stuck)
+    with pytest.raises(ValueError, match="quality gate"):
+        run_nursery_scenario(str(tmp_path), "walk_forward", _small_config())
+
+    # data_quality_gate=False trains on the same recordings without raising.
+    model, report = run_nursery_scenario(
+        str(tmp_path / "ungated"), "walk_forward", _small_config(data_quality_gate=False)
+    )
+    assert report.horizon_metrics
+
+
+# --------------------------------------------------------------------------- prediction export
+
+
+def test_run_nursery_scenario_exports_viewer_predictions(tmp_path):
+    cfg = _small_config()
+    _model, report = run_nursery_scenario(str(tmp_path), "walk_forward", cfg)
+
+    assert report.prediction_files
+    all_sessions = set(report.train_sessions + report.holdout_sessions)
+    for key, path in report.prediction_files.items():
+        session_dir = key.rsplit("/", 1)[0]
+        assert session_dir in all_sessions
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        assert payload["format"] == "pixel-predictions-v1"
+        assert payload["horizons"] == sorted(cfg.horizons)
+        assert len(payload["targets"]) == payload["n_frames"]
+        for h in cfg.horizons:
+            assert len(payload["predictions"][str(h)]["frames"]) == payload["n_frames"] - h
+
+
+def test_run_nursery_scenario_can_skip_prediction_export(tmp_path):
+    cfg = _small_config(export_predictions=False)
+    _model, report = run_nursery_scenario(str(tmp_path), "walk_forward", cfg)
+    assert report.prediction_files == {}
+    for session_dir in report.train_sessions + report.holdout_sessions:
+        assert not [f for f in os.listdir(session_dir) if f.startswith("predictions_")]
+
+
+def test_full_visual_model_round_trips_and_re_exports(tmp_path):
+    import base64
+
+    cfg = _small_config()
+    model, report = run_nursery_scenario(str(tmp_path), "walk_forward", cfg)
+
+    bundle = tmp_path / "walk-full.pt"
+    save_full_visual_model(model, str(bundle))
+    reloaded = load_full_visual_model(str(bundle))
+    assert reloaded.pixel_shape == model.pixel_shape
+    assert reloaded.latent_width == model.latent_width
+    assert reloaded.reconstruction_shape == model.reconstruction_shape
+
+    session_dir = report.holdout_sessions[0]
+    episode_id = list_episodes(session_dir)[0]
+    out = export_prediction_file(
+        reloaded, session_dir, episode_id, cfg.horizons,
+        out_path=str(tmp_path / "re-export.json"),
+    )
+    with open(out, encoding="utf-8") as fh:
+        payload = json.load(fh)
+    h, w, c = payload["prediction_shape"]
+    frame = base64.b64decode(payload["predictions"]["1"]["frames"][0])
+    assert len(frame) == h * w * c
+
+
+# --------------------------------------------------------------------------- catalog honesty
+
+
+def test_stream_catalog_reports_paced_rates_in_realtime():
+    from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+
+    program = MinecraftSurvivalBox(config={"episode_ticks": 8, "world_size": 16})
+    try:
+        specs = {s.stream_id: s for s in program.stream_catalog()}
+        assert specs["vision.frame.pixels"].nominal_rate_hz == 20.0
+        assert specs["body.health"].nominal_rate_hz == 1.0
+        assert specs["spatial.position"].range == (0.0, 16.0)
+
+        program.set_realtime(True)
+        specs = {s.stream_id: s for s in program.stream_catalog()}
+        assert specs["vision.frame.pixels"].nominal_rate_hz == program._config.realtime_vision_hz
+        assert specs["vision.frame.grid"].nominal_rate_hz == program._config.realtime_vision_hz
+        assert specs["body.health"].nominal_rate_hz == program._config.realtime_body_heartbeat_hz
+
+        program.set_realtime(False)
+        specs = {s.stream_id: s for s in program.stream_catalog()}
+        assert specs["vision.frame.pixels"].nominal_rate_hz == 20.0
+    finally:
+        program.close()
+
+
+def test_stream_catalog_drops_position_bounds_for_remote_backend():
+    from cognitive_runtime.programs.minecraft.streams import build_survival_stream_specs
+
+    specs = {s.stream_id: s for s in build_survival_stream_specs(48, bounded_position=False)}
+    assert specs["spatial.position"].range is None
+    assert specs["spatial.distance_from_spawn"].range is None

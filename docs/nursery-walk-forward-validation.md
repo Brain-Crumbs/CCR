@@ -88,3 +88,36 @@ check below is reproducible from the stream logs; the viewer under
   stream rate with the catalog.
 - Add a post-record sanity gate before training: minimum unique-frame
   count and minimum displacement per episode.
+
+## Fixes landed since this review
+
+- **Data-quality gate** (finding 2): `run_nursery_scenario` now measures
+  every recorded episode (unique-frame fraction, net displacement per tick)
+  against the scenario's declared expectations and refuses to train on
+  recordings without the scenario's signal
+  (`NurseryConfig.data_quality_gate`, `--skip-data-quality-gate`). The six
+  sessions reviewed here all fail it.
+- **Catalog honesty in realtime** (findings 3 & 6): `stream_catalog()` now
+  declares the paced rates (`realtime_vision_hz`, `realtime_body_heartbeat_hz`)
+  in realtime mode instead of the 20 Hz tick cadence, and the remote backend
+  drops the `[0, world_size]` position/distance ranges its live-server
+  coordinates never respected.
+- **Predictions survive the run** (finding 8): after training,
+  `run_nursery_scenario` exports `predictions_<episode>.json` (the pixel
+  viewer's "model" source) for every recorded session by default
+  (`NurseryConfig.export_predictions`, `--no-export-predictions`), and
+  `nursery run --out-dir` also saves `<scenario>-full.pt` — a full
+  encoder+decoder+predictor bundle
+  (`cognitive_runtime.training.prediction_export`) that can re-export
+  predictions later without retraining.
+- **Louder remote warning** (finding 1): `nursery run` on a non-simulated
+  backend now spells out that seeds do not vary terrain, sessions inherit
+  the previous session's agent position, and vision is paced below the tick
+  rate.
+
+Still open: the agent getting stuck without an `event.bumped` (the
+mineflayer bridge only emits it when the blocking block has
+`boundingBox === 'block'` — whatever blocked this run didn't) needs a live
+server to reproduce; the half-rate recording itself is by design
+(`realtime_vision_hz`), so horizon comparisons across backends must
+rescale, which the corrected catalog metadata now makes visible.
