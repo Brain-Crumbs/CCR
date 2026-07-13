@@ -254,16 +254,100 @@ def evaluate_ego_motion_holdout(
         psnr_mean_frame = _psnr_from_mse(mean_frame_mse)
         report[h] = {
             "n_samples": len(entry["model_mse"]),
+            "model_mse": model_mse,
+            "copy_last_mse": copy_last_mse,
+            "mean_frame_mse": mean_frame_mse,
             "psnr_model": psnr_model,
             "psnr_copy_last": psnr_copy_last,
             "psnr_mean_frame": psnr_mean_frame,
             "ssim_model": model_ssim,
             "ssim_copy_last": copy_last_ssim,
             "ssim_mean_frame": mean_frame_ssim,
+            # Baseline-relative ratios (< 1.0 beats the reference): raw PSNR
+            # hides whether the model is doing anything a frame-copy would
+            # not, which is how the first collapsed nursery model looked
+            # plausible in isolation.
+            "model_over_copy_last_mse": (
+                model_mse / copy_last_mse if copy_last_mse > 0 else None
+            ),
+            "model_over_mean_frame_mse": (
+                model_mse / mean_frame_mse if mean_frame_mse > 0 else None
+            ),
             "beats_copy_last": bool(psnr_model > psnr_copy_last and model_ssim > copy_last_ssim),
             "beats_mean_frame": bool(psnr_model > psnr_mean_frame and model_ssim > mean_frame_ssim),
         }
     return report
+
+
+def evaluate_rollout_health(
+    model: VisualRepresentationModel,
+    holdout_sessions: Sequence[str],
+    horizons: Sequence[int],
+) -> Dict[str, Any]:
+    """Frozen-rollout detector for the iterated single-step predictor.
+
+    Compares how much the model's *predictions* vary across the configured
+    horizons against how much the *actual* frames vary across the same
+    horizons.  A healthy rollout tracks the scene, so its per-horizon
+    predictions differ roughly as much as reality does; a rollout that has
+    collapsed to a latent fixed point decodes the same frame at every
+    horizon (``prediction_dispersion`` ~ 0) while reality keeps moving --
+    the exact signature of the first real turn_in_place run (identical
+    predictions and identical MSE at t+10 and t+100).
+    """
+    horizons_sorted = sorted(set(int(h) for h in horizons))
+    if len(horizons_sorted) < 2:
+        return {
+            "prediction_dispersion": 0.0,
+            "target_dispersion": 0.0,
+            "frozen_rollout": False,
+            "note": "needs >= 2 horizons to compare rollout dispersion",
+        }
+    max_horizon = horizons_sorted[-1]
+    was_training = model.training
+    model.eval()
+    prediction_dispersion: List[float] = []
+    target_dispersion: List[float] = []
+    with torch.no_grad():
+        for session_dir in holdout_sessions:
+            for episode_id in list_episodes(session_dir):
+                frames = load_episode_pixel_frames(session_dir, episode_id)
+                if len(frames) <= max_horizon:
+                    continue
+                pixel_tensors = torch.stack([pixels_to_chw(f) for f in frames])
+                targets = reconstruction_target(pixel_tensors, model.reconstruction_shape)
+                latents = model.encoder(pixel_tensors)
+                for t in range(len(frames) - max_horizon):
+                    rolled = latents[t : t + 1]
+                    decoded: List[torch.Tensor] = []
+                    actual: List[torch.Tensor] = []
+                    for step in range(1, max_horizon + 1):
+                        rolled = model.next_predictor(rolled)
+                        if step in horizons_sorted:
+                            decoded.append(model.decoder(rolled).squeeze(0))
+                            actual.append(targets[t + step])
+                    prediction_dispersion.append(_pairwise_dispersion(decoded))
+                    target_dispersion.append(_pairwise_dispersion(actual))
+    if was_training:
+        model.train()
+
+    pred = sum(prediction_dispersion) / len(prediction_dispersion) if prediction_dispersion else 0.0
+    tgt = sum(target_dispersion) / len(target_dispersion) if target_dispersion else 0.0
+    return {
+        "prediction_dispersion": pred,
+        "target_dispersion": tgt,
+        "frozen_rollout": bool(tgt > 1e-6 and pred < 0.05 * tgt),
+    }
+
+
+def _pairwise_dispersion(frames: Sequence[torch.Tensor]) -> float:
+    total = 0.0
+    pairs = 0
+    for i in range(len(frames)):
+        for j in range(i + 1, len(frames)):
+            total += float(F.mse_loss(frames[i], frames[j]))
+            pairs += 1
+    return total / pairs if pairs else 0.0
 
 
 def save_ego_motion_canary_checkpoint(

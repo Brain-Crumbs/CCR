@@ -1262,6 +1262,20 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
                 f"beats_copy_last={entry['beats_copy_last']} "
                 f"beats_mean_frame={entry['beats_mean_frame']}"
             )
+        if report.ticks_per_frame > 1.05:
+            print(
+                f"  vision ran at ~1 frame per {round(report.ticks_per_frame, 2)} ticks; "
+                f"tick horizons {list(config.horizons)} evaluated as frame steps "
+                f"{report.horizon_frames}"
+            )
+        health = report.rollout_health
+        if health.get("frozen_rollout"):
+            print(
+                "  WARNING: FROZEN ROLLOUT -- predictions barely vary across horizons "
+                f"(prediction dispersion {health['prediction_dispersion']:.2e} vs actual "
+                f"{health['target_dispersion']:.2e}); the predictor has collapsed to a "
+                "fixed point and is not modelling the dynamics"
+            )
         if report.entity_persistence_stats is not None:
             eps = report.entity_persistence_stats
             if "beats_forget_baseline" in eps:
@@ -1293,6 +1307,9 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
 
         report_payload[name] = {
             "horizon_metrics": {str(h): v for h, v in report.horizon_metrics.items()},
+            "horizon_frames": report.horizon_frames,
+            "ticks_per_frame": report.ticks_per_frame,
+            "rollout_health": report.rollout_health,
             "entity_persistence_stats": report.entity_persistence_stats,
             "dream_strips": report.dream_strips,
             "train_sessions": report.train_sessions,
@@ -1305,6 +1322,146 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
         with open(args.report, "w", encoding="utf-8") as fh:
             json.dump(report_payload, fh, indent=2)
         print(f"\nreport written to {args.report}")
+
+
+def cmd_nursery_joint(args: argparse.Namespace) -> None:
+    """``ccr nursery joint``: record every scenario and train ONE
+    action-conditioned recurrent world model across them (phase 3 of
+    docs/nursery-turn-in-place-analysis.md), evaluating in-distribution
+    generalization (held-out seeds), zero-shot generality (held-out
+    scenarios), rollout health (frozen-rollout detector), and a yaw linear
+    probe."""
+    try:
+        import json
+
+        from cognitive_runtime.training.action_world_model import (
+            ActionWorldModelConfig,
+            save_action_world_model,
+        )
+        from cognitive_runtime.training.nursery import (
+            NURSERY_SCENARIOS,
+            NurseryConfig,
+            run_nursery_joint,
+        )
+    except ImportError as exc:  # torch not installed
+        sys.exit(f"the nursery suite needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+
+    holdout_scenarios = args.holdout_scenarios or ["approach_entity"]
+    train_scenarios = args.train_scenarios or None
+    for name in (train_scenarios or []) + holdout_scenarios:
+        if name not in NURSERY_SCENARIOS:
+            sys.exit(
+                f"unknown nursery scenario {name!r}; choices: {sorted(NURSERY_SCENARIOS)}"
+            )
+
+    train_seeds = list(range(args.train_seeds))
+    holdout_seeds = list(range(args.train_seeds, args.train_seeds + args.holdout_seeds))
+    config = NurseryConfig(
+        train_seeds=train_seeds,
+        holdout_seeds=holdout_seeds,
+        episode_ticks=args.episode_ticks,
+        world_size=args.world_size,
+        backend=args.backend,
+        realtime=args.realtime or args.backend == "remote",
+        horizons=args.horizons,
+        latent_width=args.latent_width,
+        hidden_dim=args.hidden_dim,
+        reconstruction_size=args.reconstruction_size,
+        epochs=args.epochs,
+        lr=args.neural_lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        data_quality_gate=not args.skip_data_quality_gate,
+    )
+    model_config = ActionWorldModelConfig(
+        latent_width=args.latent_width,
+        hidden_dim=args.hidden_dim,
+        reconstruction_size=args.reconstruction_size,
+        epochs=args.epochs,
+        lr=args.neural_lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        warmup_frames=args.warmup_frames,
+        rollout_frames=args.rollout_frames,
+    )
+    print(
+        f"nursery joint: training one action-conditioned world model "
+        f"(holdout scenarios: {holdout_scenarios}; {len(train_seeds)} train seeds, "
+        f"{len(holdout_seeds)} held-out seeds, backend={config.backend})"
+    )
+
+    model, report = run_nursery_joint(
+        args.record_dir,
+        train_scenarios=train_scenarios,
+        holdout_scenarios=holdout_scenarios,
+        config=config,
+        model_config=model_config,
+    )
+
+    def _print_metrics(label: str, metrics: Dict[str, Any]) -> None:
+        print(f"\n{label}:")
+        for h, entry in metrics["horizons"].items():
+            oracle = entry["model_over_oracle_mse"]
+            print(
+                f"  t+{h} frames (n={entry['n_samples']}): "
+                f"model_mse={entry['model_mse']:.5f} "
+                f"copy_last={entry['copy_last_mse']:.5f} "
+                f"model/copy_last={entry['model_over_copy_last_mse']:.2f} "
+                f"model/oracle={f'{oracle:.2f}' if oracle is not None else 'n/a'} "
+                f"beats_copy_last={entry['beats_copy_last']}"
+            )
+        health = metrics["rollout_health"]
+        if health.get("frozen_rollout"):
+            print(
+                "  WARNING: FROZEN ROLLOUT (prediction dispersion "
+                f"{health['prediction_dispersion']:.2e} vs actual "
+                f"{health['target_dispersion']:.2e})"
+            )
+
+    if report.ticks_per_frame > 1.05:
+        print(
+            f"vision ran at ~1 frame per {round(report.ticks_per_frame, 2)} ticks; "
+            f"tick horizons {list(config.horizons)} evaluated as frame steps "
+            f"{report.horizon_frames}"
+        )
+    for name, metrics in report.scenario_metrics.items():
+        _print_metrics(f"{name} (held-out seeds)", metrics)
+    for name, metrics in report.zero_shot_metrics.items():
+        _print_metrics(f"{name} (ZERO-SHOT scenario)", metrics)
+
+    probe = report.yaw_probe
+    if "latent" in probe:
+        print(
+            f"\nyaw probe (n={probe['n_samples']}): "
+            f"latent r2={probe['latent']['r2']:.3f} "
+            f"({probe['latent']['mean_angular_error_deg']:.1f} deg err), "
+            f"hidden r2={probe['hidden']['r2']:.3f} "
+            f"({probe['hidden']['mean_angular_error_deg']:.1f} deg err)"
+        )
+
+    if args.out_dir:
+        os.makedirs(args.out_dir, exist_ok=True)
+        model_path = os.path.join(args.out_dir, "joint-world-model.pt")
+        save_action_world_model(model_path, model, report.training_stats)
+        print(f"\njoint world model saved to {model_path}")
+
+    if args.report:
+        payload = {
+            "train_scenarios": report.train_scenarios,
+            "holdout_scenarios": report.holdout_scenarios,
+            "horizon_frames": report.horizon_frames,
+            "ticks_per_frame": report.ticks_per_frame,
+            "training_stats": report.training_stats,
+            "scenario_metrics": report.scenario_metrics,
+            "zero_shot_metrics": report.zero_shot_metrics,
+            "yaw_probe": report.yaw_probe,
+            "train_sessions": report.train_sessions,
+            "eval_sessions": report.eval_sessions,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(args.report)) or ".", exist_ok=True)
+        with open(args.report, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+        print(f"report written to {args.report}")
 
 
 def cmd_trainer(args: argparse.Namespace) -> None:
@@ -1912,6 +2069,47 @@ def build_parser() -> argparse.ArgumentParser:
                                help="train even when recordings fail the scenario's "
                                     "data-quality expectations (stuck agent, static view)")
     p_nursery_run.set_defaults(func=cmd_nursery_run)
+
+    p_nursery_joint = nursery_sub.add_parser(
+        "joint",
+        help="record every scenario and train ONE action-conditioned recurrent "
+             "world model across them, with zero-shot held-out-scenario "
+             "evaluation, a frozen-rollout detector, and a yaw linear probe",
+    )
+    p_nursery_joint.add_argument("--record-dir", default="sessions")
+    p_nursery_joint.add_argument("--train-scenarios", nargs="+", default=None,
+                                 help="scenarios to train on (default: every scenario not held out)")
+    p_nursery_joint.add_argument("--holdout-scenarios", nargs="+", default=None,
+                                 help="scenarios excluded from training and evaluated zero-shot "
+                                      "(default: approach_entity)")
+    p_nursery_joint.add_argument("--train-seeds", type=int, default=6)
+    p_nursery_joint.add_argument("--holdout-seeds", type=int, default=2)
+    p_nursery_joint.add_argument("--episode-ticks", type=int, default=400)
+    p_nursery_joint.add_argument("--world-size", type=int, default=48)
+    p_nursery_joint.add_argument("--backend", default=_default_nursery_backend(),
+                                 choices=sorted(BACKENDS))
+    p_nursery_joint.add_argument("--realtime", action="store_true")
+    p_nursery_joint.add_argument("--horizons", type=int, nargs="+", default=[1, 10, 100],
+                                 help="tick offsets to evaluate at (converted to recorded-frame "
+                                      "steps via the measured vision rate)")
+    p_nursery_joint.add_argument("--latent-width", type=int, default=32)
+    p_nursery_joint.add_argument("--hidden-dim", type=int, default=64)
+    p_nursery_joint.add_argument("--reconstruction-size", type=int, default=16)
+    p_nursery_joint.add_argument("--epochs", type=int, default=30)
+    p_nursery_joint.add_argument("--warmup-frames", type=int, default=3,
+                                 help="teacher-forced frames before each training rollout")
+    p_nursery_joint.add_argument("--rollout-frames", type=int, default=8,
+                                 help="closed-loop steps per training window (short on purpose)")
+    p_nursery_joint.add_argument("--neural-lr", type=float, default=1e-3)
+    p_nursery_joint.add_argument("--batch-size", type=int, default=32)
+    p_nursery_joint.add_argument("--seed", type=int, default=0)
+    p_nursery_joint.add_argument("--out-dir", default=None,
+                                 help="directory to save the joint model bundle "
+                                      "(<out-dir>/joint-world-model.pt)")
+    p_nursery_joint.add_argument("--report", default=None,
+                                 help="path to save a JSON report of all metrics")
+    p_nursery_joint.add_argument("--skip-data-quality-gate", action="store_true")
+    p_nursery_joint.set_defaults(func=cmd_nursery_joint)
 
     p_replay = sub.add_parser("replay", help="re-simulate a session and verify determinism")
     p_replay.add_argument("--session", required=True)

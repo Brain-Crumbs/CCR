@@ -306,9 +306,16 @@ class WorldSession {
     // issue #32: a real rendered frame, when the (optional) pixel viewer is
     // enabled and working; otherwise omitted, and the Python-side
     // `RemoteMinecraftBackend.observe()` colorizes `obs.frame` instead.
+    // `pixel_source` records which path actually produced this frame -- the
+    // silent viewer->grid fallback changes the observation distribution, and
+    // the nursery data-quality gate refuses to train across that boundary.
+    obs.pixel_source = 'grid';
     if (this._pixelViewer && this._pixelViewer.available()) {
       const pixels = this._pixelViewer.capture();
-      if (pixels) obs.pixels = pixels;
+      if (pixels) {
+        obs.pixels = pixels;
+        obs.pixel_source = 'viewer';
+      }
     }
     return { ok: true, observation: obs };
   }

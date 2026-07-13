@@ -67,7 +67,10 @@ def _small_config(**overrides) -> NurseryConfig:
     base = dict(
         train_seeds=(0, 1),
         holdout_seeds=(1000,),
-        episode_ticks=24,
+        # 26 ticks: enough for turn_in_place's gate to see a full 360-degree
+        # yaw sweep (15 deg/tick; the sweep counts deltas between rotation
+        # events, so 24 ticks lands at 345).
+        episode_ticks=26,
         world_size=16,
         horizons=(1, 5),
         latent_width=16,
@@ -421,3 +424,100 @@ def test_stream_catalog_drops_position_bounds_for_remote_backend():
     specs = {s.stream_id: s for s in build_survival_stream_specs(48, bounded_position=False)}
     assert specs["spatial.position"].range is None
     assert specs["spatial.distance_from_spawn"].range is None
+
+
+# --------------------------------------------------------------------------- turn_in_place gate
+
+
+def test_measure_recording_quality_sees_rotation_completion_and_provenance(tmp_path):
+    cfg = _small_config()
+    session_dir = _record_scenario_episode(
+        str(tmp_path), "healthy-turn", 0, NURSERY_SCENARIOS["turn_in_place"], cfg
+    )
+    quality = measure_recording_quality(session_dir, list_episodes(session_dir)[0])
+    assert quality.yaw_sweep_degrees >= 360.0
+    assert quality.max_displacement == 0.0
+    assert quality.completed is True
+    # The simulated backend declares its deterministic proxy render.
+    assert quality.pixel_sources == ["grid"]
+
+
+def test_validate_nursery_recordings_passes_a_healthy_turn(tmp_path):
+    cfg = _small_config()
+    session_dir = _record_scenario_episode(
+        str(tmp_path), "healthy-turn", 0, NURSERY_SCENARIOS["turn_in_place"], cfg
+    )
+    assert validate_nursery_recordings([session_dir], NURSERY_SCENARIOS["turn_in_place"]) == []
+
+
+def test_validate_nursery_recordings_flags_a_drifting_turn(tmp_path):
+    """The first real turn_in_place run drifted up to 24 blocks while only
+    issuing LOOK_LEFT (live-server knockback/water); the gate must flag a
+    session whose 'stationary' agent moved."""
+    from cognitive_runtime.core.action import Action as A
+
+    drifting = NurseryScenario(
+        "turn_in_place", "drifting surrogate",
+        lambda seed, cfg: ScenarioRecording(
+            policy=ScriptedSequencePolicy([(A("LOOK_LEFT"), 25), (A("MOVE_FORWARD"), 8)])
+        ),
+        max_blocks_per_tick=NURSERY_SCENARIOS["turn_in_place"].max_blocks_per_tick,
+        min_yaw_sweep_degrees=NURSERY_SCENARIOS["turn_in_place"].min_yaw_sweep_degrees,
+    )
+    cfg = _small_config(episode_ticks=33)
+    session_dir = _record_scenario_episode(str(tmp_path), "drifting-turn", 0, drifting, cfg)
+    issues = validate_nursery_recordings([session_dir], drifting)
+    assert any("strayed" in issue for issue in issues)
+
+
+def test_validate_nursery_recordings_flags_missing_yaw_sweep(tmp_path):
+    session_dir = _record_static_walk_session(tmp_path, session_id="static-no-turn")
+    issues = validate_nursery_recordings([session_dir], NURSERY_SCENARIOS["turn_in_place"])
+    assert any("yaw sweep" in issue for issue in issues)
+
+
+def test_validate_nursery_recordings_flags_early_termination(tmp_path):
+    cfg = _small_config()
+    session_dir = _record_scenario_episode(
+        str(tmp_path), "died-turn", 0, NURSERY_SCENARIOS["turn_in_place"], cfg
+    )
+    episode_id = list_episodes(session_dir)[0]
+    summary_path = os.path.join(session_dir, f"{episode_id}.summary.json")
+    with open(summary_path, encoding="utf-8") as fh:
+        summary = json.load(fh)
+    summary["success"] = False
+    summary["termination_reason"] = "death:hit"
+    with open(summary_path, "w", encoding="utf-8") as fh:
+        json.dump(summary, fh)
+    issues = validate_nursery_recordings([session_dir], NURSERY_SCENARIOS["turn_in_place"])
+    assert any("terminated early" in issue for issue in issues)
+
+
+def test_validate_nursery_recordings_checks_pixel_provenance(tmp_path):
+    cfg = _small_config()
+    session_dir = _record_scenario_episode(
+        str(tmp_path), "provenance-turn", 0, NURSERY_SCENARIOS["turn_in_place"], cfg
+    )
+    # The sim recorded 'grid'; a run that expected the first-person viewer
+    # must be refused rather than silently trained on the fallback.
+    issues = validate_nursery_recordings(
+        [session_dir], NURSERY_SCENARIOS["turn_in_place"], expected_pixel_source="viewer"
+    )
+    assert any("pixel source" in issue for issue in issues)
+    assert validate_nursery_recordings(
+        [session_dir], NURSERY_SCENARIOS["turn_in_place"], expected_pixel_source="grid"
+    ) == []
+
+
+def test_nursery_report_carries_tick_horizon_mapping_and_rollout_health(tmp_path):
+    cfg = _small_config(train_seeds=(0, 1), holdout_seeds=(1000,), horizons=(1, 5))
+    _model, report = run_nursery_scenario(str(tmp_path), "turn_in_place", cfg)
+    # Simulated backend: ~1 frame per tick, so tick horizons == frame horizons.
+    assert report.horizon_frames == [1, 5]
+    assert 0.5 < report.ticks_per_frame < 1.5
+    assert set(report.horizon_metrics) == set(report.horizon_frames)
+    assert "frozen_rollout" in report.rollout_health
+    assert report.rollout_health["target_dispersion"] >= 0.0
+    for entry in report.horizon_metrics.values():
+        assert "model_over_copy_last_mse" in entry
+        assert entry["model_mse"] > 0.0

@@ -237,6 +237,38 @@ the same harness into something that trains one model across scenarios.
    lands) so the benchmark is reproducible from the artifact alone.
 5. Remove `nursery-turn_in_place-train-0 copy/`.
 
+## Implementation status
+
+Everything below landed with this document's branch; what remains is
+host-side (installing headless-GL/`node-canvas-webgl` on the recording
+server so the viewer path activates) and re-recording.
+
+- **Phase 0** — the bridge reports `pixel_source` (`viewer`/`grid`) per
+  observation; both backends surface it through `stats()` into
+  `summary.program_stats.pixel_sources`; the data-quality gate refuses mixed
+  provenance and (via `NurseryConfig.expected_pixel_source`) provenance that
+  contradicts the run's intent. `pixels.js` `PIXEL_SHAPE` now matches the
+  catalog's 33×33×3. The duplicate `train-0 copy/` folder is gone.
+- **Phase 1** — `training/action_world_model.py`: action-conditioned
+  recurrent world model (`z`, `a` → GRU state → next `z`), built from the
+  already-recorded `motor.command` stream; horizons are declared in ticks
+  and converted to recorded-frame steps via the measured vision rate
+  (`horizons_ticks_to_frames`), for both the joint model and the existing
+  per-scenario harness (`NurseryScenarioReport.horizon_frames` /
+  `ticks_per_frame`).
+- **Phase 2** — training uses short-rollout scheduled sampling
+  (`warmup_frames`/`rollout_frames`), not 100-step compositions; evaluation
+  reports `model_over_copy_last_mse` and `model_over_oracle_mse` (recurrence
+  oracle) per horizon; `evaluate_rollout_health` /
+  `rollout_health` flag frozen rollouts on both the new and the legacy
+  predictor (`ccr nursery run` prints a FROZEN ROLLOUT warning).
+- **Phase 3** — `run_nursery_joint` / `ccr nursery joint`: one model trained
+  across scenarios with a vocabulary pinned to the full action space,
+  evaluated on held-out seeds per scenario and zero-shot on held-out
+  scenarios, plus `linear_probe_yaw` (does the latent/hidden state decode
+  heading?). The gate holds `turn_in_place` to its premise: ≥ 360° yaw
+  sweep, ≤ 0.02 blocks/tick drift, completed episode, ≥ 5% unique frames.
+
 ## Appendix: reproduction
 
 All snippets read the session folders directly; frames resolve via

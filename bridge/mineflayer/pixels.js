@@ -14,7 +14,10 @@
 // permanently for the session and falls back to the existing grid-colorization
 // path. Nothing here ever throws out of `start()`/`capture()`.
 
-const PIXEL_SHAPE = [128, 128, 3]; // keep in sync with streams.py:PIXEL_SHAPE
+// Must match streams.py:PIXEL_SHAPE ((2*PIXEL_RADIUS+1)*PIXEL_SCALE = 33):
+// the catalog declares this shape and models train against it, so a
+// viewer frame of any other size would contradict the session metadata.
+const PIXEL_SHAPE = [33, 33, 3];
 
 function log(...args) {
   process.stderr.write('[mc-bridge:pixels] ' + args.join(' ') + '\n');

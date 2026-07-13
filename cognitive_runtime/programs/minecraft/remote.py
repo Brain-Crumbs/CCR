@@ -255,6 +255,12 @@ class RemoteMinecraftBackend(SurvivalBackend):
         self._dead = False
         self._death_reason: Optional[str] = None
         self._stats: Dict[str, Any] = {}
+        # Pixel provenance actually observed this session ("viewer"/"grid"):
+        # the viewer path can silently fall back to the grid render, which
+        # changes the observation distribution -- record which path produced
+        # the frames so the nursery data-quality gate can refuse to train
+        # across that boundary.
+        self._pixel_sources: List[str] = []
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -308,8 +314,13 @@ class RemoteMinecraftBackend(SurvivalBackend):
         pixels = obs.get("pixels")
         if pixels is not None:
             pixels = _pixels_array(pixels)
+            source = str(obs.get("pixel_source") or "viewer")
+        else:
+            source = "grid"
         if pixels is None and frame is not None:
             pixels = pixels_from_frame(frame, yaw_degrees=_yaw_degrees(obs.get("data", {})))
+        if pixels is not None and source not in self._pixel_sources:
+            self._pixel_sources.append(source)
         return Observation(
             timestamp=timestamp,
             tick=obs.get("tick", self._tick),
@@ -330,7 +341,10 @@ class RemoteMinecraftBackend(SurvivalBackend):
         return self._death_reason
 
     def stats(self) -> Dict[str, Any]:
-        return dict(self._stats)
+        stats = dict(self._stats)
+        if self._pixel_sources:
+            stats["pixel_sources"] = sorted(self._pixel_sources)
+        return stats
 
     # -- unsupported on a live world ---------------------------------------
 
