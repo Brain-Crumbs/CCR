@@ -1,523 +1,269 @@
-"""Nursery scenario suite (issue #62)."""
+"""Live pathfinder nursery."""
 
 from __future__ import annotations
 
 import json
-import math
 import os
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from cognitive_runtime.cli import main  # noqa: E402
-from cognitive_runtime.cli import build_parser  # noqa: E402
-from cognitive_runtime.policies.null_policy import NullPolicy  # noqa: E402
-from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy  # noqa: E402
-from cognitive_runtime.core.action import Action  # noqa: E402
+from cognitive_runtime.cli import build_parser, main  # noqa: E402
+from cognitive_runtime.training.action_world_model import ActionWorldModelConfig  # noqa: E402
 from cognitive_runtime.training.nursery import (  # noqa: E402
-    NURSERY_SCENARIOS,
     NurseryConfig,
-    NurseryScenario,
-    ScenarioRecording,
-    _record_scenario_episode,
-    measure_recording_quality,
-    render_dream_strip,
-    run_nursery_scenario,
-    run_nursery_suite,
-    save_nursery_scenario_checkpoint,
-    validate_nursery_recordings,
+    PathfinderGoal,
+    PathfinderTeacherPolicy,
+    measure_pathfinder_recording,
+    nursery_recorded_ticks,
+    record_pathfinder_episode,
+    run_live_pathfinder_nursery,
+    validate_pathfinder_recordings,
 )
-from cognitive_runtime.training.prediction_export import (  # noqa: E402
-    export_prediction_file,
-    load_full_visual_model,
-    save_full_visual_model,
-)
-from cognitive_runtime.training.visual_representation import load_pretrained_pixel_encoder  # noqa: E402
-from cognitive_runtime.runtime.replay import list_episodes, load_session_metadata  # noqa: E402
-
-
-def test_scripted_sequence_policy_cycles_and_validates():
-    policy = ScriptedSequencePolicy([(Action("MOVE_LEFT"), 2), (Action("NULL"), 3)])
-    actions = [policy.decide(None, None, None) for _ in range(10)]
-    assert actions == [
-        Action("MOVE_LEFT"), Action("MOVE_LEFT"), Action("NULL"), Action("NULL"), Action("NULL"),
-        Action("MOVE_LEFT"), Action("MOVE_LEFT"), Action("NULL"), Action("NULL"), Action("NULL"),
-    ]
-    policy.reset()
-    assert policy.decide(None, None, None) == Action("MOVE_LEFT")
-
-    with pytest.raises(ValueError):
-        ScriptedSequencePolicy([])
-    with pytest.raises(ValueError):
-        ScriptedSequencePolicy([(Action("MOVE_LEFT"), 0)])
-
-
-def test_registry_has_every_scenario_from_the_issue():
-    expected = {
-        "walk_forward", "turn_in_place", "strafe_and_stop",
-        "object_permanence", "day_night", "approach_entity",
-    }
-    assert set(NURSERY_SCENARIOS) == expected
-    assert NURSERY_SCENARIOS["object_permanence"].entity_persistence_metric is True
-    assert NURSERY_SCENARIOS["walk_forward"].entity_persistence_metric is False
+from cognitive_runtime.training.nursery import _learning_check  # noqa: E402
+from cognitive_runtime.runtime.replay import list_episodes, load_decisions, load_session_metadata  # noqa: E402
 
 
 def _small_config(**overrides) -> NurseryConfig:
     base = dict(
-        train_seeds=(0, 1),
-        holdout_seeds=(1000,),
-        # 26 ticks: enough for turn_in_place's gate to see a full 360-degree
-        # yaw sweep (15 deg/tick; the sweep counts deltas between rotation
-        # events, so 24 ticks lands at 345).
-        episode_ticks=26,
-        world_size=16,
-        horizons=(1, 5),
+        backend="simulated",
+        realtime=False,
+        train_episodes=2,
+        holdout_episodes=1,
+        episode_ticks=34,
+        world_size=18,
+        horizons=(1, 3),
         latent_width=16,
         hidden_dim=32,
         reconstruction_size=8,
-        epochs=3,
-        consistency_epochs=2,
+        epochs=2,
         batch_size=16,
-        entity_persistence_epochs=30,
+        warmup_frames=2,
+        rollout_frames=3,
+        setup_live_arena=False,
+        require_first_person=False,
+        require_learning=False,
     )
     base.update(overrides)
     return NurseryConfig(**base)
 
 
-def test_walk_forward_scenario_matches_the_ego_motion_canary_shape(tmp_path):
-    """`walk_forward` reuses `ego_motion_canary`'s recording/evaluation
-    helpers verbatim, so its report has the same per-horizon shape as issue
-    #39's canary (`test_ego_motion_canary.py` doesn't hard-assert
-    `beats_copy_last`/`beats_mean_frame` either -- whether the model beats
-    the baselines is a hyperparameter/training-budget-scale property,
-    validated by running `nursery run walk_forward` at production
-    hyperparameters, not by this fast unit test)."""
-    cfg = _small_config()
-    model, report = run_nursery_scenario(str(tmp_path), "walk_forward", cfg)
-
-    assert report.scenario == "walk_forward"
-    assert len(report.train_sessions) == 2
-    assert len(report.holdout_sessions) == 1
-    for session_dir in report.train_sessions + report.holdout_sessions:
-        assert os.path.isdir(session_dir)
-        metadata = load_session_metadata(session_dir)
-        assert metadata["curriculum"] == "nursery/walk_forward"
-
-    assert set(report.horizon_metrics) == {1, 5}
-    for entry in report.horizon_metrics.values():
-        assert entry["n_samples"] > 0
-        assert math.isfinite(entry["psnr_model"])
-        assert math.isfinite(entry["psnr_copy_last"])
-        assert math.isfinite(entry["psnr_mean_frame"])
-        assert isinstance(entry["beats_copy_last"], bool)
-        assert isinstance(entry["beats_mean_frame"], bool)
-    assert report.entity_persistence_stats is None
-    assert report.dream_strips  # one per holdout episode
-
-
-def test_object_permanence_scenario_records_occlusion_and_beats_forget_baseline(tmp_path):
-    """Acceptance criterion: object_permanence's metric distinguishes a model
-    with entity-persistence training from one without (issue #27) -- here,
-    the trained model's MSE against the "forget immediately" baseline."""
-    cfg = _small_config(train_seeds=(0, 1, 2), holdout_seeds=(1000,), horizons=(1, 3))
-    model, report = run_nursery_scenario(str(tmp_path), "object_permanence", cfg)
-
-    assert report.scenario == "object_permanence"
-    assert report.entity_persistence_stats is not None
-    stats = report.entity_persistence_stats
-    assert stats.get("samples", 1) != 0  # not the "no occlusion events" fallback
-    assert stats["beats_forget_baseline"] is True
-    assert stats["model_mse"] < stats["baseline_mse"]
-
-    # The occlusion/reappearance cycle also produced pixel frames long enough
-    # for the configured horizons.
-    assert set(report.horizon_metrics) == {1, 3}
-
-
-def test_run_nursery_scenario_rejects_overlapping_seeds():
-    cfg = NurseryConfig(train_seeds=(0, 1), holdout_seeds=(1,))
-    with pytest.raises(ValueError, match="overlap"):
-        run_nursery_scenario("unused", "walk_forward", cfg)
-
-
-def test_run_nursery_scenario_rejects_unknown_backend():
-    cfg = NurseryConfig(backend="not-a-backend")
-    with pytest.raises(ValueError, match="unknown nursery backend"):
-        run_nursery_scenario("unused", "walk_forward", cfg)
-
-
-def test_run_nursery_scenario_rejects_unknown_name(tmp_path):
-    with pytest.raises(ValueError, match="unknown nursery scenario"):
-        run_nursery_scenario(str(tmp_path), "not_a_real_scenario", NurseryConfig())
-
-
-def test_run_nursery_suite_runs_every_scenario_unattended(tmp_path):
-    """Acceptance criterion: `nursery run all` runs unattended in the
-    simulated backend, producing recordings + a per-scenario, per-horizon
-    report."""
-    cfg = _small_config(train_seeds=(0, 1), holdout_seeds=(1000,), horizons=(1, 2))
-    reports = run_nursery_suite(str(tmp_path), config=cfg)
-
-    assert set(reports) == set(NURSERY_SCENARIOS)
-    for name, report in reports.items():
-        assert set(report.horizon_metrics) == {1, 2}
-        for entry in report.horizon_metrics.values():
-            assert math.isfinite(entry["psnr_model"])
-            assert isinstance(entry["beats_copy_last"], bool)
-        assert report.dream_strips
-        if NURSERY_SCENARIOS[name].entity_persistence_metric:
-            assert report.entity_persistence_stats is not None
-        else:
-            assert report.entity_persistence_stats is None
-
-
-def test_render_dream_strip_has_a_line_per_horizon(tmp_path):
-    cfg = _small_config(horizons=(1, 5))
-    model, report = run_nursery_scenario(str(tmp_path), "walk_forward", cfg)
-    session_dir = report.holdout_sessions[0]
-    episode_id = list_episodes(session_dir)[0]
-
-    strip = render_dream_strip(model, session_dir, episode_id, cfg.horizons)
-    assert "t+1:" in strip
-    assert "t+5:" in strip
-    assert "predicted | actual" in strip
-
-
-def test_save_nursery_scenario_checkpoint_round_trips(tmp_path):
-    cfg = _small_config()
-    model, report = run_nursery_scenario(str(tmp_path), "walk_forward", cfg)
-    path = os.path.join(str(tmp_path), "nursery_walk_forward.pt")
-    metadata = save_nursery_scenario_checkpoint(path, model, report)
-    assert metadata["training_stats"]["nursery"]["scenario"] == "walk_forward"
-    assert metadata["training_stats"]["nursery"]["horizon_metrics"]
-
-    loaded_encoder = load_pretrained_pixel_encoder(
-        path, pixel_shape=model.pixel_shape, latent_width=cfg.latent_width
+def _small_model_config() -> ActionWorldModelConfig:
+    return ActionWorldModelConfig(
+        latent_width=16,
+        hidden_dim=32,
+        reconstruction_size=8,
+        epochs=2,
+        batch_size=16,
+        warmup_frames=2,
+        rollout_frames=3,
     )
-    assert loaded_encoder.latent_width == cfg.latent_width
 
 
-def test_nursery_cli_list_and_run(tmp_path, capsys):
+def test_pathfinder_teacher_emits_turns_then_forward():
+    policy = PathfinderTeacherPolicy(PathfinderGoal(0.0, None, 8.0, 1.0))
+    action = policy.decide(
+        state=type("StateLike", (), {
+            "observation": type("Obs", (), {"data": {"x": 0.0, "z": 0.0, "yaw": 90.0}})()
+        })(),
+        memory=None,
+        prediction=None,
+    )
+    assert action.name in {"LOOK_LEFT", "LOOK_RIGHT"}
+
+    action = policy.decide(
+        state=type("StateLike", (), {
+            "observation": type("Obs", (), {"data": {"x": 0.0, "z": 0.0, "yaw": 0.0}})()
+        })(),
+        memory=None,
+        prediction=None,
+    )
+    assert action.name == "MOVE_FORWARD"
+
+
+def test_record_pathfinder_episode_records_nursery_metadata_and_actions(tmp_path):
+    cfg = _small_config(episode_ticks=24, horizons=(1, 4, 8))
+    session_dir = record_pathfinder_episode(str(tmp_path), "pathfinder-one", 0, 0, cfg)
+    metadata = load_session_metadata(session_dir)
+    assert metadata["curriculum"] == "nursery/pathfinder"
+    assert metadata["program_config"]["episode_ticks"] == nursery_recorded_ticks(cfg)
+    assert metadata["program_config"]["nursery"]["active_episode_ticks"] == cfg.episode_ticks
+    assert metadata["program_config"]["nursery"]["horizon_tail_ticks"] == 8
+    assert len(load_decisions(session_dir, "episode_00000")) == cfg.episode_ticks + 8
+
+    episode_id = list_episodes(session_dir)[0]
+    quality = measure_pathfinder_recording(session_dir, episode_id)
+    assert quality.n_frames > 1
+    assert quality.non_null_action_counts
+
+
+def test_record_pathfinder_episode_refuses_existing_session_dir(tmp_path):
+    cfg = _small_config(episode_ticks=12)
+    record_pathfinder_episode(str(tmp_path), "pathfinder-one", 0, 0, cfg)
+
+    with pytest.raises(FileExistsError, match="refuses to overwrite"):
+        record_pathfinder_episode(str(tmp_path), "pathfinder-one", 0, 0, cfg)
+
+
+def test_validate_pathfinder_recordings_checks_first_person_for_remote(tmp_path):
+    cfg = _small_config(episode_ticks=24)
+    session_dir = record_pathfinder_episode(str(tmp_path), "pathfinder-grid", 0, 0, cfg)
+    episode_id = list_episodes(session_dir)[0]
+    summary_path = os.path.join(session_dir, f"{episode_id}.summary.json")
+    with open(summary_path, encoding="utf-8") as fh:
+        summary = json.load(fh)
+    summary.setdefault("program_stats", {})["pixel_sources"] = ["grid"]
+    with open(summary_path, "w", encoding="utf-8") as fh:
+        json.dump(summary, fh)
+
+    remote_cfg = _small_config(backend="remote", require_first_person=True)
+    _qualities, issues = validate_pathfinder_recordings([session_dir], remote_cfg)
+    assert any("first-person viewer" in issue for issue in issues)
+
+
+def test_validate_pathfinder_recordings_checks_failed_live_setup(tmp_path):
+    cfg = _small_config(episode_ticks=24)
+    session_dir = record_pathfinder_episode(str(tmp_path), "pathfinder-setup", 0, 0, cfg)
+    episode_id = list_episodes(session_dir)[0]
+    summary_path = os.path.join(session_dir, f"{episode_id}.summary.json")
+    with open(summary_path, encoding="utf-8") as fh:
+        summary = json.load(fh)
+    summary.setdefault("program_stats", {}).update(
+        {
+            "pixel_sources": ["viewer"],
+            "nursery_setup_requested": True,
+            "nursery_setup_reached_start": False,
+            "nursery_setup_distance_from_start": 12.5,
+        }
+    )
+    with open(summary_path, "w", encoding="utf-8") as fh:
+        json.dump(summary, fh)
+
+    remote_cfg = _small_config(
+        backend="remote",
+        setup_live_arena=True,
+        require_first_person=True,
+    )
+    _qualities, issues = validate_pathfinder_recordings([session_dir], remote_cfg)
+    assert any("arena setup did not move the bot" in issue for issue in issues)
+
+
+def test_run_live_pathfinder_nursery_trains_action_world_model(tmp_path):
+    cfg = _small_config()
+    model, report = run_live_pathfinder_nursery(
+        str(tmp_path), config=cfg, model_config=_small_model_config()
+    )
+    assert model.action_keys
+    assert len(report.train_sessions) == cfg.train_episodes
+    assert len(report.holdout_sessions) == cfg.holdout_episodes
+    assert set(report.metrics["horizons"]) == set(report.horizon_frames)
+    assert report.horizon_ticks == list(cfg.horizons)
+    assert report.horizon_frame_mapping == {"1": 1, "3": 3}
+    assert set(report.metrics["tick_horizons"]) == {"1", "3"}
+    assert report.metrics["tick_horizons"]["1"]["frame_horizon"] == 1
+    assert "beats_copy_last_any_horizon" in report.learning_check
+    assert report.quality
+
+
+def test_run_live_pathfinder_nursery_skips_existing_session_dirs(tmp_path):
+    cfg = _small_config()
+    existing = tmp_path / "nursery-pathfinder-train-1"
+    existing.mkdir()
+
+    _model, report = run_live_pathfinder_nursery(
+        str(tmp_path), config=cfg, model_config=_small_model_config()
+    )
+
+    train_names = {os.path.basename(path) for path in report.train_sessions}
+    assert train_names == {"nursery-pathfinder-train-0", "nursery-pathfinder-train-2"}
+    assert existing.exists()
+
+
+def test_learning_check_prefers_tick_horizon_labels_when_frames_collide():
+    metrics = {
+        "horizons": {
+            1: {"model_over_copy_last_mse": 10.0},
+            2: {"model_over_copy_last_mse": 20.0},
+        },
+        "tick_horizons": {
+            "1": {"frame_horizon": 1, "model_over_copy_last_mse": 10.0},
+            "2": {"frame_horizon": 1, "model_over_copy_last_mse": 10.0},
+            "8": {"frame_horizon": 2, "model_over_copy_last_mse": 20.0},
+        },
+    }
+
+    check = _learning_check(metrics)
+
+    assert check["model_over_copy_last_mse"] == {"1": 10.0, "2": 10.0, "8": 20.0}
+
+
+def test_nursery_cli_list_and_simulated_smoke(tmp_path, capsys):
     main(["nursery", "list"])
-    listed = capsys.readouterr().out
-    assert "walk_forward" in listed
-    assert "object_permanence" in listed
+    assert "pathfinder" in capsys.readouterr().out
 
-    record_dir = str(tmp_path / "sessions")
-    report_path = str(tmp_path / "report.json")
+    report_path = tmp_path / "report.json"
     main([
-        "nursery", "run", "walk_forward",
-        "--record-dir", record_dir,
-        "--train-seeds", "2", "--holdout-seeds", "1",
-        "--episode-ticks", "24", "--world-size", "16",
+        "nursery", "run",
+        "--backend", "simulated",
+        "--record-dir", str(tmp_path / "sessions"),
+        "--train-episodes", "2",
+        "--holdout-episodes", "1",
+        "--episode-ticks", "24",
+        "--world-size", "18",
         "--horizons", "1", "3",
-        "--latent-width", "16", "--hidden-dim", "32", "--reconstruction-size", "8",
-        "--epochs", "3", "--consistency-epochs", "2", "--batch-size", "16",
-        "--report", report_path,
+        "--latent-width", "16",
+        "--hidden-dim", "32",
+        "--reconstruction-size", "8",
+        "--epochs", "2",
+        "--warmup-frames", "2",
+        "--rollout-frames", "3",
+        "--batch-size", "16",
+        "--no-setup-live-arena",
+        "--allow-grid-pixels",
+        "--out-dir", str(tmp_path / "models"),
+        "--report", str(report_path),
     ])
     out = capsys.readouterr().out
-    assert "walk_forward:" in out
-    assert "horizon t+1" in out
-    assert os.path.exists(report_path)
+    assert "holdout prediction metrics" in out
+    assert report_path.exists()
     with open(report_path, encoding="utf-8") as fh:
-        payload = json.load(fh)
-    assert "walk_forward" in payload
-    assert "1" in payload["walk_forward"]["horizon_metrics"]
-
-    with pytest.raises(SystemExit, match="unknown nursery scenario"):
-        main(["nursery", "run", "not_a_scenario", "--record-dir", record_dir])
+        report = json.load(fh)
+    pred_path = os.path.join(
+        report["holdout_sessions"][0], "predictions_episode_00000.json"
+    )
+    assert os.path.exists(pred_path)
+    with open(pred_path, encoding="utf-8") as fh:
+        predictions = json.load(fh)
+    assert predictions["format"] == "pixel-predictions-v1"
+    assert predictions["playback_frame_count"] == 24
+    assert report["horizon_ticks"] == [1, 3]
+    assert report["horizon_frame_mapping"] == {"1": 1, "3": 3}
+    assert set(predictions["predictions"]) == set(str(h) for h in report["horizon_ticks"])
+    assert predictions["horizon_frames"] == {"1": 1, "3": 3}
+    assert {
+        len(entry["frames"]) for entry in predictions["predictions"].values()
+    } == {predictions["playback_frame_count"]}
 
 
 def test_nursery_cli_backend_default_tracks_live_env(monkeypatch):
     monkeypatch.delenv("CCR_NURSERY_BACKEND", raising=False)
     monkeypatch.delenv("CCR_MINECRAFT_HOST", raising=False)
     parser = build_parser()
-    args = parser.parse_args(["nursery", "run", "walk_forward"])
+    args = parser.parse_args(["nursery", "run"])
     assert args.backend == "simulated"
+    assert args.require_learning is False
 
     monkeypatch.setenv("CCR_MINECRAFT_HOST", "localhost")
     parser = build_parser()
-    args = parser.parse_args(["nursery", "run", "walk_forward"])
+    args = parser.parse_args(["nursery", "run"])
     assert args.backend == "remote"
 
     monkeypatch.setenv("CCR_NURSERY_BACKEND", "simulated")
     parser = build_parser()
-    args = parser.parse_args(["nursery", "run", "walk_forward"])
+    args = parser.parse_args(["nursery", "run"])
     assert args.backend == "simulated"
 
-
-# --------------------------------------------------------------------------- data-quality gate
-
-
-def _record_static_walk_session(tmp_path, session_id="static-walk"):
-    """Record a session whose agent never moves -- the recorded shape of the
-    first real walk_forward run (stuck agent on the remote backend's
-    persistent world), reproduced on the simulated backend with a null
-    policy."""
-    from cognitive_runtime.policies.null_policy import NullPolicy
-
-    stuck = NurseryScenario(
-        "walk_forward", "stuck-agent surrogate",
-        lambda seed, cfg: ScenarioRecording(policy=NullPolicy()),
-    )
-    cfg = _small_config()
-    return _record_scenario_episode(str(tmp_path), session_id, 0, stuck, cfg)
-
-
-def test_measure_recording_quality_sees_motion_and_unique_frames(tmp_path):
-    cfg = _small_config()
-    session_dir = _record_scenario_episode(
-        str(tmp_path), "healthy-walk", 0, NURSERY_SCENARIOS["walk_forward"], cfg
-    )
-    quality = measure_recording_quality(session_dir, list_episodes(session_dir)[0])
-    assert quality.n_frames > 0
-    assert quality.duration_ticks == cfg.episode_ticks
-    assert quality.blocks_per_tick >= NURSERY_SCENARIOS["walk_forward"].min_blocks_per_tick
-    assert (
-        quality.unique_frame_fraction
-        >= NURSERY_SCENARIOS["walk_forward"].min_unique_frame_fraction
-    )
-
-
-def test_validate_nursery_recordings_flags_a_static_session(tmp_path):
-    session_dir = _record_static_walk_session(tmp_path)
-    issues = validate_nursery_recordings([session_dir], NURSERY_SCENARIOS["walk_forward"])
-    assert issues
-    assert any("barely moved" in issue for issue in issues)
-
-
-def test_validate_nursery_recordings_flags_static_remote_turn_in_place(tmp_path):
-    static_turn = NurseryScenario(
-        "turn_in_place",
-        "static remote turn surrogate",
-        lambda seed, cfg: ScenarioRecording(policy=NullPolicy()),
-    )
-    cfg = _small_config()
-    session_dir = _record_scenario_episode(str(tmp_path), "static-turn", 0, static_turn, cfg)
-
-    metadata_path = os.path.join(session_dir, "session.json")
-    with open(metadata_path, encoding="utf-8") as fh:
-        metadata = json.load(fh)
-    metadata["program_tags"] = ["minecraft", "survival", "mvp", "remote"]
-    with open(metadata_path, "w", encoding="utf-8") as fh:
-        json.dump(metadata, fh)
-
-    issues = validate_nursery_recordings([session_dir], NURSERY_SCENARIOS["turn_in_place"])
-    assert issues
-    assert any("unique pixel frames" in issue for issue in issues)
-
-
-def test_validate_nursery_recordings_passes_a_healthy_walk(tmp_path):
-    cfg = _small_config()
-    session_dir = _record_scenario_episode(
-        str(tmp_path), "healthy-walk", 0, NURSERY_SCENARIOS["walk_forward"], cfg
-    )
-    assert validate_nursery_recordings([session_dir], NURSERY_SCENARIOS["walk_forward"]) == []
-
-
-def test_run_nursery_scenario_gate_rejects_motionless_recordings(tmp_path, monkeypatch):
-    from cognitive_runtime.policies.null_policy import NullPolicy
-
-    stuck = NurseryScenario(
-        "walk_forward",
-        NURSERY_SCENARIOS["walk_forward"].description,
-        lambda seed, cfg: ScenarioRecording(policy=NullPolicy()),
-        min_blocks_per_tick=NURSERY_SCENARIOS["walk_forward"].min_blocks_per_tick,
-        min_unique_frame_fraction=NURSERY_SCENARIOS["walk_forward"].min_unique_frame_fraction,
-    )
-    monkeypatch.setitem(NURSERY_SCENARIOS, "walk_forward", stuck)
-    with pytest.raises(ValueError, match="quality gate"):
-        run_nursery_scenario(str(tmp_path), "walk_forward", _small_config())
-
-    # data_quality_gate=False trains on the same recordings without raising.
-    model, report = run_nursery_scenario(
-        str(tmp_path / "ungated"), "walk_forward", _small_config(data_quality_gate=False)
-    )
-    assert report.horizon_metrics
-
-
-# --------------------------------------------------------------------------- prediction export
-
-
-def test_run_nursery_scenario_exports_viewer_predictions(tmp_path):
-    cfg = _small_config()
-    _model, report = run_nursery_scenario(str(tmp_path), "walk_forward", cfg)
-
-    assert report.prediction_files
-    all_sessions = set(report.train_sessions + report.holdout_sessions)
-    for key, path in report.prediction_files.items():
-        session_dir = key.rsplit("/", 1)[0]
-        assert session_dir in all_sessions
-        with open(path, encoding="utf-8") as fh:
-            payload = json.load(fh)
-        assert payload["format"] == "pixel-predictions-v1"
-        assert payload["horizons"] == sorted(cfg.horizons)
-        assert len(payload["targets"]) == payload["n_frames"]
-        for h in cfg.horizons:
-            assert len(payload["predictions"][str(h)]["frames"]) == payload["n_frames"] - h
-
-
-def test_run_nursery_scenario_can_skip_prediction_export(tmp_path):
-    cfg = _small_config(export_predictions=False)
-    _model, report = run_nursery_scenario(str(tmp_path), "walk_forward", cfg)
-    assert report.prediction_files == {}
-    for session_dir in report.train_sessions + report.holdout_sessions:
-        assert not [f for f in os.listdir(session_dir) if f.startswith("predictions_")]
-
-
-def test_full_visual_model_round_trips_and_re_exports(tmp_path):
-    import base64
-
-    cfg = _small_config()
-    model, report = run_nursery_scenario(str(tmp_path), "walk_forward", cfg)
-
-    bundle = tmp_path / "walk-full.pt"
-    save_full_visual_model(model, str(bundle))
-    reloaded = load_full_visual_model(str(bundle))
-    assert reloaded.pixel_shape == model.pixel_shape
-    assert reloaded.latent_width == model.latent_width
-    assert reloaded.reconstruction_shape == model.reconstruction_shape
-
-    session_dir = report.holdout_sessions[0]
-    episode_id = list_episodes(session_dir)[0]
-    out = export_prediction_file(
-        reloaded, session_dir, episode_id, cfg.horizons,
-        out_path=str(tmp_path / "re-export.json"),
-    )
-    with open(out, encoding="utf-8") as fh:
-        payload = json.load(fh)
-    h, w, c = payload["prediction_shape"]
-    frame = base64.b64decode(payload["predictions"]["1"]["frames"][0])
-    assert len(frame) == h * w * c
-
-
-# --------------------------------------------------------------------------- catalog honesty
-
-
-def test_stream_catalog_reports_paced_rates_in_realtime():
-    from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
-
-    program = MinecraftSurvivalBox(config={"episode_ticks": 8, "world_size": 16})
-    try:
-        specs = {s.stream_id: s for s in program.stream_catalog()}
-        assert specs["vision.frame.pixels"].nominal_rate_hz == 20.0
-        assert specs["body.health"].nominal_rate_hz == 1.0
-        assert specs["spatial.position"].range == (0.0, 16.0)
-
-        program.set_realtime(True)
-        specs = {s.stream_id: s for s in program.stream_catalog()}
-        assert specs["vision.frame.pixels"].nominal_rate_hz == program._config.realtime_vision_hz
-        assert specs["vision.frame.grid"].nominal_rate_hz == program._config.realtime_vision_hz
-        assert specs["body.health"].nominal_rate_hz == program._config.realtime_body_heartbeat_hz
-
-        program.set_realtime(False)
-        specs = {s.stream_id: s for s in program.stream_catalog()}
-        assert specs["vision.frame.pixels"].nominal_rate_hz == 20.0
-    finally:
-        program.close()
-
-
-def test_stream_catalog_drops_position_bounds_for_remote_backend():
-    from cognitive_runtime.programs.minecraft.streams import build_survival_stream_specs
-
-    specs = {s.stream_id: s for s in build_survival_stream_specs(48, bounded_position=False)}
-    assert specs["spatial.position"].range is None
-    assert specs["spatial.distance_from_spawn"].range is None
-
-
-# --------------------------------------------------------------------------- turn_in_place gate
-
-
-def test_measure_recording_quality_sees_rotation_completion_and_provenance(tmp_path):
-    cfg = _small_config()
-    session_dir = _record_scenario_episode(
-        str(tmp_path), "healthy-turn", 0, NURSERY_SCENARIOS["turn_in_place"], cfg
-    )
-    quality = measure_recording_quality(session_dir, list_episodes(session_dir)[0])
-    assert quality.yaw_sweep_degrees >= 360.0
-    assert quality.max_displacement == 0.0
-    assert quality.completed is True
-    # The simulated backend declares its deterministic proxy render.
-    assert quality.pixel_sources == ["grid"]
-
-
-def test_validate_nursery_recordings_passes_a_healthy_turn(tmp_path):
-    cfg = _small_config()
-    session_dir = _record_scenario_episode(
-        str(tmp_path), "healthy-turn", 0, NURSERY_SCENARIOS["turn_in_place"], cfg
-    )
-    assert validate_nursery_recordings([session_dir], NURSERY_SCENARIOS["turn_in_place"]) == []
-
-
-def test_validate_nursery_recordings_flags_a_drifting_turn(tmp_path):
-    """The first real turn_in_place run drifted up to 24 blocks while only
-    issuing LOOK_LEFT (live-server knockback/water); the gate must flag a
-    session whose 'stationary' agent moved."""
-    from cognitive_runtime.core.action import Action as A
-
-    drifting = NurseryScenario(
-        "turn_in_place", "drifting surrogate",
-        lambda seed, cfg: ScenarioRecording(
-            policy=ScriptedSequencePolicy([(A("LOOK_LEFT"), 25), (A("MOVE_FORWARD"), 8)])
-        ),
-        max_blocks_per_tick=NURSERY_SCENARIOS["turn_in_place"].max_blocks_per_tick,
-        min_yaw_sweep_degrees=NURSERY_SCENARIOS["turn_in_place"].min_yaw_sweep_degrees,
-    )
-    cfg = _small_config(episode_ticks=33)
-    session_dir = _record_scenario_episode(str(tmp_path), "drifting-turn", 0, drifting, cfg)
-    issues = validate_nursery_recordings([session_dir], drifting)
-    assert any("strayed" in issue for issue in issues)
-
-
-def test_validate_nursery_recordings_flags_missing_yaw_sweep(tmp_path):
-    session_dir = _record_static_walk_session(tmp_path, session_id="static-no-turn")
-    issues = validate_nursery_recordings([session_dir], NURSERY_SCENARIOS["turn_in_place"])
-    assert any("yaw sweep" in issue for issue in issues)
-
-
-def test_validate_nursery_recordings_flags_early_termination(tmp_path):
-    cfg = _small_config()
-    session_dir = _record_scenario_episode(
-        str(tmp_path), "died-turn", 0, NURSERY_SCENARIOS["turn_in_place"], cfg
-    )
-    episode_id = list_episodes(session_dir)[0]
-    summary_path = os.path.join(session_dir, f"{episode_id}.summary.json")
-    with open(summary_path, encoding="utf-8") as fh:
-        summary = json.load(fh)
-    summary["success"] = False
-    summary["termination_reason"] = "death:hit"
-    with open(summary_path, "w", encoding="utf-8") as fh:
-        json.dump(summary, fh)
-    issues = validate_nursery_recordings([session_dir], NURSERY_SCENARIOS["turn_in_place"])
-    assert any("terminated early" in issue for issue in issues)
-
-
-def test_validate_nursery_recordings_checks_pixel_provenance(tmp_path):
-    cfg = _small_config()
-    session_dir = _record_scenario_episode(
-        str(tmp_path), "provenance-turn", 0, NURSERY_SCENARIOS["turn_in_place"], cfg
-    )
-    # The sim recorded 'grid'; a run that expected the first-person viewer
-    # must be refused rather than silently trained on the fallback.
-    issues = validate_nursery_recordings(
-        [session_dir], NURSERY_SCENARIOS["turn_in_place"], expected_pixel_source="viewer"
-    )
-    assert any("pixel source" in issue for issue in issues)
-    assert validate_nursery_recordings(
-        [session_dir], NURSERY_SCENARIOS["turn_in_place"], expected_pixel_source="grid"
-    ) == []
-
-
-def test_nursery_report_carries_tick_horizon_mapping_and_rollout_health(tmp_path):
-    cfg = _small_config(train_seeds=(0, 1), holdout_seeds=(1000,), horizons=(1, 5))
-    _model, report = run_nursery_scenario(str(tmp_path), "turn_in_place", cfg)
-    # Simulated backend: ~1 frame per tick, so tick horizons == frame horizons.
-    assert report.horizon_frames == [1, 5]
-    assert 0.5 < report.ticks_per_frame < 1.5
-    assert set(report.horizon_metrics) == set(report.horizon_frames)
-    assert "frozen_rollout" in report.rollout_health
-    assert report.rollout_health["target_dispersion"] >= 0.0
-    for entry in report.horizon_metrics.values():
-        assert "model_over_copy_last_mse" in entry
-        assert entry["model_mse"] > 0.0
+    parser = build_parser()
+    args = parser.parse_args(["nursery", "run", "--require-learning"])
+    assert args.require_learning is True

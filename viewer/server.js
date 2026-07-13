@@ -28,7 +28,7 @@ function parseArgs(argv) {
       process.exit(0);
     }
   }
-  args.dataDir = path.resolve(args.dataDir || path.join(__dirname, "..", "shared"));
+  args.dataDir = path.resolve(args.dataDir || path.join(__dirname, "..", "sessions"));
   return args;
 }
 

@@ -307,6 +307,12 @@ class Recorder:
         self._episode_index = episode_index
         episode_id = f"episode_{episode_index:05d}"
         base = os.path.join(self.session_dir, episode_id)
+        # Re-recording a session invalidates any model export for the old
+        # episode contents. Remove it so viewers/notebooks cannot pair fresh
+        # frames with stale predictions when session ids are reused.
+        prediction_path = os.path.join(self.session_dir, f"predictions_{episode_id}.json")
+        if os.path.exists(prediction_path):
+            os.remove(prediction_path)
         self._streams_file = open(f"{base}.streams.jsonl", "w", encoding="utf-8")
         self._decisions_file = open(f"{base}.decisions.jsonl", "w", encoding="utf-8")
         return episode_id

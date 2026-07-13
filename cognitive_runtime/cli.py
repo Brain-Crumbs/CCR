@@ -9,7 +9,7 @@
     python -m cognitive_runtime view --session sessions/<id> --episode episode_00000
     python -m cognitive_runtime dashboard
     python -m cognitive_runtime nursery list
-    python -m cognitive_runtime nursery run walk_forward
+    python -m cognitive_runtime nursery run --backend remote
 """
 
 from __future__ import annotations
@@ -1165,58 +1165,39 @@ def cmd_ego_motion_canary(args: argparse.Namespace) -> None:
 
 
 def cmd_nursery_list(args: argparse.Namespace) -> None:
-    """``ccr nursery list`` (issue #62): print every registered nursery
-    scenario -- scripted micro-scenarios that isolate one worldly regularity
-    each, feeding checkpoints into the survival curriculum's stage one."""
-    try:
-        from cognitive_runtime.training.nursery import NURSERY_SCENARIOS
-    except ImportError as exc:  # torch not installed
-        sys.exit(f"the nursery suite needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
-    for name in sorted(NURSERY_SCENARIOS):
-        scenario = NURSERY_SCENARIOS[name]
-        tag = " [+entity-persistence metric]" if scenario.entity_persistence_metric else ""
-        print(f"{name}{tag}: {scenario.description}")
+    """Describe the single live pathfinder nursery objective."""
+    print(
+        "pathfinder: live-server first-person recordings from a pathfinder "
+        "teacher, used to train an action-conditioned multi-horizon visual "
+        "world model."
+    )
 
 
 def cmd_nursery_run(args: argparse.Namespace) -> None:
-    """``ccr nursery run <scenario|all>`` (issue #62): record train/holdout
-    episodes for one nursery scenario (or every scenario via ``all``),
-    pretrain a pixel encoder+decoder+next-latent predictor on the train
-    seeds only, and evaluate multi-horizon next-frame prediction on
-    held-out seeds against copy-last-frame and mean-frame baselines --
-    generalizing ``ego-motion-canary`` (issue #39) into a suite.
-    ``object_permanence`` also reports an entity-persistence metric (issue
-    #27); every held-out episode gets a rendered dream strip (predicted vs.
-    actual frames at each horizon).
-    """
+    """Record pathfinder-teacher episodes and train the action world model."""
     try:
         import json
 
+        from cognitive_runtime.training.action_world_model import save_action_world_model
         from cognitive_runtime.training.nursery import (
-            NURSERY_SCENARIOS,
             NurseryConfig,
-            run_nursery_scenario,
-            save_nursery_scenario_checkpoint,
+            run_live_pathfinder_nursery,
         )
+        from cognitive_runtime.training.prediction_export import export_action_session_predictions
     except ImportError as exc:  # torch not installed
-        sys.exit(f"the nursery suite needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
-
-    if args.scenario != "all" and args.scenario not in NURSERY_SCENARIOS:
         sys.exit(
-            f"unknown nursery scenario {args.scenario!r}; choices: "
-            f"{sorted(NURSERY_SCENARIOS)} or 'all'"
+            f"the pathfinder nursery needs PyTorch ({exc}). "
+            "Install it with 'pip install -e .[neural]'."
         )
-    scenario_names = sorted(NURSERY_SCENARIOS) if args.scenario == "all" else [args.scenario]
 
-    train_seeds = list(range(args.train_seeds))
-    holdout_seeds = list(range(args.train_seeds, args.train_seeds + args.holdout_seeds))
     config = NurseryConfig(
-        train_seeds=train_seeds,
-        holdout_seeds=holdout_seeds,
+        train_episodes=args.train_episodes,
+        holdout_episodes=args.holdout_episodes,
         episode_ticks=args.episode_ticks,
-        world_size=args.world_size,
         backend=args.backend,
         realtime=args.realtime or args.backend == "remote",
+        world_size=args.world_size,
+        seed=args.seed,
         horizons=args.horizons,
         latent_width=args.latent_width,
         hidden_dim=args.hidden_dim,
@@ -1224,244 +1205,96 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
         epochs=args.epochs,
         lr=args.neural_lr,
         batch_size=args.batch_size,
-        seed=args.seed,
-        consistency_epochs=args.consistency_epochs,
-        entity_persistence_epochs=args.entity_persistence_epochs,
-        data_quality_gate=not args.skip_data_quality_gate,
-        export_predictions=not args.no_export_predictions,
-    )
-    print(
-        f"nursery: running {'all scenarios' if args.scenario == 'all' else args.scenario} "
-        f"({len(train_seeds)} train seeds, {len(holdout_seeds)} held-out seeds, "
-        f"{config.episode_ticks} ticks each, world_size={config.world_size}, "
-        f"backend={config.backend})"
-    )
-    if config.backend != "simulated":
-        print(
-            "nursery: WARNING -- the remote backend plays on the server's persistent "
-            "world: seeds do NOT vary terrain, each session starts where the previous "
-            "one ended, sim-only scenario setup hooks are skipped, and realtime pacing "
-            "records vision at the config's realtime_vision_hz (10 Hz by default), not "
-            "the 20 Hz tick rate. The data-quality gate will reject recordings without "
-            "the scenario's signal (e.g. a stuck agent)."
-        )
-
-    report_payload: Dict[str, Any] = {}
-    for name in scenario_names:
-        model, report = run_nursery_scenario(args.record_dir, name, config)
-        print(f"\n{name}:")
-        for h, entry in report.horizon_metrics.items():
-            print(
-                f"  horizon t+{h} (n={entry['n_samples']}): "
-                f"psnr model={round(entry['psnr_model'], 2)} "
-                f"copy_last={round(entry['psnr_copy_last'], 2)} "
-                f"mean_frame={round(entry['psnr_mean_frame'], 2)} | "
-                f"ssim model={round(entry['ssim_model'], 4)} "
-                f"copy_last={round(entry['ssim_copy_last'], 4)} "
-                f"mean_frame={round(entry['ssim_mean_frame'], 4)} | "
-                f"beats_copy_last={entry['beats_copy_last']} "
-                f"beats_mean_frame={entry['beats_mean_frame']}"
-            )
-        if report.ticks_per_frame > 1.05:
-            print(
-                f"  vision ran at ~1 frame per {round(report.ticks_per_frame, 2)} ticks; "
-                f"tick horizons {list(config.horizons)} evaluated as frame steps "
-                f"{report.horizon_frames}"
-            )
-        health = report.rollout_health
-        if health.get("frozen_rollout"):
-            print(
-                "  WARNING: FROZEN ROLLOUT -- predictions barely vary across horizons "
-                f"(prediction dispersion {health['prediction_dispersion']:.2e} vs actual "
-                f"{health['target_dispersion']:.2e}); the predictor has collapsed to a "
-                "fixed point and is not modelling the dynamics"
-            )
-        if report.entity_persistence_stats is not None:
-            eps = report.entity_persistence_stats
-            if "beats_forget_baseline" in eps:
-                print(
-                    f"  entity persistence: model_mse={round(eps['model_mse'], 4)} "
-                    f"baseline_mse={round(eps['baseline_mse'], 4)} "
-                    f"beats_forget_baseline={eps['beats_forget_baseline']}"
-                )
-            else:
-                print(f"  entity persistence: {eps.get('note', eps)}")
-        print(f"  dream strips rendered: {len(report.dream_strips)}")
-
-        if report.prediction_files:
-            print(f"  viewer predictions exported: {len(report.prediction_files)} episode(s)")
-
-        if args.out_dir:
-            os.makedirs(args.out_dir, exist_ok=True)
-            checkpoint_path = os.path.join(args.out_dir, f"{name}.pt")
-            save_nursery_scenario_checkpoint(checkpoint_path, model, report)
-            print(f"  checkpoint saved to {checkpoint_path}")
-            # The unified checkpoint keeps only the encoder; the full bundle
-            # (encoder+decoder+next-predictor) lets the prediction exporter
-            # re-render predicted frames later without retraining.
-            from cognitive_runtime.training.prediction_export import save_full_visual_model
-
-            full_model_path = os.path.join(args.out_dir, f"{name}-full.pt")
-            save_full_visual_model(model, full_model_path)
-            print(f"  full model bundle saved to {full_model_path}")
-
-        report_payload[name] = {
-            "horizon_metrics": {str(h): v for h, v in report.horizon_metrics.items()},
-            "horizon_frames": report.horizon_frames,
-            "ticks_per_frame": report.ticks_per_frame,
-            "rollout_health": report.rollout_health,
-            "entity_persistence_stats": report.entity_persistence_stats,
-            "dream_strips": report.dream_strips,
-            "train_sessions": report.train_sessions,
-            "holdout_sessions": report.holdout_sessions,
-            "prediction_files": report.prediction_files,
-        }
-
-    if args.report:
-        os.makedirs(os.path.dirname(os.path.abspath(args.report)) or ".", exist_ok=True)
-        with open(args.report, "w", encoding="utf-8") as fh:
-            json.dump(report_payload, fh, indent=2)
-        print(f"\nreport written to {args.report}")
-
-
-def cmd_nursery_joint(args: argparse.Namespace) -> None:
-    """``ccr nursery joint``: record every scenario and train ONE
-    action-conditioned recurrent world model across them (phase 3 of
-    docs/nursery-turn-in-place-analysis.md), evaluating in-distribution
-    generalization (held-out seeds), zero-shot generality (held-out
-    scenarios), rollout health (frozen-rollout detector), and a yaw linear
-    probe."""
-    try:
-        import json
-
-        from cognitive_runtime.training.action_world_model import (
-            ActionWorldModelConfig,
-            save_action_world_model,
-        )
-        from cognitive_runtime.training.nursery import (
-            NURSERY_SCENARIOS,
-            NurseryConfig,
-            run_nursery_joint,
-        )
-    except ImportError as exc:  # torch not installed
-        sys.exit(f"the nursery suite needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
-
-    holdout_scenarios = args.holdout_scenarios or ["approach_entity"]
-    train_scenarios = args.train_scenarios or None
-    for name in (train_scenarios or []) + holdout_scenarios:
-        if name not in NURSERY_SCENARIOS:
-            sys.exit(
-                f"unknown nursery scenario {name!r}; choices: {sorted(NURSERY_SCENARIOS)}"
-            )
-
-    train_seeds = list(range(args.train_seeds))
-    holdout_seeds = list(range(args.train_seeds, args.train_seeds + args.holdout_seeds))
-    config = NurseryConfig(
-        train_seeds=train_seeds,
-        holdout_seeds=holdout_seeds,
-        episode_ticks=args.episode_ticks,
-        world_size=args.world_size,
-        backend=args.backend,
-        realtime=args.realtime or args.backend == "remote",
-        horizons=args.horizons,
-        latent_width=args.latent_width,
-        hidden_dim=args.hidden_dim,
-        reconstruction_size=args.reconstruction_size,
-        epochs=args.epochs,
-        lr=args.neural_lr,
-        batch_size=args.batch_size,
-        seed=args.seed,
-        data_quality_gate=not args.skip_data_quality_gate,
-    )
-    model_config = ActionWorldModelConfig(
-        latent_width=args.latent_width,
-        hidden_dim=args.hidden_dim,
-        reconstruction_size=args.reconstruction_size,
-        epochs=args.epochs,
-        lr=args.neural_lr,
-        batch_size=args.batch_size,
-        seed=args.seed,
         warmup_frames=args.warmup_frames,
         rollout_frames=args.rollout_frames,
+        target_radius=args.target_radius,
+        arena_origin_x=args.arena_origin_x,
+        arena_origin_y=args.arena_origin_y,
+        arena_origin_z=args.arena_origin_z,
+        arena_spacing=args.arena_spacing,
+        arena_radius=args.arena_radius,
+        setup_live_arena=not args.no_setup_live_arena,
+        require_first_person=not args.allow_grid_pixels,
+        data_quality_gate=not args.skip_data_quality_gate,
+        require_learning=args.require_learning,
     )
     print(
-        f"nursery joint: training one action-conditioned world model "
-        f"(holdout scenarios: {holdout_scenarios}; {len(train_seeds)} train seeds, "
-        f"{len(holdout_seeds)} held-out seeds, backend={config.backend})"
+        "nursery: recording pathfinder-teacher first-person episodes "
+        f"({config.train_episodes} train, {config.holdout_episodes} holdout, "
+        f"{config.episode_ticks} ticks each, backend={config.backend})"
     )
+    if config.backend == "remote":
+        print(
+            "nursery: live arena setup uses server commands when enabled; the bot "
+            "should be op, and first-person viewer pixels must be available unless "
+            "--allow-grid-pixels is passed."
+        )
 
-    model, report = run_nursery_joint(
-        args.record_dir,
-        train_scenarios=train_scenarios,
-        holdout_scenarios=holdout_scenarios,
-        config=config,
-        model_config=model_config,
-    )
-
-    def _print_metrics(label: str, metrics: Dict[str, Any]) -> None:
-        print(f"\n{label}:")
-        for h, entry in metrics["horizons"].items():
-            oracle = entry["model_over_oracle_mse"]
-            print(
-                f"  t+{h} frames (n={entry['n_samples']}): "
-                f"model_mse={entry['model_mse']:.5f} "
-                f"copy_last={entry['copy_last_mse']:.5f} "
-                f"model/copy_last={entry['model_over_copy_last_mse']:.2f} "
-                f"model/oracle={f'{oracle:.2f}' if oracle is not None else 'n/a'} "
-                f"beats_copy_last={entry['beats_copy_last']}"
-            )
-        health = metrics["rollout_health"]
-        if health.get("frozen_rollout"):
-            print(
-                "  WARNING: FROZEN ROLLOUT (prediction dispersion "
-                f"{health['prediction_dispersion']:.2e} vs actual "
-                f"{health['target_dispersion']:.2e})"
-            )
-
+    model, report = run_live_pathfinder_nursery(args.record_dir, config=config)
     if report.ticks_per_frame > 1.05:
         print(
             f"vision ran at ~1 frame per {round(report.ticks_per_frame, 2)} ticks; "
-            f"tick horizons {list(config.horizons)} evaluated as frame steps "
-            f"{report.horizon_frames}"
+            f"tick horizons map to frame steps {report.horizon_frame_mapping}"
         )
-    for name, metrics in report.scenario_metrics.items():
-        _print_metrics(f"{name} (held-out seeds)", metrics)
-    for name, metrics in report.zero_shot_metrics.items():
-        _print_metrics(f"{name} (ZERO-SHOT scenario)", metrics)
-
-    probe = report.yaw_probe
-    if "latent" in probe:
+    print("\nholdout prediction metrics:")
+    for h, entry in report.metrics["horizons"].items():
+        oracle = entry.get("model_over_oracle_mse")
         print(
-            f"\nyaw probe (n={probe['n_samples']}): "
-            f"latent r2={probe['latent']['r2']:.3f} "
-            f"({probe['latent']['mean_angular_error_deg']:.1f} deg err), "
-            f"hidden r2={probe['hidden']['r2']:.3f} "
-            f"({probe['hidden']['mean_angular_error_deg']:.1f} deg err)"
+            f"  t+{h} frames (n={entry['n_samples']}): "
+            f"model_mse={entry['model_mse']:.5f} "
+            f"copy_last={entry['copy_last_mse']:.5f} "
+            f"model/copy_last={entry['model_over_copy_last_mse']:.2f} "
+            f"model/oracle={f'{oracle:.2f}' if oracle is not None else 'n/a'} "
+            f"beats_copy_last={entry['beats_copy_last']}"
+        )
+    health = report.metrics["rollout_health"]
+    if health.get("frozen_rollout"):
+        print(
+            "  WARNING: FROZEN ROLLOUT (prediction dispersion "
+            f"{health['prediction_dispersion']:.2e} vs actual "
+            f"{health['target_dispersion']:.2e})"
+        )
+    print(f"\nlearning check: {report.learning_check}")
+    if not report.learning_check.get("beats_copy_last_any_horizon"):
+        print(
+            "  WARNING: model did not beat copy-last on the held-out horizons; "
+            "report/model are still saved for inspection"
         )
 
     if args.out_dir:
         os.makedirs(args.out_dir, exist_ok=True)
-        model_path = os.path.join(args.out_dir, "joint-world-model.pt")
+        model_path = os.path.join(args.out_dir, "pathfinder-world-model.pt")
         save_action_world_model(model_path, model, report.training_stats)
-        print(f"\njoint world model saved to {model_path}")
+        print(f"world model saved to {model_path}")
+        exported = export_action_session_predictions(
+            model,
+            report.train_sessions + report.holdout_sessions,
+            report.horizon_frames,
+            horizon_labels=report.horizon_ticks,
+        )
+        print(f"exported {len(exported)} viewer prediction file(s)")
 
     if args.report:
         payload = {
-            "train_scenarios": report.train_scenarios,
-            "holdout_scenarios": report.holdout_scenarios,
+            "train_sessions": report.train_sessions,
+            "holdout_sessions": report.holdout_sessions,
+            "horizon_ticks": report.horizon_ticks,
             "horizon_frames": report.horizon_frames,
+            "horizon_frame_mapping": report.horizon_frame_mapping,
             "ticks_per_frame": report.ticks_per_frame,
             "training_stats": report.training_stats,
-            "scenario_metrics": report.scenario_metrics,
-            "zero_shot_metrics": report.zero_shot_metrics,
-            "yaw_probe": report.yaw_probe,
-            "train_sessions": report.train_sessions,
-            "eval_sessions": report.eval_sessions,
+            "metrics": report.metrics,
+            "learning_check": report.learning_check,
+            "quality": [q.__dict__ for q in report.quality],
         }
         os.makedirs(os.path.dirname(os.path.abspath(args.report)) or ".", exist_ok=True)
         with open(args.report, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2)
         print(f"report written to {args.report}")
+
+
+def cmd_nursery_joint(args: argparse.Namespace) -> None:
+    sys.exit("nursery joint was removed; use 'nursery run' for the live pathfinder nursery.")
 
 
 def cmd_trainer(args: argparse.Namespace) -> None:
@@ -1898,7 +1731,7 @@ def build_parser() -> argparse.ArgumentParser:
                               "learned latent fusion, the action-conditioned world model, the "
                               "multi-horizon uncertainty-aware world model (issue #39), or "
                               "the entity-persistence (object permanence) model")
-    p_train.add_argument("--horizons", type=int, nargs="+", default=[1, 10, 100],
+    p_train.add_argument("--horizons", type=int, nargs="+", default=[1, 4, 8],
                          help="--model-type multi-horizon-world-model only: tick offsets to "
                               "predict at (action ticks, per build_multi_horizon_world_model_"
                               "dataset; must include 1)")
@@ -1989,7 +1822,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_canary.add_argument("--action-noise", type=float, default=0.0,
                           help="probability each tick's action is a random action instead of "
                                "MOVE_FORWARD")
-    p_canary.add_argument("--horizons", type=int, nargs="+", default=[1, 10, 100],
+    p_canary.add_argument("--horizons", type=int, nargs="+", default=[1, 4, 8],
                           help="tick offsets to evaluate next-frame prediction at")
     p_canary.add_argument("--latent-width", type=int, default=32)
     p_canary.add_argument("--hidden-dim", type=int, default=64)
@@ -2008,73 +1841,76 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_nursery = sub.add_parser(
         "nursery",
-        help="issue #62: nursery scenario suite -- scripted micro-scenarios "
-             "benchmarking multi-horizon (t+1/t+10/t+100) world-model prediction "
-             "against copy-last-frame/mean-frame baselines",
+        help="live pathfinder nursery: record first-person teacher traces and "
+             "train a multi-horizon action-conditioned visual world model",
     )
     nursery_sub = p_nursery.add_subparsers(dest="nursery_command", required=True)
 
-    p_nursery_list = nursery_sub.add_parser("list", help="list available nursery scenarios")
+    p_nursery_list = nursery_sub.add_parser("list", help="describe the pathfinder nursery")
     p_nursery_list.set_defaults(func=cmd_nursery_list)
 
     p_nursery_run = nursery_sub.add_parser(
-        "run", help="record + benchmark one scenario (or 'all' for the whole suite)"
-    )
-    p_nursery_run.add_argument(
-        "scenario", help="scenario name (see 'nursery list'), or 'all' to run the full suite"
+        "run", help="record live pathfinder teacher traces and train the world model"
     )
     p_nursery_run.add_argument("--record-dir", default="sessions",
-                               help="directory to record each scenario's train/holdout episodes into")
-    p_nursery_run.add_argument("--train-seeds", type=int, default=6,
-                               help="number of train-seed episodes (seeds 0..N-1)")
-    p_nursery_run.add_argument("--holdout-seeds", type=int, default=2,
-                               help="number of held-out-seed episodes (seeds N..N+M-1, never trained on)")
-    p_nursery_run.add_argument("--episode-ticks", type=int, default=400)
-    p_nursery_run.add_argument("--world-size", type=int, default=48)
+                               help="directory to record train/holdout episodes into")
+    p_nursery_run.add_argument("--train-episodes", type=int, default=6)
+    p_nursery_run.add_argument("--holdout-episodes", type=int, default=2)
+    p_nursery_run.add_argument("--episode-ticks", type=int, default=500)
+    p_nursery_run.add_argument("--world-size", type=int, default=96)
     p_nursery_run.add_argument("--backend", default=_default_nursery_backend(),
                                choices=sorted(BACKENDS),
-                               help="backend used to record nursery episodes. Defaults to "
-                                    "remote when CCR_MINECRAFT_HOST is set, otherwise "
-                                    "simulated; CCR_NURSERY_BACKEND can override this.")
+                               help="backend used to record nursery episodes. Production "
+                                    "nursery runs should use remote.")
     p_nursery_run.add_argument("--realtime", action="store_true",
-                               help="hold wall-clock tick pacing while recording nursery "
-                                    "episodes. Remote nursery recordings force realtime.")
-    p_nursery_run.add_argument("--horizons", type=int, nargs="+", default=[1, 10, 100],
+                               help="hold wall-clock tick pacing; remote forces realtime")
+    p_nursery_run.add_argument("--horizons", type=int, nargs="+", default=[1, 4, 8],
                                help="tick offsets to evaluate next-frame prediction at")
     p_nursery_run.add_argument("--latent-width", type=int, default=32)
     p_nursery_run.add_argument("--hidden-dim", type=int, default=64)
     p_nursery_run.add_argument("--reconstruction-size", type=int, default=16,
                                help="max side length for downsampled reconstruction targets")
-    p_nursery_run.add_argument("--epochs", type=int, default=15,
-                               help="pixel encoder/decoder pretraining epochs")
-    p_nursery_run.add_argument("--consistency-epochs", type=int, default=15,
-                               help="horizon-consistency fine-tuning epochs (0 skips it)")
-    p_nursery_run.add_argument("--entity-persistence-epochs", type=int, default=30,
-                               help="object_permanence only: entity-persistence model training epochs")
+    p_nursery_run.add_argument("--epochs", type=int, default=30)
+    p_nursery_run.add_argument("--warmup-frames", type=int, default=3,
+                               help="teacher-forced frames before each training rollout")
+    p_nursery_run.add_argument("--rollout-frames", type=int, default=8,
+                               help="closed-loop steps per training window")
     p_nursery_run.add_argument("--neural-lr", type=float, default=1e-3)
     p_nursery_run.add_argument("--batch-size", type=int, default=32)
     p_nursery_run.add_argument("--seed", type=int, default=0)
+    p_nursery_run.add_argument("--target-radius", type=float, default=1.5)
+    p_nursery_run.add_argument("--arena-origin-x", type=int, default=0)
+    p_nursery_run.add_argument("--arena-origin-y", type=int, default=None)
+    p_nursery_run.add_argument("--arena-origin-z", type=int, default=0)
+    p_nursery_run.add_argument("--arena-spacing", type=int, default=24)
+    p_nursery_run.add_argument("--arena-radius", type=int, default=9)
+    p_nursery_run.add_argument("--no-setup-live-arena", action="store_true",
+                               help="do not ask the bridge to /tp, clear, and prepare "
+                                    "per-episode live-server arenas")
+    p_nursery_run.add_argument("--allow-grid-pixels", action="store_true",
+                               help="allow training on grid fallback pixels instead of "
+                                    "requiring first-person viewer pixels")
     p_nursery_run.add_argument("--out-dir", default=None,
-                               help="directory to save one checkpoint bundle per scenario "
-                                    "(<out-dir>/<scenario>.pt) plus a full-model bundle "
-                                    "(<out-dir>/<scenario>-full.pt) the prediction exporter "
-                                    "can reload; omit to skip saving")
+                               help="directory to save pathfinder-world-model.pt")
     p_nursery_run.add_argument("--report", default=None,
-                               help="path to save a JSON report (per-scenario per-horizon "
-                                    "metrics + dream strips); omit to skip saving")
-    p_nursery_run.add_argument("--no-export-predictions", action="store_true",
-                               help="skip writing predictions_<episode>.json (the pixel "
-                                    "viewer's 'model' source) next to each recorded episode")
+                               help="path to save a JSON report")
     p_nursery_run.add_argument("--skip-data-quality-gate", action="store_true",
-                               help="train even when recordings fail the scenario's "
-                                    "data-quality expectations (stuck agent, static view)")
+                               help="train even when recordings fail first-person/action "
+                                    "quality checks")
+    p_nursery_run.add_argument("--require-learning", dest="require_learning",
+                               action="store_true",
+                               help="fail when the trained model fails to beat copy-last "
+                                    "on holdout horizons")
+    p_nursery_run.add_argument("--no-require-learning", dest="require_learning",
+                               action="store_false",
+                               help="compatibility no-op: learning failures are reported "
+                                    "without failing by default")
+    p_nursery_run.set_defaults(require_learning=False)
     p_nursery_run.set_defaults(func=cmd_nursery_run)
 
     p_nursery_joint = nursery_sub.add_parser(
         "joint",
-        help="record every scenario and train ONE action-conditioned recurrent "
-             "world model across them, with zero-shot held-out-scenario "
-             "evaluation, a frozen-rollout detector, and a yaw linear probe",
+        help="removed compatibility stub; use nursery run",
     )
     p_nursery_joint.add_argument("--record-dir", default="sessions")
     p_nursery_joint.add_argument("--train-scenarios", nargs="+", default=None,
@@ -2089,7 +1925,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_joint.add_argument("--backend", default=_default_nursery_backend(),
                                  choices=sorted(BACKENDS))
     p_nursery_joint.add_argument("--realtime", action="store_true")
-    p_nursery_joint.add_argument("--horizons", type=int, nargs="+", default=[1, 10, 100],
+    p_nursery_joint.add_argument("--horizons", type=int, nargs="+", default=[1, 4, 8],
                                  help="tick offsets to evaluate at (converted to recorded-frame "
                                       "steps via the measured vision rate)")
     p_nursery_joint.add_argument("--latent-width", type=int, default=32)

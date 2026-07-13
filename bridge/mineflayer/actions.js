@@ -76,7 +76,7 @@ function targetEntity(bot) {
 function frontBlockObj(bot) {
   const yaw = bot.entity.yaw;
   const dx = -Math.sin(yaw);
-  const dz = Math.cos(yaw);
+  const dz = -Math.cos(yaw);
   const p = bot.entity.position;
   return bot.blockAt(new Vec3(Math.floor(p.x + dx), Math.floor(p.y), Math.floor(p.z + dz)));
 }
@@ -128,9 +128,9 @@ function applyAction(bot, action, hooks) {
     case 'SNEAK':
       bot.setControlState('sneak', true); bot.setControlState('forward', true); return;
     case 'LOOK_LEFT':
-      bot.look(bot.entity.yaw - LOOK_STEP_RAD, bot.entity.pitch, true); return;
-    case 'LOOK_RIGHT':
       bot.look(bot.entity.yaw + LOOK_STEP_RAD, bot.entity.pitch, true); return;
+    case 'LOOK_RIGHT':
+      bot.look(bot.entity.yaw - LOOK_STEP_RAD, bot.entity.pitch, true); return;
     case 'LOOK_UP':
       bot.look(bot.entity.yaw, Math.min(HALF_PI, bot.entity.pitch + PITCH_STEP_RAD), true); return;
     case 'LOOK_DOWN':

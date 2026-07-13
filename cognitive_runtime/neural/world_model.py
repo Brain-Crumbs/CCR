@@ -278,7 +278,7 @@ class MultiHorizonMLPWorldModel(MLPWorldModel):
         fused_width: int,
         n_actions: int,
         *,
-        horizons: Sequence[int] = (1, 10, 100),
+        horizons: Sequence[int] = (1, 4, 8),
         hidden_dim: int = 128,
         depth: int = 2,
         dropout: float = 0.0,

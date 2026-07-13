@@ -584,7 +584,7 @@ class MultiHorizonWorldModelDataset:
     horizon are kept, so every sample has a target at every horizon.
     """
 
-    horizons: List[int] = field(default_factory=lambda: [1, 10, 100])
+    horizons: List[int] = field(default_factory=lambda: [1, 4, 8])
     latents: List[List[float]] = field(default_factory=list)
     labels: List[int] = field(default_factory=list)
     future_latents: Dict[int, List[List[float]]] = field(default_factory=dict)
@@ -606,7 +606,7 @@ class MultiHorizonWorldModelDataset:
 
 def build_multi_horizon_world_model_dataset(
     session_dirs: List[str],
-    horizons: Iterable[int] = (1, 10, 100),
+    horizons: Iterable[int] = (1, 4, 8),
     max_samples: Optional[int] = None,
     min_episode_reward: Optional[float] = None,
 ) -> MultiHorizonWorldModelDataset:

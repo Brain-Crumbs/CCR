@@ -17,6 +17,7 @@ dependencies = ["numpy>=1.23", "PyYAML>=6"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+notebook = ["jupyterlab>=4", "ipykernel>=6"]
 # Neural pixel vision (end-to-end behavioral cloning). Optional: the whole
 # pure-Python stack (loop, streams, simulated/remote backends, the linear BC
 # trainer and every heuristic encoder) runs without it. Only the pixel CNN,

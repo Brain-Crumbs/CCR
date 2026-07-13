@@ -76,10 +76,12 @@ Remote runs request first-person viewer pixels by default
 
 This is **best-effort**: `prismarine-viewer` plus `node-canvas-webgl` pull in
 native/headless-GL pieces that many hosts (containers, CI, a sandbox with no
-GPU/X server) cannot build or run. Any failure to install, initialize, or
-capture a frame disables it for the session and silently falls back to the
-compact colorized-grid pixels -- nothing here ever breaks a run. Force that
-fallback with `--pixel-source grid` or `CCR_MINECRAFT_PIXELS=grid`.
+GPU/X server) cannot build or run. When native rendering is unavailable, the
+bridge now uses a pure-JS first-person raycast renderer over the bot's live
+world data and still reports `pixel_source="viewer"`. If neither native
+rendering nor raycast is available, it falls back to compact colorized-grid
+pixels. Force that grid fallback with `--pixel-source grid` or
+`CCR_MINECRAFT_PIXELS=grid`.
 
 To try it:
 
@@ -133,6 +135,7 @@ latents, and old unpinned segments roll off under `--frame-disk-budget-mb`.
    export CCR_MINECRAFT_USERNAME=CCRAgent
    # export CCR_MINECRAFT_VERSION=1.20.4   # pin if auto-detect misfires
    # export CCR_MINECRAFT_AUTH=offline     # or 'microsoft' for online-mode
+   # export CCR_MINECRAFT_COMMAND_DELAY_MS=500  # slow /fill,/tp setup on anti-spam servers
 
    python -m cognitive_runtime run --backend remote \
        --policy scripted --episodes 1 --episode-ticks 400 --realtime --record-frames

@@ -78,19 +78,21 @@ python -m cognitive_runtime train --model-type multi-horizon-world-model \
 python -m cognitive_runtime ego-motion-canary --record-dir sessions \
     --train-seeds 6 --holdout-seeds 2
 
-# Nursery scenario suite (issue #62): scripted micro-scenarios --
-# walk_forward, turn_in_place, strafe_and_stop, object_permanence,
-# day_night, approach_entity -- generalizing the ego-motion canary above
-# into stage zero of docs/curriculum.md. Each scenario benchmarks
-# multi-horizon next-frame prediction the same way; object_permanence also
-# reports whether entity-persistence training beats a forget-immediately
-# baseline, and every held-out episode gets a rendered dream strip.
+# Live pathfinder nursery: records first-person Mineflayer pathfinder-teacher
+# episodes, then trains one action-conditioned world model to predict future
+# pixels at multiple horizons. The gate refuses grid fallback pixels, static
+# views, no-motion sessions, and runs that fail to beat copy-last unless told
+# otherwise.
 python -m cognitive_runtime nursery list
-python -m cognitive_runtime nursery run all --record-dir sessions
+python -m cognitive_runtime nursery run --backend remote --record-dir sessions \
+    --train-episodes 6 --holdout-episodes 2 --episode-ticks 500 \
+    --out-dir models/nursery --report models/nursery/report.json
 # With CCR_MINECRAFT_HOST set, nursery defaults to the remote backend; otherwise
-# pass it explicitly for live-server nursery recordings.
-CCR_MINECRAFT_HOST=localhost python -m cognitive_runtime nursery run walk_forward \
-    --backend remote --record-dir sessions --out-dir models/nursery
+# pass --backend remote explicitly. The bot should be op if you want clean
+# per-episode arenas; anti-spam servers may also need
+# CCR_MINECRAFT_COMMAND_DELAY_MS=500 or higher. Non-op servers fall back to a
+# local pathfinder goal but may fail the movement/static-view gate if the spawn
+# is obstructed.
 
 # Evaluation gates (issue #31): train actor/critic + linear online-Q,
 # eval both plus scripted/random on identical seeds, and report the three

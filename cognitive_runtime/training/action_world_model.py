@@ -39,10 +39,15 @@ torch.
 from __future__ import annotations
 
 import math
+import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from cognitive_runtime.runtime.replay import iter_cognitive_ticks, list_episodes
+from cognitive_runtime.runtime.replay import (
+    iter_cognitive_ticks,
+    list_episodes,
+    load_session_metadata,
+)
 from cognitive_runtime.runtime.frame_store import open_frame_store
 from cognitive_runtime.runtime.recorder import stream_event_from_log
 
@@ -71,6 +76,7 @@ class EpisodeActionFrames:
     actions: List[int] = field(default_factory=list)
     yaw: List[Optional[float]] = field(default_factory=list)
     ticks: List[int] = field(default_factory=list)
+    playback_frame_count: Optional[int] = None
 
     @property
     def ticks_per_frame(self) -> float:
@@ -110,16 +116,19 @@ class ActionSequenceDataset:
 def horizons_ticks_to_frames(
     horizons_ticks: Sequence[int], ticks_per_frame: float
 ) -> List[int]:
-    """Convert tick-denominated horizons to recorded-frame steps, preserving
-    order and de-duplicating collisions (two tick horizons can land on the
-    same frame step when vision runs below the tick rate)."""
+    """Convert tick-denominated horizons to recorded-frame steps.
+
+    The returned list preserves one entry per requested tick horizon. When
+    vision runs below the tick rate, multiple tick horizons can map to the
+    same recorded frame step (for example t+1 and t+2 at ~2 ticks/frame);
+    callers that need unique evaluation work can de-duplicate separately.
+    """
     if ticks_per_frame <= 0:
         raise ValueError(f"ticks_per_frame must be positive, got {ticks_per_frame!r}")
     frames: List[int] = []
     for h in horizons_ticks:
         f = max(1, int(round(h / ticks_per_frame)))
-        if f not in frames:
-            frames.append(f)
+        frames.append(f)
     return frames
 
 
@@ -169,10 +178,24 @@ def build_action_sequence_dataset(
         return index[name]
 
     for session_dir in session_dirs:
+        playback_frame_count: Optional[int] = None
+        try:
+            metadata = load_session_metadata(session_dir)
+        except (FileNotFoundError, json.JSONDecodeError):
+            metadata = {}
+        nursery = (
+            (metadata.get("program_config") or {}).get("nursery") or {}
+            if isinstance(metadata, dict)
+            else {}
+        )
+        active_ticks = nursery.get("active_episode_ticks")
+        if isinstance(active_ticks, int) and active_ticks > 0:
+            playback_frame_count = active_ticks
         frame_store = open_frame_store(session_dir)
         try:
             for episode_id in list_episodes(session_dir):
                 episode = EpisodeActionFrames(session_dir=session_dir, episode_id=episode_id)
+                episode.playback_frame_count = playback_frame_count
                 last_action: Optional[str] = None
                 for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
                     tick = int(decision.get("tick_index", len(episode.ticks)))

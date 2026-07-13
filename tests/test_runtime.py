@@ -197,6 +197,24 @@ def test_default_config_still_elides_frames_hash_only(tmp_path):
     assert pixel_lines and all(r.get("elided") for r in pixel_lines)
 
 
+def test_recorder_removes_stale_prediction_export_when_rerecording(tmp_path):
+    from cognitive_runtime.runtime.recorder import Recorder
+
+    recorder = Recorder(record_dir=str(tmp_path), session_id="rerun")
+    recorder.write_session_metadata({})
+    prediction_path = os.path.join(
+        str(tmp_path), "rerun", "predictions_episode_00000.json"
+    )
+    with open(prediction_path, "w", encoding="utf-8") as fh:
+        json.dump({"old": True}, fh)
+
+    recorder.start_episode(0)
+    try:
+        assert not os.path.exists(prediction_path)
+    finally:
+        recorder.close()
+
+
 def test_pin_on_streams_pins_current_segment_on_trigger(tmp_path):
     """A configured pin-trigger stream firing this tick pins the frame
     store's current segment so it survives rotation."""

@@ -8,6 +8,8 @@ import ...`` entry points working.  See that module's docstring for the
 
 from cognitive_runtime.training.prediction_export import (  # noqa: F401
     FULL_MODEL_FORMAT,
+    export_action_prediction_file,
+    export_action_session_predictions,
     export_prediction_file,
     export_session_predictions,
     load_full_visual_model,

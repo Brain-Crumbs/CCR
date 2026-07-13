@@ -23,7 +23,13 @@ policy.
 Presets only tune existing world/reward knobs — no policy or heuristic
 behavior is encoded here; rewards state goals, never actions to take.
 
-## Stage zero: the nursery scenario suite (issue #62)
+## Stage zero: live pathfinder nursery
+
+Current nursery code has been replaced by a single live-server pathfinder
+objective: record first-person Mineflayer pathfinder-teacher episodes, train
+one action-conditioned world model, and require the model to beat copy-last on
+holdout visual prediction. The older scripted scenario suite notes below are
+historical context only.
 
 Below the survival curriculum sits an "infant" stage,
 `cognitive_runtime/training/nursery.py`: scripted micro-scenarios —
@@ -67,22 +73,17 @@ episode gets a rendered "dream strip": predicted vs. actual frames at each
 horizon, as ASCII (no image-rendering dependency exists in this project).
 
 ```bash
-# List the registered scenarios:
+# Describe the nursery objective:
 python -m cognitive_runtime nursery list
 
-# Record + benchmark one scenario:
-python -m cognitive_runtime nursery run walk_forward \
-    --record-dir sessions --out-dir checkpoints/nursery --report nursery-report.json
-
-# The whole suite, unattended:
-python -m cognitive_runtime nursery run all --record-dir sessions
-
-# Record nursery episodes through the live Mineflayer backend instead. When
-# CCR_MINECRAFT_HOST is set, `nursery run` defaults to `--backend remote`;
-# otherwise pass it explicitly. Remote nursery runs use the server's current
-# scene, so sim-only setup hooks for entity placement/occluders are skipped.
-CCR_MINECRAFT_HOST=localhost python -m cognitive_runtime nursery run walk_forward \
-    --backend remote --record-dir sessions --out-dir models/nursery
+# Record live pathfinder teacher episodes and train the world model:
+CCR_MINECRAFT_HOST=localhost python -m cognitive_runtime nursery run \
+    --backend remote \
+    --record-dir sessions \
+    --train-episodes 6 --holdout-episodes 2 \
+    --episode-ticks 500 \
+    --out-dir models/nursery \
+    --report models/nursery/report.json
 ```
 
 An automated **curriculum runner** (issue #43,

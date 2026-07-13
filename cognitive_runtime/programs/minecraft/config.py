@@ -7,7 +7,7 @@ Minecraft hard yet -- the goal is to make learning measurable.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict
 
 
@@ -30,6 +30,9 @@ class SurvivalBoxConfig:
     # bridge falls back to the colorized semantic grid if native GL deps are
     # unavailable. The simulated backend always uses its deterministic proxy.
     pixel_source: str = "viewer"
+    # Live-only structured config forwarded to the mineflayer bridge for
+    # constrained teacher-data collection, e.g. nursery pathfinder arenas.
+    nursery: Dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def from_dict(raw: Dict[str, Any]) -> "SurvivalBoxConfig":

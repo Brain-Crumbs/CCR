@@ -14,8 +14,25 @@ const { applyAction, clearControls } = require('./actions');
 const { buildObservation, isSheltered, timeState } = require('./observation');
 const { PixelViewer } = require('./pixels');
 
+let PATHFINDER_API = null;
+try {
+  PATHFINDER_API = require('mineflayer-pathfinder');
+} catch (e) {
+  PATHFINDER_API = null;
+}
+let minecraftData = null;
+try {
+  minecraftData = require('minecraft-data');
+} catch (e) {
+  minecraftData = null;
+}
+
 // issue #32: opt in to higher-fidelity rendered pixels (see README).
 const PIXEL_SOURCE_ENV = process.env.CCR_MINECRAFT_PIXELS;
+const COMMAND_DELAY_MS = Math.max(
+  50,
+  Number(process.env.CCR_MINECRAFT_COMMAND_DELAY_MS || 500)
+);
 
 function log(...args) {
   process.stderr.write('[mc-bridge] ' + args.join(' ') + '\n');
@@ -51,6 +68,8 @@ class WorldSession {
     // issue #32: optional higher-fidelity pixel capture, off unless the
     // config/env explicitly asks for it (see README "Higher-fidelity pixels").
     this._pixelViewer = null;
+    this._pathfinderLoaded = false;
+    this._pathfinderMovements = null;
   }
 
   // -- connection ----------------------------------------------------------
@@ -128,12 +147,15 @@ class WorldSession {
     this.config = config || {};
     this.connection = connection || {};
     await this._connect();
+    this._stats = freshStats();
     // Best-effort world reset via op commands; harmless if the server refuses.
     try {
       this.bot.chat('/gamemode survival');
       this.bot.chat(`/effect clear ${this.bot.username}`);
       this.bot.chat(`/time set ${this.config.start_time || 0}`);
     } catch (e) { /* not op / commands disabled: fall through */ }
+    await this._setupNurseryArena(this.config.nursery || null);
+    this._ensurePathfinder();
     await sleep(250);
     this.tick = 0;
     this.dead = (this.bot.health != null && this.bot.health <= 0);
@@ -145,7 +167,6 @@ class WorldSession {
     this._prevInventory = this._inventoryVocabCounts();
     this._prevSheltered = isSheltered(this.bot);
     this._prevNight = timeState(0, this.config).is_night;
-    this._stats = freshStats();
     this.spawn = { x: this.bot.entity.position.x, z: this.bot.entity.position.z };
     const biomeBlock = this.bot.blockAt(this.bot.entity.position);
     this._prevBiome = biomeToVocab(biomeBlock && biomeBlock.biome ? biomeBlock.biome.name : null);
@@ -169,6 +190,134 @@ class WorldSession {
     try {
       await this._pixelViewer.start(this.bot);
     } catch (e) { /* PixelViewer.start() already swallows its own errors */ }
+  }
+
+  async _setupNurseryArena(nursery) {
+    if (!nursery || nursery.mode !== 'pathfinder' || nursery.setup === false) return;
+    const start = nursery.start || {};
+    const target = nursery.target || {};
+    const radius = Number(nursery.arena_radius || 32);
+    const sx = Math.floor(Number(start.x == null ? this.bot.entity.position.x : start.x));
+    const sz = Math.floor(Number(start.z == null ? this.bot.entity.position.z : start.z));
+    const sy = start.y == null
+      ? Math.floor(this.bot.entity.position.y)
+      : Math.floor(Number(start.y));
+    const tx = Math.floor(Number(target.x == null ? sx + radius - 2 : target.x));
+    const tz = Math.floor(Number(target.z == null ? sz : target.z));
+    const ty = target.y == null ? sy : Math.floor(Number(target.y));
+    const y0 = sy - 1;
+    const y1 = sy + 5;
+    const x0 = sx - radius;
+    const x1 = sx + radius;
+    const z0 = sz - radius;
+    const z1 = sz + radius;
+
+    await this._chatCommand('/difficulty peaceful');
+    await this._chatCommand('/gamerule doMobSpawning false');
+    await this._chatCommand(`/kill @e[type=!player,x=${sx},y=${sy},z=${sz},distance=..${radius * 2}]`);
+    await this._chatCommand(`/fill ${x0} ${sy} ${z0} ${x1} ${y1} ${z1} air`);
+    await this._chatCommand(`/fill ${x0} ${y0} ${z0} ${x1} ${y0} ${z1} grass_block`);
+    await this._chatCommand(`/setblock ${tx} ${y0} ${tz} gold_block`);
+    await this._chatCommand(`/setblock ${tx} ${sy} ${tz} torch`);
+    await this._chatCommand(`/setblock ${tx} ${sy + 1} ${tz} gold_block`);
+    await this._chatCommand(`/setblock ${tx} ${sy + 2} ${tz} gold_block`);
+    const landmarks = [
+      [sx - radius + 2, sz - radius + 2, 'red_wool'],
+      [sx + radius - 2, sz - radius + 2, 'blue_wool'],
+      [sx - radius + 2, sz + radius - 2, 'lime_wool'],
+      [sx + radius - 2, sz + radius - 2, 'orange_wool'],
+      [sx, sz - radius + 1, 'stone'],
+      [sx, sz + radius - 1, 'oak_log'],
+      [sx - radius + 1, sz, 'cobblestone'],
+      [sx + radius - 1, sz, 'sandstone'],
+    ];
+    for (const [lx, lz, block] of landmarks) {
+      await this._chatCommand(`/setblock ${lx} ${sy} ${lz} ${block}`);
+      await this._chatCommand(`/setblock ${lx} ${sy + 1} ${lz} ${block}`);
+    }
+    await this._chatCommand(`/tp ${this.bot.username} ${sx + 0.5} ${sy} ${sz + 0.5} 0 0`);
+    await sleep(250);
+    const actual = this.bot.entity.position;
+    const setupDistance = Math.hypot(actual.x - (sx + 0.5), actual.z - (sz + 0.5));
+    this._stats.nursery_setup_requested = true;
+    this._stats.nursery_setup_distance_from_start = round(setupDistance, 3);
+    this._stats.nursery_setup_reached_start = setupDistance <= 2.0;
+    this._stats.nursery_setup_start = { x: sx + 0.5, y: sy, z: sz + 0.5 };
+    this._stats.nursery_setup_actual = {
+      x: round(actual.x, 3),
+      y: round(actual.y, 3),
+      z: round(actual.z, 3),
+    };
+    if (setupDistance > 2.0) {
+      const message = 'nursery arena setup did not move bot near requested start'
+        + ` distance=${setupDistance.toFixed(2)}`
+        + ` requested=${sx + 0.5},${sy},${sz + 0.5}`
+        + ` actual=${actual.x.toFixed(3)},${actual.y.toFixed(3)},${actual.z.toFixed(3)}`
+        + ' -- is the bot op and are commands enabled?';
+      log(message);
+      throw new Error(message);
+    } else {
+      log('nursery arena prepared at', `${sx},${sy},${sz}`, 'target', `${tx},${ty},${tz}`);
+    }
+  }
+
+  async _chatCommand(command) {
+    try {
+      this.bot.chat(command);
+    } catch (e) {
+      log('command failed:', command, e && e.message ? e.message : String(e));
+    }
+    await sleep(COMMAND_DELAY_MS);
+  }
+
+  _ensurePathfinder() {
+    if (this._pathfinderLoaded || !this.bot || !PATHFINDER_API || !minecraftData) return;
+    try {
+      this.bot.loadPlugin(PATHFINDER_API.pathfinder);
+      const mcData = minecraftData(this.bot.version);
+      this._pathfinderMovements = new PATHFINDER_API.Movements(this.bot, mcData);
+      this.bot.pathfinder.setMovements(this._pathfinderMovements);
+      this._pathfinderLoaded = true;
+      log('mineflayer-pathfinder teacher enabled');
+    } catch (e) {
+      this._pathfinderLoaded = false;
+      this._pathfinderMovements = null;
+      log('mineflayer-pathfinder unavailable; using steering fallback:',
+        e && e.message ? e.message : String(e));
+    }
+  }
+
+  async pathfinderSuggest(goal) {
+    if (!this.bot) throw new Error('pathfinder_suggest before reset');
+    this._ensurePathfinder();
+    const radius = Number(goal.radius || 1.5);
+    let waypoint = null;
+    let source = 'steering-fallback';
+    if (this._pathfinderLoaded && this.bot.pathfinder && this._pathfinderMovements) {
+      try {
+        const GoalNear = PATHFINDER_API.goals.GoalNear;
+        const targetY = goal.y == null
+          ? Math.floor(this.bot.entity.position.y)
+          : Number(goal.y);
+        const path = this.bot.pathfinder.getPathTo(
+          this._pathfinderMovements,
+          new GoalNear(Number(goal.x), targetY, Number(goal.z), radius),
+          50
+        );
+        if (path && path.path && path.path.length > 1) {
+          waypoint = path.path[1];
+          source = 'mineflayer-pathfinder';
+        }
+      } catch (e) {
+        log('pathfinder_suggest failed; using steering fallback:',
+          e && e.message ? e.message : String(e));
+      }
+    }
+    const target = waypoint || { x: Number(goal.x), z: Number(goal.z) };
+    const action = steerAction(this.bot, target, radius);
+    this._stats.pathfinder_teacher_actions += 1;
+    this._stats.pathfinder_teacher_source = source;
+    return { ok: true, action: { name: action, params: {} }, source };
   }
 
   async step(action) {
@@ -376,6 +525,13 @@ function freshStats() {
     max_distance_from_spawn: 0.0,
     unique_items_collected: 0,
     survived_night: false,
+    pathfinder_teacher_actions: 0,
+    pathfinder_teacher_source: null,
+    nursery_setup_requested: false,
+    nursery_setup_distance_from_start: null,
+    nursery_setup_reached_start: null,
+    nursery_setup_start: null,
+    nursery_setup_actual: null,
   };
 }
 
@@ -399,10 +555,30 @@ function horizontalDistance(a, b) {
   return Math.hypot((b.x || 0) - (a.x || 0), (b.z || 0) - (a.z || 0));
 }
 
+function wrapRadians(value) {
+  while (value <= -Math.PI) value += Math.PI * 2;
+  while (value > Math.PI) value -= Math.PI * 2;
+  return value;
+}
+
+function steerAction(bot, target, radius) {
+  const pos = bot.entity.position;
+  const dx = Number(target.x) - pos.x;
+  const dz = Number(target.z) - pos.z;
+  if (Math.hypot(dx, dz) <= radius) return 'NULL';
+  // Mineflayer's forward vector is (-sin(yaw), -cos(yaw)) in x/z.
+  const desiredYaw = Math.atan2(-dx, -dz);
+  const delta = wrapRadians(desiredYaw - bot.entity.yaw);
+  if (Math.abs(delta) > 0.30) return delta > 0 ? 'LOOK_LEFT' : 'LOOK_RIGHT';
+  const ahead = blockInMoveDirection(bot, 'MOVE_FORWARD');
+  if (ahead && ahead.boundingBox === 'block') return 'JUMP';
+  return 'MOVE_FORWARD';
+}
+
 function blockInMoveDirection(bot, actionName) {
   const yaw = bot.entity.yaw;
   const fx = -Math.sin(yaw);
-  const fz = Math.cos(yaw);
+  const fz = -Math.cos(yaw);
   let dx = fx;
   let dz = fz;
   if (actionName === 'MOVE_BACKWARD') {

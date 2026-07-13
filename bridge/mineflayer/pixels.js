@@ -18,6 +18,7 @@
 // the catalog declares this shape and models train against it, so a
 // viewer frame of any other size would contradict the session metadata.
 const PIXEL_SHAPE = [33, 33, 3];
+const Vec3 = require('vec3');
 
 function log(...args) {
   process.stderr.write('[mc-bridge:pixels] ' + args.join(' ') + '\n');
@@ -53,6 +54,7 @@ class PixelViewer {
     this._bot = null;
     this._onMove = null;
     this._available = null; // null = not yet probed, true/false once known
+    this._raycastFallback = false;
   }
 
   // Best-effort start; never throws. `available()` reflects whether capture()
@@ -74,10 +76,18 @@ class PixelViewer {
       global.Worker = Worker;
       viewerApi = require('prismarine-viewer').viewer;
     } catch (e) {
+      if (bot.world && typeof bot.world.raycast === 'function') {
+        this._bot = bot;
+        this._raycastFallback = true;
+        this._available = true;
+        log('native first-person viewer dependencies are not installed; using '
+          + 'pure-JS first-person raycast pixels from live world data.');
+        return;
+      }
       this._available = false;
-      log('first-person viewer dependencies are not installed -- falling back to '
-        + 'colorized grid pixels. Install optional deps with '
-        + 'npm install --include=optional and see bridge/mineflayer/README.md '
+      log('first-person viewer dependencies are not installed and raycast is '
+        + 'unavailable -- falling back to colorized grid pixels. Install optional '
+        + 'deps with npm install --include=optional and see bridge/mineflayer/README.md '
         + 'for headless-GL setup.');
       return;
     }
@@ -122,7 +132,9 @@ class PixelViewer {
   // Returns a PIXEL_SHAPE-nested uint8 array, or null on any failure
   // (never throws -- the caller falls back to the grid-colorization path).
   capture() {
-    if (!this.available() || !this._viewer) return null;
+    if (!this.available()) return null;
+    if (this._raycastFallback) return renderRaycastPixels(this._bot);
+    if (!this._viewer) return null;
     try {
       this._syncCamera();
       this._viewer.update();
@@ -150,6 +162,7 @@ class PixelViewer {
     this._gl = null;
     this._bot = null;
     this._onMove = null;
+    this._raycastFallback = false;
   }
 
   _syncCamera() {
@@ -170,6 +183,91 @@ function flipRgbaRows(buffer, width, height) {
     buffer.copy(out, dst, src, src + stride);
   }
   return out;
+}
+
+function renderRaycastPixels(bot) {
+  if (!bot || !bot.entity || !bot.world || typeof bot.world.raycast !== 'function') return null;
+  const [height, width] = PIXEL_SHAPE;
+  const eyeHeight = bot.entity.eyeHeight == null ? 1.62 : bot.entity.eyeHeight;
+  const eye = bot.entity.position.offset(0, eyeHeight, 0);
+  const yaw = bot.entity.yaw || 0;
+  const pitch = bot.entity.pitch || 0;
+  const hFov = Math.PI / 2.2;
+  const vFov = hFov * (height / width);
+  const maxRange = 32;
+  const out = [];
+  for (let y = 0; y < height; y++) {
+    const row = [];
+    const v = ((y + 0.5) / height - 0.5) * vFov;
+    for (let x = 0; x < width; x++) {
+      const h = ((x + 0.5) / width - 0.5) * hFov;
+      const dir = directionFromYawPitch(yaw + h, pitch + v);
+      let color = skyColor(v);
+      try {
+        const hit = bot.world.raycast(
+          eye,
+          dir,
+          maxRange,
+          (block) => Boolean(block && block.name !== 'air' && block.boundingBox !== 'empty')
+        );
+        if (hit && typeof hit.then !== 'function' && hit.name) {
+          const distance = hit.position ? hit.position.distanceTo(eye) : maxRange;
+          color = shade(blockColor(hit.name), distance, maxRange);
+        }
+      } catch (e) {
+        color = [0, 0, 0];
+      }
+      row.push(color);
+    }
+    out.push(row);
+  }
+  return out;
+}
+
+function directionFromYawPitch(yaw, pitch) {
+  const cp = Math.cos(pitch);
+  return new Vec3(
+    -Math.sin(yaw) * cp,
+    -Math.sin(pitch),
+    -Math.cos(yaw) * cp
+  ).normalize();
+}
+
+function skyColor(verticalAngle) {
+  const t = Math.max(0, Math.min(1, 0.5 + verticalAngle));
+  return [
+    Math.round(95 + t * 45),
+    Math.round(135 + t * 55),
+    Math.round(190 + t * 45),
+  ];
+}
+
+function shade(rgb, distance, maxRange) {
+  const f = Math.max(0.35, 1.0 - Math.min(distance, maxRange) / maxRange * 0.65);
+  return rgb.map((v) => Math.max(0, Math.min(255, Math.round(v * f))));
+}
+
+function blockColor(name) {
+  const n = String(name || '').toLowerCase();
+  if (n.includes('water')) return [55, 90, 205];
+  if (n.includes('lava') || n.includes('fire')) return [240, 90, 30];
+  if (n.includes('grass') || n.includes('leaves') || n.includes('moss')) return [75, 145, 65];
+  if (n.includes('red_wool')) return [170, 45, 45];
+  if (n.includes('blue_wool')) return [55, 75, 180];
+  if (n.includes('lime_wool')) return [95, 180, 55];
+  if (n.includes('orange_wool')) return [220, 120, 35];
+  if (n.includes('wool')) return [185, 185, 185];
+  if (n.includes('dirt') || n.includes('mud')) return [118, 82, 48];
+  if (n.includes('sand')) return [215, 198, 130];
+  if (n.includes('log') || n.includes('wood') || n.includes('planks')) return [126, 88, 48];
+  if (n.includes('gold')) return [235, 190, 45];
+  if (n.includes('torch') || n.includes('lantern')) return [245, 200, 90];
+  if (n.includes('coal')) return [45, 45, 45];
+  if (n.includes('stone') || n.includes('deepslate') || n.includes('ore')) return [120, 120, 125];
+  if (n.includes('snow') || n.includes('quartz')) return [230, 235, 238];
+  if (n.includes('glass') || n.includes('ice')) return [150, 205, 225];
+  if (n.includes('air')) return [130, 175, 225];
+  return [145, 130, 105];
 }
 
 module.exports = { PixelViewer, resizeToPixelShape, flipRgbaRows, PIXEL_SHAPE };

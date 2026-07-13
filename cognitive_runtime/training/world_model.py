@@ -534,7 +534,7 @@ def load_multi_horizon_world_model_checkpoint(
     model = MultiHorizonMLPWorldModel(
         fused_width=int(wm_meta["fused_width"]),
         n_actions=int(wm_meta["n_actions"]),
-        horizons=list(wm_meta.get("horizons", (1, 10, 100))),
+        horizons=list(wm_meta.get("horizons", (1, 4, 8))),
         hidden_dim=int(wm_meta["hidden_dim"]),
         depth=int(wm_meta["depth"]),
         dropout=float(wm_meta["dropout"]),

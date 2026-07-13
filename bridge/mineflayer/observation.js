@@ -17,10 +17,10 @@ function round(value, digits) {
 }
 
 // SurvivalBox yaw: degrees, 0 = +z (south), increasing clockwise, like the
-// sim's _facing_vector (dx=-sin(yaw), dz=cos(yaw)).  mineflayer yaw is radians
-// with the same convention (0 = south), so degrees = yaw * 180/pi mod 360.
+// sim's _facing_vector (dx=-sin(yaw), dz=cos(yaw)). Mineflayer yaw is radians
+// with 0 = -z (north), so convert to the SurvivalBox convention for streams.
 function yawDegrees(bot) {
-  return ((bot.entity.yaw * RAD2DEG) % 360 + 360) % 360;
+  return ((180 - bot.entity.yaw * RAD2DEG) % 360 + 360) % 360;
 }
 
 // mineflayer pitch: radians, positive = looking up.  SurvivalBox pitch:
@@ -31,7 +31,7 @@ function pitchDegrees(bot) {
 
 function facingVector(bot) {
   const yaw = bot.entity.yaw;
-  return { dx: -Math.sin(yaw), dz: Math.cos(yaw) };
+  return { dx: -Math.sin(yaw), dz: -Math.cos(yaw) };
 }
 
 // A block at an integer column, sampled at the player's feet Y.

@@ -13,17 +13,17 @@
  * Attributes:
  *   frames-src       URL returning the /frames API payload (required)
  *   predictions-src  URL returning a pixel-predictions-v1 payload (optional)
- *   horizons         comma list, default "1,10,100"
+ *   horizons         comma list, default "1,4,8"
  *   scale            CSS pixels per frame pixel, default 6
  *
  * Usage (plain HTML):
  *   <script type="module" src="/pixel-horizon-viewer.js"></script>
  *   <pixel-horizon-viewer frames-src="/api/sessions/S/episodes/episode_00000/frames"
  *                         predictions-src="/api/sessions/S/episodes/episode_00000/predictions"
- *                         horizons="1,10,100"></pixel-horizon-viewer>
+ *                         horizons="1,4,8"></pixel-horizon-viewer>
  *
  * Usage (React — custom elements work as-is; set attributes as strings):
- *   <pixel-horizon-viewer frames-src={framesUrl} horizons="1,10,100" />
+ *   <pixel-horizon-viewer frames-src={framesUrl} horizons="1,4,8" />
  */
 "use strict";
 
@@ -162,6 +162,7 @@ class PixelHorizonViewer extends HTMLElement {
     this._shape = null;       // [h,w,c]
     this._pred = null;        // decoded predictions payload or null
     this._meanFrame = null;   // Float array, native shape
+    this._playbackFrameCount = null;
     this._t = 0;
     this._timer = null;
     this._mseCache = new Map(); // source -> {h: Float64Array}
@@ -189,7 +190,7 @@ class PixelHorizonViewer extends HTMLElement {
   }
 
   get horizons() {
-    return (this.getAttribute("horizons") || "1,10,100").split(",").map((s) => parseInt(s.trim(), 10)).filter((h) => h > 0);
+    return (this.getAttribute("horizons") || "1,4,8").split(",").map((s) => parseInt(s.trim(), 10)).filter((h) => h > 0);
   }
   get scale() { return Number(this.getAttribute("scale") || 6); }
 
@@ -211,6 +212,7 @@ class PixelHorizonViewer extends HTMLElement {
       return;
     }
     this._pred = null;
+    this._playbackFrameCount = null;
     const predSrc = this.getAttribute("predictions-src");
     if (predSrc) {
       try {
@@ -222,6 +224,9 @@ class PixelHorizonViewer extends HTMLElement {
           }
           p._targets = p.targets ? p.targets.map(b64ToBytes) : null;
           this._pred = p;
+          if (Number.isFinite(Number(p.playback_frame_count)) && Number(p.playback_frame_count) > 0) {
+            this._playbackFrameCount = Math.floor(Number(p.playback_frame_count));
+          }
         }
       } catch { /* predictions are optional */ }
     }
@@ -240,7 +245,11 @@ class PixelHorizonViewer extends HTMLElement {
     this._mseCache.clear();
     const maxH = Math.max(...this.horizons);
     const scrub = this._$("#scrub");
-    scrub.max = Math.max(0, this._frames.length - 1 - maxH);
+    const horizonBound = Math.max(0, this._frames.length - 1 - maxH);
+    const playbackBound = this._playbackFrameCount === null
+      ? horizonBound
+      : Math.max(0, Math.min(horizonBound, this._playbackFrameCount - 1));
+    scrub.max = playbackBound;
     this._t = Math.min(this._t, Number(scrub.max));
     scrub.value = this._t;
     this._$("#status").textContent =
@@ -331,7 +340,9 @@ class PixelHorizonViewer extends HTMLElement {
   _mseSeries(source, h) {
     const key = `${source}:${h}`;
     if (this._mseCache.has(key)) return this._mseCache.get(key);
-    const n = this._frames.length - h;
+    const n = this._playbackFrameCount === null
+      ? this._frames.length - h
+      : Math.min(this._playbackFrameCount, this._frames.length - h);
     const out = new Float64Array(Math.max(0, n)).fill(NaN);
     for (let t = 0; t < n; t++) {
       const pred = this._predicted(source, t, h);

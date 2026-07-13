@@ -31,19 +31,19 @@ Open http://localhost:8787 — pick a session and episode.
 
 ```bash
 python -m cognitive_runtime.training.prediction_export \
-    --model out/walk_forward-full.pt \
-    --session shared/nursery-walk_forward-train-0 --horizons 1,10,100
+    --model models/nursery/pathfinder-world-model.pt \
+    --session sessions/live-pathfinder/nursery-pathfinder-holdout-0 \
+    --horizons 1,4,8
 ```
 
 or in code, while the trained model is in memory:
 
 ```python
 from cognitive_runtime.training.prediction_export import (
-    export_prediction_file, save_full_visual_model,
+    export_action_prediction_file,
 )
 
-export_prediction_file(model, session_dir, "episode_00000", (1, 10, 100))
-save_full_visual_model(model, "walk_forward-full.pt")
+export_prediction_file(model, session_dir, "episode_00000", (1, 4, 8))
 ```
 
 (`viewer/export_predictions.py` remains as a shim re-exporting the same
@@ -67,7 +67,7 @@ Plain HTML:
 <pixel-horizon-viewer
     frames-src="/api/sessions/S/episodes/episode_00000/frames"
     predictions-src="/api/sessions/S/episodes/episode_00000/predictions"
-    horizons="1,10,100" scale="6">
+    horizons="1,4,8" scale="6">
 </pixel-horizon-viewer>
 ```
 
@@ -81,7 +81,7 @@ export function EpisodeViewer({ session, episode }) {
     <pixel-horizon-viewer
       frames-src={`/api/sessions/${session}/episodes/${episode}/frames`}
       predictions-src={`/api/sessions/${session}/episodes/${episode}/predictions`}
-      horizons="1,10,100"
+      horizons="1,4,8"
       scale="6"
     />
   );
@@ -89,7 +89,7 @@ export function EpisodeViewer({ session, episode }) {
 ```
 
 Attributes: `frames-src` (required), `predictions-src` (optional),
-`horizons` (default `1,10,100`), `scale` (CSS px per frame pixel, default 6).
+`horizons` (default `1,4,8`), `scale` (CSS px per frame pixel, default 6).
 Light/dark theme follows `prefers-color-scheme`.
 
 ## Endpoint contracts

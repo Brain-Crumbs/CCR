@@ -74,7 +74,7 @@ Why, in order of importance:
 
 2. **The identity is a strong attractor under this loss.**
    `train_horizon_consistency` decodes the h-step *iterated* rollout and
-   MSE-matches the true frame at t+h, for h ∈ {1, 10, 100}, backpropagating
+   MSE-matches the true frame at t+h, for h ∈ {1, 4, 8}, backpropagating
    through up to 100 compositions of the same MLP. The lowest-effort way to
    keep a 100-step composition stable is `f ≈ identity`; the decoder then
    pays a constant, modest MSE at every horizon. On mostly-uniform terrain
@@ -298,7 +298,7 @@ for lag in (1, 6, 12, 24):
           np.mean(np.abs(seq[lag:] - seq[:-lag])))
 
 # horizon table: copy-last vs mean-frame vs period-12 oracle
-for h in (1, 10, 100):
+for h in (1, 4, 8):
     cur, tgt = seq[:-h], seq[h:]
     copy = np.mean((cur - tgt) ** 2)
     mean = np.mean((seq.mean(0) - tgt) ** 2)

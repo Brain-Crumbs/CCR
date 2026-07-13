@@ -300,6 +300,23 @@ class RemoteMinecraftBackend(SurvivalBackend):
         events = response.get("events", [])
         return [str(e) for e in events]
 
+    def suggest_pathfinder_action(self, goal: Dict[str, Any]) -> Action:
+        """Ask the live bridge's pathfinder teacher for the next low-level
+        SurvivalBox action toward ``goal``.
+
+        This is deliberately not a new macro action in the recorded motor
+        stream: the nursery wants ordinary MOVE/LOOK labels so the world model
+        learns how those actions change first-person pixels.
+        """
+        bridge = self._require_bridge()
+        response = bridge.request({"cmd": "pathfinder_suggest", "goal": dict(goal)})
+        spec = response.get("action") or {}
+        name = spec.get("name") or "NULL"
+        params = spec.get("params") or {}
+        if params:
+            return Action.make(str(name), **dict(params))
+        return Action(str(name))
+
     def observe(self, timestamp: float) -> Observation:
         bridge = self._require_bridge()
         response = bridge.request({"cmd": "observe", "timestamp": timestamp})

@@ -30,6 +30,9 @@ async function handle(message) {
     if (cmd === 'observe') {
       return session.observe(message.timestamp || 0.0);
     }
+    if (cmd === 'pathfinder_suggest') {
+      return await session.pathfinderSuggest(message.goal || {});
+    }
     if (cmd === 'close') {
       session.close();
       return { ok: true, _close: true };
