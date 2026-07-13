@@ -50,6 +50,8 @@ import threading
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
+import numpy as np
+
 from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.observation import Observation
 from cognitive_runtime.core.program import RecoverableEpisodeError
@@ -253,6 +255,12 @@ class RemoteMinecraftBackend(SurvivalBackend):
         self._dead = False
         self._death_reason: Optional[str] = None
         self._stats: Dict[str, Any] = {}
+        # Pixel provenance actually observed this session ("viewer"/"grid"):
+        # the viewer path can silently fall back to the grid render, which
+        # changes the observation distribution -- record which path produced
+        # the frames so the nursery data-quality gate can refuse to train
+        # across that boundary.
+        self._pixel_sources: List[str] = []
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -297,12 +305,22 @@ class RemoteMinecraftBackend(SurvivalBackend):
         response = bridge.request({"cmd": "observe", "timestamp": timestamp})
         obs = response.get("observation") or {}
         frame = obs.get("frame")
-        # Prefer a bridge-supplied RGB frame (e.g. a future prismarine-viewer
-        # screenshot); otherwise colorize the semantic grid the same way the
-        # simulated backend does, so the neural pixel stream works either way.
+        # Prefer a bridge-supplied first-person RGB frame from the
+        # prismarine-viewer capture path; otherwise colorize the semantic grid
+        # the same way the simulated backend does, so the neural pixel stream
+        # works either way. Bridge frames arrive over JSON as nested lists, so
+        # convert them immediately to uint8 arrays; that keeps recording on the
+        # binary FrameStore instead of embedding large JSON payloads.
         pixels = obs.get("pixels")
+        if pixels is not None:
+            pixels = _pixels_array(pixels)
+            source = str(obs.get("pixel_source") or "viewer")
+        else:
+            source = "grid"
         if pixels is None and frame is not None:
-            pixels = pixels_from_frame(frame)
+            pixels = pixels_from_frame(frame, yaw_degrees=_yaw_degrees(obs.get("data", {})))
+        if pixels is not None and source not in self._pixel_sources:
+            self._pixel_sources.append(source)
         return Observation(
             timestamp=timestamp,
             tick=obs.get("tick", self._tick),
@@ -323,7 +341,10 @@ class RemoteMinecraftBackend(SurvivalBackend):
         return self._death_reason
 
     def stats(self) -> Dict[str, Any]:
-        return dict(self._stats)
+        stats = dict(self._stats)
+        if self._pixel_sources:
+            stats["pixel_sources"] = sorted(self._pixel_sources)
+        return stats
 
     # -- unsupported on a live world ---------------------------------------
 
@@ -345,3 +366,19 @@ class RemoteMinecraftBackend(SurvivalBackend):
         self._dead = bool(response.get("dead", self._dead))
         self._death_reason = response.get("death_reason")
         self._stats = dict(response.get("stats") or {})
+
+
+def _pixels_array(pixels: Any) -> np.ndarray:
+    """Normalize a bridge pixel payload to H x W x 3 uint8."""
+    array = np.asarray(pixels, dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise BridgeError(
+            f"bridge returned invalid pixels shape {tuple(array.shape)}; "
+            "expected HxWx3 RGB"
+        )
+    return np.ascontiguousarray(array)
+
+
+def _yaw_degrees(data: Dict[str, Any]) -> Optional[float]:
+    yaw = data.get("yaw") if isinstance(data, dict) else None
+    return float(yaw) if isinstance(yaw, (int, float)) else None

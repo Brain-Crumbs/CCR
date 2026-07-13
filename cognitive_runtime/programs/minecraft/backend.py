@@ -90,7 +90,12 @@ class SimulatedBackend(SurvivalBackend):
         return self.world.death_reason
 
     def stats(self) -> Dict[str, Any]:
-        return dict(self.world.stats)
+        stats = dict(self.world.stats)
+        # The sim's pixels are always the deterministic colorized-grid proxy;
+        # declaring provenance here keeps the shape uniform with the remote
+        # backend so the nursery data-quality gate can check it everywhere.
+        stats["pixel_sources"] = ["grid"]
+        return stats
 
     def snapshot(self) -> str:
         return self.world.snapshot()

@@ -68,40 +68,41 @@ flags behave identically regardless of the server clock.
   since the sim and this bridge apply the same `LOOK_STEP`/`PITCH_STEP`
   magnitudes (`world.py` / `actions.js`).
 
-## Higher-fidelity pixels (issue #32, optional)
+## First-person pixels (optional)
 
-By default `RemoteMinecraftBackend.observe()` colorizes the same 11×11
-semantic `frame` the sim renders, so `vision.frame.pixels` behaves
-identically on both backends. This bridge can instead capture a **real
-rendered screenshot** of the bot's view via
-[`prismarine-viewer`](https://github.com/PrismarineJS/prismarine-viewer)'s
-headless renderer (`bot.viewer` off-screen mode), resized to the fixed
-33×33×3 `PIXEL_SHAPE` so it's a drop-in replacement for the colorized frame.
+Remote runs request first-person viewer pixels by default
+(`pixel_source="viewer"`). The top-down semantic `frame` still publishes as
+`vision.frame.grid`, but pixel-vision training consumes `vision.frame.pixels`.
 
-This is **opt-in and best-effort**: `prismarine-viewer` pulls in a
-headless-GL native dependency (`gl`) that many hosts (containers, CI, a
-sandbox with no GPU/X server) cannot build or run. Any failure to install,
-initialize, or capture a frame disables it for the session and silently
-falls back to the colorized-grid pixels -- nothing here ever breaks a run.
+This is **best-effort**: `prismarine-viewer` plus `node-canvas-webgl` pull in
+native/headless-GL pieces that many hosts (containers, CI, a sandbox with no
+GPU/X server) cannot build or run. Any failure to install, initialize, or
+capture a frame disables it for the session and silently falls back to the
+compact colorized-grid pixels -- nothing here ever breaks a run. Force that
+fallback with `--pixel-source grid` or `CCR_MINECRAFT_PIXELS=grid`.
 
 To try it:
 
 ```bash
 cd bridge/mineflayer
-npm install --include=optional     # prismarine-viewer is an optionalDependency
+npm install --include=optional     # prismarine-viewer + node-canvas-webgl
 # On headless Linux you likely also need a virtual display, e.g.:
 #   xvfb-run -a node index.js   (or wrap the whole `ccr run` invocation)
 
-export CCR_MINECRAFT_PIXELS=viewer   # or pass {"pixel_source": "viewer"} in reset's config
 python -m cognitive_runtime run --backend remote --policy scripted \
     --episodes 1 --episode-ticks 200 --realtime --record-frames
 ```
 
-Watch stderr for `[mc-bridge:pixels]` lines: `headless capture enabled` on
+Watch stderr for `[mc-bridge:pixels]` lines: `first-person capture enabled` on
 success, or a reason it fell back (module not installed, headless-GL init
 failure, a bad frame). `bridge/mineflayer/pixels.js` is the whole
-integration (`PixelViewer`); nothing elsewhere needs to know which pixel
-source was used.
+integration (`PixelViewer`).
+
+Storage note: `--record-frames` does not embed PNG/JPEG/frame JSON in the
+stream log. Python converts bridge frames to `uint8` arrays immediately, and
+the recorder writes them to the bounded binary frame store under
+`<session>/frames/`. Training loads frames from there, learns/predicts compact
+latents, and old unpinned segments roll off under `--frame-disk-budget-mb`.
 
 ## Setup
 

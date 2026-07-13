@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CCR pixel prediction viewer</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0; padding: 16px;
+      font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: #fcfcfb; color: #0b0b0b;
+    }
+    @media (prefers-color-scheme: dark) { body { background: #1a1a19; color: #ffffff; } }
+    header { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; margin-bottom: 12px; }
+    h1 { font-size: 16px; margin: 0; }
+    select {
+      font: inherit; padding: 4px 8px; border-radius: 6px;
+      border: 1px solid #dcdbd7; background: inherit; color: inherit;
+    }
+    .hint { color: #52514e; }
+    @media (prefers-color-scheme: dark) { .hint { color: #c3c2b7; } select { border-color: #3a3a38; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Pixel prediction viewer</h1>
+    <label>session <select id="session"></select></label>
+    <label>episode <select id="episode"></select></label>
+    <span class="hint" id="hint"></span>
+  </header>
+  <pixel-horizon-viewer id="viewer" horizons="1,10,100" scale="6"></pixel-horizon-viewer>
+
+  <script type="module" src="/pixel-horizon-viewer.js"></script>
+  <script type="module">
+    const $ = (id) => document.getElementById(id);
+    const res = await fetch("/api/sessions");
+    const { sessions, data_dir } = await res.json();
+    $("hint").textContent = sessions.length ? `data: ${data_dir}` : `no sessions found in ${data_dir}`;
+
+    for (const s of sessions) {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      opt.textContent = `${s.id}${s.curriculum ? ` (${s.curriculum})` : ""}`;
+      $("session").appendChild(opt);
+    }
+
+    function fillEpisodes() {
+      const s = sessions.find((x) => x.id === $("session").value);
+      $("episode").innerHTML = "";
+      for (const e of (s?.episodes ?? [])) {
+        const opt = document.createElement("option");
+        opt.value = e;
+        opt.textContent = e;
+        $("episode").appendChild(opt);
+      }
+    }
+
+    function point() {
+      const sid = $("session").value, eid = $("episode").value;
+      if (!sid || !eid) return;
+      const v = $("viewer");
+      v.setAttribute("predictions-src", `/api/sessions/${sid}/episodes/${eid}/predictions`);
+      v.setAttribute("frames-src", `/api/sessions/${sid}/episodes/${eid}/frames`);
+    }
+
+    $("session").addEventListener("change", () => { fillEpisodes(); point(); });
+    $("episode").addEventListener("change", point);
+    if (sessions.length) { fillEpisodes(); point(); }
+  </script>
+</body>
+</html>

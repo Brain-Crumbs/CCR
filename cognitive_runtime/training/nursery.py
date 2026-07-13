@@ -24,6 +24,8 @@ group nursery runs the same way they already group curriculum-preset runs
 
 from __future__ import annotations
 
+import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -44,8 +46,17 @@ from cognitive_runtime.training.datasets import (
     build_pixel_sequence_dataset,
     load_episode_pixel_frames,
 )
+from cognitive_runtime.training.action_world_model import (
+    ActionWorldModelConfig,
+    build_action_sequence_dataset,
+    evaluate_action_world_model,
+    horizons_ticks_to_frames,
+    linear_probe_yaw,
+    train_action_world_model,
+)
 from cognitive_runtime.training.ego_motion_canary import (
     evaluate_ego_motion_holdout,
+    evaluate_rollout_health,
     train_horizon_consistency,
 )
 from cognitive_runtime.training.entity_persistence import (
@@ -53,6 +64,7 @@ from cognitive_runtime.training.entity_persistence import (
     build_entity_persistence_dataset,
     train_entity_persistence_model,
 )
+from cognitive_runtime.training.prediction_export import export_session_predictions
 from cognitive_runtime.training.visual_representation import (
     VisualPretrainingConfig,
     VisualRepresentationModel,
@@ -101,6 +113,25 @@ class NurseryConfig:
     #: model that distinguishes "trained on occlusion/reappearance" from the
     #: forget-immediately baseline (issue #27).
     entity_persistence_epochs: int = 30
+    #: Refuse to train on recordings that don't contain the regularity the
+    #: scenario exists to capture (each scenario declares its own
+    #: expectations -- see ``NurseryScenario.min_blocks_per_tick`` /
+    #: ``min_unique_frame_fraction``).  The first real walk_forward run
+    #: recorded an agent that was stuck against an obstacle for ~95% of its
+    #: frames; this gate fails such sessions before any training happens.
+    data_quality_gate: bool = True
+    #: Write ``predictions_<episode>.json`` (viewer "model" source) for every
+    #: recorded session after training.  The nursery checkpoint persists only
+    #: the pixel encoder, so predicted frames are unrecoverable later unless
+    #: exported now (or the full model is saved --
+    #: ``training.prediction_export.save_full_visual_model``).
+    export_predictions: bool = True
+    #: When set ("viewer"/"grid"), the data-quality gate fails any recording
+    #: whose backend-reported pixel provenance differs -- the first real runs
+    #: requested the first-person viewer and silently trained on the grid
+    #: fallback instead.  ``None`` accepts either, but still refuses to mix
+    #: sources within one training run.
+    expected_pixel_source: Optional[str] = None
 
 
 @dataclass
@@ -127,6 +158,30 @@ class NurseryScenario:
     #: Whether this scenario also reports the entity-persistence metric
     #: (only ``object_permanence`` today).
     entity_persistence_metric: bool = False
+    #: Data-quality expectations for the gate (0.0 = no expectation).  Only
+    #: movement scenarios expect displacement.  Thresholds sit well below a
+    #: healthy simulated recording (a walking agent covers ~0.09 blocks/tick
+    #: with ~12% unique frames) but well above the pathological runs they
+    #: exist to catch (the stuck remote agent: 0.009 blocks/tick, ~2% unique
+    #: frames).  The pixel render rotates with yaw (``_orient_frame_grid``),
+    #: so ``turn_in_place`` produces changing pixels and declares a
+    #: unique-frame floor like the movement scenarios.
+    min_blocks_per_tick: float = 0.0
+    min_unique_frame_fraction: float = 0.0
+    #: Upper displacement bound (None = no expectation): scenarios whose
+    #: premise is a stationary agent (``turn_in_place``) fail their purpose
+    #: when live-server physics (knockback, water, mobs) drags the agent
+    #: around -- the first real turn_in_place run drifted up to 24 blocks
+    #: while only ever issuing LOOK_LEFT.
+    max_blocks_per_tick: Optional[float] = None
+    #: Minimum total |yaw delta| over the episode in degrees (0.0 = no
+    #: expectation): ``turn_in_place`` requires at least one full revolution,
+    #: otherwise there is no view-rotation regularity to learn.
+    min_yaw_sweep_degrees: float = 0.0
+    #: Nursery episodes are scripted micro-scenarios; one that terminated
+    #: early (the first real turn_in_place train-0 was beaten to death by
+    #: mobs at tick 167/400) is not the scenario it claims to be.
+    require_completed: bool = True
 
 
 @dataclass
@@ -147,6 +202,22 @@ class NurseryScenarioReport:
     #: One rendered dream strip (predicted vs. actual frame per horizon) per
     #: held-out ``session_dir/episode_id``.
     dream_strips: Dict[str, str] = field(default_factory=dict)
+    #: ``{f"{session_dir}/{episode_id}": predictions_<episode>.json path}``
+    #: written after training (``NurseryConfig.export_predictions``) for the
+    #: pixel viewer's "model" source.
+    prediction_files: Dict[str, str] = field(default_factory=dict)
+    #: ``config.horizons`` is declared in *ticks*; recorded vision may run
+    #: below the tick rate (the first remote runs paced ~10 Hz against 20 Hz
+    #: ticks), so evaluation converts to recorded-frame steps via the
+    #: measured rate.  ``horizon_metrics``/``dream_strips`` are keyed by
+    #: these frame horizons.
+    horizon_frames: List[int] = field(default_factory=list)
+    ticks_per_frame: float = 1.0
+    #: Frozen-rollout detector (``ego_motion_canary.evaluate_rollout_health``):
+    #: flags predictions that do not vary across horizons while the actual
+    #: frames do -- the collapse signature of the first real turn_in_place
+    #: run.
+    rollout_health: Dict[str, Any] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- scenario builders
@@ -220,16 +291,23 @@ NURSERY_SCENARIOS: Dict[str, NurseryScenario] = {
         "constant MOVE_FORWARD over varied terrain seeds -- ego-motion/optical-flow "
         "regularities (subsumes issue #39's canary).",
         _walk_forward,
+        min_blocks_per_tick=0.02,
+        min_unique_frame_fraction=0.05,
     ),
     "turn_in_place": NurseryScenario(
         "turn_in_place",
         "constant turn -- view rotation consistency.",
         _turn_in_place,
+        min_unique_frame_fraction=0.05,
+        max_blocks_per_tick=0.02,
+        min_yaw_sweep_degrees=360.0,
     ),
     "strafe_and_stop": NurseryScenario(
         "strafe_and_stop",
         "alternating movement/stillness -- motion onset/offset dynamics.",
         _strafe_and_stop,
+        min_blocks_per_tick=0.01,
+        min_unique_frame_fraction=0.05,
     ),
     "object_permanence": NurseryScenario(
         "object_permanence",
@@ -247,8 +325,270 @@ NURSERY_SCENARIOS: Dict[str, NurseryScenario] = {
         "approach_entity",
         "scripted approach to a passive entity -- scale change with distance.",
         _approach_entity,
+        min_blocks_per_tick=0.02,
     ),
 }
+
+
+# --------------------------------------------------------------------------- data-quality gate
+
+
+@dataclass
+class EpisodeRecordingQuality:
+    """What the gate measures from one recorded episode's stream log."""
+
+    session_dir: str
+    episode_id: str
+    n_frames: int
+    unique_frames: int
+    net_displacement: float
+    duration_ticks: int
+    #: Furthest x/z distance from the episode's starting position -- catches
+    #: an agent that drifted away and back (net displacement ~0) just as
+    #: well as one that walked off.
+    max_displacement: float = 0.0
+    #: Total |wrapped yaw delta| over the episode, in degrees.
+    yaw_sweep_degrees: float = 0.0
+    #: ``summary.success`` -- False when the episode terminated early (death);
+    #: ``None`` for recordings whose summary predates the field or is absent.
+    completed: Optional[bool] = None
+    termination_reason: str = ""
+    #: Pixel provenance reported by the backend (``viewer``/``grid``), empty
+    #: for recordings that predate provenance tracking.
+    pixel_sources: List[str] = field(default_factory=list)
+
+    @property
+    def unique_frame_fraction(self) -> float:
+        return self.unique_frames / self.n_frames if self.n_frames else 0.0
+
+    @property
+    def blocks_per_tick(self) -> float:
+        return self.net_displacement / self.duration_ticks if self.duration_ticks else 0.0
+
+    @property
+    def max_blocks_per_tick(self) -> float:
+        return self.max_displacement / self.duration_ticks if self.duration_ticks else 0.0
+
+
+def _wrapped_degrees(delta: float) -> float:
+    return abs((delta + 180.0) % 360.0 - 180.0)
+
+
+def measure_recording_quality(session_dir: str, episode_id: str) -> EpisodeRecordingQuality:
+    """Scan one episode's stream log for the gate's signals: unique pixel
+    frames (via content-hash ``frame_ref``), x/z displacement (net and max),
+    yaw sweep, episode completion, and pixel provenance."""
+
+    first_pos: Optional[Tuple[float, float]] = None
+    last_pos: Optional[Tuple[float, float]] = None
+    max_displacement = 0.0
+    last_yaw: Optional[float] = None
+    yaw_sweep = 0.0
+    n_frames = 0
+    frame_refs: set = set()
+    streams_path = os.path.join(session_dir, f"{episode_id}.streams.jsonl")
+    with open(streams_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            stream_id = record.get("stream_id")
+            if stream_id == "vision.frame.pixels":
+                n_frames += 1
+                ref = record.get("frame_ref") or record.get("hash")
+                if ref:
+                    frame_refs.add(ref)
+            elif stream_id == "spatial.position":
+                payload = record.get("payload") or {}
+                pos = (float(payload.get("x", 0.0)), float(payload.get("z", 0.0)))
+                if first_pos is None:
+                    first_pos = pos
+                else:
+                    max_displacement = max(
+                        max_displacement,
+                        math.hypot(pos[0] - first_pos[0], pos[1] - first_pos[1]),
+                    )
+                last_pos = pos
+            elif stream_id == "spatial.rotation":
+                payload = record.get("payload") or {}
+                yaw = payload.get("yaw")
+                if isinstance(yaw, (int, float)):
+                    if last_yaw is not None:
+                        yaw_sweep += _wrapped_degrees(float(yaw) - last_yaw)
+                    last_yaw = float(yaw)
+
+    displacement = (
+        math.hypot(last_pos[0] - first_pos[0], last_pos[1] - first_pos[1])
+        if first_pos is not None and last_pos is not None
+        else 0.0
+    )
+    duration_ticks = 0
+    completed: Optional[bool] = None
+    termination_reason = ""
+    pixel_sources: List[str] = []
+    summary_path = os.path.join(session_dir, f"{episode_id}.summary.json")
+    if os.path.exists(summary_path):
+        with open(summary_path, encoding="utf-8") as fh:
+            summary = json.load(fh)
+        duration_ticks = int(summary.get("duration_ticks", 0))
+        if "success" in summary:
+            completed = bool(summary["success"])
+        termination_reason = str(summary.get("termination_reason", ""))
+        program_stats = summary.get("program_stats") or {}
+        sources = program_stats.get("pixel_sources")
+        if isinstance(sources, list):
+            pixel_sources = [str(s) for s in sources]
+    return EpisodeRecordingQuality(
+        session_dir=session_dir,
+        episode_id=episode_id,
+        n_frames=n_frames,
+        unique_frames=len(frame_refs),
+        net_displacement=displacement,
+        duration_ticks=duration_ticks,
+        max_displacement=max_displacement,
+        yaw_sweep_degrees=yaw_sweep,
+        completed=completed,
+        termination_reason=termination_reason,
+        pixel_sources=pixel_sources,
+    )
+
+
+def _session_backend(session_dir: str) -> str:
+    path = os.path.join(session_dir, "session.json")
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8") as fh:
+        metadata = json.load(fh)
+    tags = metadata.get("program_tags") or []
+    if "remote" in tags:
+        return "remote"
+    if "simulated" in tags:
+        return "simulated"
+    return ""
+
+
+def validate_nursery_recordings(
+    session_dirs: Sequence[str],
+    scenario: NurseryScenario,
+    *,
+    expected_pixel_source: Optional[str] = None,
+) -> List[str]:
+    """Check every recorded episode against the scenario's data-quality
+    expectations; returns human-readable issue strings (empty = healthy).
+
+    Exists because of the first real ``walk_forward`` run: recorded against
+    the remote backend's persistent world, the agent was stuck against an
+    obstacle with ~2% unique frames and near-zero displacement -- data with
+    none of the ego-motion regularity the scenario exists to capture, which
+    no amount of training can fix.  Extended after the first real
+    ``turn_in_place`` run: the agent drifted up to 24 blocks, one session
+    was killed by mobs mid-episode, and the requested first-person viewer
+    had silently fallen back to the grid render -- so the gate now also
+    checks displacement ceilings, yaw sweep, episode completion, and pixel
+    provenance (no mixing, and matching ``expected_pixel_source`` when set).
+    """
+    issues: List[str] = []
+    sources_seen: Dict[str, List[str]] = {}
+    for session_dir in session_dirs:
+        for episode_id in list_episodes(session_dir):
+            quality = measure_recording_quality(session_dir, episode_id)
+            where = f"{session_dir}/{episode_id}"
+            if quality.n_frames == 0:
+                issues.append(f"{where}: no pixel frames recorded (record_frames off?)")
+                continue
+            if (
+                scenario.min_unique_frame_fraction > 0.0
+                and quality.unique_frame_fraction < scenario.min_unique_frame_fraction
+            ):
+                issues.append(
+                    f"{where}: only {quality.unique_frames}/{quality.n_frames} unique pixel "
+                    f"frames ({quality.unique_frame_fraction:.1%} < "
+                    f"{scenario.min_unique_frame_fraction:.1%}) -- a near-static view has "
+                    f"no {scenario.name!r} signal to learn"
+                )
+            if (
+                scenario.min_blocks_per_tick > 0.0
+                and quality.duration_ticks > 0
+                and quality.blocks_per_tick < scenario.min_blocks_per_tick
+            ):
+                issues.append(
+                    f"{where}: net displacement {quality.net_displacement:.2f} blocks over "
+                    f"{quality.duration_ticks} ticks ({quality.blocks_per_tick:.4f}/tick < "
+                    f"{scenario.min_blocks_per_tick}/tick) -- the agent barely moved "
+                    f"(stuck against an obstacle?)"
+                )
+            if (
+                scenario.max_blocks_per_tick is not None
+                and quality.duration_ticks > 0
+                and quality.max_blocks_per_tick > scenario.max_blocks_per_tick
+            ):
+                issues.append(
+                    f"{where}: the agent strayed {quality.max_displacement:.2f} blocks from "
+                    f"its start ({quality.max_blocks_per_tick:.4f}/tick > "
+                    f"{scenario.max_blocks_per_tick}/tick) -- {scenario.name!r} expects a "
+                    "stationary agent (live-server knockback/water/mobs?)"
+                )
+            if (
+                scenario.min_yaw_sweep_degrees > 0.0
+                and quality.yaw_sweep_degrees < scenario.min_yaw_sweep_degrees
+            ):
+                issues.append(
+                    f"{where}: total yaw sweep {quality.yaw_sweep_degrees:.0f} degrees < "
+                    f"{scenario.min_yaw_sweep_degrees:.0f} -- {scenario.name!r} needs the "
+                    "view to actually rotate"
+                )
+            if scenario.require_completed and quality.completed is False:
+                issues.append(
+                    f"{where}: episode terminated early "
+                    f"({quality.termination_reason or 'unknown reason'}) -- a nursery "
+                    "recording that died mid-scenario is not the scenario it claims to be"
+                )
+            if quality.pixel_sources:
+                sources_seen[where] = sorted(set(quality.pixel_sources))
+                if len(sources_seen[where]) > 1:
+                    issues.append(
+                        f"{where}: mixed pixel sources within one episode "
+                        f"({sources_seen[where]}) -- the observation distribution changed "
+                        "mid-recording (viewer died and fell back to the grid?)"
+                    )
+                if (
+                    expected_pixel_source is not None
+                    and sources_seen[where] != [expected_pixel_source]
+                ):
+                    issues.append(
+                        f"{where}: pixel source {sources_seen[where]} != expected "
+                        f"{expected_pixel_source!r} -- the requested render path was not "
+                        "the one that produced these frames"
+                    )
+
+    distinct = {tuple(v) for v in sources_seen.values()}
+    if len(distinct) > 1:
+        issues.append(
+            "sessions mix pixel sources across episodes "
+            f"({sorted(sources_seen.items())}) -- do not train one model on frames from "
+            "different render paths"
+        )
+    return issues
+
+
+def _measured_ticks_per_frame(session_dirs: Sequence[str]) -> float:
+    """Median cognitive ticks per recorded vision frame across the given
+    sessions -- ~1.0 on the simulated backend, ~2.0 on the first paced remote
+    runs.  Falls back to 1.0 when nothing is measurable."""
+    values: List[float] = []
+    for session_dir in session_dirs:
+        for episode_id in list_episodes(session_dir):
+            quality = measure_recording_quality(session_dir, episode_id)
+            if quality.n_frames > 1 and quality.duration_ticks > 0:
+                values.append(quality.duration_ticks / quality.n_frames)
+    if not values:
+        return 1.0
+    values.sort()
+    mid = len(values) // 2
+    if len(values) % 2:
+        return values[mid]
+    return 0.5 * (values[mid - 1] + values[mid])
 
 
 # --------------------------------------------------------------------------- recording
@@ -370,6 +710,34 @@ def run_nursery_scenario(
         for seed in cfg.holdout_seeds
     ]
 
+    if cfg.data_quality_gate:
+        issues = validate_nursery_recordings(
+            train_sessions + holdout_sessions,
+            scenario,
+            expected_pixel_source=cfg.expected_pixel_source,
+        )
+        if issues:
+            hint = (
+                " Hint: the remote backend plays on the server's persistent world -- "
+                "seeds do not vary terrain, sessions inherit the previous session's "
+                "agent position, and a stuck agent records a static view. Re-record "
+                "on the simulated backend, or reposition the agent per session. "
+                "(data_quality_gate=False skips this check.)"
+                if cfg.backend != "simulated"
+                else " (data_quality_gate=False skips this check.)"
+            )
+            raise ValueError(
+                f"nursery scenario {scenario_name!r}: recorded data fails the quality "
+                "gate:\n  - " + "\n  - ".join(issues) + hint
+            )
+
+    # config.horizons is declared in ticks; recorded vision may run below the
+    # tick rate (the first remote runs paced ~10 Hz against 20 Hz ticks, so
+    # "t+100" silently meant 200 ticks).  Convert via the measured rate so a
+    # horizon means the same amount of world time on every backend.
+    ticks_per_frame = _measured_ticks_per_frame(train_sessions + holdout_sessions)
+    horizon_frames = horizons_ticks_to_frames(cfg.horizons, ticks_per_frame)
+
     train_dataset = build_pixel_sequence_dataset(train_sessions, max_samples=cfg.max_train_samples)
     if len(train_dataset) == 0:
         raise ValueError(
@@ -393,25 +761,26 @@ def run_nursery_scenario(
         consistency_stats = train_horizon_consistency(
             model,
             train_sessions,
-            cfg.horizons,
+            horizon_frames,
             epochs=cfg.consistency_epochs,
             lr=cfg.consistency_lr,
             batch_size=cfg.batch_size,
             seed=cfg.seed,
         )
 
-    max_horizon = max(cfg.horizons)
+    max_horizon = max(horizon_frames)
     for session_dir in holdout_sessions:
         for episode_id in list_episodes(session_dir):
             if len(load_episode_pixel_frames(session_dir, episode_id)) <= max_horizon:
                 raise ValueError(
                     f"{session_dir}/{episode_id} is too short for the largest horizon "
-                    f"({max_horizon}); increase episode_ticks"
+                    f"({max_horizon} frames); increase episode_ticks"
                 )
 
     horizon_metrics = evaluate_ego_motion_holdout(
-        model, holdout_sessions, cfg.horizons, ssim_window=cfg.ssim_window
+        model, holdout_sessions, horizon_frames, ssim_window=cfg.ssim_window
     )
+    rollout_health = evaluate_rollout_health(model, holdout_sessions, horizon_frames)
 
     entity_persistence_stats: Optional[Dict[str, Any]] = None
     if scenario.entity_persistence_metric:
@@ -423,8 +792,17 @@ def run_nursery_scenario(
     for session_dir in holdout_sessions:
         for episode_id in list_episodes(session_dir):
             dream_strips[f"{session_dir}/{episode_id}"] = render_dream_strip(
-                model, session_dir, episode_id, cfg.horizons
+                model, session_dir, episode_id, horizon_frames
             )
+
+    # The checkpoint persists only the encoder, so predicted frames are
+    # unrecoverable once this process exits -- export them now for the pixel
+    # viewer's "model" source (viewer/README.md).
+    prediction_files: Dict[str, str] = {}
+    if cfg.export_predictions:
+        prediction_files = export_session_predictions(
+            model, train_sessions + holdout_sessions, horizon_frames
+        )
 
     return model, NurseryScenarioReport(
         scenario=scenario_name,
@@ -436,6 +814,10 @@ def run_nursery_scenario(
         horizon_metrics=horizon_metrics,
         entity_persistence_stats=entity_persistence_stats,
         dream_strips=dream_strips,
+        prediction_files=prediction_files,
+        horizon_frames=horizon_frames,
+        ticks_per_frame=ticks_per_frame,
+        rollout_health=rollout_health,
     )
 
 
@@ -453,6 +835,194 @@ def run_nursery_suite(
         _model, report = run_nursery_scenario(record_dir, name, config)
         reports[name] = report
     return reports
+
+
+# --------------------------------------------------------------------------- joint world model
+
+
+@dataclass
+class JointNurseryReport:
+    """One action-conditioned world model trained across scenarios
+    (phase 3 of docs/nursery-turn-in-place-analysis.md)."""
+
+    train_scenarios: List[str]
+    holdout_scenarios: List[str]
+    config: NurseryConfig
+    model_config: ActionWorldModelConfig
+    #: scenario -> its recorded train-seed session dirs (training pool).
+    train_sessions: Dict[str, List[str]] = field(default_factory=dict)
+    #: scenario -> its recorded holdout-seed session dirs (evaluation).
+    eval_sessions: Dict[str, List[str]] = field(default_factory=dict)
+    training_stats: Dict[str, Any] = field(default_factory=dict)
+    #: In-distribution generalization: per train scenario, evaluated on that
+    #: scenario's held-out seeds ({"horizons": ..., "rollout_health": ...}).
+    scenario_metrics: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    #: Zero-shot generality: per held-out scenario the model never trained
+    #: on, same metric shape.
+    zero_shot_metrics: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    #: Does the representation linearly decode the agent's heading?
+    yaw_probe: Dict[str, Any] = field(default_factory=dict)
+    horizon_frames: List[int] = field(default_factory=list)
+    ticks_per_frame: float = 1.0
+
+
+def run_nursery_joint(
+    record_dir: str,
+    train_scenarios: Optional[Sequence[str]] = None,
+    holdout_scenarios: Sequence[str] = ("approach_entity",),
+    config: Optional[NurseryConfig] = None,
+    model_config: Optional[ActionWorldModelConfig] = None,
+) -> Tuple[Any, JointNurseryReport]:
+    """Record every scenario, train ONE action-conditioned recurrent world
+    model on the train scenarios' train seeds, then evaluate:
+
+    - per train scenario on its held-out seeds (in-distribution
+      generalization),
+    - per held-out scenario the model never saw (zero-shot generality --
+      the metric that separates "memorized six scripted policies" from
+      "learned how actions move the view"),
+    - a yaw linear probe (does the latent/hidden state carry heading?).
+
+    This is the "general model" counterpart of ``run_nursery_suite``'s
+    per-scenario canaries: the same recordings, one shared model, and the
+    action stream (already in every log as ``motor.command``) finally used
+    as a model input instead of being baked into per-scenario dynamics.
+    """
+    cfg = config or NurseryConfig()
+    if cfg.backend not in BACKENDS:
+        raise ValueError(f"unknown nursery backend {cfg.backend!r}; choices: {sorted(BACKENDS)}")
+    if not cfg.horizons or any(h <= 0 for h in cfg.horizons):
+        raise ValueError(f"horizons must be positive tick offsets, got {cfg.horizons!r}")
+    if set(cfg.train_seeds) & set(cfg.holdout_seeds):
+        raise ValueError("train_seeds and holdout_seeds must not overlap")
+
+    holdout_names = list(holdout_scenarios)
+    train_names = (
+        list(train_scenarios)
+        if train_scenarios is not None
+        else [n for n in sorted(NURSERY_SCENARIOS) if n not in holdout_names]
+    )
+    for name in list(train_names) + holdout_names:
+        if name not in NURSERY_SCENARIOS:
+            raise ValueError(
+                f"unknown nursery scenario {name!r}; choices: {sorted(NURSERY_SCENARIOS)}"
+            )
+    overlap = set(train_names) & set(holdout_names)
+    if overlap:
+        raise ValueError(f"scenarios cannot be both trained and held out: {sorted(overlap)}")
+    if not train_names:
+        raise ValueError("no training scenarios left after excluding holdouts")
+
+    model_cfg = model_config or ActionWorldModelConfig(
+        latent_width=cfg.latent_width,
+        hidden_dim=cfg.hidden_dim,
+        reconstruction_size=cfg.reconstruction_size,
+        epochs=cfg.epochs,
+        lr=cfg.lr,
+        batch_size=cfg.batch_size,
+        seed=cfg.seed,
+    )
+
+    train_sessions: Dict[str, List[str]] = {}
+    eval_sessions: Dict[str, List[str]] = {}
+    for name in train_names:
+        scenario = NURSERY_SCENARIOS[name]
+        train_sessions[name] = [
+            _record_scenario_episode(
+                record_dir, f"nursery-{name}-train-{seed}", seed, scenario, cfg
+            )
+            for seed in cfg.train_seeds
+        ]
+        eval_sessions[name] = [
+            _record_scenario_episode(
+                record_dir, f"nursery-{name}-holdout-{seed}", seed, scenario, cfg
+            )
+            for seed in cfg.holdout_seeds
+        ]
+    for name in holdout_names:
+        scenario = NURSERY_SCENARIOS[name]
+        eval_sessions[name] = [
+            _record_scenario_episode(
+                record_dir, f"nursery-{name}-holdout-{seed}", seed, scenario, cfg
+            )
+            for seed in cfg.holdout_seeds
+        ]
+
+    if cfg.data_quality_gate:
+        issues: List[str] = []
+        for name in train_names:
+            issues += validate_nursery_recordings(
+                train_sessions[name] + eval_sessions[name],
+                NURSERY_SCENARIOS[name],
+                expected_pixel_source=cfg.expected_pixel_source,
+            )
+        for name in holdout_names:
+            issues += validate_nursery_recordings(
+                eval_sessions[name],
+                NURSERY_SCENARIOS[name],
+                expected_pixel_source=cfg.expected_pixel_source,
+            )
+        if issues:
+            raise ValueError(
+                "nursery joint run: recorded data fails the quality gate:\n  - "
+                + "\n  - ".join(issues)
+            )
+
+    # Pin the vocabulary to the full action space (plus NULL): a held-out
+    # scenario may issue actions no training scenario used, and zero-shot
+    # evaluation must be able to encode them (their embeddings are simply
+    # untrained).
+    from cognitive_runtime.training.features import ACTION_KEYS
+
+    vocabulary = list(ACTION_KEYS)
+    if NULL_ACTION.name not in vocabulary:
+        vocabulary.append(NULL_ACTION.name)
+
+    all_train_dirs = [d for name in train_names for d in train_sessions[name]]
+    dataset = build_action_sequence_dataset(all_train_dirs, action_keys=vocabulary)
+    if len(dataset) == 0:
+        raise ValueError("nursery joint run: no frame transitions in the training sessions")
+    ticks_per_frame = dataset.ticks_per_frame
+    horizon_frames = horizons_ticks_to_frames(cfg.horizons, ticks_per_frame)
+
+    model, training_stats = train_action_world_model(dataset, model_cfg)
+
+    scenario_metrics: Dict[str, Dict[str, Any]] = {}
+    for name in train_names:
+        holdout_dataset = build_action_sequence_dataset(
+            eval_sessions[name], action_keys=model.action_keys
+        )
+        scenario_metrics[name] = evaluate_action_world_model(
+            model, holdout_dataset, horizon_frames, warmup_frames=model_cfg.warmup_frames
+        )
+    zero_shot_metrics: Dict[str, Dict[str, Any]] = {}
+    for name in holdout_names:
+        holdout_dataset = build_action_sequence_dataset(
+            eval_sessions[name], action_keys=model.action_keys
+        )
+        zero_shot_metrics[name] = evaluate_action_world_model(
+            model, holdout_dataset, horizon_frames, warmup_frames=model_cfg.warmup_frames
+        )
+
+    probe_dataset = build_action_sequence_dataset(
+        [d for dirs in eval_sessions.values() for d in dirs], action_keys=model.action_keys
+    )
+    yaw_probe = linear_probe_yaw(model, probe_dataset)
+
+    return model, JointNurseryReport(
+        train_scenarios=train_names,
+        holdout_scenarios=holdout_names,
+        config=cfg,
+        model_config=model_cfg,
+        train_sessions=train_sessions,
+        eval_sessions=eval_sessions,
+        training_stats=training_stats,
+        scenario_metrics=scenario_metrics,
+        zero_shot_metrics=zero_shot_metrics,
+        yaw_probe=yaw_probe,
+        horizon_frames=horizon_frames,
+        ticks_per_frame=ticks_per_frame,
+    )
 
 
 def _run_entity_persistence_metric(
@@ -573,9 +1143,12 @@ def save_nursery_scenario_checkpoint(
     stats["nursery"] = {
         "scenario": report.scenario,
         "horizons": list(report.config.horizons),
+        "horizon_frames": list(report.horizon_frames),
+        "ticks_per_frame": report.ticks_per_frame,
         "train_sessions": report.train_sessions,
         "holdout_sessions": report.holdout_sessions,
         "horizon_metrics": report.horizon_metrics,
+        "rollout_health": report.rollout_health,
         "entity_persistence_stats": report.entity_persistence_stats,
     }
     dataset_stub = _StubPixelDataset(

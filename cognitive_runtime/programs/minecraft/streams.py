@@ -116,19 +116,33 @@ FRONT_BLOCK_CATEGORIES = tuple(sorted(BLOCK_IDS))
 FRAME_LEGEND = _frame_legend()
 
 
-def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
+def build_survival_stream_specs(
+    world_size: int = 64,
+    *,
+    vision_hz: float = 20.0,
+    heartbeat_hz: float = BODY_HEARTBEAT_HZ,
+    bounded_position: bool = True,
+) -> List[StreamSpec]:
     """The survival catalog, with encoder metadata (ranges/legend/categories).
 
     Position ranges depend on the world size, so the catalog is built per
-    config rather than as a bare constant.
+    config rather than as a bare constant.  ``vision_hz``/``heartbeat_hz``
+    let a realtime run declare the rates its pacer actually publishes at
+    (``SurvivalBoxConfig.realtime_vision_hz`` / ``realtime_body_heartbeat_hz``)
+    instead of the fast-forward tick cadence.  ``bounded_position=False``
+    (remote backend) drops the ``[0, world_size]`` position/distance ranges --
+    a live server's absolute coordinates aren't bounded by the config.
     """
-    pos_range = (0.0, float(world_size))
+    pos_range = (0.0, float(world_size)) if bounded_position else None
+    pos_neutral = world_size / 2.0 if bounded_position else 0.0
     return [
         StreamSpec("vision.frame.grid", "vision", "Coarse top-down frame.",
-                   nominal_rate_hz=20.0, payload_schema="11x11 int grid",
+                   nominal_rate_hz=vision_hz, payload_schema="11x11 int grid",
                    legend=FRAME_LEGEND),
-        StreamSpec(PIXEL_STREAM, "vision", "Top-down RGB pixel frame.",
-                   nominal_rate_hz=20.0,
+        StreamSpec(PIXEL_STREAM, "vision",
+                   "RGB camera frame: first-person viewer pixels on the remote "
+                   "backend when available, deterministic colorized proxy in the sim.",
+                   nominal_rate_hz=vision_hz,
                    payload_schema=f"{PIXEL_SHAPE[0]}x{PIXEL_SHAPE[1]}x3 uint8 image",
                    range=(0.0, 255.0), shape=PIXEL_SHAPE, overflow="coalesce"),
         StreamSpec("vision.entities", "vision",
@@ -142,13 +156,13 @@ def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
                    payload_schema='{"value": float, "direction": {"bearing_deg": float}|null}',
                    range=(0.0, 1.0)),
         StreamSpec("body.health", "body", "Health, on change + heartbeat.",
-                   nominal_rate_hz=BODY_HEARTBEAT_HZ,
+                   nominal_rate_hz=heartbeat_hz,
                    payload_schema="float 0..20", range=VITAL_RANGE, neutral=20.0),
         StreamSpec("body.hunger", "body", "Hunger, on change + heartbeat.",
-                   nominal_rate_hz=BODY_HEARTBEAT_HZ,
+                   nominal_rate_hz=heartbeat_hz,
                    payload_schema="float 0..20", range=VITAL_RANGE, neutral=20.0),
         StreamSpec("body.oxygen", "body", "Oxygen, on change + heartbeat.",
-                   nominal_rate_hz=BODY_HEARTBEAT_HZ,
+                   nominal_rate_hz=heartbeat_hz,
                    payload_schema="float 0..20", range=VITAL_RANGE, neutral=20.0),
         StreamSpec("body.inventory", "body", "Inventory summary, on change.",
                    payload_schema="{item: count}"),
@@ -165,12 +179,13 @@ def build_survival_stream_specs(world_size: int = 64) -> List[StreamSpec]:
         StreamSpec("body.alive", "body", "Alive flag; flips once on death.",
                    payload_schema="bool", neutral=1.0),
         StreamSpec("spatial.position", "spatial", "Agent position, on change.",
-                   payload_schema="{x, y, z}", range=pos_range, neutral=world_size / 2.0),
+                   payload_schema="{x, y, z}", range=pos_range, neutral=pos_neutral),
         StreamSpec("spatial.rotation", "spatial", "Agent view direction, on change.",
                    payload_schema="{yaw, pitch}"),
         StreamSpec("spatial.distance_from_spawn", "spatial",
                    "Distance from the spawn point, on change.",
-                   payload_schema="float", range=(0.0, float(world_size))),
+                   payload_schema="float",
+                   range=(0.0, float(world_size)) if bounded_position else None),
         StreamSpec("world.time", "world", "Day/night clock, every tick.",
                    nominal_rate_hz=20.0,
                    payload_schema="{time_of_day, day_length, is_night}"),

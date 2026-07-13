@@ -14,6 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from cognitive_runtime.core.action import Action
@@ -98,6 +99,97 @@ def test_reset_step_observe_and_status_caching():
         assert isinstance(backend.stats(), dict)
     finally:
         backend.close()
+
+
+class _PixelBridge:
+    def __init__(self):
+        self.closed = False
+
+    def start(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    def request(self, message):
+        if message["cmd"] == "reset":
+            return {"ok": True, "tick": 0, "dead": False, "stats": {}}
+        if message["cmd"] == "observe":
+            return {
+                "ok": True,
+                "observation": {
+                    "tick": 0,
+                    "data": {},
+                    "frame": [[1]],
+                    "pixels": [
+                        [[1, 2, 3], [4, 5, 6]],
+                        [[7, 8, 9], [10, 11, 12]],
+                    ],
+                },
+            }
+        raise AssertionError(message)
+
+
+class _YawOnlyBridge:
+    def __init__(self):
+        self.yaw = 0.0
+
+    def start(self):
+        pass
+
+    def close(self):
+        pass
+
+    def request(self, message):
+        if message["cmd"] == "reset":
+            return {"ok": True, "tick": 0, "dead": False, "stats": {}}
+        if message["cmd"] == "observe":
+            return {
+                "ok": True,
+                "observation": {
+                    "tick": 0,
+                    "data": {"yaw": self.yaw},
+                    "frame": [
+                        [1, 1, 1],
+                        [2, 99, 4],
+                        [3, 3, 3],
+                    ],
+                },
+            }
+        raise AssertionError(message)
+
+
+def test_remote_backend_normalizes_bridge_pixels_to_uint8_arrays():
+    backend = RemoteMinecraftBackend(
+        SurvivalBoxConfig.from_dict(FAST_CONFIG), bridge=_PixelBridge()
+    )
+    try:
+        backend.reset(0)
+        obs = backend.observe(0.0)
+    finally:
+        backend.close()
+
+    assert isinstance(obs.pixels, np.ndarray)
+    assert obs.pixels.dtype == np.uint8
+    assert obs.pixels.shape == (2, 2, 3)
+    assert obs.pixels[0, 0].tolist() == [1, 2, 3]
+
+
+def test_remote_grid_fallback_pixels_rotate_with_yaw():
+    bridge = _YawOnlyBridge()
+    backend = RemoteMinecraftBackend(SurvivalBoxConfig.from_dict(FAST_CONFIG), bridge=bridge)
+    try:
+        backend.reset(0)
+        bridge.yaw = 0.0
+        first = backend.observe(0.0).pixels
+        bridge.yaw = 90.0
+        second = backend.observe(0.05).pixels
+    finally:
+        backend.close()
+
+    assert isinstance(first, np.ndarray)
+    assert isinstance(second, np.ndarray)
+    assert not np.array_equal(first, second)
 
 
 def test_snapshot_and_restore_are_unsupported():
@@ -216,7 +308,7 @@ def _scripted():
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 def test_node_bridge_syntax_checks():
-    for name in ("index.js", "world.js", "actions.js", "observation.js", "blocks.js"):
+    for name in ("index.js", "world.js", "actions.js", "observation.js", "blocks.js", "pixels.js"):
         result = subprocess.run(
             ["node", "--check", str(BRIDGE_DIR / name)],
             capture_output=True, text=True,

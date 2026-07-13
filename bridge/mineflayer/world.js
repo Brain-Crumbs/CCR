@@ -162,7 +162,8 @@ class WorldSession {
   // `observe()` to keep using the colorized semantic-grid fallback it already
   // has (`RemoteMinecraftBackend.observe()` on the Python side).
   async _maybeStartPixelViewer() {
-    const wantsViewer = (this.config.pixel_source || PIXEL_SOURCE_ENV) === 'viewer';
+    const pixelSource = PIXEL_SOURCE_ENV || this.config.pixel_source || 'grid';
+    const wantsViewer = pixelSource === 'viewer';
     if (!wantsViewer || this._pixelViewer) return;
     this._pixelViewer = new PixelViewer();
     try {
@@ -305,9 +306,16 @@ class WorldSession {
     // issue #32: a real rendered frame, when the (optional) pixel viewer is
     // enabled and working; otherwise omitted, and the Python-side
     // `RemoteMinecraftBackend.observe()` colorizes `obs.frame` instead.
+    // `pixel_source` records which path actually produced this frame -- the
+    // silent viewer->grid fallback changes the observation distribution, and
+    // the nursery data-quality gate refuses to train across that boundary.
+    obs.pixel_source = 'grid';
     if (this._pixelViewer && this._pixelViewer.available()) {
       const pixels = this._pixelViewer.capture();
-      if (pixels) obs.pixels = pixels;
+      if (pixels) {
+        obs.pixels = pixels;
+        obs.pixel_source = 'viewer';
+      }
     }
     return { ok: true, observation: obs };
   }
