@@ -12,6 +12,7 @@ torch = pytest.importorskip("torch")
 
 from cognitive_runtime.cli import main  # noqa: E402
 from cognitive_runtime.cli import build_parser  # noqa: E402
+from cognitive_runtime.policies.null_policy import NullPolicy  # noqa: E402
 from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy  # noqa: E402
 from cognitive_runtime.core.action import Action  # noqa: E402
 from cognitive_runtime.training.nursery import (  # noqa: E402
@@ -281,6 +282,27 @@ def test_validate_nursery_recordings_flags_a_static_session(tmp_path):
     issues = validate_nursery_recordings([session_dir], NURSERY_SCENARIOS["walk_forward"])
     assert issues
     assert any("barely moved" in issue for issue in issues)
+
+
+def test_validate_nursery_recordings_flags_static_remote_turn_in_place(tmp_path):
+    static_turn = NurseryScenario(
+        "turn_in_place",
+        "static remote turn surrogate",
+        lambda seed, cfg: ScenarioRecording(policy=NullPolicy()),
+    )
+    cfg = _small_config()
+    session_dir = _record_scenario_episode(str(tmp_path), "static-turn", 0, static_turn, cfg)
+
+    metadata_path = os.path.join(session_dir, "session.json")
+    with open(metadata_path, encoding="utf-8") as fh:
+        metadata = json.load(fh)
+    metadata["program_tags"] = ["minecraft", "survival", "mvp", "remote"]
+    with open(metadata_path, "w", encoding="utf-8") as fh:
+        json.dump(metadata, fh)
+
+    issues = validate_nursery_recordings([session_dir], NURSERY_SCENARIOS["turn_in_place"])
+    assert issues
+    assert any("unique pixel frames" in issue for issue in issues)
 
 
 def test_validate_nursery_recordings_passes_a_healthy_walk(tmp_path):

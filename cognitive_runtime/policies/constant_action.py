@@ -47,7 +47,7 @@ class ConstantActionPolicy(SingleActionPolicy):
         self.noise = float(noise)
         self.action_space = list(action_space) if action_space else None
         self.seed = seed
-        self.rng = random.Random(seed)
+        self.rng = random.Random(seed) 
 
     def reset(self) -> None:
         self.rng = random.Random(self.seed)

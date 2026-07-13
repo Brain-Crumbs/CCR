@@ -25,6 +25,11 @@ class SurvivalBoxConfig:
     # fast-forward mode, where publication maps onto tick cadence instead.
     realtime_vision_hz: float = 10.0          # vision frames paced to this rate
     realtime_body_heartbeat_hz: float = 2.0   # body vitals heartbeat rate
+    # Pixel source requested from the remote mineflayer bridge. "viewer" uses
+    # prismarine-viewer's first-person headless renderer when available; the
+    # bridge falls back to the colorized semantic grid if native GL deps are
+    # unavailable. The simulated backend always uses its deterministic proxy.
+    pixel_source: str = "viewer"
 
     @staticmethod
     def from_dict(raw: Dict[str, Any]) -> "SurvivalBoxConfig":

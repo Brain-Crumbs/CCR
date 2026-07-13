@@ -63,6 +63,14 @@ def test_pixel_render_is_deterministic_and_correct_shape():
     assert bool(((pa >= 0) & (pa <= 255)).all())
 
 
+def test_pixel_render_changes_when_turning_in_place():
+    world = SimulatedWorld(SurvivalBoxConfig.from_dict(FAST_CONFIG), seed=7)
+    before = world.render_pixels()
+    world.yaw = (world.yaw + 90.0) % 360.0
+    after = world.render_pixels()
+    assert not np.array_equal(before, after)
+
+
 def test_pixels_from_frame_upscales_and_colors_generically():
     # A 1x2 grid frame of two frame codes -> scale*2 wide, scale tall, RGB.
     frame = [[1, 4]]  # grass, water

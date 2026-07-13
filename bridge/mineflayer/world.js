@@ -162,7 +162,8 @@ class WorldSession {
   // `observe()` to keep using the colorized semantic-grid fallback it already
   // has (`RemoteMinecraftBackend.observe()` on the Python side).
   async _maybeStartPixelViewer() {
-    const wantsViewer = (this.config.pixel_source || PIXEL_SOURCE_ENV) === 'viewer';
+    const pixelSource = PIXEL_SOURCE_ENV || this.config.pixel_source || 'grid';
+    const wantsViewer = pixelSource === 'viewer';
     if (!wantsViewer || this._pixelViewer) return;
     this._pixelViewer = new PixelViewer();
     try {

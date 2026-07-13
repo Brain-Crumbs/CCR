@@ -139,7 +139,9 @@ def build_survival_stream_specs(
         StreamSpec("vision.frame.grid", "vision", "Coarse top-down frame.",
                    nominal_rate_hz=vision_hz, payload_schema="11x11 int grid",
                    legend=FRAME_LEGEND),
-        StreamSpec(PIXEL_STREAM, "vision", "Top-down RGB pixel frame.",
+        StreamSpec(PIXEL_STREAM, "vision",
+                   "RGB camera frame: first-person viewer pixels on the remote "
+                   "backend when available, deterministic colorized proxy in the sim.",
                    nominal_rate_hz=vision_hz,
                    payload_schema=f"{PIXEL_SHAPE[0]}x{PIXEL_SHAPE[1]}x3 uint8 image",
                    range=(0.0, 255.0), shape=PIXEL_SHAPE, overflow="coalesce"),

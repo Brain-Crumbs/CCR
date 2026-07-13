@@ -155,6 +155,9 @@ class NurseryScenario:
     min_unique_frame_fraction: float = 0.0
 
 
+REMOTE_TURN_IN_PLACE_MIN_UNIQUE_FRAME_FRACTION = 0.05
+
+
 @dataclass
 class NurseryScenarioReport:
     scenario: str
@@ -357,6 +360,29 @@ def measure_recording_quality(session_dir: str, episode_id: str) -> EpisodeRecor
     )
 
 
+def _session_backend(session_dir: str) -> str:
+    path = os.path.join(session_dir, "session.json")
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8") as fh:
+        metadata = json.load(fh)
+    tags = metadata.get("program_tags") or []
+    if "remote" in tags:
+        return "remote"
+    if "simulated" in tags:
+        return "simulated"
+    return ""
+
+
+def _min_unique_frame_fraction(scenario: NurseryScenario, session_dir: str) -> float:
+    if scenario.name == "turn_in_place" and _session_backend(session_dir) == "remote":
+        return max(
+            scenario.min_unique_frame_fraction,
+            REMOTE_TURN_IN_PLACE_MIN_UNIQUE_FRAME_FRACTION,
+        )
+    return scenario.min_unique_frame_fraction
+
+
 def validate_nursery_recordings(
     session_dirs: Sequence[str], scenario: NurseryScenario
 ) -> List[str]:
@@ -377,14 +403,15 @@ def validate_nursery_recordings(
             if quality.n_frames == 0:
                 issues.append(f"{where}: no pixel frames recorded (record_frames off?)")
                 continue
+            min_unique = _min_unique_frame_fraction(scenario, session_dir)
             if (
-                scenario.min_unique_frame_fraction > 0.0
-                and quality.unique_frame_fraction < scenario.min_unique_frame_fraction
+                min_unique > 0.0
+                and quality.unique_frame_fraction < min_unique
             ):
                 issues.append(
                     f"{where}: only {quality.unique_frames}/{quality.n_frames} unique pixel "
                     f"frames ({quality.unique_frame_fraction:.1%} < "
-                    f"{scenario.min_unique_frame_fraction:.1%}) -- a near-static view has "
+                    f"{min_unique:.1%}) -- a near-static view has "
                     f"no {scenario.name!r} signal to learn"
                 )
             if (

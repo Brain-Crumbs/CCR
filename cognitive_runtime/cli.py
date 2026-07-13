@@ -103,6 +103,7 @@ _WORLD_DEFAULTS: Dict[str, Any] = {
     "day_length": 6000,
     "start_time": 0,
     "max_mobs": 3,
+    "pixel_source": "viewer",
 }
 
 
@@ -150,6 +151,7 @@ def _program_config(args: argparse.Namespace) -> Dict[str, Any]:
         "day_length": args.day_length,
         "start_time": args.start_time,
         "max_mobs": args.max_mobs,
+        "pixel_source": args.pixel_source,
     }
 
 
@@ -537,6 +539,10 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
                         help="time of day at spawn (default: the curriculum's, else 0)")
     parser.add_argument("--max-mobs", type=int, default=None,
                         help="max concurrent hostile mobs (default: the curriculum's, else 3)")
+    parser.add_argument("--pixel-source", choices=["viewer", "grid"], default=None,
+                        help="remote backend pixel source: 'viewer' requests "
+                             "prismarine-viewer first-person snapshots (default); "
+                             "'grid' uses the compact colorized semantic-grid fallback")
     parser.add_argument("--model", default=None, help="path to a trained BC model (learned policy)")
     parser.add_argument("--backend", default="simulated", choices=sorted(BACKENDS),
                         help="survival backend: the deterministic simulated world, or "
