@@ -50,6 +50,8 @@ import threading
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
+import numpy as np
+
 from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.observation import Observation
 from cognitive_runtime.core.program import RecoverableEpisodeError
@@ -297,12 +299,17 @@ class RemoteMinecraftBackend(SurvivalBackend):
         response = bridge.request({"cmd": "observe", "timestamp": timestamp})
         obs = response.get("observation") or {}
         frame = obs.get("frame")
-        # Prefer a bridge-supplied RGB frame (e.g. a future prismarine-viewer
-        # screenshot); otherwise colorize the semantic grid the same way the
-        # simulated backend does, so the neural pixel stream works either way.
+        # Prefer a bridge-supplied first-person RGB frame from the
+        # prismarine-viewer capture path; otherwise colorize the semantic grid
+        # the same way the simulated backend does, so the neural pixel stream
+        # works either way. Bridge frames arrive over JSON as nested lists, so
+        # convert them immediately to uint8 arrays; that keeps recording on the
+        # binary FrameStore instead of embedding large JSON payloads.
         pixels = obs.get("pixels")
+        if pixels is not None:
+            pixels = _pixels_array(pixels)
         if pixels is None and frame is not None:
-            pixels = pixels_from_frame(frame)
+            pixels = pixels_from_frame(frame, yaw_degrees=_yaw_degrees(obs.get("data", {})))
         return Observation(
             timestamp=timestamp,
             tick=obs.get("tick", self._tick),
@@ -345,3 +352,19 @@ class RemoteMinecraftBackend(SurvivalBackend):
         self._dead = bool(response.get("dead", self._dead))
         self._death_reason = response.get("death_reason")
         self._stats = dict(response.get("stats") or {})
+
+
+def _pixels_array(pixels: Any) -> np.ndarray:
+    """Normalize a bridge pixel payload to H x W x 3 uint8."""
+    array = np.asarray(pixels, dtype=np.uint8)
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise BridgeError(
+            f"bridge returned invalid pixels shape {tuple(array.shape)}; "
+            "expected HxWx3 RGB"
+        )
+    return np.ascontiguousarray(array)
+
+
+def _yaw_degrees(data: Dict[str, Any]) -> Optional[float]:
+    yaw = data.get("yaw") if isinstance(data, dict) else None
+    return float(yaw) if isinstance(yaw, (int, float)) else None

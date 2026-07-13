@@ -1,0 +1,15 @@
+{
+  "name": "ccr-pixel-viewer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lightweight zero-dependency node server + reusable <pixel-horizon-viewer> web component: actual vs. predicted pixel frames per prediction horizon for recorded streams-v2 sessions.",
+  "license": "MIT",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check public/pixel-horizon-viewer.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

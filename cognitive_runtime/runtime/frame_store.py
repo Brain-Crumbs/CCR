@@ -40,7 +40,7 @@ from cognitive_runtime.core.hashing import hash_array
 #: Bumped only if the on-disk segment/index layout itself changes; the event
 #: log's hash algorithm (see runtime.recorder) is versioned separately.
 SEGMENT_PREFIX = "segment_"
-FRAME_HASH_ALGORITHM = "content-bytes-v1"
+FRAME_HASH_ALGORITHM = "content-bytes-v2-yaw-aware-pixels"
 
 DEFAULT_SEGMENT_MAX_BYTES = 32 * 1024 * 1024
 DEFAULT_SEGMENT_MAX_SECONDS = 60.0

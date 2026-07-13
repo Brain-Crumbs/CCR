@@ -103,6 +103,7 @@ _WORLD_DEFAULTS: Dict[str, Any] = {
     "day_length": 6000,
     "start_time": 0,
     "max_mobs": 3,
+    "pixel_source": "viewer",
 }
 
 
@@ -150,6 +151,7 @@ def _program_config(args: argparse.Namespace) -> Dict[str, Any]:
         "day_length": args.day_length,
         "start_time": args.start_time,
         "max_mobs": args.max_mobs,
+        "pixel_source": args.pixel_source,
     }
 
 
@@ -537,6 +539,10 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
                         help="time of day at spawn (default: the curriculum's, else 0)")
     parser.add_argument("--max-mobs", type=int, default=None,
                         help="max concurrent hostile mobs (default: the curriculum's, else 3)")
+    parser.add_argument("--pixel-source", choices=["viewer", "grid"], default=None,
+                        help="remote backend pixel source: 'viewer' requests "
+                             "prismarine-viewer first-person snapshots (default); "
+                             "'grid' uses the compact colorized semantic-grid fallback")
     parser.add_argument("--model", default=None, help="path to a trained BC model (learned policy)")
     parser.add_argument("--backend", default="simulated", choices=sorted(BACKENDS),
                         help="survival backend: the deterministic simulated world, or "
@@ -1221,6 +1227,8 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
         seed=args.seed,
         consistency_epochs=args.consistency_epochs,
         entity_persistence_epochs=args.entity_persistence_epochs,
+        data_quality_gate=not args.skip_data_quality_gate,
+        export_predictions=not args.no_export_predictions,
     )
     print(
         f"nursery: running {'all scenarios' if args.scenario == 'all' else args.scenario} "
@@ -1230,8 +1238,12 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
     )
     if config.backend != "simulated":
         print(
-            "nursery: remote backend uses the server's current scene; sim-only "
-            "scenario setup hooks are skipped"
+            "nursery: WARNING -- the remote backend plays on the server's persistent "
+            "world: seeds do NOT vary terrain, each session starts where the previous "
+            "one ended, sim-only scenario setup hooks are skipped, and realtime pacing "
+            "records vision at the config's realtime_vision_hz (10 Hz by default), not "
+            "the 20 Hz tick rate. The data-quality gate will reject recordings without "
+            "the scenario's signal (e.g. a stuck agent)."
         )
 
     report_payload: Dict[str, Any] = {}
@@ -1262,11 +1274,22 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
                 print(f"  entity persistence: {eps.get('note', eps)}")
         print(f"  dream strips rendered: {len(report.dream_strips)}")
 
+        if report.prediction_files:
+            print(f"  viewer predictions exported: {len(report.prediction_files)} episode(s)")
+
         if args.out_dir:
             os.makedirs(args.out_dir, exist_ok=True)
             checkpoint_path = os.path.join(args.out_dir, f"{name}.pt")
             save_nursery_scenario_checkpoint(checkpoint_path, model, report)
             print(f"  checkpoint saved to {checkpoint_path}")
+            # The unified checkpoint keeps only the encoder; the full bundle
+            # (encoder+decoder+next-predictor) lets the prediction exporter
+            # re-render predicted frames later without retraining.
+            from cognitive_runtime.training.prediction_export import save_full_visual_model
+
+            full_model_path = os.path.join(args.out_dir, f"{name}-full.pt")
+            save_full_visual_model(model, full_model_path)
+            print(f"  full model bundle saved to {full_model_path}")
 
         report_payload[name] = {
             "horizon_metrics": {str(h): v for h, v in report.horizon_metrics.items()},
@@ -1274,6 +1297,7 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
             "dream_strips": report.dream_strips,
             "train_sessions": report.train_sessions,
             "holdout_sessions": report.holdout_sessions,
+            "prediction_files": report.prediction_files,
         }
 
     if args.report:
@@ -1875,10 +1899,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_run.add_argument("--seed", type=int, default=0)
     p_nursery_run.add_argument("--out-dir", default=None,
                                help="directory to save one checkpoint bundle per scenario "
-                                    "(<out-dir>/<scenario>.pt); omit to skip saving")
+                                    "(<out-dir>/<scenario>.pt) plus a full-model bundle "
+                                    "(<out-dir>/<scenario>-full.pt) the prediction exporter "
+                                    "can reload; omit to skip saving")
     p_nursery_run.add_argument("--report", default=None,
                                help="path to save a JSON report (per-scenario per-horizon "
                                     "metrics + dream strips); omit to skip saving")
+    p_nursery_run.add_argument("--no-export-predictions", action="store_true",
+                               help="skip writing predictions_<episode>.json (the pixel "
+                                    "viewer's 'model' source) next to each recorded episode")
+    p_nursery_run.add_argument("--skip-data-quality-gate", action="store_true",
+                               help="train even when recordings fail the scenario's "
+                                    "data-quality expectations (stuck agent, static view)")
     p_nursery_run.set_defaults(func=cmd_nursery_run)
 
     p_replay = sub.add_parser("replay", help="re-simulate a session and verify determinism")

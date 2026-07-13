@@ -64,10 +64,13 @@ class Observation:
 
     @staticmethod
     def from_dict(raw: Dict[str, Any]) -> "Observation":
+        pixels = raw.get("pixels")
+        if pixels is not None and not isinstance(pixels, np.ndarray):
+            pixels = np.asarray(pixels, dtype=np.uint8)
         return Observation(
             timestamp=raw.get("timestamp", 0.0),
             tick=raw.get("tick", 0),
             data=raw.get("data", {}),
             frame=raw.get("frame"),
-            pixels=raw.get("pixels"),
+            pixels=pixels,
         )

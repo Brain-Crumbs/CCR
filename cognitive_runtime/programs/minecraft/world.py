@@ -163,18 +163,50 @@ for _code, _rgb in FRAME_CODE_COLORS.items():
     _FRAME_COLOR_LUT[_code] = _rgb
 
 
-def pixels_from_frame(frame: List[List[int]], scale: int = PIXEL_SCALE) -> np.ndarray:
+def pixels_from_frame(
+    frame: List[List[int]],
+    scale: int = PIXEL_SCALE,
+    yaw_degrees: Optional[float] = None,
+) -> np.ndarray:
     """Colorize a semantic grid frame (frame codes) into an H*scale x W*scale x 3
     RGB image (uint8 ndarray).  Backend-agnostic: any world that emits the
     shared grid frame gets identical pixel vision, and the mapping is a pure
-    function of the grid (so it stays deterministic / replay-safe)."""
+    function of the grid (so it stays deterministic / replay-safe).
+
+    When ``yaw_degrees`` is provided, the grid is first resampled into an
+    ego-centric orientation: the center cell remains the agent, but the local
+    patch rotates with the agent's camera heading. This is still a compact
+    semantic fallback, not a true perspective render, but turn-in-place now
+    produces changing pixels instead of a static minimap.
+    """
     grid = np.asarray(frame, dtype=np.int64)
+    if yaw_degrees is not None and grid.ndim == 2 and grid.shape[0] == grid.shape[1]:
+        grid = _orient_frame_grid(grid, float(yaw_degrees))
     unknown = grid > _MAX_FRAME_CODE
     codes = np.where(unknown, 0, grid)
     colored = _FRAME_COLOR_LUT[codes]
     if unknown.any():
         colored[unknown] = _UNKNOWN_CELL_COLOR
     return np.repeat(np.repeat(colored, scale, axis=0), scale, axis=1)
+
+
+def _orient_frame_grid(grid: np.ndarray, yaw_degrees: float) -> np.ndarray:
+    size = grid.shape[0]
+    radius = size // 2
+    yaw = math.radians(yaw_degrees)
+    forward_x, forward_z = -math.sin(yaw), math.cos(yaw)
+    right_x, right_z = math.cos(yaw), math.sin(yaw)
+    out = np.empty_like(grid)
+    for row in range(size):
+        lateral = row - radius
+        for col in range(size):
+            forward = col - radius
+            src_dx = int(round(right_x * lateral + forward_x * forward))
+            src_dz = int(round(right_z * lateral + forward_z * forward))
+            src_row = min(max(src_dx + radius, 0), size - 1)
+            src_col = min(max(src_dz + radius, 0), size - 1)
+            out[row, col] = grid[src_row, src_col]
+    return out
 
 WALK_SPEED = 0.25
 SPRINT_SPEED = 0.45
@@ -939,12 +971,12 @@ class SimulatedWorld:
         """Deterministic RGB pixel render of the local view (H x W x 3, 0..255).
 
         The pixel counterpart to :meth:`render_frame`: the same semantic grid,
-        colorized and upscaled so a small CNN gets real pixels while the result
-        stays a pure function of world state -- byte-identical under replay.  A
-        real backend renders/captures a frame here instead; the stream contract
-        is the same.
+        rotated by yaw, colorized and upscaled so a small CNN gets changing
+        ego-centric pixels while the result stays a pure function of world
+        state -- byte-identical under replay. A real backend renders/captures
+        a frame here instead; the stream contract is the same.
         """
-        return pixels_from_frame(self.render_frame(radius), scale)
+        return pixels_from_frame(self.render_frame(radius), scale, yaw_degrees=self.yaw)
 
     def _has_line_of_sight(self, x0: float, z0: float, x1: float, z1: float) -> bool:
         """True when no SOLID cell lies strictly between the two points.

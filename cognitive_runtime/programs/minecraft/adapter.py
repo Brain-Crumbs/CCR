@@ -33,6 +33,7 @@ from cognitive_runtime.programs.minecraft.reward_engine import ProfileRewardEngi
 from cognitive_runtime.programs.minecraft.reward_profile import RewardProfile
 from cognitive_runtime.programs.minecraft.rewards import SurvivalReward, SurvivalRewardConfig
 from cognitive_runtime.programs.minecraft.streams import (
+    BODY_HEARTBEAT_HZ,
     BODY_HEARTBEAT_KEY,
     MOUSE_LOOK_STREAM,
     VISION_STREAM,
@@ -81,6 +82,7 @@ class MinecraftSurvivalBox(Program):
         #: Off until set_realtime() enables it; shared with the publisher so
         #: the runtime can flip realtime mode after attach_buses().
         self._pacer = RatePacer(enabled=False)
+        self._realtime = False
         self.initialize(config)
 
     # ------------------------------------------------------------ interface
@@ -177,7 +179,21 @@ class MinecraftSurvivalBox(Program):
     # ------------------------------------------------- streams-first interface
 
     def stream_catalog(self) -> List[StreamSpec]:
-        return build_survival_stream_specs(self._config.world_size)
+        # In realtime mode the pacer throttles vision + the body heartbeat to
+        # the config's wall-clock rates, so the catalog must declare *those*
+        # rates, not the fast-forward tick cadence -- otherwise recorded
+        # session metadata contradicts the recording (the first nursery run
+        # declared 20 Hz vision while pacing it at 10 Hz).  The remote backend
+        # plays on a live server whose absolute coordinates aren't bounded by
+        # world_size, so the position range is unknowable there.
+        return build_survival_stream_specs(
+            self._config.world_size,
+            vision_hz=self._config.realtime_vision_hz if self._realtime else 20.0,
+            heartbeat_hz=(
+                self._config.realtime_body_heartbeat_hz if self._realtime else BODY_HEARTBEAT_HZ
+            ),
+            bounded_position=self._backend_name != "remote",
+        )
 
     def attach_buses(self, sensory: SensoryStreamBus, motor: MotorStreamBus) -> None:
         self._sensory_bus = sensory
