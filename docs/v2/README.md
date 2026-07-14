@@ -20,8 +20,9 @@ Read in order:
 **Design commitments** (the choices these docs are built on): re-architect +
 rename rather than rewrite; predict in latent space but always decode to the
 same-shaped input; action-conditioned recurrent world model; a fast Crafter
-nursery world plus Minecraft graduation; one learned voluntary motor path
-(active inference) with a hardcoded **reflex stack** overriding it and a nursery
-caregiver override on top, every tick recording predicted-vs-actuated action;
-diagnostics instead of enforced determinism; and a
+nursery world plus Minecraft graduation; one voluntary motor path that **plans
+over the world model** (one-step MPC by default; active-inference decoding and an
+imagination actor kept as experiments) with a hardcoded **reflex stack** overriding
+it and a nursery caregiver override on top, every tick recording
+predicted-vs-actuated action; diagnostics instead of enforced determinism; and a
 Node/React clinic (read-only first) as the primary interface.

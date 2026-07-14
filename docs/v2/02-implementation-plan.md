@@ -30,12 +30,16 @@ the old one.
 
 - Add `OrganismConfig.name` (string id). Thread it into: checkpoint bundle
   metadata, session-id prefix, dream-export filenames, clinic session grouping.
-  Default to a generated name; `--name Pixel` overrides.
-- Create the target package tree as thin namespaces re-exporting current code:
-  `organism/`, `world/`, `senses/`, `motor/`, `brain/`, `sleep/`, `record/`,
-  `development/`, `clinic/`. No logic moves yet — these are landing pads.
-- Write an `ARCHITECTURE_MAP.md` (the old→new table from the architecture doc, as
-  the living source of truth for the rename).
+  Default to a generated name; `--name Pixel` overrides. *(This is the whole of
+  Phase 0 — cheap provenance that's easiest to add before there are files to
+  rename.)*
+- **Defer the rename to after Milestone 2.** The target package tree (`organism/`,
+  `world/`, `senses/`, `motor/`, `brain/`, `sleep/`, `record/`, `development/`,
+  `clinic/`) and `ARCHITECTURE_MAP.md` land **once the cortex is proven**, not now.
+  Empty re-export namespaces are bikeshedding vocabulary before the science holds;
+  the critique's sharpest process point is *don't rename ~100 files before the
+  three missing organs exist.* Build Phases 1–2 in the current names, prove
+  Milestone 2, then rename behind shims — or never.
 
 **Milestone 0:** a run recorded as `Pixel-<session>`, its checkpoint carrying
 `name: Pixel`, and every generated file discoverable by organism name.
@@ -51,16 +55,20 @@ the old one.
   `motor.command`; consume efferents. Keep it behind the exact same
   catalog/stream-registry contract Minecraft uses, so the brain is unchanged.
 - Wire an `--world crafter|minecraft` selector (CLI now, clinic later).
-- Port the nursery scenarios (`walk_forward`, `turn_in_place`, `object_permanence`,
-  `approach_entity`) to run in Crafter, where determinism and pixel provenance
-  are free.
+- Port the nursery scenarios to run in Crafter, where determinism and pixel
+  provenance are free: `walk_forward`, `object_permanence`, `approach_entity`, and
+  a discrete-facing `turn` (Crafter's facing is a discrete flip, not the continuous
+  rotation `turn_in_place` assumed — re-scope, don't port the optical-flow premise).
 - Bring the **data-quality gates** forward from `nursery-turn-in-place-analysis.md`
   (pixel provenance, motion floor, completed-episode, yaw-sweep) as a reusable
   `record/quality.py`.
 
-**Milestone 1:** `walk_forward` and `turn_in_place` recorded in Crafter pass the
-data-quality gates deterministically, with genuine frame-to-frame motion (the
-thing the top-down Minecraft render never delivered).
+**Milestone 1:** `walk_forward` (and a discrete-facing `turn`) recorded in Crafter
+pass the data-quality gates deterministically, with genuine frame-to-frame motion.
+The win here is **determinism, pixel provenance, speed, and clean translational
+motion** — *not* perspective: Crafter is 2-D top-down like the old Minecraft
+render, so ego-motion / optical-flow is explicitly out of scope until the
+first-person graduation world (see overview).
 
 ---
 
@@ -78,6 +86,10 @@ that serves every scenario — replacing the per-scenario tiny predictors.
   through-composition (it selects for the identity).
 - Horizons in **ticks**, stored with the checkpoint; default {1, 4, 8}, fully
   configurable per organism.
+- **Temporal backbone is a choice — benchmark it.** GRU is the default; also try a
+  **dilated temporal-conv or small transformer over a frame window** (parallel over
+  time, multi-timescale in one forward pass) with a **context-length curriculum**
+  (1 frame → 2 → k). Same interface, so it's an A/B, not a fork.
 - Scoring gates wired in: `model/copy-last`, `model/oracle`, **frozen-rollout
   detector** — as structured report fields, not just logs.
 
@@ -90,8 +102,8 @@ measurably hurts* `turn_in_place` (proving it actually uses actions). This is th
 
 ## Phase 3 — Neuromodulators, Amygdala & the Arbiter
 
-**Goal:** the three modes arise from the predict→surprise→(threat?) loop and
-visibly change behaviour.
+**Goal:** the three modes are selected each tick by the switch over (surprise,
+predicted pain) and visibly change behaviour.
 
 - Rename `core/modulation.py` → `brain/neuromod/` with human-named signals
   (dopamine, acetylcholine, adrenaline) over the existing `internal.*` math. No
@@ -103,6 +115,11 @@ visibly change behaviour.
   recorded stream.
 - Feed acetylcholine into the renamed **Thalamus** (`core/attention.py`) as a
   precision term.
+- **Calibrate surprise; add hysteresis.** The arbiter is a 2×2 lookup, so it is
+  only as good as its inputs: produce cortex uncertainty (ensemble or predicted-
+  error head), **calibrate and report it** (reliability diagram / temperature
+  scaling on the rolling holdout), and require a mode change to persist k ticks
+  before it takes.
 
 **Milestone 3 (the three-region test, generalised):** in a scripted scene with a
 harmless surprise and a harmful one, the organism demonstrably enters
@@ -135,12 +152,21 @@ the dream strip. Recall works.
 stalling the tick — and dreaming prevents forgetting.
 
 - Re-frame `training/async_trainer.py` + `neural/weight_publisher.py` as `sleep/`:
-  Wake takes cheap in-tick updates + episodic encoding; Sleep (separate process)
-  drains **real + dreamed** replay, takes heavy cortical steps, publishes weights
-  back between ticks.
-- Add **generative replay**: interleave dreamed old seeds with new experience so
-  cortical consolidation doesn't overwrite prior skill. Report a forgetting
-  metric (does `walk_forward` accuracy survive learning `object_permanence`?).
+  Wake takes cheap in-tick updates + episodic encoding; Sleep drains **real +
+  dreamed** replay, takes heavy cortical steps, publishes weights back between
+  ticks. The learned spine is the **world model** (self-supervised regression =
+  stable); the motor only plans over it, so this loop has no bootstrapped-policy
+  instability.
+- **Phasic before concurrent.** Ship the simple schedule first — act, pause,
+  consolidate, resume — which has no weight staleness. Only then enable the
+  concurrent separate-process trainer; when you do, publish **EMA-averaged**
+  weights with a **monotonic version stamp** so the actor can bound staleness.
+- Add **generative replay** with the bootstrap guardrail: keep a **reservoir of
+  real transitions** (never train on dreams alone) and **gate the dream fraction on
+  model quality** (0% until the cortex beats copy-last on held-out; ramp with the
+  ratio; cap ≈0.5). Interleaving dreamed old seeds with new experience is the
+  forgetting defence; report a forgetting metric (does `walk_forward` accuracy
+  survive learning `object_permanence`?).
 - Micro-sleep during runs + long consolidation at session boundaries; both
   clinic-triggerable later.
 
@@ -152,13 +178,19 @@ with zero missed-tick regression versus a no-sleep baseline.
 
 ## Phase 6 — The motor system (voluntary + reflex stack)
 
-**Goal:** one learned voluntary path with a hardcoded reflex stack overriding it,
-full predicted-vs-actuated tracking, and nursery caregiver override.
+**Goal:** one voluntary path (planning over the world model) with a hardcoded
+reflex stack overriding it, full predicted-vs-actuated tracking, and nursery
+caregiver override.
 
-- `motor/voluntary.py`: decode the T+1 forecast into an action (active
-  inference) — the default, and the only motor path that learns. Keep
-  `policies/actor_critic.py` as `motor/policy.py`, an optional alternative
-  *voluntary* controller for A/B (`motor.voluntary = active | policy`).
+- `motor/voluntary.py`: the default voluntary controller is **one-step planning
+  (MPC) over the Predictive Cortex** — roll the cortex forward for each of
+  Crafter's ~17 actions and pick the best-scoring predicted next-state. Nothing
+  here learns; the cortex does. Keep three alternatives behind the same seam for
+  A/B (`motor.voluntary = mpc | active | imagination | policy`): **active-inference
+  decoding** (the T+1→encoder→motor inverse path), a **DreamerV3-style imagination
+  actor** trained in dreams, and the existing **actor/critic policy head**
+  (`policies/actor_critic.py` → `motor/policy.py`). MPC is the spine; the others
+  are experiments.
 - `motor/reflexes.py`: a configured set of hardcoded stimulus→action reflexes
   that override voluntary output by priority. Migrate `OrientingReflex` and the
   threat/withdrawal response here; move scripted survival behaviours in as
@@ -286,8 +318,8 @@ checkpoint across stages, which 5 and 6 must land first.
 
 ## First concrete step
 
-Phase 0 + the start of Phase 1: land `OrganismConfig.name`, the namespace
-skeleton, and a stub `worlds/crafter/` World that publishes a pixel stream and
-consumes a motor command — the smallest thing that proves the seam holds for a
-second, cleaner world. Everything else builds on the cortex that Phase 2 grows in
-that world.
+Phase 0 + the start of Phase 1: land `OrganismConfig.name` and a stub
+`worlds/crafter/` World that publishes a pixel stream and consumes a motor command
+— the smallest thing that proves the seam holds for a second, cleaner world. The
+rename scaffolding waits until after Milestone 2; everything else builds on the
+cortex that Phase 2 grows in that world.

@@ -64,7 +64,22 @@ The three organs that are genuinely missing today:
    it a *sleep cycle* that replays hippocampal seeds as generative dreams and
    consolidates them into the cortex without forgetting.
 3. **Motor-from-prediction.** Today a separate policy head chooses actions; V2
-   adds the on-analogy path where the *forecast itself* drives the motor system.
+   adds the path where the organism *acts by planning over its own world model* —
+   choosing the action whose forecast best fits its goal (one-step MPC by
+   default). Decoding the forecast straight into an action (active inference) and
+   an imagination-trained actor are alternative controllers (see architecture).
+
+## The one measured claim
+
+Everything above is the vision; a project needs one falsifiable result to be a
+research contribution rather than a well-engineered relabelling of known parts.
+Ours: **developmental staging plus generative replay (dreaming old seeds while
+learning new ones) produces measurably less catastrophic forgetting than flat
+training on the same data.** That is the sharp bet — world models, CLS replay,
+dopamine-as-RPE and active inference are all established; the continual,
+developmentally-raised organism that *doesn't forget how to crawl when it learns
+to forage* is the thing we can measure and defend (Milestone 5). The milestones
+are designed to prove this, not just to show the plumbing runs.
 
 ## The core loop, precisely
 
@@ -94,13 +109,17 @@ Every waking tick the organism:
      toward the surprise and sample it to drive the error down (curiosity).
    - **Fight-or-flight** when surprised *and* predicting pain — reflexive
      avoidance overrides deliberation.
-7. **Acts.** Its default (voluntary) action is the one that would fulfil its own
-   forecast — active inference. Above that sits a stack of hardcoded **reflexes**
-   (orienting toward salience, threat/withdrawal) that *override* the voluntary
-   action when their stimulus fires, and — in the nursery — a direct **caregiver
-   override**. Every tick records what it *meant* to do (voluntary) versus what
-   its body actually did (reflex/override). NULL (do nothing) is always a real,
-   recorded voluntary choice.
+7. **Acts.** Its default (voluntary) action is chosen by **planning one step over
+   its own world model** — rolling the forecast forward for each candidate action
+   and taking the one whose predicted next senses best fit its current goal
+   (model-predictive control). Decoding the forecast directly into an action
+   (active inference) and a Dreamer-style imagination-trained actor are
+   alternative voluntary controllers, kept for A/B. Above the voluntary action
+   sits a stack of hardcoded **reflexes** (orienting toward salience,
+   threat/withdrawal) that *override* it when their stimulus fires, and — in the
+   nursery — a direct **caregiver override**. Every tick records what it *meant*
+   to do (voluntary) versus what its body actually did (reflex/override). NULL (do
+   nothing) is always a real, recorded voluntary choice.
 8. **Remembers.** The tick is written to the record and a sparse *seed* is
    handed to the hippocampus.
 
@@ -157,7 +176,7 @@ existing curriculum runner already knows how to walk with gated promotion:
 |---|---|---|---|
 | 0 | **Gestation** | just *see and hear*, and habituate — learn sensory regularities and a calm baseline (don't be frightened by everything) | frozen |
 | 1 | **Babbling** | its own body: that its actions cause sensory change (forward/inverse models) | random, overridden |
-| 2 | **Crawling** | ego-motion, optical flow, view rotation (`walk_forward`, `turn_in_place`) | scripted / overridden |
+| 2 | **Crawling** | that moving changes the view predictably: translation and action→effect (`walk_forward`; discrete facing via `turn`). *(True ego-motion — optical flow, view rotation, parallax — needs a first-person world and waits for Minecraft; a 2-D top-down nursery can't teach it.)* | scripted / overridden |
 | 3 | **Objects** | object permanence, affordances, approach & scale (`object_permanence`, `approach_entity`) | scripted / learned |
 | 4 | **Foraging** | goal-directed, reward-seeking behaviour (the survival curriculum) | learned |
 | 5 | **Speaking** | communication / language streams (later) | learned |
@@ -191,6 +210,14 @@ the brain. (This directly fixes the recording-quality problems documented in
 `docs/nursery-turn-in-place-analysis.md`, which were mostly headless-render and
 non-determinism artifacts of using live survival Minecraft as a nursery.)
 
+Two honesties about the nursery: Crafter is itself **2-D and top-down**, so it
+teaches object dynamics, action→effect and consequence — *not* ego-motion,
+parallax, or optical flow (those wait for the first-person Minecraft world). And
+the learned weights **do not transfer across worlds yet**: graduating to Minecraft
+means starting the model over on first-person input. The World seam keeps the
+*code* portable; it does not make the *learning* portable, and we don't pretend it
+does.
+
 ## What you interact with: the clinic
 
 Day-to-day, you work through a **Node/React front-end — a developmental
@@ -222,7 +249,9 @@ The redesign has succeeded when:
 - **Dreams are real**: hippocampal seeds replay generatively and demonstrably
   consolidate skill and reduce forgetting.
 - The **three modes** (reward-seeking / information-gathering / fight-or-flight)
-  arise from the predict→surprise→(threat?) loop and visibly change behaviour.
+  are selected each tick by a thresholded switch over *calibrated* surprise and
+  predicted-pain (with hysteresis so the mode doesn't flap), and visibly change
+  behaviour.
 - It is **raised developmentally**, stage by stage, with validated milestones and
   direct motor override in the nursery.
 - Every organism has a **configurable name** that ids its model and all its

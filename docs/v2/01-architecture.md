@@ -22,13 +22,16 @@
    predictors.
 4. **Two worlds, one brain.** A fast deterministic nursery world (Crafter/
    Craftax) and Minecraft (mineflayer) behind the same World seam.
-5. **One learned voluntary path; hardcoded reflexes override it.** Voluntary
-   action is the world-model forecast decoded to motor (active inference). Above
-   it sits a configured, genetic **reflex stack** (orienting, threat/withdrawal,
+5. **Voluntary action = planning over the world model; hardcoded reflexes
+   override it.** The default voluntary controller chooses the action by **one-step
+   planning (MPC) over the Predictive Cortex** — nothing in the motor path learns;
+   the cortex it plans over is what improves. Decoding the forecast into an action
+   (active inference), an imagination-trained actor (DreamerV3-style), and a policy
+   head are alternative *voluntary* controllers kept for A/B. Above the voluntary
+   action sits a configured, genetic **reflex stack** (orienting, threat/withdrawal,
    the former scripted behaviours) and, in the nursery, a **caregiver override**,
    with strict precedence. Every tick records voluntary-vs-actuated action, so
-   reflex integration is measurable. (A policy head stays as an optional
-   alternative *voluntary* controller for A/B — it is not a reflex.)
+   reflex integration is measurable.
 6. **Don't constrain for determinism; diagnose instead.** Byte-exact replay stays
    available for the sim nursery as a cheap plumbing check, but it is no longer a
    design constraint. Rich diagnostics replace it as the trust mechanism.
@@ -60,7 +63,7 @@ the [implementation plan](02-implementation-plan.md) sequences it.
 | `core/modulation.py` (`internal.*`) | **Neuromodulators** (`brain/neuromod/`) | dopamine, threat/adrenaline, acetylcholine |
 | `internal.risk` + predicted-pain | **Amygdala** (`brain/amygdala.py`) | threat appraisal → adrenaline release |
 | *(the state machine your rant describes)* | **Arbiter** (`brain/arbiter.py`) | picks reward-seeking / info-gathering / fight-or-flight |
-| *(new, on-analogy path)* | **Voluntary motor** (`motor/voluntary.py`) | learned; decode the forecast into the action that fulfils it (active inference) |
+| *(new)* | **Voluntary motor** (`motor/voluntary.py`) | plan over the world model (one-step MPC) to pick the action; active-inference decode / imagination actor are alt controllers |
 | `policies/actor_critic.py` | **alt. voluntary controller** (`motor/policy.py`) | optional learned policy head, kept for A/B against voluntary motor |
 | `policies/scripted.py`, `core/orienting_reflex.py` | **Reflexes** (`motor/reflexes.py`) | hardcoded genetic stimulus→action overrides (colliculus/orienting, threat/withdrawal) |
 | NULL action / go–no-go | **basal-ganglia gate** (in `motor/`) | inaction as a real, gated *voluntary* choice |
@@ -141,6 +144,12 @@ r̂_{t+h} (reward),  d̂_{t+h} (terminal/death),  risk_{t+h} (predicted pain)
   through-composition, which selects for the identity) plus short-rollout
   scheduled sampling. `neural/world_model.py`'s `MultiHorizonMLPWorldModel` is
   the seed; it gains the recurrent, action-conditioned, decoded body.
+- **Recurrence is not the only option.** A GRU is the default, but a **dilated
+  temporal-conv (WaveNet-style) or a small transformer over a window of recent
+  frames** is an alternative worth benchmarking: it processes the whole window in
+  parallel (no sequential unroll), naturally reads several timescales in one
+  forward pass, and pairs with a **context-length curriculum** (train on 1 frame,
+  then 2, then k). Same interface, different temporal backbone — an A/B, not a fork.
 - **Horizons are counted in ticks/seconds**, stored with the checkpoint, so
   "T+8" means the same thing across worlds and sample rates.
 
@@ -209,6 +218,33 @@ is the defence against catastrophic forgetting — the organism doesn't forget h
 to crawl when it learns to forage. The clinic can trigger, watch, and inspect a
 sleep phase (dream strips of what it dreamed, loss curves, forgetting metrics).
 
+**Why this is stable: the spine is self-supervised.** The heavy thing learned
+during sleep is the *world model*, whose objective is regression onto the world's
+own recorded future — not a bootstrapped policy chasing a moving value target.
+Because the default motor merely *plans* over that model (commitment 5, nothing in
+the motor learns online), the loop avoids the classic async-RL instabilities
+(policy lag, oscillation) almost entirely. Keep the make-or-break online learning
+on the world model; keep the motor as planning over it.
+
+**Phasic first, concurrent later.** Two schedules satisfy "trains as it lives":
+
+- *Phasic wake/sleep* — act for a while, then pause acting and consolidate, then
+  resume. No weight staleness (nothing acts while the cortex updates); simplest to
+  get right; closest to the sleep-consolidates-memory story. **Build this first.**
+- *Concurrent* — the existing separate-process async trainer publishing weights to
+  a live actor. Always-on, but introduces staleness. When we go concurrent, publish
+  an **EMA/Polyak-averaged** copy of the weights (a slow-moving target kills
+  tick-to-tick oscillation) and stamp a **monotonic version** so the actor can log
+  and bound how stale its weights are.
+
+**The dream bootstrap paradox (guardrail).** Dreams from a half-trained cortex
+reinforce that cortex's own errors, so generative replay only helps once the
+generator is decent. Two rules: (1) keep a bounded **reservoir of real
+transitions** and never train on dreams alone; (2) **schedule the dream fraction
+on measured quality** — 0% until the cortex beats copy-last on held-out by a
+margin, ramping with the ratio, capped (≈0.5). The dream fraction is a function of
+a metric, not a constant.
+
 ## Neuromodulation & the three modes
 
 ### The chemicals (grounded, behaviour-changing — commitment from Q7)
@@ -261,6 +297,14 @@ computes each tick — **surprise** (prediction error) and **predicted pain**
   reflex that **overrides** the policy (the existing reflex-veto precedence:
   never suppress fleeing/eating). This is your "duck, cover, run."
 
+**The switch needs trustworthy inputs.** It is a hand-authored 2×2 lookup, not an
+emergent process — which is fine, but it only works if *surprise* is **calibrated**
+(an uncalibrated error/σ head makes the mode flap tick-to-tick). So the cortex's
+uncertainty is produced cheaply (ensemble disagreement or a predicted-error head)
+and **calibrated and reported** as a first-class metric (reliability diagram /
+temperature scaling on the rolling holdout), and the switch applies **hysteresis**
+(a mode change requires the threshold to hold for k consecutive ticks).
+
 The arbiter's chosen mode is a recorded stream and a headline diagnostic — you
 can watch the organism flip from bored to curious to afraid as the world
 surprises it, which is exactly the behaviour you already saw error-spike in the
@@ -271,13 +315,20 @@ nursery runs.
 Motor output is a **precedence stack**, not competing brains. From lowest
 authority to highest:
 
-1. **Voluntary action (cortical, learned).** The default. The Predictive
-   Cortex's forecast of "what I expect to sense next" is decoded into the action
-   that would bring it about — active inference, the T+1-output→encoder→motor
-   path you described (`motor/voluntary.py`). This is the *only* motor path that
-   learns. An actor/critic **policy head** (`motor/policy.py`, today's
-   `actor_critic.py`) remains available as an *alternative* voluntary controller
-   for A/B — but it is voluntary, not a reflex.
+1. **Voluntary action (cortical).** The default: choose the action by **one-step
+   planning over the Predictive Cortex** — roll the world model forward for each
+   candidate action and take the one whose predicted next senses best fit the
+   current goal (predicted reward / achievement progress / calibrated novelty).
+   MPC over Crafter's ~17 discrete actions is cheap and embarrassingly parallel.
+   Crucially, **nothing in the motor path learns** — the cortex it plans over is
+   the only thing that improves (during sleep), which is what keeps the online loop
+   stable. Three alternative voluntary controllers are kept for A/B, all behind the
+   same seam (`motor/voluntary.py`): **active-inference decoding** (the
+   T+1-output→encoder→motor inverse path — decode the forecast straight into the
+   action that fulfils it), a **DreamerV3-style imagination actor** trained inside
+   dreams, and the existing **actor/critic policy head** (`motor/policy.py`, today's
+   `actor_critic.py`). These are experiments, not the spine — so the project does
+   not hinge on the least-proven mechanism.
 
 2. **Reflexes (subcortical, hardcoded — the "genome").** A configured set of
    stimulus→action rules that **override** the voluntary action when their
@@ -394,7 +445,7 @@ optional alternative voluntary controller.
 
 **Newly built:** Hippocampus (episodic seed store), Dreams (generative rollout
 subsystem), the Arbiter (three-mode state machine), the Crafter nursery World,
-the voluntary (active-inference) motor path + the reflex-override stack with
+the voluntary (planning/MPC) motor path + the reflex-override stack with
 predicted-vs-actuated tracking, and the Clinic front-end.
 
 See the [implementation plan](02-implementation-plan.md) for the order.
