@@ -22,8 +22,13 @@
    predictors.
 4. **Two worlds, one brain.** A fast deterministic nursery world (Crafter/
    Craftax) and Minecraft (mineflayer) behind the same World seam.
-5. **Both motor paths, switchable + comparable.** Act-from-prediction (active
-   inference) and a policy head, chosen by config, A/B-able in diagnostics.
+5. **One learned voluntary path; hardcoded reflexes override it.** Voluntary
+   action is the world-model forecast decoded to motor (active inference). Above
+   it sits a configured, genetic **reflex stack** (orienting, threat/withdrawal,
+   the former scripted behaviours) and, in the nursery, a **caregiver override**,
+   with strict precedence. Every tick records voluntary-vs-actuated action, so
+   reflex integration is measurable. (A policy head stays as an optional
+   alternative *voluntary* controller for A/B — it is not a reflex.)
 6. **Don't constrain for determinism; diagnose instead.** Byte-exact replay stays
    available for the sim nursery as a cheap plumbing check, but it is no longer a
    design constraint. Rich diagnostics replace it as the trust mechanism.
@@ -55,10 +60,10 @@ the [implementation plan](02-implementation-plan.md) sequences it.
 | `core/modulation.py` (`internal.*`) | **Neuromodulators** (`brain/neuromod/`) | dopamine, threat/adrenaline, acetylcholine |
 | `internal.risk` + predicted-pain | **Amygdala** (`brain/amygdala.py`) | threat appraisal → adrenaline release |
 | *(the state machine your rant describes)* | **Arbiter** (`brain/arbiter.py`) | picks reward-seeking / info-gathering / fight-or-flight |
-| `core/orienting_reflex.py` | **Colliculus** (`brain/colliculus.py`) | orienting reflex; look toward salience |
-| `policies/actor_critic.py` | **Striatum / policy head** (`motor/policy.py`) | learned action selection |
-| *(new, on-analogy path)* | **Active-inference motor** (`motor/active.py`) | act to fulfil the forecast |
-| NULL action / go–no-go | **basal-ganglia gate** (in `motor/`) | inaction as a real, gated choice |
+| *(new, on-analogy path)* | **Voluntary motor** (`motor/voluntary.py`) | learned; decode the forecast into the action that fulfils it (active inference) |
+| `policies/actor_critic.py` | **alt. voluntary controller** (`motor/policy.py`) | optional learned policy head, kept for A/B against voluntary motor |
+| `policies/scripted.py`, `core/orienting_reflex.py` | **Reflexes** (`motor/reflexes.py`) | hardcoded genetic stimulus→action overrides (colliculus/orienting, threat/withdrawal) |
+| NULL action / go–no-go | **basal-ganglia gate** (in `motor/`) | inaction as a real, gated *voluntary* choice |
 | `training/curriculum_runner.py` + nursery | **Development** (`development/`) | staged ontogeny with gated promotion |
 | `tools/`, `viewer/` | **Clinic** (`clinic/` server + web) | diagnostics & control front-end |
 | recorder / record format | **the Record** (`record/`) | the organism's life history |
@@ -89,10 +94,10 @@ the [implementation plan](02-implementation-plan.md) sequences it.
                         │         ▼                ▼               ▼   │
                         │  ┌────────────┐   ┌───────────┐   ┌──────────┴─────┐
                         │  │ Predictive │   │ Amygdala  │   │ Motor:         │
-                        │  │ Cortex     │   │ (threat)  │   │ active-inf OR  │
-                        │  │ ẑ_{t+1,4,8}│   └─────┬─────┘   │ policy head    │
-                        │  │ + decode   │         │         │ (+ colliculus  │
-                        │  └─────┬──────┘         │         │  orienting)    │
+                        │  │ Cortex     │   │ (threat)  │   │ voluntary      │
+                        │  │ ẑ_{t+1,4,8}│   └─────┬─────┘   │ (active-inf)   │
+                        │  │ + decode   │         │         │ ◄ reflex stack │
+                        │  └─────┬──────┘         │         │   overrides    │
                         │        │ pred. error    │ threat  └──────┬─────────┘
                         │        ▼                ▼                │
                         │   ┌──────────────────────────┐          │
@@ -261,26 +266,60 @@ can watch the organism flip from bored to curious to afraid as the world
 surprises it, which is exactly the behaviour you already saw error-spike in the
 nursery runs.
 
-## The motor system (both paths — commitment 5)
+## The motor system: one voluntary path, a reflex stack over it (commitment 5)
 
-The T+1 forecast and the workspace both feed the motor system, which can run in
-either mode (config `motor.mode = active | policy`, or `both` for A/B):
+Motor output is a **precedence stack**, not competing brains. From lowest
+authority to highest:
 
-- **Active-inference motor** (`motor/active.py`): the forecast of "what I expect
-  to sense next" is decoded into the action that would make it come true — the
-  on-analogy path you described (T+1 output → encoder → motor action). During
-  nursery stages the caregiver **overrides** these outputs directly (motor
-  babbling / guided movement).
-- **Policy head** (`motor/policy.py`): today's actor/critic over the workspace,
-  kept as the proven learner and the A/B baseline.
-- **Colliculus** sits below both as the orienting reflex; **basal-ganglia gate**
-  makes NULL a real choice. Reflexes and threat responses out-rank both motor
-  modes.
+1. **Voluntary action (cortical, learned).** The default. The Predictive
+   Cortex's forecast of "what I expect to sense next" is decoded into the action
+   that would bring it about — active inference, the T+1-output→encoder→motor
+   path you described (`motor/voluntary.py`). This is the *only* motor path that
+   learns. An actor/critic **policy head** (`motor/policy.py`, today's
+   `actor_critic.py`) remains available as an *alternative* voluntary controller
+   for A/B — but it is voluntary, not a reflex.
+
+2. **Reflexes (subcortical, hardcoded — the "genome").** A configured set of
+   stimulus→action rules that **override** the voluntary action when their
+   trigger fires. Reflexes do not learn; they are the organism's genetic priors.
+   The *stimuli available* to trigger them are declared at the **World interface**
+   (a World can advertise a localizable threat, a looming object, a damage
+   event); *which reflexes this organism has, and their thresholds/priorities* is
+   **model configuration** — the genotype/phenotype split. This is exactly what
+   the old scripted/hardcoded policies become: the `OrientingReflex` (orient
+   toward salience) and the threat/withdrawal response are the first two, and
+   scripted survival behaviours migrate here as configured reflexes rather than
+   "agent intelligence."
+
+3. **Caregiver override (external).** During nursery stages the experimenter
+   injects motor commands directly (babbling, guided movement). This is the same
+   override slot as a reflex, driven from outside — the top of the stack.
+
+Precedence: `caregiver override > reflex (by priority) > voluntary`. NULL
+(inaction) remains a real, gated *voluntary* choice (basal-ganglia gate).
+
+**Every tick records the whole stack, not just the outcome:** the voluntary
+(predicted) action, which reflex fired and why (if any), whether a caregiver
+override applied, and the final actuated action. So *predicted action vs.
+reflexive/overridden action* is always reconstructable — the efference signal of
+"what I meant to do vs. what my body did."
 
 The action space stays World-defined and opaque to the brain
-(`core/action_registry.py`'s world/info-gathering classification carries over,
-so the arbiter and colliculus can reason about "is this action explshoratory or
-world-changing" without knowing what it *is*).
+(`core/action_registry.py`'s world-changing/information-gathering classification
+carries over, so reflexes and the arbiter can reason about an action's *kind*
+without knowing what it *is*).
+
+### Why tracking predicted-vs-reflex matters: reflex integration
+
+That record is also a **teaching signal**, and it yields a genuinely biological
+developmental curve. Human infant reflexes (grasp, rooting, Moro) are hardcoded
+and then *integrated* — voluntary cortical control gradually learns to reproduce
+and finally supersede them, and the raw reflex fades. Because the organism logs
+the reflex action next to its own predicted action, the cortex can learn to
+predict/pre-empt what its reflexes do; over development the voluntary path
+internalises the reflex and the hardcoded override fires less often. The clinic
+charts this directly as **reflex-activation rate falling** with maturity — a
+concrete, on-analogy milestone rather than a metaphor.
 
 ## The World seam (unchanged principle, renamed)
 
@@ -349,11 +388,13 @@ viewer.
 
 **Renamed + extended:** world model → recurrent, action-conditioned, decoded
 Predictive Cortex; async trainer → Sleep with dreams; modulation → named
-Neuromodulators + Amygdala; attention → Thalamus fed by acetylcholine; policy →
-Striatum, joined by the active-inference motor.
+Neuromodulators + Amygdala; attention → Thalamus fed by acetylcholine; scripted
+policies + orienting reflex → the hardcoded **reflex stack**; actor/critic → an
+optional alternative voluntary controller.
 
 **Newly built:** Hippocampus (episodic seed store), Dreams (generative rollout
 subsystem), the Arbiter (three-mode state machine), the Crafter nursery World,
-the active-inference motor path, and the Clinic front-end.
+the voluntary (active-inference) motor path + the reflex-override stack with
+predicted-vs-actuated tracking, and the Clinic front-end.
 
 See the [implementation plan](02-implementation-plan.md) for the order.

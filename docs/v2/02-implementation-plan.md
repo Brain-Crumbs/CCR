@@ -150,23 +150,34 @@ with zero missed-tick regression versus a no-sleep baseline.
 
 ---
 
-## Phase 6 — The motor system (both paths)
+## Phase 6 — The motor system (voluntary + reflex stack)
 
-**Goal:** act-from-prediction exists alongside the policy head, switchable and
-comparable; nursery override works.
+**Goal:** one learned voluntary path with a hardcoded reflex stack overriding it,
+full predicted-vs-actuated tracking, and nursery caregiver override.
 
-- `motor/active.py`: decode the T+1 forecast into an action (active inference).
-- Keep `policies/actor_critic.py` as `motor/policy.py`.
-- `motor.mode = active | policy | both`; `both` records both proposals for A/B.
-- **Caregiver override**: a development-stage hook that injects motor commands
-  directly (babbling / guided movement), bypassing both paths, and records that
-  the action was overridden.
-- Colliculus + basal-ganglia gate retained below both; reflex/threat precedence
-  unchanged.
+- `motor/voluntary.py`: decode the T+1 forecast into an action (active
+  inference) — the default, and the only motor path that learns. Keep
+  `policies/actor_critic.py` as `motor/policy.py`, an optional alternative
+  *voluntary* controller for A/B (`motor.voluntary = active | policy`).
+- `motor/reflexes.py`: a configured set of hardcoded stimulus→action reflexes
+  that override voluntary output by priority. Migrate `OrientingReflex` and the
+  threat/withdrawal response here; move scripted survival behaviours in as
+  configured reflexes. Trigger *stimuli* come from World-declared streams
+  (localization/threat hints); the reflex *set + thresholds* are organism config
+  (the genome).
+- **Caregiver override**: a development-stage hook injecting motor commands
+  directly (babbling / guided movement) at the top of the precedence stack.
+- **Record the whole stack** every tick: voluntary action, reflex fired
+  (which/why), override applied, final actuated action.
+- Precedence enforced: `caregiver override > reflex > voluntary`; NULL stays a
+  real gated voluntary choice.
 
-**Milestone 6:** in the babbling stage, overridden motor produces clean
-forward/inverse-model data; on a locomotion scenario, `active` and `policy` motor
-are both runnable and their behaviour is A/B-charted in the clinic.
+**Milestone 6:** in the babbling stage, caregiver-overridden motor produces clean
+forward/inverse-model data; on a locomotion+threat scenario, a reflex demonstrably
+overrides the voluntary action when its stimulus fires, the predicted-vs-actuated
+divergence is logged, and the clinic charts **reflex-activation rate** — the curve
+expected to fall as the cortex learns to pre-empt its reflexes (reflex
+integration).
 
 ---
 
@@ -232,7 +243,7 @@ Phase 3 (modes)   Phase 4 (dreams)   Phase 8a (read-only clinic)
       Phase 5 (sleep/consolidation)
              │
              ▼
-      Phase 6 (motor: both paths)
+      Phase 6 (motor: voluntary + reflex stack)
              │
              ▼
       Phase 7 (development ladder)

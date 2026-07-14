@@ -94,9 +94,13 @@ Every waking tick the organism:
      toward the surprise and sample it to drive the error down (curiosity).
    - **Fight-or-flight** when surprised *and* predicting pain — reflexive
      avoidance overrides deliberation.
-7. **Acts** — either by choosing an action to fulfil its own prediction
-   (active inference) or via a learned policy head; NULL (do nothing) is always
-   a real, recorded choice.
+7. **Acts.** Its default (voluntary) action is the one that would fulfil its own
+   forecast — active inference. Above that sits a stack of hardcoded **reflexes**
+   (orienting toward salience, threat/withdrawal) that *override* the voluntary
+   action when their stimulus fires, and — in the nursery — a direct **caregiver
+   override**. Every tick records what it *meant* to do (voluntary) versus what
+   its body actually did (reflex/override). NULL (do nothing) is always a real,
+   recorded voluntary choice.
 8. **Remembers.** The tick is written to the record and a sparse *seed* is
    handed to the hippocampus.
 
