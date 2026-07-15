@@ -399,6 +399,7 @@ def _run_stage_episodes(
     policy_model, critic_model, optimizer, action_keys,
     episodes: int, seed: int, *, train: bool,
     record_dir: Optional[str], session_id: Optional[str], stage_index: int,
+    name: Optional[str] = None,
 ) -> List[EpisodeSummary]:
     program = MinecraftSurvivalBox(
         config=stage.world_config,
@@ -420,6 +421,7 @@ def _run_stage_episodes(
         program_config=stage.world_config,
         curriculum=stage.name,
         curriculum_stage_index=stage_index,
+        name=name,
     )
     recorder = None if record_dir is not None else NullRecorder()
     return CognitiveRuntime(
@@ -456,6 +458,7 @@ def run_curriculum(
     force_promote: bool = False,
     fresh: bool = False,
     record_dir: Optional[str] = None,
+    name: Optional[str] = None,
 ) -> CurriculumRunResult:
     """Run (or resume) ``definition`` against ``checkpoint_path``.
 
@@ -480,6 +483,7 @@ def run_curriculum(
         critic=critic_model,
         online_optimizer=optimizer,
         extra_metadata={"actor_critic": arch},
+        name=name,
     )
 
     resumed = False
@@ -529,11 +533,13 @@ def run_curriculum(
                 stage, policy_model, critic_model, optimizer, action_keys,
                 stage.train_episodes, train_seed_i, train=True,
                 record_dir=record_dir, session_id=None, stage_index=state.stage_index,
+                name=name,
             )
             eval_episodes = _run_stage_episodes(
                 stage, policy_model, critic_model, optimizer, action_keys,
                 stage.promotion.sample_size, eval_seed_i, train=False,
                 record_dir=record_dir, session_id=None, stage_index=state.stage_index,
+                name=name,
             )
             summary = EvaluationSummary.from_episodes(stage.name, eval_episodes)
             value = stage.promotion.value_of(summary)

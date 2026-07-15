@@ -13,7 +13,9 @@ license = { text = "MIT" }
 # through fusion, the binary frame store and the recorder, whether or not
 # torch (the neural extra) is installed.  PyYAML is core: reward profiles
 # (issue #41, --reward-profile) are the one place YAML is the primary format.
-dependencies = ["numpy>=1.23", "PyYAML>=6"]
+# namesgenerator is core: the organism's default name (issue #88,
+# RuntimeConfig.resolve_name) is generated from it; zero transitive deps.
+dependencies = ["numpy>=1.23", "PyYAML>=6", "namesgenerator>=0.3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]

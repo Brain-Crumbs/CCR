@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from cognitive_runtime.programs.minecraft.evaluation import comparison_table, summarize_episodes
 from cognitive_runtime.runtime.recorder import EpisodeSummary
+
+#: Group label for episodes recorded before organism identity existed
+#: (issue #88) -- `EpisodeSummary.name` is `None` for those.
+LEGACY_NAME = "legacy"
 
 
 def load_summaries(session_dir: str) -> List[EpisodeSummary]:
@@ -96,10 +100,10 @@ def _attention_focus_table(summaries: List[EpisodeSummary]) -> str:
     return "\n".join(lines)
 
 
-#: Dashboard comparison columns: curriculum + policy identify the group,
-#: everything else is `evaluation.comparison_table`'s default set.
+#: Dashboard comparison columns: name + curriculum + policy identify the
+#: group, everything else is `evaluation.comparison_table`'s default set.
 _DASHBOARD_COLUMNS = [
-    "curriculum", "policy", "episodes", "avg_survival_ticks", "death_rate",
+    "name", "curriculum", "policy", "episodes", "avg_survival_ticks", "death_rate",
     "success_rate", "avg_total_reward", "reward_per_minute", "avg_food_consumed",
     "avg_unique_items", "avg_blocks_placed", "null_action_rate",
     "avg_max_distance", "avg_decision_latency_ms", "stream_events_per_sec",
@@ -118,19 +122,25 @@ def _statistical_section(by_group: Dict[tuple, List[EpisodeSummary]]) -> str:
     )
 
     stats = [
-        compute_statistics(f"{policy} [{curriculum}]" if curriculum != "-" else policy, group)
-        for (curriculum, policy), group in sorted(by_group.items())
+        compute_statistics(
+            f"{policy} [{curriculum}] ({name})" if curriculum != "-" else f"{policy} ({name})",
+            group,
+        )
+        for (name, curriculum, policy), group in sorted(by_group.items())
     ]
     return "\nstatistical summary (mean +/- 95% CI, issue #44):\n" + format_statistics_report(stats)
 
 
-def dashboard(record_dir: str, statistical: bool = False) -> str:
-    """One row per (curriculum, policy) group, aggregated over every session
-    under record_dir -- so a curriculum run (issue #30) is comparable across
-    steps, and plain runs (curriculum=None) still group by policy alone.
+def dashboard(record_dir: str, statistical: bool = False, name: Optional[str] = None) -> str:
+    """One row per (organism name, curriculum, policy) group, aggregated over
+    every session under record_dir -- so a curriculum run (issue #30) is
+    comparable across steps, and plain runs (curriculum=None) still group by
+    policy alone. Episodes recorded before organism identity existed (issue
+    #88) group under ``"legacy"``.
 
-    ``statistical=True`` appends the statistical evaluation harness's mean
-    +/- confidence-interval report for the same groups."""
+    ``name`` restricts the report to one organism (exact match, "legacy"
+    included). ``statistical=True`` appends the statistical evaluation
+    harness's mean +/- confidence-interval report for the same groups."""
     if not os.path.isdir(record_dir):
         return f"(no sessions directory at {record_dir})"
     by_group: Dict[tuple, List[EpisodeSummary]] = {}
@@ -140,16 +150,20 @@ def dashboard(record_dir: str, statistical: bool = False) -> str:
         if not os.path.isdir(session_dir):
             continue
         for summary in load_summaries(session_dir):
-            key = (summary.curriculum or "-", summary.policy_name)
+            organism_name = summary.name or LEGACY_NAME
+            if name is not None and organism_name != name:
+                continue
+            key = (organism_name, summary.curriculum or "-", summary.policy_name)
             by_group.setdefault(key, []).append(summary)
             all_summaries.append(summary)
     if not by_group:
         return f"(no recorded episodes under {record_dir})"
     rows: List[Dict[str, Any]] = []
-    for curriculum, policy_name in sorted(by_group):
-        row = summarize_episodes(by_group[(curriculum, policy_name)])
+    for organism_name, curriculum, policy_name in sorted(by_group):
+        row = summarize_episodes(by_group[(organism_name, curriculum, policy_name)])
         row["policy"] = policy_name
         row["curriculum"] = curriculum
+        row["name"] = organism_name
         rows.append(row)
     out = (
         comparison_table(rows, columns=_DASHBOARD_COLUMNS)
