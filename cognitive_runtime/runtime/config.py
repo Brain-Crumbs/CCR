@@ -2,26 +2,19 @@
 
 from __future__ import annotations
 
-import random
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-#: Short readable words used to generate a default organism name (issue #88)
-#: when none is configured -- a run must always record a concrete name, never
-#: `None`. Purely cosmetic; never used to seed anything behavioural.
-_GENERATED_NAME_WORDS = [
-    "sprout", "seed", "spark", "pixel", "wisp", "ember", "glint", "moss",
-    "fern", "nova", "willow", "quill", "flicker", "dew", "brook", "petal",
-]
+import namesgenerator
 
 
 def _generate_organism_name() -> str:
-    """A stable-looking but unique default name, e.g. ``sprout-7f3a``."""
-    word = random.choice(_GENERATED_NAME_WORDS)
-    suffix = uuid.uuid4().hex[:4]
-    return f"{word}-{suffix}"
+    """A readable default organism name (issue #88) when none is configured
+    -- a run must always record a concrete name, never `None`. Docker-style
+    ``adjective-surname`` (e.g. ``vigorous-shannon``) via ``namesgenerator``;
+    purely cosmetic, never used to seed anything behavioural."""
+    return namesgenerator.get_random_name(sep="-")
 
 
 @dataclass

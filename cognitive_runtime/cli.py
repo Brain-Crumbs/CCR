@@ -1674,7 +1674,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--name", default=None,
                        help="issue #88: organism name, threaded into the session id, "
                             "recorded metadata, checkpoints and exports; default: a "
-                            "generated slug (e.g. sprout-7f3a)")
+                            "generated Docker-style name (e.g. vigorous-shannon)")
     p_run.add_argument("--policy", default="scripted",
                        choices=["null", "random", "scripted", "learned", "neural", "online",
                                 "actor-critic", "human"])
