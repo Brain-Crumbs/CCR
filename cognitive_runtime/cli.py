@@ -86,10 +86,10 @@ def _default_nursery_backend() -> str:
     return "simulated"
 
 
-def _encoders_for_input_profile(profile: str):
+def _encoders_for_input_profile(profile: str, stream_registry=MINECRAFT_STREAM_REGISTRY):
     if profile == "full":
         return None
-    return MINECRAFT_STREAM_REGISTRY.to_encoder_registry(classifications={"agent_input"})
+    return stream_registry.to_encoder_registry(classifications={"agent_input"})
 
 
 #: Historical CLI defaults for the world knobs a curriculum preset can also
@@ -155,12 +155,20 @@ def _program_config(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
-def _make_policy(name: str, args: argparse.Namespace) -> Policy:
+def _make_policy(
+    name: str, args: argparse.Namespace, action_space: Optional[list] = None
+) -> Policy:
     if name == "null":
         return NullPolicy()
     if name == "random":
-        return RandomPolicy(ACTION_SPACE, seed=args.seed)
+        return RandomPolicy(action_space or ACTION_SPACE, seed=args.seed)
     if name == "scripted":
+        if getattr(args, "world", "minecraft") != "minecraft":
+            sys.exit(
+                f"--policy scripted is Minecraft-specific (a hand-authored heuristic over "
+                f"Minecraft's own actions); it does not support --world {args.world!r}. "
+                "Pick --policy null/random/human/online/actor-critic/learned/neural instead."
+            )
         return ScriptedSurvivalPolicy(seed=args.seed)
     if name == "human":
         return HumanDemoPolicy(realtime=getattr(args, "realtime", False))
@@ -268,7 +276,8 @@ def _make_online_policy_and_learner(
 
 
 def _make_actor_critic_policy_and_learner(
-    args: argparse.Namespace, program: MinecraftSurvivalBox, encoders=None
+    args: argparse.Namespace, program: MinecraftSurvivalBox, encoders=None,
+    stream_registry=MINECRAFT_STREAM_REGISTRY,
 ):
     """``--policy actor-critic``: the neural actor/critic online policy
     (issue #29, docs/neural-stream-agent.md Phase E), wired the same way
@@ -337,7 +346,7 @@ def _make_actor_critic_policy_and_learner(
 
         live_fusion = LiveLearnedFusion(
             program.stream_catalog(),
-            MINECRAFT_STREAM_REGISTRY,
+            stream_registry,
             base_layout_hash=fusion.layout_hash,
             fused_width=arch.get("fused_width"),
             hidden_dim=arch["hidden_dim"],
@@ -561,6 +570,54 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
                              "sigmoid around --intrinsic-risk-threshold (default: 0.15)")
 
 
+#: Programs that aren't Minecraft (issue #89). Default stays "minecraft" for
+#: back-compat; ``--world crafter`` routes construction through
+#: ``_build_program`` instead of the historical hardcoded ``MinecraftSurvivalBox``.
+WORLDS = {"minecraft", "crafter"}
+
+
+def _add_world_selector_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--world", default="minecraft", choices=sorted(WORLDS),
+                        help="which Program to run: the deterministic Minecraft-like "
+                             "survival sim (default, for back-compat), or the Crafter "
+                             "nursery world (issue #89; needs the 'crafter' extra "
+                             "installed). Both implement the same streams-v2 seam, so "
+                             "the runtime/policy code is unchanged either way.")
+
+
+def _build_program(args: argparse.Namespace, program_config: Dict[str, Any],
+                    reward_config, reward_profile):
+    """Construct the selected world's Program plus its stream/action
+    registries -- the "small factory" the ``--world`` selector routes
+    through (issue #89). ``reward_config``/``reward_profile`` only apply to
+    ``--world minecraft``; Crafter has no reward-profile system yet (it uses
+    the achievement/health reward the ``crafter`` package computes itself).
+    """
+    world = getattr(args, "world", "minecraft")
+    if world == "minecraft":
+        program = MinecraftSurvivalBox(
+            config=program_config,
+            reward_config=None if reward_profile else reward_config,
+            backend=args.backend,
+            reward_profile=reward_profile,
+        )
+        return program, MINECRAFT_STREAM_REGISTRY, MINECRAFT_ACTION_REGISTRY
+    if world == "crafter":
+        from cognitive_runtime.programs.crafter.action_registry import CRAFTER_ACTION_REGISTRY
+        from cognitive_runtime.programs.crafter.adapter import CrafterWorld
+        from cognitive_runtime.programs.crafter.stream_registry import CRAFTER_STREAM_REGISTRY
+
+        # CrafterWorld imports the optional 'crafter' package lazily, inside
+        # __init__ -- the ImportError (if it's not installed) only surfaces
+        # at construction, not at the module import above.
+        try:
+            program = CrafterWorld(config=program_config)
+        except ImportError as exc:
+            sys.exit(str(exc))
+        return program, CRAFTER_STREAM_REGISTRY, CRAFTER_ACTION_REGISTRY
+    sys.exit(f"unknown --world {world!r}; expected one of {sorted(WORLDS)}")
+
+
 #: Online-learning policies whose model path needs a checkpoint-or-`--fresh`
 #: decision for live runs (issue #33).
 _CHECKPOINTED_POLICIES = {"online": "online_model", "actor-critic": "actor_critic_model"}
@@ -594,24 +651,31 @@ def _enforce_live_run_protocol(args: argparse.Namespace) -> None:
 
 def cmd_run(args: argparse.Namespace) -> None:
     _resolve_world_args(args)
+    world = getattr(args, "world", "minecraft")
+    if world != "minecraft" and args.backend != "simulated":
+        sys.exit(f"--backend only applies to --world minecraft (got --world {world!r})")
+    if world != "minecraft" and args.curriculum is not None:
+        sys.exit(f"--curriculum only applies to --world minecraft (got --world {world!r})")
     _enforce_live_run_protocol(args)
     program_config = _program_config(args)
     reward_profile = _reward_profile_for(args)
-    program = MinecraftSurvivalBox(
-        config=program_config,
-        reward_config=None if reward_profile else _reward_config_for(args),
-        backend=args.backend,
-        reward_profile=reward_profile,
+    if world != "minecraft" and reward_profile is not None:
+        sys.exit(f"--reward-profile only applies to --world minecraft (got --world {world!r})")
+    program, stream_registry, action_registry = _build_program(
+        args, program_config, _reward_config_for(args), reward_profile,
     )
-    encoders = _encoders_for_input_profile(args.input_profile)
+    encoders = _encoders_for_input_profile(args.input_profile, stream_registry)
+    action_space = list(program.metadata().action_space)
     learner = None
     learned_fusion = None
     if args.policy == "online":
         policy, learner = _make_online_policy_and_learner(args, program, encoders)
     elif args.policy == "actor-critic":
-        policy, learner, learned_fusion = _make_actor_critic_policy_and_learner(args, program, encoders)
+        policy, learner, learned_fusion = _make_actor_critic_policy_and_learner(
+            args, program, encoders, stream_registry,
+        )
     else:
-        policy = _make_policy(args.policy, args)
+        policy = _make_policy(args.policy, args, action_space)
     world_model = _make_world_model(args, program)
     entity_persistence = _make_entity_persistence(args)
     config = RuntimeConfig(
@@ -643,10 +707,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         learner=learner,
         world_model=world_model,
         entity_persistence=entity_persistence,
-        stream_registry=MINECRAFT_STREAM_REGISTRY,
+        stream_registry=stream_registry,
         encoders=encoders,
         learned_fusion=learned_fusion,
-        action_registry=MINECRAFT_ACTION_REGISTRY,
+        action_registry=action_registry,
     )
     try:
         summaries = runtime.run()
@@ -1787,6 +1851,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--async-reload-every-ticks", type=int, default=5,
                        help="actor polls for a newer published snapshot every N ticks")
     _add_world_args(p_run)
+    _add_world_selector_arg(p_run)
     _add_world_model_arg(p_run)
     _add_entity_persistence_arg(p_run)
     p_run.set_defaults(func=cmd_run)
@@ -1799,6 +1864,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_demo.add_argument("--name", default=None,
                         help="issue #88: organism name (see 'run --name'); default: generated")
     _add_world_args(p_demo)
+    _add_world_selector_arg(p_demo)
     _add_world_model_arg(p_demo)
     _add_entity_persistence_arg(p_demo)
     p_demo.set_defaults(func=cmd_demo)

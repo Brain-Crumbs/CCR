@@ -24,6 +24,11 @@ dev = ["pytest>=7"]
 # trainer and every heuristic encoder) runs without it. Only the pixel CNN,
 # its trainer and the neural policy import torch, always lazily.
 neural = ["torch>=2"]
+# Crafter nursery world (issue #89): a fast, deterministic, pixel-native 2-D
+# world behind the same Program seam Minecraft uses. Optional and imported
+# lazily (`programs.crafter.adapter`) so `--world minecraft` (the default)
+# never needs it installed.
+crafter = ["crafter>=1.8,<2"]
 
 [project.scripts]
 ccr = "cognitive_runtime.cli:main"
