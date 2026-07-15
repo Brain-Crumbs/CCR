@@ -277,6 +277,7 @@ class CognitiveRuntime:
         meta = self.program.metadata()
         session_metadata = {
             "session_id": self.recorder.session_id,
+            "name": self.config.resolve_name(),
             "program": meta.name,
             "program_version": meta.version,
             "program_tags": list(meta.tags),
@@ -578,6 +579,7 @@ class CognitiveRuntime:
             episode_id=episode_id,
             seed=seed,
             policy_name=self.policy.name,
+            name=self.config.resolve_name(),
             curriculum=self.config.curriculum,
             curriculum_stage_index=self.config.curriculum_stage_index,
             duration_ticks=ticks,

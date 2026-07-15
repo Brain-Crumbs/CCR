@@ -164,6 +164,11 @@ class EpisodeSummary:
     #: this episode; 0 for `reflex_mode != "on"` and for every episode
     #: recorded before this field existed.
     reflex_activations: int = 0
+    #: Organism identity (issue #88): `RuntimeConfig.resolve_name()`'s
+    #: result for the run this episode belongs to; `None` for every episode
+    #: recorded before this field existed (dashboards group those as
+    #: "legacy").
+    name: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

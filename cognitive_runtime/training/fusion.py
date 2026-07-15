@@ -148,6 +148,7 @@ def save_latent_fusion_checkpoint(
     model: LatentFusionTrainingModel,
     dataset: LatentFusionDataset,
     stats: Dict[str, Any],
+    name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Save learned fusion and auxiliary heads in the unified checkpoint format."""
 
@@ -171,6 +172,7 @@ def save_latent_fusion_checkpoint(
             "model_type": "latent-fusion",
             "losses": ["behavior_cloning", "reward_prediction", "next_latent_prediction"],
         },
+        name=name,
     )
     return manager.save(reason="latent_fusion_training")
 

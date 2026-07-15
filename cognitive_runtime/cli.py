@@ -388,6 +388,7 @@ def _make_actor_critic_policy_and_learner(
         action_keys=action_keys,
         online_optimizer=optimizer,
         extra_metadata={"actor_critic": arch},
+        name=getattr(args, "name", None),
     )
     if live_fusion is not None:
         checkpoint_kwargs["encoders"] = live_fusion.encoders
@@ -627,6 +628,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         frame_disk_budget_mb=args.frame_disk_budget_mb,
         pin_on_streams=args.pin_on_streams,
         session_id=args.session_id,
+        name=args.name,
         program_config=program_config,
         curriculum=args.curriculum,
         attention_mode=getattr(args, "attention", "off"),
@@ -882,7 +884,7 @@ def _train_pixel_encoder(args: argparse.Namespace) -> None:
     model, stats = train_pixel_encoder_pretraining(dataset, config)
     out = args.out if args.out != DEFAULT_MODEL_OUT else "models/pixel_encoder.pt"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    save_pixel_encoder_pretraining_checkpoint(out, model, dataset, stats)
+    save_pixel_encoder_pretraining_checkpoint(out, model, dataset, stats, name=args.name)
     for key in (
         "final_total_loss",
         "final_reconstruction_loss",
@@ -931,7 +933,7 @@ def _train_latent_fusion(args: argparse.Namespace) -> None:
     model, stats = train_latent_fusion_model(dataset, config)
     out = args.out if args.out != DEFAULT_MODEL_OUT else "models/latent_fusion.pt"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    save_latent_fusion_checkpoint(out, model, dataset, stats)
+    save_latent_fusion_checkpoint(out, model, dataset, stats, name=args.name)
     for key in (
         "final_action_loss",
         "final_reward_loss",
@@ -980,7 +982,7 @@ def _train_world_model(args: argparse.Namespace) -> None:
     model, stats = train_world_model(dataset, config)
     out = args.out if args.out != DEFAULT_MODEL_OUT else "models/world_model.pt"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    save_world_model_checkpoint(out, model, dataset, stats)
+    save_world_model_checkpoint(out, model, dataset, stats, name=args.name)
     for key in (
         "final_next_latent_loss",
         "final_reward_loss",
@@ -1042,7 +1044,7 @@ def _train_multi_horizon_world_model(args: argparse.Namespace) -> None:
     model, stats = train_multi_horizon_world_model(dataset, config)
     out = args.out if args.out != DEFAULT_MODEL_OUT else "models/multi_horizon_world_model.pt"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    save_multi_horizon_world_model_checkpoint(out, model, dataset, stats)
+    save_multi_horizon_world_model_checkpoint(out, model, dataset, stats, name=args.name)
     for h, entry in stats["evaluation"].items():
         print(
             f"  horizon t+{h}: model_mse={round(entry['model_mse'], 4)} "
@@ -1096,7 +1098,7 @@ def _train_entity_persistence(args: argparse.Namespace) -> None:
     model, stats = train_entity_persistence_model(dataset, config)
     out = args.out if args.out != DEFAULT_MODEL_OUT else "models/entity_persistence.pt"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    save_entity_persistence_checkpoint(out, model, dataset, stats)
+    save_entity_persistence_checkpoint(out, model, dataset, stats, name=args.name)
     for key in ("final_feature_loss", "final_surprise_loss", "final_total_loss",
                 "baseline_mse", "model_mse", "beats_forget_baseline"):
         print(f"  {key}: {stats[key]}")
@@ -1229,6 +1231,7 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
         entity_persistence_epochs=args.entity_persistence_epochs,
         data_quality_gate=not args.skip_data_quality_gate,
         export_predictions=not args.no_export_predictions,
+        name=args.name,
     )
     print(
         f"nursery: running {'all scenarios' if args.scenario == 'all' else args.scenario} "
@@ -1625,6 +1628,7 @@ def cmd_curriculum_run(args: argparse.Namespace) -> None:
             force_promote=args.force_promote,
             fresh=args.fresh,
             record_dir=None if args.no_record else args.record_dir,
+            name=args.name,
         )
     except (CurriculumDefinitionError, ValueError) as exc:
         sys.exit(str(exc))
@@ -1647,7 +1651,7 @@ def cmd_curriculum_run(args: argparse.Namespace) -> None:
 
 
 def cmd_dashboard(args: argparse.Namespace) -> None:
-    print(dashboard(args.record_dir, statistical=args.statistical))
+    print(dashboard(args.record_dir, statistical=args.statistical, name=args.name))
 
 
 def cmd_review(args: argparse.Namespace) -> None:
@@ -1667,6 +1671,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_run = sub.add_parser("run", help="run the runtime with a policy")
+    p_run.add_argument("--name", default=None,
+                       help="issue #88: organism name, threaded into the session id, "
+                            "recorded metadata, checkpoints and exports; default: a "
+                            "generated slug (e.g. sprout-7f3a)")
     p_run.add_argument("--policy", default="scripted",
                        choices=["null", "random", "scripted", "learned", "neural", "online",
                                 "actor-critic", "human"])
@@ -1788,6 +1796,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_demo.add_argument("--tick-rate", type=float, default=20.0)
     p_demo.add_argument("--record-dir", default="sessions")
     p_demo.add_argument("--session-id", default=None)
+    p_demo.add_argument("--name", default=None,
+                        help="issue #88: organism name (see 'run --name'); default: generated")
     _add_world_args(p_demo)
     _add_world_model_arg(p_demo)
     _add_entity_persistence_arg(p_demo)
@@ -1876,6 +1886,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--fresh", action="store_true",
         help="ignore any existing checkpoint and start stage 0 with fresh weights",
     )
+    p_curriculum_run.add_argument("--name", default=None,
+                                  help="issue #88: organism name threaded into every stage's "
+                                       "recorded session metadata and the actor/critic "
+                                       "checkpoint; default: generated per stage run")
     p_curriculum_run.add_argument("--model-seed", type=int, default=1)
     p_curriculum_run.add_argument("--train-seed", type=int, default=100)
     p_curriculum_run.add_argument("--eval-seed", type=int, default=500)
@@ -1886,6 +1900,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_curriculum_run.set_defaults(func=cmd_curriculum_run)
 
     p_train = sub.add_parser("train", help="train a behavioral-cloning policy from sessions")
+    p_train.add_argument("--name", default=None,
+                         help="issue #88: organism name stamped into the trained checkpoint's "
+                              "metadata (model-type checkpoints only, not the plain linear BC "
+                              "model); default: unstamped")
     p_train.add_argument("--sessions", nargs="+", required=True,
                          help="session directories (e.g. sessions/20260101-...-scripted)")
     p_train.add_argument("--out", default=DEFAULT_MODEL_OUT,
@@ -2023,6 +2041,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_run.add_argument(
         "scenario", help="scenario name (see 'nursery list'), or 'all' to run the full suite"
     )
+    p_nursery_run.add_argument("--name", default=None,
+                               help="issue #88: organism name threaded into every recorded "
+                                    "episode's session metadata, prediction exports, and the "
+                                    "trained encoder checkpoint; default: generated per episode")
     p_nursery_run.add_argument("--record-dir", default="sessions",
                                help="directory to record each scenario's train/holdout episodes into")
     p_nursery_run.add_argument("--train-seeds", type=int, default=6,
@@ -2132,6 +2154,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_dash.add_argument("--statistical", action="store_true",
                         help="append the statistical evaluation harness's mean +/- CI "
                              "report (issue #44) for the same (curriculum, policy) groups")
+    p_dash.add_argument("--name", default=None,
+                        help="issue #88: restrict to one organism name (sessions recorded "
+                             "before this field existed group as 'legacy')")
     p_dash.set_defaults(func=cmd_dashboard)
 
     p_review = sub.add_parser(

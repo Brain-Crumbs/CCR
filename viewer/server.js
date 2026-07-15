@@ -61,6 +61,7 @@ function listSessions() {
         .sort();
       return {
         id: e.name,
+        name: meta.name ?? null,
         curriculum: meta.curriculum ?? null,
         program: meta.program ?? null,
         tick_rate: meta.tick_rate ?? null,
@@ -179,7 +180,19 @@ const server = http.createServer((req, res) => {
         }
         if (parts[5] === "predictions") {
           if (!/^episode_\d+$/.test(parts[4])) return sendJSON(res, 404, { error: "bad episode id" });
-          const predPath = path.join(dir, `predictions_${parts[4]}.json`);
+          // Prediction exports are name-prefixed when the session carries an
+          // organism name (issue #88); fall back to the unprefixed legacy
+          // filename for sessions recorded before that field existed.
+          let predPath = path.join(dir, `predictions_${parts[4]}.json`);
+          if (!fs.existsSync(predPath)) {
+            let name = null;
+            try {
+              name = JSON.parse(fs.readFileSync(path.join(dir, "session.json"), "utf8")).name ?? null;
+            } catch {
+              /* unreadable metadata; fall through to 404 below */
+            }
+            if (name) predPath = path.join(dir, `${name}-predictions_${parts[4]}.json`);
+          }
           if (!fs.existsSync(predPath)) {
             return sendJSON(res, 404, { error: "no predictions exported for this episode", hint: "see viewer/export_predictions.py" });
           }

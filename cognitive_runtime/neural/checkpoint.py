@@ -207,10 +207,16 @@ class NeuralAgentCheckpoint:
         training_ticks: int = 0,
         extra_metadata: Optional[Mapping[str, Any]] = None,
         capture_rng: bool = True,
+        name: Optional[str] = None,
     ) -> None:
         self.path = path
         self.layout_hash = layout_hash
         self.action_keys = list(action_keys)
+        #: Organism identity (issue #88): cosmetic provenance only. `None`
+        #: on construction is overwritten by `load()` with whatever name (if
+        #: any) the loaded checkpoint carries -- legacy checkpoints have
+        #: none and still load.
+        self.name = name
         self.encoders = dict(encoders or {})
         self.fusion = fusion
         self.world_model = world_model
@@ -236,6 +242,7 @@ class NeuralAgentCheckpoint:
         return {
             "checkpoint_path": self.path,
             "format": FORMAT_VERSION,
+            "name": self.name,
             "layout_hash": self.layout_hash,
             "action_space_hash": self.action_space_hash,
             "compatibility_hash": self.compatibility_hash,
@@ -320,6 +327,10 @@ class NeuralAgentCheckpoint:
         )
         if growth:
             self.action_keys = expected_keys
+        # Legacy checkpoints predate `name` (issue #88); leave it as
+        # whatever this instance was constructed with rather than clobbering
+        # it with `None`.
+        self.name = metadata.get("name", self.name)
         self.training_ticks = int(metadata.get("training_ticks", self.training_ticks))
         self.training_stats = dict(metadata.get("training_stats", self.training_stats))
         self.replay_metadata = dict(metadata.get("replay_metadata", self.replay_metadata))
@@ -363,6 +374,7 @@ class NeuralAgentCheckpoint:
             "format": FORMAT_VERSION,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "reason": reason,
+            "name": self.name,
             "layout_hash": self.layout_hash,
             "action_keys": list(self.action_keys),
             "action_space_hash": self.action_space_hash,

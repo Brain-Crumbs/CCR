@@ -42,7 +42,7 @@ import argparse
 import base64
 import json
 import os
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 
@@ -91,6 +91,17 @@ def load_full_visual_model(path: str) -> VisualRepresentationModel:
     return model
 
 
+def _session_name(session_dir: str) -> Optional[str]:
+    """Best-effort read of the recorded organism name (issue #88) from
+    ``session.json``, for prefixing export filenames; `None` for sessions
+    recorded before the field existed or with no metadata at all."""
+    try:
+        with open(os.path.join(session_dir, "session.json"), encoding="utf-8") as fh:
+            return json.load(fh).get("name")
+    except (OSError, ValueError):
+        return None
+
+
 def _b64_frame(chw: torch.Tensor) -> str:
     """``Tensor[C, H, W]`` in [0, 1] -> base64 of HWC uint8 bytes."""
     hwc = (chw.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).permute(1, 2, 0)
@@ -103,9 +114,14 @@ def export_prediction_file(
     episode_id: str,
     horizons: Sequence[int],
     out_path: str | None = None,
+    name: Optional[str] = None,
 ) -> str:
     """Roll the model out from every start frame and write
-    ``predictions_<episode>.json`` into ``session_dir``. Returns the path."""
+    ``predictions_<episode>.json`` into ``session_dir``. Returns the path.
+
+    The filename is prefixed with the organism ``name`` (issue #88) --
+    explicit if given, else read from the session's own recorded metadata,
+    else left unprefixed for a legacy nameless session."""
 
     horizons_sorted = sorted({int(h) for h in horizons if int(h) > 0})
     if not horizons_sorted:
@@ -146,7 +162,13 @@ def export_prediction_file(
         "predictions": predictions,
         "targets": [_b64_frame(targets[i]) for i in range(len(frames))],
     }
-    out_path = out_path or os.path.join(session_dir, f"predictions_{episode_id}.json")
+    if out_path is None:
+        resolved_name = name or _session_name(session_dir)
+        filename = (
+            f"{resolved_name}-predictions_{episode_id}.json"
+            if resolved_name else f"predictions_{episode_id}.json"
+        )
+        out_path = os.path.join(session_dir, filename)
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
     return out_path

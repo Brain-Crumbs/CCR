@@ -132,6 +132,11 @@ class NurseryConfig:
     #: fallback instead.  ``None`` accepts either, but still refuses to mix
     #: sources within one training run.
     expected_pixel_source: Optional[str] = None
+    #: Organism identity (issue #88): threaded into every recorded episode's
+    #: `RuntimeConfig.name`, so its session metadata, prediction exports, and
+    #: the encoder checkpoint all carry it. ``None`` lets each recorded
+    #: episode resolve its own generated name (cosmetic only).
+    name: Optional[str] = None
 
 
 @dataclass
@@ -661,6 +666,7 @@ def _record_scenario_episode(
         realtime=cfg.realtime,
         record_frames=True,
         curriculum=f"nursery/{scenario.name}",
+        name=cfg.name,
     )
     program = MinecraftSurvivalBox(config=program_config, backend=cfg.backend)
     if recording.scene_setup is not None and cfg.backend == "simulated":
@@ -1157,4 +1163,6 @@ def save_nursery_scenario_checkpoint(
         pixel_shape=model.pixel_shape,
         representation=f"nursery-{report.scenario}",
     )
-    return save_pixel_encoder_pretraining_checkpoint(path, model, dataset_stub, stats)
+    return save_pixel_encoder_pretraining_checkpoint(
+        path, model, dataset_stub, stats, name=report.config.name
+    )

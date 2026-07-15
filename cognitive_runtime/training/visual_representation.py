@@ -250,6 +250,7 @@ def save_pixel_encoder_pretraining_checkpoint(
     model: VisualRepresentationModel,
     dataset: PixelSequenceDataset,
     stats: Dict[str, Any],
+    name: Optional[str] = None,
 ) -> Dict[str, Any]:
     manager = NeuralAgentCheckpoint(
         path,
@@ -267,6 +268,7 @@ def save_pixel_encoder_pretraining_checkpoint(
             "model_type": "pixel-encoder",
             "losses": ["reconstruction", "next_latent_prediction", "contrastive_consistency"],
         },
+        name=name,
     )
     return manager.save(reason="pixel_encoder_pretraining")
 
