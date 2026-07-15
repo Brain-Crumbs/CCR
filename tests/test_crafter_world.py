@@ -79,7 +79,7 @@ def test_stream_catalog_covers_the_crafter_taxonomy():
         "vision.frame.grid", "vision.frame.pixels",
         "body.health", "body.food", "body.drink", "body.energy",
         "body.inventory", "body.sleeping", "body.alive",
-        "spatial.position",
+        "spatial.position", "spatial.facing",
         "event.achievement", "event.died", "event.action_rejected",
         "reward.scalar",
     }

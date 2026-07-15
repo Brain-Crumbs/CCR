@@ -84,6 +84,14 @@ class CrafterWorld(Program):
         #: name -> highest count seen this episode (achievements are
         #: cumulative counters, not one-shot flags -- see event.achievement).
         self._achievements_earned: Dict[str, int] = {}
+        #: Set by ``freeze_reset()`` (issue #90's scripted nursery scenarios,
+        #: e.g. ``object_permanence``'s scripted mob path): once set,
+        #: ``reset()`` re-derives state from the already-edited ``self._env``
+        #: instead of constructing a fresh one, so a caller's scripted world
+        #: edits survive ``CognitiveRuntime.run()``'s own ``reset(seed)`` call
+        #: at episode start (mirrors Minecraft scene-setup's
+        #: ``world.reset = lambda seed: None`` convention).
+        self._env_frozen = False
         self.initialize(config)
 
     # ------------------------------------------------------------ interface
@@ -93,19 +101,34 @@ class CrafterWorld(Program):
             self._config = CrafterConfig.from_dict(config)
         self.reset(seed=self._seed)
 
+    def freeze_reset(self) -> None:
+        """Defeat future ``reset()`` calls rebuilding ``self._env`` -- for a
+        scripted nursery scenario (issue #90) that has just finished editing
+        the live env's world (walls, a scripted mob path) and needs that
+        state to survive ``CognitiveRuntime.run()``'s own ``reset(seed)`` at
+        episode start."""
+        self._env_frozen = True
+
     def reset(self, seed: Optional[int] = None) -> None:
         if seed is not None:
             self._seed = seed
-        # A fresh Env per reset, not env.reset(): crafter.Env.reset() seeds
-        # each episode off hash((self._seed, self._episode)), so calling
-        # reset() twice on one instance produces two *different* worlds. A
-        # new instance keyed on the seed alone is what makes reset(seed)
-        # reproducible -- this Program's determinism contract.
-        self._env = self._crafter.Env(
-            area=self._config.area, view=self._config.view, size=self._config.size,
-            length=self._config.episode_ticks, seed=self._seed,
-        )
-        pixels = self._env.reset()
+        if self._env_frozen:
+            # A frozen env keeps its scripted world exactly as edited; only
+            # re-derive state/observation from it (no ``env.reset()``, which
+            # would regenerate the world and evict every scripted edit).
+            pixels = self._env.render()
+        else:
+            # A fresh Env per reset, not env.reset(): crafter.Env.reset()
+            # seeds each episode off hash((self._seed, self._episode)), so
+            # calling reset() twice on one instance produces two *different*
+            # worlds. A new instance keyed on the seed alone is what makes
+            # reset(seed) reproducible -- this Program's determinism
+            # contract.
+            self._env = self._crafter.Env(
+                area=self._config.area, view=self._config.view, size=self._config.size,
+                length=self._config.episode_ticks, seed=self._seed,
+            )
+            pixels = self._env.reset()
         self._tick = 0
         self._dead = False
         self._done = False
@@ -296,4 +319,9 @@ class CrafterWorld(Program):
             "death_reason": "health" if self._dead else None,
             "achievements_unlocked": sum(1 for c in self._achievements_earned.values() if c),
             "achievement_counts": dict(self._achievements_earned),
+            # Unlike Minecraft's grid/viewer duality, Crafter's pixel frame
+            # always comes from the same native renderer -- issue #90's
+            # data-quality gate (record.quality) still reads this key to
+            # confirm provenance across worlds via one shared field.
+            "pixel_sources": ["crafter"],
         }

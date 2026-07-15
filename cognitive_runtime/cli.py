@@ -1233,13 +1233,15 @@ def cmd_ego_motion_canary(args: argparse.Namespace) -> None:
 def cmd_nursery_list(args: argparse.Namespace) -> None:
     """``ccr nursery list`` (issue #62): print every registered nursery
     scenario -- scripted micro-scenarios that isolate one worldly regularity
-    each, feeding checkpoints into the survival curriculum's stage one."""
+    each, feeding checkpoints into the survival curriculum's stage one.
+    ``--world crafter`` (issue #90) lists the Crafter ports instead."""
     try:
-        from cognitive_runtime.training.nursery import NURSERY_SCENARIOS
+        from cognitive_runtime.training.nursery import _scenarios_for_world
     except ImportError as exc:  # torch not installed
         sys.exit(f"the nursery suite needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
-    for name in sorted(NURSERY_SCENARIOS):
-        scenario = NURSERY_SCENARIOS[name]
+    scenarios = _scenarios_for_world(getattr(args, "world", "minecraft"))
+    for name in sorted(scenarios):
+        scenario = scenarios[name]
         tag = " [+entity-persistence metric]" if scenario.entity_persistence_metric else ""
         print(f"{name}{tag}: {scenario.description}")
 
@@ -1259,20 +1261,22 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
         import json
 
         from cognitive_runtime.training.nursery import (
-            NURSERY_SCENARIOS,
             NurseryConfig,
+            _scenarios_for_world,
             run_nursery_scenario,
             save_nursery_scenario_checkpoint,
         )
     except ImportError as exc:  # torch not installed
         sys.exit(f"the nursery suite needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
 
-    if args.scenario != "all" and args.scenario not in NURSERY_SCENARIOS:
+    world = getattr(args, "world", "minecraft")
+    scenarios = _scenarios_for_world(world)
+    if args.scenario != "all" and args.scenario not in scenarios:
         sys.exit(
-            f"unknown nursery scenario {args.scenario!r}; choices: "
-            f"{sorted(NURSERY_SCENARIOS)} or 'all'"
+            f"unknown nursery scenario {args.scenario!r} for --world {world!r}; choices: "
+            f"{sorted(scenarios)} or 'all'"
         )
-    scenario_names = sorted(NURSERY_SCENARIOS) if args.scenario == "all" else [args.scenario]
+    scenario_names = sorted(scenarios) if args.scenario == "all" else [args.scenario]
 
     train_seeds = list(range(args.train_seeds))
     holdout_seeds = list(range(args.train_seeds, args.train_seeds + args.holdout_seeds))
@@ -1281,6 +1285,7 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
         holdout_seeds=holdout_seeds,
         episode_ticks=args.episode_ticks,
         world_size=args.world_size,
+        world=world,
         backend=args.backend,
         realtime=args.realtime or args.backend == "remote",
         horizons=args.horizons,
@@ -1297,13 +1302,13 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
         export_predictions=not args.no_export_predictions,
         name=args.name,
     )
+    backend_note = f"backend={config.backend}" if world == "minecraft" else f"world={world}"
     print(
         f"nursery: running {'all scenarios' if args.scenario == 'all' else args.scenario} "
         f"({len(train_seeds)} train seeds, {len(holdout_seeds)} held-out seeds, "
-        f"{config.episode_ticks} ticks each, world_size={config.world_size}, "
-        f"backend={config.backend})"
+        f"{config.episode_ticks} ticks each, world_size={config.world_size}, {backend_note})"
     )
-    if config.backend != "simulated":
+    if world == "minecraft" and config.backend != "simulated":
         print(
             "nursery: WARNING -- the remote backend plays on the server's persistent "
             "world: seeds do NOT vary terrain, each session starts where the previous "
@@ -2099,6 +2104,9 @@ def build_parser() -> argparse.ArgumentParser:
     nursery_sub = p_nursery.add_subparsers(dest="nursery_command", required=True)
 
     p_nursery_list = nursery_sub.add_parser("list", help="list available nursery scenarios")
+    p_nursery_list.add_argument("--world", default="minecraft", choices=sorted(WORLDS),
+                                help="issue #90: list Minecraft's scenarios (default) or "
+                                     "Crafter's ports (--world crafter)")
     p_nursery_list.set_defaults(func=cmd_nursery_list)
 
     p_nursery_run = nursery_sub.add_parser(
@@ -2107,6 +2115,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_run.add_argument(
         "scenario", help="scenario name (see 'nursery list'), or 'all' to run the full suite"
     )
+    p_nursery_run.add_argument("--world", default="minecraft", choices=sorted(WORLDS),
+                               help="issue #90: record against Minecraft's simulated/remote "
+                                    "backend (default) or the Crafter nursery world "
+                                    "(--world crafter; needs the 'crafter' extra installed). "
+                                    "--backend/--world-size only apply to --world minecraft.")
     p_nursery_run.add_argument("--name", default=None,
                                help="issue #88: organism name threaded into every recorded "
                                     "episode's session metadata, prediction exports, and the "

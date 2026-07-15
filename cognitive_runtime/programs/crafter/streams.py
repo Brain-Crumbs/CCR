@@ -137,6 +137,11 @@ def build_crafter_stream_specs(
                    payload_schema="bool", neutral=1.0),
         StreamSpec("spatial.position", "spatial", "Agent grid position, on change.",
                    payload_schema="{x, y}", range=(0.0, world_size), neutral=world_size / 2.0),
+        StreamSpec("spatial.facing", "spatial",
+                   "Agent facing direction, on change -- a discrete grid flip "
+                   "((-1,0)/(1,0)/(0,-1)/(0,1)), not a continuous yaw; updates on every "
+                   "directional move attempt, even one blocked by terrain.",
+                   payload_schema="{x, y}"),
         StreamSpec("event.achievement", "event",
                    "Achievement counter incremented (repeatable per episode, unlike "
                    "Minecraft's once-only event.advancement).",
@@ -213,6 +218,7 @@ class CrafterStreamPublisher:
         pub("body.sleeping", state["sleeping"])
         pub("body.alive", state["alive"])
         pub("spatial.position", state["position"])
+        pub("spatial.facing", state["facing"])
 
         for name, count in achievement_events:
             published.append(
