@@ -241,6 +241,10 @@ class ActionWorldModelConfig:
     pixel_loss_weight: float = 1.0
     latent_loss_weight: float = 1.0
     seed: int = 0
+    #: Horizons in ticks (not frames), persisted with the checkpoint so
+    #: "T+8" means the same thing across worlds/sample rates. Convert to
+    #: frame steps per-recording via ``horizons_ticks_to_frames``.
+    horizons_ticks: Tuple[int, ...] = (1, 4, 8)
 
 
 def build_action_world_model(
@@ -248,70 +252,26 @@ def build_action_world_model(
     action_keys: Sequence[str],
     config: Optional[ActionWorldModelConfig] = None,
 ):
-    """Construct an ``ActionConditionedWorldModel`` (requires torch)."""
-    torch, _F = _torch()
-    import torch.nn as nn  # noqa: PLC0415
+    """Construct a :class:`brain.cortex.predictive.PredictiveCortex`
+    (requires torch).
 
-    from cognitive_runtime.neural.pixel_stream_encoder import PixelStreamEncoder
-    from cognitive_runtime.training.visual_representation import (
-        PixelReconstructionDecoder,
-        _reconstruction_shape,
-    )
+    This is a thin re-export shim (issue #91): the model itself -- encoder
+    + action-conditioned GRU transition + latent head + decoder, plus the
+    multi-horizon reward/terminal/risk/uncertainty heads -- now lives in
+    ``brain.cortex.predictive``, promoted out of this module. Callers of
+    this function are unaffected.
+    """
+    from brain.cortex.predictive import PredictiveCortex, PredictiveCortexConfig
 
     cfg = config or ActionWorldModelConfig()
-
-    class ActionConditionedWorldModel(nn.Module):
-        """Encoder + action-conditioned GRU transition + decoder.
-
-        The GRU hidden state is the model's world state: it accumulates
-        observation history (so rotation *rate* is representable) and is
-        advanced by ``(latent, action)`` pairs.  Closed-loop rollout feeds
-        predicted latents back in, so evaluation exercises exactly the
-        multi-horizon interface the nursery benchmarks.
-        """
-
-        def __init__(self) -> None:
-            super().__init__()
-            self.pixel_shape = tuple(int(d) for d in pixel_shape)
-            self.action_keys = list(action_keys)
-            self.latent_width = cfg.latent_width
-            self.hidden_dim = cfg.hidden_dim
-            self.reconstruction_shape = _reconstruction_shape(
-                self.pixel_shape, cfg.reconstruction_size
-            )
-            self.encoder = PixelStreamEncoder(self.pixel_shape, latent_width=cfg.latent_width)
-            self.action_embedding = nn.Embedding(len(self.action_keys), cfg.action_embed_dim)
-            self.transition = nn.GRUCell(
-                cfg.latent_width + cfg.action_embed_dim, cfg.hidden_dim
-            )
-            self.latent_head = nn.Linear(cfg.hidden_dim, cfg.latent_width)
-            self.decoder = PixelReconstructionDecoder(
-                cfg.latent_width, self.reconstruction_shape, hidden_dim=cfg.hidden_dim
-            )
-
-        def initial_state(self, batch: int):
-            weight = self.latent_head.weight
-            return weight.new_zeros(batch, self.hidden_dim)
-
-        def step(self, latent, action_idx, hidden):
-            """Advance the world state by one (latent, action) pair; returns
-            (predicted next latent, next hidden)."""
-            embedded = self.action_embedding(action_idx)
-            hidden = self.transition(torch.cat([latent, embedded], dim=-1), hidden)
-            return self.latent_head(hidden), hidden
-
-        def rollout(self, start_latent, actions, hidden):
-            """Closed-loop rollout: from ``start_latent`` and world state
-            ``hidden``, apply ``actions`` ([B, R] indices) feeding each
-            predicted latent back in; returns predicted latents [B, R, L]."""
-            predictions = []
-            latent = start_latent
-            for i in range(actions.shape[1]):
-                latent, hidden = self.step(latent, actions[:, i], hidden)
-                predictions.append(latent)
-            return torch.stack(predictions, dim=1), hidden
-
-    return ActionConditionedWorldModel()
+    cortex_cfg = PredictiveCortexConfig(
+        latent_width=cfg.latent_width,
+        hidden_dim=cfg.hidden_dim,
+        action_embed_dim=cfg.action_embed_dim,
+        reconstruction_size=cfg.reconstruction_size,
+        horizons_ticks=tuple(cfg.horizons_ticks),
+    )
+    return PredictiveCortex(pixel_shape, action_keys, cortex_cfg)
 
 
 # --------------------------------------------------------------------------- training
@@ -718,7 +678,11 @@ def _ridge_probe(x, y, l2: float = 1e-3) -> Dict[str, float]:
 def save_action_world_model(path: str, model: Any, stats: Dict[str, Any]) -> None:
     """Persist the full model (encoder + transition + decoder) so rollouts
     remain reproducible after the process exits -- the nursery's
-    encoder-only checkpoint cannot regenerate predictions."""
+    encoder-only checkpoint cannot regenerate predictions.
+
+    ``horizons_ticks`` (issue #91, task 4) is persisted here too, so a
+    reloaded model's configured horizons survive the round trip unchanged.
+    """
     torch, _F = _torch()
     torch.save(
         {
@@ -728,6 +692,7 @@ def save_action_world_model(path: str, model: Any, stats: Dict[str, Any]) -> Non
             "latent_width": model.latent_width,
             "hidden_dim": model.hidden_dim,
             "reconstruction_shape": list(model.reconstruction_shape),
+            "horizons_ticks": list(model.horizons_ticks),
             "state_dict": model.state_dict(),
             "training_stats": stats,
         },
@@ -744,6 +709,7 @@ def load_action_world_model(path: str):
         latent_width=int(payload["latent_width"]),
         hidden_dim=int(payload["hidden_dim"]),
         reconstruction_size=int(payload["reconstruction_shape"][0]),
+        horizons_ticks=tuple(payload.get("horizons_ticks", ActionWorldModelConfig.horizons_ticks)),
     )
     model = build_action_world_model(
         tuple(payload["pixel_shape"]), payload["action_keys"], cfg

@@ -11,7 +11,9 @@ torch = pytest.importorskip("torch")
 
 from cognitive_runtime.training.action_world_model import (  # noqa: E402
     ActionWorldModelConfig,
+    _episode_tensors,
     build_action_sequence_dataset,
+    build_action_world_model,
     evaluate_action_world_model,
     horizons_ticks_to_frames,
     linear_probe_yaw,
@@ -26,6 +28,7 @@ from cognitive_runtime.training.nursery import (  # noqa: E402
     run_nursery_joint,
 )
 from cognitive_runtime.training.action_world_model import ActionWorldModelConfig  # noqa: E402
+from brain.cortex.predictive import PredictiveCortex  # noqa: E402
 
 
 def _small_nursery_config(**overrides) -> NurseryConfig:
@@ -188,3 +191,85 @@ def test_run_nursery_joint_rejects_overlapping_scenarios(tmp_path):
             holdout_scenarios=["turn_in_place"],
             config=_small_nursery_config(),
         )
+
+
+# ---------------------------------------------------------------- issue #91
+# Predictive Cortex: promotion to brain/cortex/predictive.py, merged
+# multi-horizon + uncertainty heads, ticks-denominated horizons.
+
+
+def test_build_action_world_model_returns_predictive_cortex(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model = build_action_world_model(
+        dataset.pixel_shape, dataset.action_keys, _small_model_config()
+    )
+    assert isinstance(model, PredictiveCortex)
+
+
+def test_forward_horizons_yields_decoded_frame_and_heads_at_every_horizon(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    episodes = _episode_tensors(dataset, model.reconstruction_shape)
+    _episode, pixels, _targets, actions = episodes[0]
+    assert actions.shape[0] >= 3
+
+    with torch.no_grad():
+        latents = model.encoder(pixels)
+        hidden = model.initial_state(1)
+        out = model.forward_horizons(
+            latents[:1], actions[:3].unsqueeze(0), hidden, horizon_frames=[1, 3]
+        )
+
+    h, w, c = model.reconstruction_shape
+    assert set(out.horizons) == {1, 3}
+    for horizon, pred in out.horizons.items():
+        # Decoder output is CHW (matches the pixel/reconstruction-target
+        # convention elsewhere in this module), same input shape at every
+        # horizon -- the "decoded-frame shape equals input shape" criterion.
+        assert pred.decoded.shape == (1, c, h, w)
+        assert pred.latent.shape == (1, model.latent_width)
+        assert pred.reward.shape == (1,)
+        assert pred.terminal_logit.shape == (1,)
+        assert pred.risk.shape == (1,)
+        assert pred.uncertainty.shape == (1,)
+        assert bool((pred.uncertainty >= 0).all())
+        assert bool((pred.risk >= 0).all())
+    # Horizon 3's decoded frame is not just a repeat of horizon 1's: the
+    # heads read a state that actually advanced through the rollout.
+    assert not torch.allclose(out[1].latent, out[3].latent)
+
+
+def test_forward_horizons_rejects_non_positive_horizon(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    start_latent = torch.zeros(1, model.latent_width)
+    actions = torch.zeros(1, 1, dtype=torch.long)
+    with pytest.raises(ValueError, match="positive"):
+        model.forward_horizons(start_latent, actions, model.initial_state(1), horizon_frames=[0])
+
+
+def test_forward_horizons_rejects_insufficient_actions(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    start_latent = torch.zeros(1, model.latent_width)
+    actions = torch.zeros(1, 1, dtype=torch.long)
+    with pytest.raises(ValueError, match="actions must cover"):
+        model.forward_horizons(start_latent, actions, model.initial_state(1), horizon_frames=[5])
+
+
+def test_default_horizons_ticks_is_1_4_8(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    assert model.horizons_ticks == (1, 4, 8)
+
+
+def test_horizons_ticks_persist_through_checkpoint_round_trip(turn_session, tmp_path):
+    dataset = build_action_sequence_dataset([turn_session])
+    cfg = _small_model_config(horizons_ticks=(1, 2, 5))
+    model, stats = train_action_world_model(dataset, cfg)
+    assert model.horizons_ticks == (1, 2, 5)
+
+    path = os.path.join(str(tmp_path), "cortex.pt")
+    save_action_world_model(path, model, stats)
+    reloaded, _stats = load_action_world_model(path)
+    assert reloaded.horizons_ticks == (1, 2, 5)
