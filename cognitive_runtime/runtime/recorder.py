@@ -178,6 +178,11 @@ class EpisodeSummary:
     #: accumulated for a fit, and for every episode recorded before this
     #: field existed.
     surprise_calibration_error: Optional[float] = None
+    #: The hippocampus's episodic seed store size at the end of this episode
+    #: (issue #96) -- persists across episodes within a run, so this is a
+    #: running total, not a per-episode count. 0 for every episode recorded
+    #: before this field existed.
+    hippocampus_seeds: int = 0
     #: Organism identity (issue #88): `RuntimeConfig.resolve_name()`'s
     #: result for the run this episode belongs to; `None` for every episode
     #: recorded before this field existed (dashboards group those as
