@@ -29,6 +29,17 @@ promoted prototype:
 Latent + decoder discipline (short rollout, scheduled sampling, latent
 loss primary / pixel loss auxiliary) is a training-loop concern and stays
 in ``training/action_world_model.py``, unchanged.
+
+**Temporal backbone as an A/B choice (issue #93, task 5).** The GRU
+transition is one ``brain.cortex.backbones.TemporalBackbone`` among several
+selectable via ``PredictiveCortexConfig.backbone``: a dilated temporal-conv
+(WaveNet-style) or a small transformer, both processing a window of recent
+``(latent, action)`` pairs in one parallel pass instead of the GRU's
+one-step-at-a-time recurrence. All three backbones implement the same
+``initial_state``/``step``/``readout`` contract (``brain.cortex.backbones``),
+so :meth:`PredictiveCortex.step`, :meth:`rollout`, and
+:meth:`forward_horizons` are backbone-agnostic -- swapping the backbone is a
+config change, not a fork.
 """
 
 from __future__ import annotations
@@ -61,6 +72,19 @@ class PredictiveCortexConfig:
     #: checkpoint. Frame-space horizons for a given recording are derived
     #: via ``horizons_ticks_to_frames(horizons_ticks, ticks_per_frame)``.
     horizons_ticks: Tuple[int, ...] = field(default=DEFAULT_HORIZONS_TICKS)
+    #: Transition backbone (issue #93): ``"gru"`` (default, unbounded
+    #: recurrent context), ``"dilated_conv"`` (WaveNet-style causal dilated
+    #: convolutions over a window), or ``"transformer"`` (causal
+    #: self-attention over a window). See ``brain.cortex.backbones``.
+    backbone: str = "gru"
+    #: Window size (in frame steps) the windowed backbones
+    #: (``dilated_conv``/``transformer``) attend over; ignored by ``"gru"``.
+    #: Persisted with the checkpoint so a reloaded model's window matches
+    #: what it was trained with.
+    context_length: int = 8
+    #: Extra backbone-specific constructor kwargs (e.g. ``kernel_size``,
+    #: ``n_layers``, ``n_heads``); not persisted with the checkpoint.
+    backbone_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -114,6 +138,7 @@ class PredictiveCortex(nn.Module):
         config: Optional[PredictiveCortexConfig] = None,
     ) -> None:
         super().__init__()
+        from brain.cortex.backbones import build_backbone
         from cognitive_runtime.neural.pixel_stream_encoder import PixelStreamEncoder
         from cognitive_runtime.training.visual_representation import (
             PixelReconstructionDecoder,
@@ -137,7 +162,13 @@ class PredictiveCortex(nn.Module):
 
         self.encoder = PixelStreamEncoder(self.pixel_shape, latent_width=cfg.latent_width)
         self.action_embedding = nn.Embedding(len(self.action_keys), cfg.action_embed_dim)
-        self.transition = nn.GRUCell(cfg.latent_width + cfg.action_embed_dim, cfg.hidden_dim)
+        self.transition_backbone = build_backbone(
+            cfg.backbone,
+            cfg.latent_width + cfg.action_embed_dim,
+            cfg.hidden_dim,
+            context_length=cfg.context_length,
+            **cfg.backbone_kwargs,
+        )
         self.latent_head = nn.Linear(cfg.hidden_dim, cfg.latent_width)
         self.decoder = PixelReconstructionDecoder(
             cfg.latent_width, self.reconstruction_shape, hidden_dim=cfg.hidden_dim
@@ -156,27 +187,47 @@ class PredictiveCortex(nn.Module):
         #: ensemble.
         self.uncertainty_head = nn.Linear(cfg.hidden_dim, 1)
 
-    def initial_state(self, batch: int) -> torch.Tensor:
-        weight = self.latent_head.weight
-        return weight.new_zeros(batch, self.hidden_dim)
+    def initial_state(self, batch: int) -> Any:
+        return self.transition_backbone.initial_state(batch)
+
+    def set_context_length(self, n: Optional[int]) -> None:
+        """Context-length curriculum hook (issue #93, task 5): a no-op for
+        the ``"gru"`` backbone, else restricts the windowed backbone's
+        attended-over window to the last ``n`` steps of its buffer."""
+        self.transition_backbone.set_context_length(n)
+
+    @property
+    def context_length_max(self) -> Optional[int]:
+        """``None`` for backbones with no fixed window (``"gru"``); else the
+        window size the curriculum ramps up to."""
+        return self.transition_backbone.context_length_max
 
     def step(
-        self, latent: torch.Tensor, action_idx: torch.Tensor, hidden: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self, latent: torch.Tensor, action_idx: torch.Tensor, hidden: Any
+    ) -> Tuple[torch.Tensor, Any]:
         """Advance the world state by one ``(latent, action)`` pair; returns
-        ``(predicted next latent, next hidden)``."""
-        embedded = self.action_embedding(action_idx)
-        hidden = self.transition(torch.cat([latent, embedded], dim=-1), hidden)
-        return self.latent_head(hidden), hidden
+        ``(predicted next latent, next hidden)``.
 
-    def heads(self, hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ``hidden`` is an opaque state object owned by the configured
+        backbone (a ``Tensor[batch, hidden_dim]`` for ``"gru"``; a
+        ``(window buffer, last hidden)`` pair for the windowed backbones) --
+        callers thread it back into the next ``step``/``heads`` call without
+        inspecting it, exactly as before backbones were selectable.
+        """
+        embedded = self.action_embedding(action_idx)
+        x = torch.cat([latent, embedded], dim=-1)
+        hidden_repr, next_state = self.transition_backbone.step(x, hidden)
+        return self.latent_head(hidden_repr), next_state
+
+    def heads(self, hidden: Any) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reward / terminal-logit / risk / uncertainty read off one rollout
-        step's hidden state; returns four ``Tensor[batch]``."""
+        step's world state; returns four ``Tensor[batch]``."""
+        hidden_repr = self.transition_backbone.readout(hidden)
         return (
-            self.reward_head(hidden).squeeze(-1),
-            self.terminal_head(hidden).squeeze(-1),
-            F.softplus(self.risk_head(hidden)).squeeze(-1),
-            F.softplus(self.uncertainty_head(hidden)).squeeze(-1),
+            self.reward_head(hidden_repr).squeeze(-1),
+            self.terminal_head(hidden_repr).squeeze(-1),
+            F.softplus(self.risk_head(hidden_repr)).squeeze(-1),
+            F.softplus(self.uncertainty_head(hidden_repr)).squeeze(-1),
         )
 
     def rollout(
@@ -248,6 +299,8 @@ class PredictiveCortex(nn.Module):
             "hidden_dim": self.hidden_dim,
             "reconstruction_shape": list(self.reconstruction_shape),
             "horizons_ticks": list(self.horizons_ticks),
+            "backbone": self.config.backbone,
+            "context_length": self.config.context_length,
         }
 
 

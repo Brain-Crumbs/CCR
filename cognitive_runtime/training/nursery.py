@@ -1314,6 +1314,154 @@ def run_action_ablation_eval(
     )
 
 
+# --------------------------------------------------------------------------- backbone benchmark (issue #93)
+
+
+@dataclass
+class BackboneBenchmarkReport:
+    """A/B benchmark of the cortex's temporal backbones
+    (docs/v2/phases/phase-2-predictive-cortex.md task 5): the same
+    recordings, the same architecture and training budget otherwise, only
+    ``ActionWorldModelConfig.backbone`` differs -- so a difference in the
+    Phase 2 scoring gates (``model/copy-last``, ``model/oracle``,
+    frozen-rollout) is attributable to the backbone choice, not noise."""
+
+    train_scenarios: List[str]
+    eval_scenario: str
+    baseline_backbone: str
+    #: backbone name -> full ``evaluate_action_world_model`` report (the
+    #: Phase 2 scoring gates per horizon, plus rollout health).
+    metrics: Dict[str, Dict[str, Any]]
+    #: backbone name -> per-horizon mean +/- CI over held-out seeds.
+    stats: Dict[str, Dict[int, MetricStats]]
+    #: backbone name (excluding ``baseline_backbone``) -> per-horizon
+    #: regression comparison against the baseline backbone.
+    comparisons: Dict[str, Dict[int, MetricComparison]]
+    #: backbone name -> {horizon: beats_copy_last} (the Milestone 2 gate
+    #: each backbone must clear on its own to be a credible alternative).
+    beats_copy_last: Dict[str, Dict[int, bool]]
+
+
+def run_backbone_benchmark(
+    record_dir: str,
+    train_scenarios: Sequence[str] = ("walk_forward", "turn_in_place"),
+    eval_scenario: str = "turn_in_place",
+    backbones: Sequence[str] = ("gru", "dilated_conv", "transformer"),
+    baseline_backbone: str = "gru",
+    config: Optional[NurseryConfig] = None,
+    model_config: Optional[ActionWorldModelConfig] = None,
+) -> BackboneBenchmarkReport:
+    """Train the cortex once per backbone on identical recorded data and
+    compare held-out ``eval_scenario`` performance -- the "benchmark harness
+    reports GRU vs temporal-conv/transformer on the Phase 2 scoring gates"
+    exit criterion (issue #93).
+
+    Mirrors :func:`run_action_ablation_eval`'s shape (same recordings, same
+    dataset, only the varied field of ``ActionWorldModelConfig`` differs
+    across runs) so the two harnesses read the same way.
+    """
+    cfg = config or NurseryConfig()
+    if eval_scenario not in train_scenarios:
+        raise ValueError(
+            f"eval_scenario {eval_scenario!r} must be one of the trained scenarios "
+            f"{list(train_scenarios)!r}"
+        )
+    if baseline_backbone not in backbones:
+        raise ValueError(
+            f"baseline_backbone {baseline_backbone!r} must be one of backbones {list(backbones)!r}"
+        )
+    if set(cfg.train_seeds) & set(cfg.holdout_seeds):
+        raise ValueError("train_seeds and holdout_seeds must not overlap")
+
+    scenarios = _scenarios_for_world(cfg.world)
+    for name in train_scenarios:
+        if name not in scenarios:
+            raise ValueError(
+                f"unknown nursery scenario {name!r} for --world {cfg.world!r}; "
+                f"choices: {sorted(scenarios)}"
+            )
+
+    base_model_cfg = model_config or ActionWorldModelConfig(
+        latent_width=cfg.latent_width,
+        hidden_dim=cfg.hidden_dim,
+        reconstruction_size=cfg.reconstruction_size,
+        epochs=cfg.epochs,
+        lr=cfg.lr,
+        batch_size=cfg.batch_size,
+        seed=cfg.seed,
+    )
+
+    train_sessions: Dict[str, List[str]] = {}
+    eval_sessions: Dict[str, List[str]] = {}
+    for name in train_scenarios:
+        scenario = scenarios[name]
+        train_sessions[name] = [
+            _record_scenario_episode(record_dir, f"backbone-bench-{name}-train-{seed}", seed, scenario, cfg)
+            for seed in cfg.train_seeds
+        ]
+        eval_sessions[name] = [
+            _record_scenario_episode(record_dir, f"backbone-bench-{name}-holdout-{seed}", seed, scenario, cfg)
+            for seed in cfg.holdout_seeds
+        ]
+
+    if cfg.data_quality_gate:
+        issues: List[str] = []
+        for name in train_scenarios:
+            issues += validate_nursery_recordings(
+                train_sessions[name] + eval_sessions[name], scenarios[name],
+                expected_pixel_source=cfg.expected_pixel_source,
+            )
+        if issues:
+            raise ValueError(
+                "backbone benchmark: recorded data fails the quality gate:\n  - "
+                + "\n  - ".join(issues)
+            )
+
+    from cognitive_runtime.training.features import ACTION_KEYS
+
+    vocabulary = list(ACTION_KEYS)
+    if NULL_ACTION.name not in vocabulary:
+        vocabulary.append(NULL_ACTION.name)
+
+    all_train_dirs = [d for name in train_scenarios for d in train_sessions[name]]
+    dataset = build_action_sequence_dataset(all_train_dirs, action_keys=vocabulary)
+    if len(dataset) == 0:
+        raise ValueError("backbone benchmark: no frame transitions in the training sessions")
+    horizon_frames = horizons_ticks_to_frames(cfg.horizons, dataset.ticks_per_frame)
+    holdout_dataset = build_action_sequence_dataset(
+        eval_sessions[eval_scenario], action_keys=vocabulary
+    )
+
+    metrics: Dict[str, Dict[str, Any]] = {}
+    stats: Dict[str, Dict[int, MetricStats]] = {}
+    beats_copy_last: Dict[str, Dict[int, bool]] = {}
+    for name in backbones:
+        backbone_cfg = replace(base_model_cfg, backbone=name)
+        model, _train_stats = train_action_world_model(dataset, backbone_cfg)
+        report = evaluate_action_world_model(
+            model, holdout_dataset, horizon_frames, warmup_frames=base_model_cfg.warmup_frames
+        )
+        metrics[name] = report
+        stats[name] = cortex_horizon_statistics(report["per_episode_model_mse"])
+        beats_copy_last[name] = {h: entry["beats_copy_last"] for h, entry in report["horizons"].items()}
+
+    comparisons: Dict[str, Dict[int, MetricComparison]] = {
+        name: compare_cortex_horizon_statistics(stats[baseline_backbone], stats[name])
+        for name in backbones
+        if name != baseline_backbone
+    }
+
+    return BackboneBenchmarkReport(
+        train_scenarios=list(train_scenarios),
+        eval_scenario=eval_scenario,
+        baseline_backbone=baseline_backbone,
+        metrics=metrics,
+        stats=stats,
+        comparisons=comparisons,
+        beats_copy_last=beats_copy_last,
+    )
+
+
 def _run_entity_persistence_metric(
     train_sessions: Sequence[str], holdout_sessions: Sequence[str], cfg: NurseryConfig
 ) -> Dict[str, Any]:
