@@ -34,6 +34,12 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
+from brain.amygdala import Amygdala
+from brain.neuromod import (
+    NAMED_NEUROMODULATOR_STREAM_SPECS,
+    compute_acetylcholine,
+    named_neuromodulator_payloads,
+)
 from cognitive_runtime.core.action_registry import ActionRegistry, DEFAULT_ACTION_REGISTRY
 from cognitive_runtime.core.action_space import action_space_hash
 from cognitive_runtime.core.attention import ATTENTION_MODES, AttentionController
@@ -202,6 +208,8 @@ class CognitiveRuntime:
         self.sensory_bus.register(ATTENTION_WEIGHTS_STREAM_SPEC)
         for spec in INTERNAL_MODULATION_STREAM_SPECS:
             self.sensory_bus.register(spec)
+        for spec in NAMED_NEUROMODULATOR_STREAM_SPECS:
+            self.sensory_bus.register(spec)
         #: Interoceptive modulation signals (issue #58) plus the risk-gated
         #: intrinsic-drive terms derived from them (issue #61): prediction
         #: error, reward-prediction error, learning progress, novelty, risk,
@@ -214,6 +222,11 @@ class CognitiveRuntime:
             risk_threshold=self.config.intrinsic_risk_threshold,
             temperature=self.config.intrinsic_risk_temperature,
         )
+        #: Fast threat appraisal -> adrenaline release (issue #94):
+        #: appraises the same risk reading `self.modulation` already
+        #: computes into a two-rate-EMA'd adrenaline level, published as
+        #: `internal.adrenaline`.
+        self.amygdala = Amygdala()
         #: Optional Program hook (issue #61) that primes a profile-driven
         #: reward engine's `internal.*` view -- see the call site below for
         #: why this can't just flow through the Program's own tick_events.
@@ -237,6 +250,7 @@ class CognitiveRuntime:
                 VALUE_ESTIMATE_STREAM_SPEC,
                 ATTENTION_WEIGHTS_STREAM_SPEC,
                 *INTERNAL_MODULATION_STREAM_SPECS,
+                *NAMED_NEUROMODULATOR_STREAM_SPECS,
             ],
             stream_registry=self.stream_registry,
             mode=attention_mode,
@@ -360,6 +374,7 @@ class CognitiveRuntime:
         self.scheduler.reset()
         self.attention.reset()
         self.reflex.reset()
+        self.amygdala.reset()
         episode_id = self.recorder.start_episode(episode_index)
 
         ratio = self.config.program_ticks_per_cognitive_tick
@@ -536,6 +551,24 @@ class CognitiveRuntime:
                 self.sensory_bus.publish(
                     stream_id, payload, window.ended_at, source="model"
                 )
+            # Named neuromodulators (issue #94): dopamine mirrors
+            # reward_prediction_error above; acetylcholine is derived from
+            # this tick's predicted-error estimate (the closest available
+            # stand-in for a dedicated cortex sigma head -- no WorldModel
+            # exposes one yet) plus learning progress; adrenaline is the
+            # amygdala's appraisal of the same risk reading the modulation
+            # tracker already computed.
+            acetylcholine = compute_acetylcholine(
+                prediction.prediction_error, modulation.learning_progress
+            )
+            adrenaline = self.amygdala.appraise(
+                modulation.risk, modulation.predicted_risk_aversion
+            )
+            neuromod_payloads = named_neuromodulator_payloads(modulation, acetylcholine, adrenaline)
+            for stream_id, payload in neuromod_payloads.items():
+                self.sensory_bus.publish(
+                    stream_id, payload, window.ended_at, source="model"
+                )
             # `internal.*` streams are computed here, after this tick's
             # `program.step()` already ran -- a Program's own reward
             # evaluation can never see them the same tick it's published, so
@@ -544,7 +577,7 @@ class CognitiveRuntime:
             # no-op for Programs that don't expose the hook (e.g. no active
             # reward profile).
             if self._observe_external_streams is not None:
-                self._observe_external_streams(modulation_payloads)
+                self._observe_external_streams({**modulation_payloads, **neuromod_payloads})
 
             self.recorder.write_cognitive_tick(
                 sensory_events=window.events,
