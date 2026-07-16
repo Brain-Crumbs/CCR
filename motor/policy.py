@@ -40,15 +40,20 @@ class ActiveInferenceState:
 
 def _encode_goal(cortex: Any, goal: Any) -> torch.Tensor:
     """Encode ``goal`` into a target latent -- the "encoder" leg of "T+1
-    output -> encoder -> motor inverse path". Accepts either a raw
-    pixel-shaped observation (run through the cortex's own encoder) or an
-    already-encoded latent, passed through unchanged."""
+    output -> encoder -> motor inverse path". Accepts either an
+    already-encoded latent, passed through unchanged, or a raw H x W x C
+    RGB pixel frame (``0..255`` per channel, matching
+    ``pixel_stream_encoder.pixels_to_chw``'s convention), permuted into the
+    encoder's expected N x C x H x W layout and normalized before
+    encoding. Stays on ``goal``'s own device/dtype throughout -- no forced
+    CPU round-trip, so a CUDA-resident goal encodes on-device."""
     if not isinstance(goal, torch.Tensor):
         raise ValueError("active-inference goal must be a tensor (pixel frame or latent)")
     if goal.dim() <= 2 and goal.shape[-1] == cortex.latent_width:
         return goal.reshape(1, -1)
     with torch.no_grad():
-        return cortex.encoder(goal if goal.dim() == 4 else goal.unsqueeze(0))
+        chw = goal.permute(2, 0, 1).float() / 255.0
+        return cortex.encoder(chw.unsqueeze(0))
 
 
 def build_active_inference_controller(
@@ -160,7 +165,7 @@ class ImaginationActor(torch.nn.Module):
             latent = next_latent
 
         returns = []
-        running = torch.zeros(1)
+        running = torch.zeros_like(rewards[-1])
         for reward in reversed(rewards):
             running = reward + gamma * running
             returns.insert(0, running)

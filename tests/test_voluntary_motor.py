@@ -64,6 +64,36 @@ def test_active_inference_controller_decodes_the_forecast_that_matches_the_goal(
     assert controller.choose(state, actions, goal=goal) == Action("LEFT")
 
 
+def test_active_inference_controller_encodes_a_raw_pixel_goal_in_nchw_layout():
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    from cognitive_runtime.neural.pixel_stream_encoder import PixelStreamEncoder
+    from motor.policy import ActiveInferenceState, build_active_inference_controller
+
+    pixel_shape = (8, 8, 3)  # (H, W, C)
+    encoder = PixelStreamEncoder(pixel_shape, latent_width=4)
+
+    class FakeCortex:
+        latent_width = 4
+
+        def __init__(self, encoder):
+            self.encoder = encoder
+
+        def step(self, latent, action_idx, hidden):
+            return latent, hidden
+
+    controller = build_active_inference_controller(FakeCortex(encoder), ["LEFT", "RIGHT"])
+    state = ActiveInferenceState(latent=torch.zeros(1, 4), hidden=None)
+    goal = torch.randint(0, 256, pixel_shape, dtype=torch.uint8)  # raw H x W x C frame
+
+    # Would previously raise inside PixelStreamEncoder.forward: unsqueeze(0)
+    # on a raw H x W x C goal produces N x H x W x C, not the N x C x H x W
+    # the encoder requires.
+    chosen = controller.choose(state, [Action("LEFT"), Action("RIGHT")], goal=goal)
+    assert chosen in (Action("LEFT"), Action("RIGHT"))
+
+
 def test_active_inference_controller_requires_a_goal():
     import pytest
 
