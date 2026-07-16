@@ -245,6 +245,14 @@ class ActionWorldModelConfig:
     #: "T+8" means the same thing across worlds/sample rates. Convert to
     #: frame steps per-recording via ``horizons_ticks_to_frames``.
     horizons_ticks: Tuple[int, ...] = (1, 4, 8)
+    #: Action-ablation harness (issue #92): when True, every action index fed
+    #: to the model during training is overwritten with a constant (index 0)
+    #: before the warmup/rollout loops see it, so the action stream carries
+    #: zero information. Training two otherwise-identical models with this
+    #: flag off/on and comparing held-out performance is the "does the model
+    #: actually use its action input" proof -- a predictor that never sees
+    #: its action can't tell "kept turning" from "stopped".
+    withhold_actions: bool = False
 
 
 def build_action_world_model(
@@ -354,6 +362,11 @@ def train_action_world_model(
             frames_b = torch.stack(frames_batch)  # [B, W+R, C, H, W]
             targets_b = torch.stack(targets_batch)
             actions_b = torch.stack(actions_batch)  # [B, W+R-1]
+            if cfg.withhold_actions:
+                # Ablation: every action index becomes the same constant, so
+                # backprop through the action embedding carries no signal
+                # that distinguishes one action from another.
+                actions_b = torch.zeros_like(actions_b)
             batch_n = frames_b.shape[0]
 
             optimizer.zero_grad()
@@ -446,13 +459,18 @@ def evaluate_action_world_model(
     """Closed-loop multi-horizon evaluation with baseline-relative metrics
     and the frozen-rollout detector.
 
-    Returns ``{"horizons": {h: {...}}, "rollout_health": {...}}``.  Each
-    horizon entry carries raw MSEs (model / copy-last / mean-frame /
-    recurrence-oracle), PSNRs, and the ratios ``model_over_copy_last_mse``
-    and ``model_over_oracle_mse``: < 1.0 means the model beats that
-    reference.  ``rollout_health.frozen_rollout`` is True when predictions
-    barely vary across horizons while the actual frames do -- the collapsed
-    fixed-point signature this evaluation exists to catch.
+    Returns ``{"horizons": {h: {...}}, "rollout_health": {...},
+    "per_episode_model_mse": {h: [...]}}``.  Each horizon entry carries raw
+    MSEs (model / copy-last / mean-frame / recurrence-oracle), PSNRs, and the
+    ratios ``model_over_copy_last_mse`` and ``model_over_oracle_mse``: < 1.0
+    means the model beats that reference.  ``rollout_health.frozen_rollout``
+    is True when predictions barely vary across horizons while the actual
+    frames do -- the collapsed fixed-point signature this evaluation exists
+    to catch.  ``per_episode_model_mse`` holds one model-MSE mean per
+    contributing episode/seed (as opposed to ``horizons[h]["model_mse"]``,
+    pooled over every overlapping rollout window) -- the independent samples
+    ``statistical_evaluation.cortex_horizon_statistics`` needs to report a
+    mean +/- CI across held-out seeds rather than a single point estimate.
     """
     torch, F = _torch()
 
@@ -474,6 +492,11 @@ def evaluate_action_world_model(
         h: {"model": [], "copy_last": [], "mean_frame": [], "oracle": []}
         for h in horizons_sorted
     }
+    #: Per-episode mean model MSE at each horizon (one value per contributing
+    #: episode/seed, not per window) -- the statistical_evaluation.py CI
+    #: machinery needs independent samples across held-out seeds, not the
+    #: many overlapping rollout-window samples pooled into ``samples`` above.
+    per_episode_model_mse: Dict[int, List[float]] = {h: [] for h in horizons_sorted}
     prediction_dispersion: List[float] = []
     target_dispersion: List[float] = []
 
@@ -505,6 +528,7 @@ def evaluate_action_world_model(
             starts = range(warmup_frames, n - max_horizon)
             if max_starts_per_episode is not None:
                 starts = list(starts)[:max_starts_per_episode]
+            episode_model_mse: Dict[int, List[float]] = {h: [] for h in horizons_sorted}
             for t in starts:
                 rolled, _h = model.rollout(
                     latents[t : t + 1],
@@ -516,7 +540,9 @@ def evaluate_action_world_model(
                     decoded = model.decoder(rolled[:, h - 1]).squeeze(0)
                     decoded_by_horizon[h] = decoded
                     target = targets[t + h]
-                    samples[h]["model"].append(float(F.mse_loss(decoded, target)))
+                    model_mse_sample = float(F.mse_loss(decoded, target))
+                    samples[h]["model"].append(model_mse_sample)
+                    episode_model_mse[h].append(model_mse_sample)
                     samples[h]["copy_last"].append(float(F.mse_loss(targets[t], target)))
                     samples[h]["mean_frame"].append(float(F.mse_loss(mean_frame, target)))
                     if oracle_lag is not None and t + h - oracle_lag >= 0:
@@ -530,6 +556,9 @@ def evaluate_action_world_model(
                     target_dispersion.append(
                         _pairwise_dispersion([targets[t + h] for h in horizons_sorted])
                     )
+            for h in horizons_sorted:
+                if episode_model_mse[h]:
+                    per_episode_model_mse[h].append(_mean(episode_model_mse[h]))
     if was_training:
         model.train()
 
@@ -568,7 +597,11 @@ def evaluate_action_world_model(
         # the rollout is frozen (identical frames at t+10 and t+100).
         "frozen_rollout": bool(tgt_disp > 1e-6 and pred_disp < 0.05 * tgt_disp),
     }
-    return {"horizons": report, "rollout_health": rollout_health}
+    return {
+        "horizons": report,
+        "rollout_health": rollout_health,
+        "per_episode_model_mse": per_episode_model_mse,
+    }
 
 
 def _pairwise_dispersion(frames: List[Any]) -> float:
