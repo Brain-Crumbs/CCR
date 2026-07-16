@@ -503,8 +503,13 @@ class AsyncActorCriticLearner(Learner):
             self._previous_decision = current
 
         self._tick += 1
-        if self.weight_subscriber is not None and self._tick % self.reload_every_ticks == 0:
-            self.weight_subscriber.maybe_reload()
+        if self.weight_subscriber is not None:
+            # Track staleness every tick (issue #100), independent of the
+            # reload cadence below, so the peak gap between published and
+            # loaded versions is measured even on ticks that don't reload.
+            self.weight_subscriber.staleness()
+            if self._tick % self.reload_every_ticks == 0:
+                self.weight_subscriber.maybe_reload()
 
     def model_metadata(self) -> Dict[str, Any]:
         return self.policy.model_metadata()

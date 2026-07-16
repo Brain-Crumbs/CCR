@@ -28,6 +28,8 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+import torch
+
 from cognitive_runtime.neural.checkpoint import (
     CheckpointCompatibilityError,
     NeuralAgentCheckpoint,
@@ -57,6 +59,105 @@ class WeightPublisher:
         return int(metadata.get("training_ticks", 0))
 
 
+def ema_publish_path(checkpoint_path: str) -> str:
+    """The actor-facing EMA snapshot path for a trainer resuming from
+    ``checkpoint_path`` (issue #100 review: this must never be
+    ``checkpoint_path`` itself -- see :class:`EMAWeightPublisher`)."""
+    return f"{checkpoint_path}.ema"
+
+
+class EMAWeightPublisher(WeightPublisher):
+    """Concurrent-schedule weight publication (issue #100).
+
+    Phasic consolidation never publishes while the actor is acting, so a raw
+    snapshot is safe -- the actor only ever sees a completed pass. The
+    concurrent schedule has no such pause: the actor keeps polling and
+    hot-swapping weights *while it acts*, so a raw in-training snapshot would
+    hand it tick-to-tick oscillation straight from the optimizer's gradient
+    noise. Publishing a Polyak/EMA-averaged copy instead -- a slow-moving
+    target -- kills that oscillation without touching how training itself
+    proceeds: the live modules keep training on the raw (fast) weights.
+
+    Critically, the EMA copy is written to its own file
+    (:attr:`publish_path`, ``<checkpoint path>.ema`` by default), never to
+    ``checkpoint.path`` itself. That path doubles as
+    ``AsyncTrainer.resume_if_checkpoint_exists``'s only source of truth;
+    overwriting it with EMA-averaged weights would mean every restart
+    resumes from the lagging EMA target instead of the actual training
+    trajectory (with the default 0.999 decay, a substantial rollback) while
+    keeping the *raw* trajectory's optimizer/Adam-moment state -- a
+    checkpoint that belongs to two different weight trajectories at once.
+    ``checkpoint.path`` therefore always gets a plain, undisturbed raw save;
+    the EMA copy is a second, separate write only the actor ever reads.
+
+    The version stamped alongside each snapshot is still the checkpoint's
+    own ``training_ticks`` (the optimizer's monotonic step count) -- EMA
+    changes *which* weights are published, not the monotonic-version
+    contract :class:`WeightSubscriber` already relies on.
+    """
+
+    def __init__(
+        self,
+        checkpoint: NeuralAgentCheckpoint,
+        *,
+        decay: float = 0.999,
+        publish_path: Optional[str] = None,
+    ):
+        if not 0.0 < decay < 1.0:
+            raise ValueError(f"decay must be in (0, 1), got {decay!r}")
+        super().__init__(checkpoint)
+        self.decay = decay
+        self.publish_path = publish_path or ema_publish_path(checkpoint.path)
+        self._shadow: Dict[str, Dict[str, Any]] = {}
+
+    def _live_modules(self) -> Dict[str, Any]:
+        modules: Dict[str, Any] = dict(self.checkpoint.encoders)
+        for name in ("fusion", "world_model", "policy", "critic"):
+            module = getattr(self.checkpoint, name)
+            if module is not None:
+                modules[name] = module
+        return modules
+
+    def _advance_shadow(self, modules: Dict[str, Any]) -> None:
+        """``shadow <- decay * shadow + (1 - decay) * raw``, seeded with the
+        raw weights on the first publish so an actor's first-ever reload
+        isn't diluted toward an untrained init."""
+        for name, module in modules.items():
+            raw = module.state_dict()
+            if name not in self._shadow:
+                self._shadow[name] = {k: v.detach().clone() for k, v in raw.items()}
+                continue
+            shadow = self._shadow[name]
+            for key, value in raw.items():
+                target = shadow[key]
+                if torch.is_floating_point(target):
+                    target.mul_(self.decay).add_(value.detach(), alpha=1.0 - self.decay)
+                else:
+                    shadow[key] = value.detach().clone()
+
+    def publish(self, *, reason: str = "publish") -> int:
+        # The raw resume checkpoint first, modules untouched -- always the
+        # actual training trajectory, never the EMA-lagged one.
+        version = super().publish(reason=reason)
+
+        modules = self._live_modules()
+        self._advance_shadow(modules)
+        # `state_dict()` values alias the live parameter storage, so this
+        # backup must clone -- `load_state_dict` below mutates in place.
+        raw_state = {
+            name: {k: v.detach().clone() for k, v in module.state_dict().items()}
+            for name, module in modules.items()
+        }
+        try:
+            for name, module in modules.items():
+                module.load_state_dict(self._shadow[name])
+            self.checkpoint.save(self.publish_path, reason=reason)
+        finally:
+            for name, module in modules.items():
+                module.load_state_dict(raw_state[name])
+        return version
+
+
 @dataclass
 class WeightSubscriber:
     """Actor-side: poll ``path`` for a newer snapshot than the last one
@@ -74,6 +175,7 @@ class WeightSubscriber:
     last_version: int = -1
     reload_count: int = 0
     skipped_count: int = 0
+    max_staleness: int = 0
 
     def poll_version(self) -> Optional[int]:
         """Peek at the snapshot's version without loading it."""
@@ -82,6 +184,22 @@ class WeightSubscriber:
         except (FileNotFoundError, json.JSONDecodeError):
             return None
         return int(metadata.get("training_ticks", -1))
+
+    def staleness(self) -> Optional[int]:
+        """How many versions the last-*loaded* snapshot is behind the
+        newest one currently published on disk (concurrent schedule, issue
+        #100): the actor can call this every tick -- even ticks that skip an
+        actual reload -- to log and bound how stale its live weights are
+        without paying for a reload. ``0`` once caught up; ``None`` before
+        anything has ever been published. Also updates :attr:`max_staleness`,
+        the peak staleness observed so far, so a run can assert its
+        staleness stayed bounded rather than drifting upward."""
+        version = self.poll_version()
+        if version is None:
+            return None
+        gap = max(0, version - self.last_version)
+        self.max_staleness = max(self.max_staleness, gap)
+        return gap
 
     def maybe_reload(self) -> Optional[int]:
         """Load a newer snapshot if one is available; returns the new
@@ -112,4 +230,5 @@ class WeightSubscriber:
             "last_version": self.last_version,
             "reload_count": self.reload_count,
             "skipped_count": self.skipped_count,
+            "max_staleness": self.max_staleness,
         }

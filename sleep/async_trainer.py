@@ -53,7 +53,7 @@ from cognitive_runtime.neural.optimizer import ActorCriticOptimizer
 from cognitive_runtime.neural.policy import MLPPolicyModel
 from cognitive_runtime.neural.replay_buffer import ReplayBuffer, load_session_into_buffer
 from cognitive_runtime.neural.value import MLPValueModel
-from sleep.weight_publisher import WeightPublisher
+from sleep.weight_publisher import EMAWeightPublisher, WeightPublisher
 from cognitive_runtime.neural.world_model import MLPWorldModel
 
 
@@ -148,6 +148,7 @@ class AsyncTrainer:
         min_buffer_size: int = 1,
         publish_every_steps: int = 20,
         drain_max_items: Optional[int] = None,
+        ema_decay: Optional[float] = None,
     ):
         if publish_every_steps <= 0:
             raise ValueError(f"publish_every_steps must be positive, got {publish_every_steps!r}")
@@ -167,7 +168,16 @@ class AsyncTrainer:
             online_optimizer=self.optimizer,
             extra_metadata={"actor_critic": arch.to_dict()},
         )
-        self.publisher = WeightPublisher(self.checkpoint)
+        # Concurrent schedule (issue #100): publish an EMA-averaged snapshot
+        # -- a slow-moving target -- instead of raw in-training weights, so a
+        # continuously-polling actor doesn't see tick-to-tick oscillation.
+        # Phasic consolidation never publishes mid-update, so it has no
+        # staleness/oscillation problem to begin with and leaves this unset.
+        self.publisher = (
+            EMAWeightPublisher(self.checkpoint, decay=ema_decay)
+            if ema_decay is not None
+            else WeightPublisher(self.checkpoint)
+        )
         self.replay_buffer = replay_buffer if replay_buffer is not None else ReplayBuffer()
         self.live_ring: Optional[SharedExperienceRing] = (
             SharedExperienceRing.attach(**live_ring_handle) if live_ring_handle else None
@@ -407,9 +417,11 @@ class TrainerSupervisor:
     )
     restart_count: int = field(default=0, init=False)
     _stopping: bool = field(default=False, init=False, repr=False)
+    _died_at: Optional[float] = field(default=None, init=False, repr=False)
 
     def start(self) -> None:
         self._stopping = False
+        self._died_at = None
         self.process, self.stop_event = spawn_trainer_process(
             self.arch, self.checkpoint_path,
             live_ring_handle=self.live_ring_handle,
@@ -418,16 +430,25 @@ class TrainerSupervisor:
         )
 
     def poll(self) -> bool:
-        """Call periodically from a supervising process/thread. Restarts
-        the trainer if it died without being asked to stop; returns
-        whether a restart happened."""
+        """Call periodically from a supervising process/thread -- including
+        every tick of a realtime loop (issue #100 review: a concurrent
+        schedule's whole point is that acting never pauses for the trainer,
+        so this must never block; a synchronous ``restart_backoff_seconds``
+        sleep here would itself cause missed ticks). Restarts the trainer
+        once ``restart_backoff_seconds`` have elapsed since it was first
+        observed dead -- each call is O(1) and returns immediately either
+        way; returns whether a restart just happened."""
         if self._stopping or self.process is None:
             return False
         if self.process.is_alive():
             return False
-        self.process.join(timeout=0)
+        if self._died_at is None:
+            self.process.join(timeout=0)
+            self._died_at = time.time()
+            return False
+        if time.time() - self._died_at < self.restart_backoff_seconds:
+            return False
         self.restart_count += 1
-        time.sleep(self.restart_backoff_seconds)
         self.start()
         return True
 

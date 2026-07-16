@@ -358,6 +358,11 @@ def _make_actor_critic_policy_and_learner(
         layout_hash = fusion.layout_hash
 
     if getattr(args, "actor_critic_async", False):
+        if getattr(args, "async_schedule", "phasic") == "concurrent":
+            return _make_concurrent_actor_critic_policy_and_learner(
+                args, arch=arch, model_path=model_path,
+                layout_hash=layout_hash, action_keys=action_keys, action_space=action_space,
+            ) + (None,)
         return _make_async_actor_critic_policy_and_learner(
             args, arch=arch, model_path=model_path,
             layout_hash=layout_hash, action_keys=action_keys, action_space=action_space,
@@ -539,6 +544,117 @@ def _make_async_actor_critic_policy_and_learner(
     return policy, learner
 
 
+def _make_concurrent_actor_critic_policy_and_learner(
+    args: argparse.Namespace,
+    *,
+    arch: Dict[str, Any],
+    model_path: str,
+    layout_hash: str,
+    action_keys: list,
+    action_space: list,
+):
+    """Build the concurrent actor/trainer split used by ``--async-trainer
+    --async-schedule concurrent`` (issue #100).
+
+    Unlike the phasic split, acting never pauses: the trainer runs
+    continuously in its own OS process (:class:`~sleep.async_trainer.
+    TrainerSupervisor`, restarting it if it crashes), and the actor polls
+    for a newer weight snapshot every ``--async-reload-every-ticks`` ticks
+    instead of blocking. Because a reload can land mid-play, the trainer
+    publishes an EMA/Polyak-averaged snapshot (see
+    ``sleep.weight_publisher.EMAWeightPublisher``) -- a slow-moving target
+    that absorbs tick-to-tick gradient noise -- stamped with the optimizer's
+    own monotonic step count, so the actor can measure and bound how many
+    versions behind its live weights are (``WeightSubscriber.staleness()``).
+    """
+    from cognitive_runtime.neural.checkpoint import NeuralAgentCheckpoint
+    from cognitive_runtime.neural.experience_queue import SharedExperienceRing
+    from sleep.weight_publisher import WeightSubscriber, ema_publish_path
+    from cognitive_runtime.policies.actor_critic import (
+        ActorCriticPolicy,
+        AsyncActorCriticLearner,
+    )
+    from sleep.async_trainer import ActorCriticArch, TrainerSupervisor, build_actor_critic_modules
+
+    # `EMAWeightPublisher` only validates this inside the spawned trainer
+    # process, which the parent would then supervise/restart forever
+    # without it ever reporting the real error back to the CLI user.
+    if not 0.0 < args.async_ema_decay < 1.0:
+        sys.exit(f"--async-ema-decay must be in (0, 1), got {args.async_ema_decay!r}")
+
+    trainer_arch = ActorCriticArch(
+        fused_width=arch["fused_width"],
+        world_feature_width=arch["world_feature_width"],
+        n_actions=arch["n_actions"],
+        action_keys=tuple(action_keys),
+        layout_hash=layout_hash,
+        hidden_dim=arch["hidden_dim"],
+        has_world_model=arch["has_world_model"],
+    )
+
+    ring = SharedExperienceRing(args.async_ring_capacity, arch["fused_width"])
+    supervisor = TrainerSupervisor(
+        trainer_arch, model_path,
+        live_ring_handle=ring.handle(),
+        trainer_kwargs={
+            "lr": args.actor_critic_lr,
+            "gamma": args.actor_critic_gamma,
+            "entropy_coef": args.actor_critic_entropy_coef,
+            "grad_clip_norm": args.actor_critic_grad_clip_norm,
+            "seed": args.seed,
+            "batch_size": args.async_batch_size,
+            "min_buffer_size": args.async_min_buffer_size,
+            "publish_every_steps": args.async_publish_every,
+            "ema_decay": args.async_ema_decay,
+        },
+    )
+    supervisor.start()
+
+    policy_model, critic_model, _world_model, _optimizer = build_actor_critic_modules(
+        trainer_arch, seed=args.seed,
+    )
+    actor_bundle = NeuralAgentCheckpoint(
+        model_path, layout_hash=layout_hash, action_keys=action_keys,
+        policy=policy_model, critic=critic_model,
+    )
+    # The trainer's `EMAWeightPublisher` never writes EMA weights to
+    # `model_path` itself -- that path doubles as the trainer's own resume
+    # checkpoint, which must always stay raw (see EMAWeightPublisher's
+    # docstring). The actor polls the separate EMA snapshot file instead.
+    subscriber = WeightSubscriber(path=ema_publish_path(model_path), bundle=actor_bundle)
+    # A resumed checkpoint is already a completed snapshot; load it before
+    # the first tick rather than waiting for the first background publish.
+    subscriber.maybe_reload()
+
+    policy = ActorCriticPolicy(
+        policy_model, critic_model, action_keys, action_space=action_space,
+        history=args.actor_critic_history, training=args.actor_critic_train, seed=args.seed,
+    )
+    actor_learner = AsyncActorCriticLearner(
+        policy, ring, weight_subscriber=subscriber,
+        reload_every_ticks=args.async_reload_every_ticks,
+    )
+
+    class _ConcurrentLearner:
+        """Learner adapter: supervises the trainer process alongside acting."""
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(actor_learner, name)
+
+        def update(self, window: Any) -> None:
+            actor_learner.update(window)
+            # Cheap liveness check; restarts the trainer process if it died
+            # (issue #37: "trainer crash must not kill the actor").
+            supervisor.poll()
+
+    learner = _ConcurrentLearner()
+    # Stashed for `cmd_run` cleanup; not part of the `Learner` contract.
+    learner.async_resources = (ring, supervisor)
+    learner.sleep_trainer_supervisor = supervisor
+    learner.weight_subscriber = subscriber
+    return policy, learner
+
+
 def _shutdown_async_trainer(learner: Optional[Any]) -> None:
     """Best-effort, always-runs cleanup for ``--async-trainer``: ask the
     trainer process to stop when using the legacy process resources, then
@@ -551,7 +667,9 @@ def _shutdown_async_trainer(learner: Optional[Any]) -> None:
         finish = getattr(learner, "finish", None)
         if finish is not None:
             finish()
-        if len(resources) == 3:
+        if len(resources) == 2 and hasattr(resources[1], "stop"):
+            resources[1].stop()
+        elif len(resources) == 3:
             _, trainer_process, trainer_stop_event = resources
             trainer_stop_event.set()
             trainer_process.join(timeout=10)
@@ -1987,8 +2105,15 @@ def build_parser() -> argparse.ArgumentParser:
                        help="run actor-critic in eval mode without mutating weights")
     p_run.add_argument("--async-trainer", dest="actor_critic_async", action="store_true",
                        default=False,
-                       help="phasic actor/learner split: collect experience during wake "
-                            "ticks, then pause acting for bounded sleep consolidation")
+                       help="actor/learner split: train in the background instead of "
+                            "synchronously in the tick loop; see --async-schedule for "
+                            "phasic (default) vs concurrent")
+    p_run.add_argument("--async-schedule", choices=("phasic", "concurrent"), default="phasic",
+                       help="'phasic' (default): pause acting for bounded sleep "
+                            "consolidation, no staleness. 'concurrent' (issue #100): the "
+                            "trainer runs continuously in its own process while the actor "
+                            "keeps acting, polling for EMA-averaged weight snapshots every "
+                            "--async-reload-every-ticks ticks instead of pausing")
     p_run.add_argument("--async-ring-capacity", type=int, default=20_000,
                        help="live-experience ring buffer capacity (transitions); "
                             "drop-oldest once full")
@@ -2001,8 +2126,14 @@ def build_parser() -> argparse.ArgumentParser:
                        help="trainer process publishes a new weight snapshot every N "
                             "gradient steps")
     p_run.add_argument("--async-reload-every-ticks", type=int, default=5,
-                       help="deprecated compatibility option; phasic runs reload exactly "
-                            "once after each completed consolidation")
+                       help="ignored by --async-schedule phasic, which reloads exactly "
+                            "once after each completed consolidation; for "
+                            "--async-schedule concurrent, the actor polls for a newer "
+                            "snapshot every N ticks")
+    p_run.add_argument("--async-ema-decay", type=float, default=0.999,
+                       help="--async-schedule concurrent only: Polyak/EMA decay for "
+                            "published weight snapshots (closer to 1 = slower-moving "
+                            "target, less tick-to-tick oscillation)")
     p_run.add_argument("--async-wake-ticks", type=int, default=50,
                        help="number of acting ticks between sleep consolidation passes")
     p_run.add_argument("--async-consolidation-steps", type=int, default=50,
