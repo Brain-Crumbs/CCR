@@ -24,6 +24,11 @@ The confidence interval uses a normal approximation
 (``statistics.NormalDist``) rather than a t-distribution, to avoid adding a
 scipy dependency; with the episode counts these harnesses actually use
 (tens, not few), the approximation is adequate for regression flagging.
+
+``cortex_horizon_statistics``/``compare_cortex_horizon_statistics`` (issue
+#92) reuse the same ``_mean_ci``/``MetricStats``/``MetricComparison``
+machinery for the predictive cortex's per-horizon held-out MSE, the metric
+family ``action_world_model.evaluate_action_world_model`` reports.
 """
 
 from __future__ import annotations
@@ -262,6 +267,43 @@ def compare_statistics(
 
 def flagged_regressions(comparisons: Sequence[MetricComparison]) -> List[MetricComparison]:
     return [c for c in comparisons if c.regressed]
+
+
+# ------------------------------------------------------------- cortex scoring
+
+
+def cortex_horizon_statistics(
+    per_episode_mse: Dict[int, Sequence[float]], confidence: float = DEFAULT_CONFIDENCE,
+) -> Dict[int, MetricStats]:
+    """Mean +/- CI over held-out episodes/seeds for each horizon's cortex
+    model MSE (issue #92) -- the per-horizon counterpart of
+    :func:`compute_statistics`, built on
+    ``action_world_model.evaluate_action_world_model``'s
+    ``per_episode_model_mse`` (one independent sample per held-out
+    episode/seed, not the many overlapping rollout-window samples pooled
+    into its ``horizons[h]["model_mse"]`` point estimate)."""
+    return {h: _mean_ci(values, confidence) for h, values in per_episode_mse.items()}
+
+
+def compare_cortex_horizon_statistics(
+    baseline: Dict[int, MetricStats], candidate: Dict[int, MetricStats],
+) -> Dict[int, MetricComparison]:
+    """Per-horizon regression check for cortex MSE (lower is better): a
+    ``candidate`` (e.g. an action-ablated model) whose CI sits entirely above
+    ``baseline``'s at some horizon is flagged "regressed" there -- the
+    action-ablation harness's "measurably hurts" claim, refereed the same
+    way whole-episode metrics are."""
+    common = sorted(set(baseline) & set(candidate))
+    return {
+        h: MetricComparison(
+            metric=f"horizon_{h}_model_mse",
+            baseline=baseline[h],
+            candidate=candidate[h],
+            higher_is_better=False,
+            direction=_direction(baseline[h], candidate[h], False),
+        )
+        for h in common
+    }
 
 
 # ------------------------------------------------------------------ running

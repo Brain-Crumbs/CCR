@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -74,6 +74,12 @@ from cognitive_runtime.training.entity_persistence import (
     train_entity_persistence_model,
 )
 from cognitive_runtime.training.prediction_export import export_session_predictions
+from cognitive_runtime.training.statistical_evaluation import (
+    MetricComparison,
+    MetricStats,
+    cortex_horizon_statistics,
+    compare_cortex_horizon_statistics,
+)
 from cognitive_runtime.training.visual_representation import (
     VisualPretrainingConfig,
     VisualRepresentationModel,
@@ -1146,6 +1152,165 @@ def run_nursery_joint(
         yaw_probe=yaw_probe,
         horizon_frames=horizon_frames,
         ticks_per_frame=ticks_per_frame,
+    )
+
+
+# --------------------------------------------------------------------------- action-ablation (issue #92)
+
+
+@dataclass
+class ActionAblationReport:
+    """Milestone 2's action-ablation proof
+    (docs/v2/phases/phase-2-predictive-cortex.md): the same joint cortex,
+    trained twice on byte-identical recordings -- once seeing the real
+    ``motor.command`` stream, once with every action index overwritten by a
+    constant -- to show action-conditioning is load-bearing rather than
+    decorative. "A predictor that never sees its action can't tell 'kept
+    turning' from 'stopped'." """
+
+    train_scenarios: List[str]
+    eval_scenario: str
+    #: Full ``evaluate_action_world_model`` report for the model trained
+    #: with the real action stream.
+    with_actions_metrics: Dict[str, Any]
+    #: Same, for the model trained with actions withheld.
+    without_actions_metrics: Dict[str, Any]
+    #: Per-horizon mean +/- CI over held-out seeds for each model
+    #: (``statistical_evaluation.cortex_horizon_statistics``).
+    with_actions_stats: Dict[int, MetricStats]
+    without_actions_stats: Dict[int, MetricStats]
+    #: Per-horizon regression comparison, ablated-vs-baseline
+    #: (``statistical_evaluation.compare_cortex_horizon_statistics``).
+    comparisons: Dict[int, MetricComparison]
+    #: True when withholding actions raises ``eval_scenario``'s held-out
+    #: model MSE at every evaluated horizon -- the Milestone 2 assertion.
+    action_withholding_degrades: bool
+
+
+def run_action_ablation_eval(
+    record_dir: str,
+    train_scenarios: Sequence[str] = ("walk_forward", "turn_in_place"),
+    eval_scenario: str = "turn_in_place",
+    config: Optional[NurseryConfig] = None,
+    model_config: Optional[ActionWorldModelConfig] = None,
+) -> ActionAblationReport:
+    """Train the joint cortex twice on identical recorded data -- with and
+    without the action stream reaching the model during training -- and
+    compare held-out ``eval_scenario`` performance.
+
+    Both runs share the same recordings, architecture, and training
+    hyperparameters (only ``ActionWorldModelConfig.withhold_actions``
+    differs), so a regression on ``eval_scenario`` when withheld is direct
+    evidence the baseline model actually uses its action input, not an
+    artifact of noise or a different random init. ``eval_scenario`` must be
+    one of ``train_scenarios`` -- the claim is "harder to predict the
+    scenario it trained on", not zero-shot generality.
+    """
+    cfg = config or NurseryConfig()
+    if eval_scenario not in train_scenarios:
+        raise ValueError(
+            f"eval_scenario {eval_scenario!r} must be one of the trained scenarios "
+            f"{list(train_scenarios)!r}: the ablation proves training-time action-"
+            "conditioning matters for a scenario the model trained on, not zero-shot "
+            "generality to one it never saw"
+        )
+    if set(cfg.train_seeds) & set(cfg.holdout_seeds):
+        raise ValueError("train_seeds and holdout_seeds must not overlap")
+
+    scenarios = _scenarios_for_world(cfg.world)
+    for name in train_scenarios:
+        if name not in scenarios:
+            raise ValueError(
+                f"unknown nursery scenario {name!r} for --world {cfg.world!r}; "
+                f"choices: {sorted(scenarios)}"
+            )
+
+    base_model_cfg = model_config or ActionWorldModelConfig(
+        latent_width=cfg.latent_width,
+        hidden_dim=cfg.hidden_dim,
+        reconstruction_size=cfg.reconstruction_size,
+        epochs=cfg.epochs,
+        lr=cfg.lr,
+        batch_size=cfg.batch_size,
+        seed=cfg.seed,
+    )
+
+    train_sessions: Dict[str, List[str]] = {}
+    eval_sessions: Dict[str, List[str]] = {}
+    for name in train_scenarios:
+        scenario = scenarios[name]
+        train_sessions[name] = [
+            _record_scenario_episode(record_dir, f"ablation-{name}-train-{seed}", seed, scenario, cfg)
+            for seed in cfg.train_seeds
+        ]
+        eval_sessions[name] = [
+            _record_scenario_episode(record_dir, f"ablation-{name}-holdout-{seed}", seed, scenario, cfg)
+            for seed in cfg.holdout_seeds
+        ]
+
+    if cfg.data_quality_gate:
+        issues: List[str] = []
+        for name in train_scenarios:
+            issues += validate_nursery_recordings(
+                train_sessions[name] + eval_sessions[name], scenarios[name],
+                expected_pixel_source=cfg.expected_pixel_source,
+            )
+        if issues:
+            raise ValueError(
+                "action-ablation eval: recorded data fails the quality gate:\n  - "
+                + "\n  - ".join(issues)
+            )
+
+    # Pin the vocabulary to the full action space (issue #91's joint-training
+    # convention) so both runs' models share one embedding table even though
+    # only one is trained to actually read it.
+    from cognitive_runtime.training.features import ACTION_KEYS
+
+    vocabulary = list(ACTION_KEYS)
+    if NULL_ACTION.name not in vocabulary:
+        vocabulary.append(NULL_ACTION.name)
+
+    all_train_dirs = [d for name in train_scenarios for d in train_sessions[name]]
+    dataset = build_action_sequence_dataset(all_train_dirs, action_keys=vocabulary)
+    if len(dataset) == 0:
+        raise ValueError("action-ablation eval: no frame transitions in the training sessions")
+    horizon_frames = horizons_ticks_to_frames(cfg.horizons, dataset.ticks_per_frame)
+
+    with_actions_cfg = replace(base_model_cfg, withhold_actions=False)
+    without_actions_cfg = replace(base_model_cfg, withhold_actions=True)
+
+    model_with, _stats_with = train_action_world_model(dataset, with_actions_cfg)
+    model_without, _stats_without = train_action_world_model(dataset, without_actions_cfg)
+
+    holdout_dataset = build_action_sequence_dataset(
+        eval_sessions[eval_scenario], action_keys=model_with.action_keys
+    )
+    with_actions_metrics = evaluate_action_world_model(
+        model_with, holdout_dataset, horizon_frames, warmup_frames=base_model_cfg.warmup_frames
+    )
+    without_actions_metrics = evaluate_action_world_model(
+        model_without, holdout_dataset, horizon_frames, warmup_frames=base_model_cfg.warmup_frames
+    )
+
+    with_actions_stats = cortex_horizon_statistics(with_actions_metrics["per_episode_model_mse"])
+    without_actions_stats = cortex_horizon_statistics(without_actions_metrics["per_episode_model_mse"])
+    comparisons = compare_cortex_horizon_statistics(with_actions_stats, without_actions_stats)
+
+    degrades = bool(horizon_frames) and all(
+        without_actions_metrics["horizons"][h]["model_mse"]
+        > with_actions_metrics["horizons"][h]["model_mse"]
+        for h in horizon_frames
+    )
+
+    return ActionAblationReport(
+        train_scenarios=list(train_scenarios),
+        eval_scenario=eval_scenario,
+        with_actions_metrics=with_actions_metrics,
+        without_actions_metrics=without_actions_metrics,
+        with_actions_stats=with_actions_stats,
+        without_actions_stats=without_actions_stats,
+        comparisons=comparisons,
+        action_withholding_degrades=degrades,
     )
 
 
