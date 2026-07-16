@@ -62,6 +62,22 @@ class PhasicSleepSchedule:
         self.sleep_due = self.ticks_in_phase >= self.wake_ticks
         return result
 
+    def request_sleep(self) -> bool:
+        """Mark a partial wake phase ready for consolidation.
+
+        Session boundaries rarely line up exactly with ``wake_ticks``.  Without
+        an explicit boundary transition, experience from the final partial wake
+        phase would remain in the live queue and be discarded during shutdown.
+        Returns ``True`` when there is wake work to consolidate and ``False``
+        when the schedule is already idle.
+        """
+        if self.phase is not Phase.WAKE:
+            raise RuntimeError("cannot request sleep while consolidation is running")
+        if self.ticks_in_phase == 0:
+            return False
+        self.sleep_due = True
+        return True
+
     def consolidate(
         self,
         sleep_pass: Callable[[], int],

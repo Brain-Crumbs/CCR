@@ -523,6 +523,14 @@ def _make_async_actor_critic_policy_and_learner(
         def model_metadata(self) -> Dict[str, Any]:
             return actor_learner.model_metadata()
 
+        def finish(self) -> None:
+            """Consolidate a final, partial wake phase before teardown."""
+            if schedule.request_sleep():
+                schedule.consolidate(
+                    lambda: trainer.consolidate(args.async_consolidation_steps),
+                    reload_weights=subscriber.maybe_reload,
+                )
+
     learner = _PhasicLearner()
     # Stashed for `cmd_run` cleanup; not part of the `Learner` contract.
     learner.async_resources = (ring,)
@@ -539,15 +547,20 @@ def _shutdown_async_trainer(learner: Optional[Any]) -> None:
     if resources is None:
         return
     ring = resources[0]
-    if len(resources) == 3:
-        _, trainer_process, trainer_stop_event = resources
-        trainer_stop_event.set()
-        trainer_process.join(timeout=10)
-        if trainer_process.is_alive():
-            trainer_process.terminate()
-            trainer_process.join(timeout=5)
-    ring.close()
-    ring.unlink()
+    try:
+        finish = getattr(learner, "finish", None)
+        if finish is not None:
+            finish()
+        if len(resources) == 3:
+            _, trainer_process, trainer_stop_event = resources
+            trainer_stop_event.set()
+            trainer_process.join(timeout=10)
+            if trainer_process.is_alive():
+                trainer_process.terminate()
+                trainer_process.join(timeout=5)
+    finally:
+        ring.close()
+        ring.unlink()
 
 
 def _add_world_args(parser: argparse.ArgumentParser) -> None:
