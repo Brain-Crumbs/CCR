@@ -253,6 +253,21 @@ class ActionWorldModelConfig:
     #: actually use its action input" proof -- a predictor that never sees
     #: its action can't tell "kept turning" from "stopped".
     withhold_actions: bool = False
+    #: Temporal backbone (issue #93): ``"gru"`` (default), ``"dilated_conv"``,
+    #: or ``"transformer"``. See ``brain.cortex.backbones``.
+    backbone: str = "gru"
+    #: Window size the windowed backbones attend over; ignored by ``"gru"``.
+    context_length: int = 8
+    #: Extra backbone-specific constructor kwargs, forwarded verbatim to
+    #: ``brain.cortex.backbones.build_backbone``.
+    backbone_kwargs: Dict[str, Any] = field(default_factory=dict)
+    #: Context-length curriculum (issue #93, task 5): ramp a windowed
+    #: backbone's attended-over window from 1 to ``context_length`` over the
+    #: first ``context_length_curriculum_epochs`` epochs (default: all of
+    #: them), rather than exposing it to the full window from epoch zero. No
+    #: effect on ``"gru"`` (its context is unbounded, not windowed).
+    context_length_curriculum: bool = True
+    context_length_curriculum_epochs: Optional[int] = None
 
 
 def build_action_world_model(
@@ -278,6 +293,9 @@ def build_action_world_model(
         action_embed_dim=cfg.action_embed_dim,
         reconstruction_size=cfg.reconstruction_size,
         horizons_ticks=tuple(cfg.horizons_ticks),
+        backbone=cfg.backbone,
+        context_length=cfg.context_length,
+        backbone_kwargs=dict(cfg.backbone_kwargs),
     )
     return PredictiveCortex(pixel_shape, action_keys, cortex_cfg)
 
@@ -343,8 +361,19 @@ def train_action_world_model(
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     curves: Dict[str, List[float]] = {"total_loss": [], "pixel_loss": [], "latent_loss": []}
 
+    #: Context-length curriculum (issue #93, task 5): windowed backbones
+    #: (dilated-conv/transformer) get their attended-over window ramped from
+    #: 1 to the configured maximum over training, rather than the full
+    #: window from epoch zero -- ``None`` on "gru" (unbounded context, no
+    #: window to ramp) leaves this a no-op.
+    max_context = getattr(model, "context_length_max", None)
+    curriculum_epochs = max(cfg.context_length_curriculum_epochs or cfg.epochs, 1)
+
     model.train()
-    for _epoch in range(cfg.epochs):
+    for epoch_idx in range(cfg.epochs):
+        if cfg.context_length_curriculum and max_context:
+            progress = min(epoch_idx / max(curriculum_epochs - 1, 1), 1.0)
+            model.set_context_length(max(1, round(1 + progress * (max_context - 1))))
         perm = torch.randperm(len(starts), generator=generator)
         epoch = {key: 0.0 for key in curves}
         seen = 0
@@ -412,6 +441,13 @@ def train_action_world_model(
             epoch["latent_loss"] += float(latent_loss.detach()) * batch_n
         for key in curves:
             curves[key].append(round(epoch[key] / max(seen, 1), 6))
+
+    if cfg.context_length_curriculum and max_context:
+        # Leave the model at its full window post-training regardless of how
+        # the curriculum schedule landed (e.g. a curriculum longer than
+        # cfg.epochs would otherwise end mid-ramp): evaluation should see
+        # the trained backbone's full context, not a truncated one.
+        model.set_context_length(max_context)
 
     stats: Dict[str, Any] = {
         "samples": float(len(starts)),
@@ -726,6 +762,8 @@ def save_action_world_model(path: str, model: Any, stats: Dict[str, Any]) -> Non
             "hidden_dim": model.hidden_dim,
             "reconstruction_shape": list(model.reconstruction_shape),
             "horizons_ticks": list(model.horizons_ticks),
+            "backbone": model.config.backbone,
+            "context_length": model.config.context_length,
             "state_dict": model.state_dict(),
             "training_stats": stats,
         },
@@ -743,6 +781,8 @@ def load_action_world_model(path: str):
         hidden_dim=int(payload["hidden_dim"]),
         reconstruction_size=int(payload["reconstruction_shape"][0]),
         horizons_ticks=tuple(payload.get("horizons_ticks", ActionWorldModelConfig.horizons_ticks)),
+        backbone=payload.get("backbone", ActionWorldModelConfig.backbone),
+        context_length=int(payload.get("context_length", ActionWorldModelConfig.context_length)),
     )
     model = build_action_world_model(
         tuple(payload["pixel_shape"]), payload["action_keys"], cfg

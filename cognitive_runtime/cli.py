@@ -1455,6 +1455,8 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
         seed=args.seed,
         warmup_frames=args.warmup_frames,
         rollout_frames=args.rollout_frames,
+        backbone=args.backbone,
+        context_length=args.context_length,
     )
     print(
         f"nursery joint: training one action-conditioned world model "
@@ -1529,6 +1531,118 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
             "yaw_probe": report.yaw_probe,
             "train_sessions": report.train_sessions,
             "eval_sessions": report.eval_sessions,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(args.report)) or ".", exist_ok=True)
+        with open(args.report, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+        print(f"report written to {args.report}")
+
+
+def cmd_nursery_backbone_benchmark(args: argparse.Namespace) -> None:
+    """``ccr nursery backbone-benchmark`` (issue #93): train the cortex once
+    per temporal backbone on identical recordings and report GRU vs
+    dilated-conv/transformer on the Phase 2 scoring gates (model/copy-last,
+    model/oracle, frozen-rollout) per horizon."""
+    try:
+        import json
+
+        from cognitive_runtime.training.action_world_model import ActionWorldModelConfig
+        from cognitive_runtime.training.nursery import (
+            NURSERY_SCENARIOS,
+            NurseryConfig,
+            run_backbone_benchmark,
+        )
+    except ImportError as exc:  # torch not installed
+        sys.exit(f"the nursery suite needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+
+    for name in args.train_scenarios:
+        if name not in NURSERY_SCENARIOS:
+            sys.exit(f"unknown nursery scenario {name!r}; choices: {sorted(NURSERY_SCENARIOS)}")
+    if args.eval_scenario not in args.train_scenarios:
+        sys.exit(
+            f"--eval-scenario {args.eval_scenario!r} must be one of --train-scenarios "
+            f"{args.train_scenarios!r}"
+        )
+
+    train_seeds = list(range(args.train_seeds))
+    holdout_seeds = list(range(args.train_seeds, args.train_seeds + args.holdout_seeds))
+    config = NurseryConfig(
+        train_seeds=train_seeds,
+        holdout_seeds=holdout_seeds,
+        episode_ticks=args.episode_ticks,
+        world_size=args.world_size,
+        backend=args.backend,
+        realtime=args.realtime or args.backend == "remote",
+        horizons=args.horizons,
+        latent_width=args.latent_width,
+        hidden_dim=args.hidden_dim,
+        reconstruction_size=args.reconstruction_size,
+        epochs=args.epochs,
+        lr=args.neural_lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        data_quality_gate=not args.skip_data_quality_gate,
+    )
+    model_config = ActionWorldModelConfig(
+        latent_width=args.latent_width,
+        hidden_dim=args.hidden_dim,
+        reconstruction_size=args.reconstruction_size,
+        epochs=args.epochs,
+        lr=args.neural_lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        warmup_frames=args.warmup_frames,
+        rollout_frames=args.rollout_frames,
+        context_length=args.context_length,
+    )
+    print(
+        f"nursery backbone-benchmark: {args.backbones} on {args.eval_scenario!r} "
+        f"({len(train_seeds)} train seeds, {len(holdout_seeds)} held-out seeds)"
+    )
+
+    report = run_backbone_benchmark(
+        args.record_dir,
+        train_scenarios=args.train_scenarios,
+        eval_scenario=args.eval_scenario,
+        backbones=args.backbones,
+        baseline_backbone=args.baseline_backbone,
+        config=config,
+        model_config=model_config,
+    )
+
+    for name in report.metrics:
+        print(f"\n{name}:")
+        for h, entry in report.metrics[name]["horizons"].items():
+            oracle = entry["model_over_oracle_mse"]
+            print(
+                f"  t+{h} frames (n={entry['n_samples']}): "
+                f"model_mse={entry['model_mse']:.5f} "
+                f"model/copy_last={entry['model_over_copy_last_mse']:.2f} "
+                f"model/oracle={f'{oracle:.2f}' if oracle is not None else 'n/a'} "
+                f"beats_copy_last={entry['beats_copy_last']}"
+            )
+        health = report.metrics[name]["rollout_health"]
+        if health.get("frozen_rollout"):
+            print(f"  WARNING: FROZEN ROLLOUT ({name})")
+        if name != report.baseline_backbone:
+            for h, comparison in report.comparisons[name].items():
+                print(f"  vs {report.baseline_backbone} at t+{h}: {comparison.direction}")
+
+    if args.report:
+        payload = {
+            "train_scenarios": report.train_scenarios,
+            "eval_scenario": report.eval_scenario,
+            "baseline_backbone": report.baseline_backbone,
+            "metrics": report.metrics,
+            "stats": {
+                name: {h: s.to_dict() for h, s in horizon_stats.items()}
+                for name, horizon_stats in report.stats.items()
+            },
+            "comparisons": {
+                name: {h: c.to_dict() for h, c in horizon_comparisons.items()}
+                for name, horizon_comparisons in report.comparisons.items()
+            },
+            "beats_copy_last": report.beats_copy_last,
         }
         os.makedirs(os.path.dirname(os.path.abspath(args.report)) or ".", exist_ok=True)
         with open(args.report, "w", encoding="utf-8") as fh:
@@ -2201,6 +2315,15 @@ def build_parser() -> argparse.ArgumentParser:
                                  help="teacher-forced frames before each training rollout")
     p_nursery_joint.add_argument("--rollout-frames", type=int, default=8,
                                  help="closed-loop steps per training window (short on purpose)")
+    p_nursery_joint.add_argument("--backbone", default="gru",
+                                 choices=["gru", "dilated_conv", "transformer"],
+                                 help="cortex temporal backbone (issue #93): the default recurrent "
+                                      "GRU, a WaveNet-style dilated causal conv, or a small causal "
+                                      "transformer, both windowed over --context-length")
+    p_nursery_joint.add_argument("--context-length", type=int, default=8,
+                                 help="window size the dilated_conv/transformer backbones attend "
+                                      "over (ignored by gru); ramped 1 -> this value over training "
+                                      "via the context-length curriculum")
     p_nursery_joint.add_argument("--neural-lr", type=float, default=1e-3)
     p_nursery_joint.add_argument("--batch-size", type=int, default=32)
     p_nursery_joint.add_argument("--seed", type=int, default=0)
@@ -2211,6 +2334,53 @@ def build_parser() -> argparse.ArgumentParser:
                                  help="path to save a JSON report of all metrics")
     p_nursery_joint.add_argument("--skip-data-quality-gate", action="store_true")
     p_nursery_joint.set_defaults(func=cmd_nursery_joint)
+
+    p_nursery_bench = nursery_sub.add_parser(
+        "backbone-benchmark",
+        help="issue #93: train the cortex once per temporal backbone (gru, dilated_conv, "
+             "transformer) on identical recordings and report the Phase 2 scoring gates "
+             "(model/copy-last, model/oracle, frozen-rollout) per horizon for each",
+    )
+    p_nursery_bench.add_argument("--record-dir", default="sessions")
+    p_nursery_bench.add_argument("--train-scenarios", nargs="+", default=["walk_forward", "turn_in_place"],
+                                 help="scenarios recorded and trained on (shared by every backbone)")
+    p_nursery_bench.add_argument("--eval-scenario", default="turn_in_place",
+                                 help="held-out-seed scenario each backbone is scored on; must be "
+                                      "one of --train-scenarios")
+    p_nursery_bench.add_argument("--backbones", nargs="+", default=["gru", "dilated_conv", "transformer"],
+                                 choices=["gru", "dilated_conv", "transformer"],
+                                 help="backbones to benchmark")
+    p_nursery_bench.add_argument("--baseline-backbone", default="gru",
+                                 choices=["gru", "dilated_conv", "transformer"],
+                                 help="backbone every other backbone's comparison is measured against")
+    p_nursery_bench.add_argument("--train-seeds", type=int, default=6)
+    p_nursery_bench.add_argument("--holdout-seeds", type=int, default=2)
+    p_nursery_bench.add_argument("--episode-ticks", type=int, default=400)
+    p_nursery_bench.add_argument("--world-size", type=int, default=48)
+    p_nursery_bench.add_argument("--backend", default=_default_nursery_backend(),
+                                 choices=sorted(BACKENDS))
+    p_nursery_bench.add_argument("--realtime", action="store_true")
+    p_nursery_bench.add_argument("--horizons", type=int, nargs="+", default=[1, 10, 100],
+                                 help="tick offsets to evaluate at (converted to recorded-frame "
+                                      "steps via the measured vision rate)")
+    p_nursery_bench.add_argument("--latent-width", type=int, default=32)
+    p_nursery_bench.add_argument("--hidden-dim", type=int, default=64)
+    p_nursery_bench.add_argument("--reconstruction-size", type=int, default=16)
+    p_nursery_bench.add_argument("--epochs", type=int, default=30)
+    p_nursery_bench.add_argument("--warmup-frames", type=int, default=3,
+                                 help="teacher-forced frames before each training rollout")
+    p_nursery_bench.add_argument("--rollout-frames", type=int, default=8,
+                                 help="closed-loop steps per training window (short on purpose)")
+    p_nursery_bench.add_argument("--context-length", type=int, default=8,
+                                 help="window size the dilated_conv/transformer backbones attend "
+                                      "over; ramped 1 -> this value via the context-length curriculum")
+    p_nursery_bench.add_argument("--neural-lr", type=float, default=1e-3)
+    p_nursery_bench.add_argument("--batch-size", type=int, default=32)
+    p_nursery_bench.add_argument("--seed", type=int, default=0)
+    p_nursery_bench.add_argument("--report", default=None,
+                                 help="path to save a JSON report of all metrics")
+    p_nursery_bench.add_argument("--skip-data-quality-gate", action="store_true")
+    p_nursery_bench.set_defaults(func=cmd_nursery_backbone_benchmark)
 
     p_replay = sub.add_parser("replay", help="re-simulate a session and verify determinism")
     p_replay.add_argument("--session", required=True)
