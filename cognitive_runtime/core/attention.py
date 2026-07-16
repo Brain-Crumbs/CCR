@@ -50,7 +50,7 @@ exactly whenever attention is off.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -306,6 +306,11 @@ class AttentionController:
             raise ValueError(f"unknown attention mode {mode!r}; expected one of {sorted(ATTENTION_MODES)}")
         self.mode = mode
         self.config = config or AttentionConfig()
+        #: The budget as configured -- `apply_budget_multiplier` always
+        #: scales from this fixed baseline (issue #95's arbiter-mode
+        #: attention-breadth gate), never compounding call over call.
+        self._base_budget: AttentionBudget = self.config.budget
+        self._budget_multiplier: float = 1.0
         catalog = list(catalog)
         self.stream_ids: Tuple[str, ...] = tuple(
             stream_registry.ids_by_classification(catalog, "agent_input")
@@ -330,6 +335,34 @@ class AttentionController:
         self._captured_score = 0.0
         self._dwell_remaining = 0
         self._last_capture_was_bottom_up = False
+        self.config = replace(self.config, budget=self._base_budget)
+        self._budget_multiplier = 1.0
+
+    def apply_budget_multiplier(self, multiplier: float) -> None:
+        """Scale this tick's budget from the fixed as-configured baseline
+        (issue #95: the arbiter's mode gates attention breadth --
+        info-gathering widens it, fight-or-flight narrows it). A no-op
+        (skips the `dataclasses.replace` allocation entirely) when
+        `multiplier` matches the one already applied, so a sustained mode
+        doesn't reallocate a fresh config every tick."""
+        if multiplier <= 0:
+            raise ValueError(f"multiplier must be positive, got {multiplier!r}")
+        if multiplier == self._budget_multiplier:
+            return
+        base = self._base_budget
+        if multiplier == 1.0:
+            scaled_budget = base
+        else:
+            max_streams = (
+                max(1, round(base.max_streams * multiplier))
+                if base.max_streams is not None else None
+            )
+            scaled_budget = AttentionBudget(
+                max_total_weight=base.max_total_weight * multiplier,
+                max_streams=max_streams,
+            )
+        self.config = replace(self.config, budget=scaled_budget)
+        self._budget_multiplier = multiplier
 
     # ------------------------------------------------------------- scoring
 
