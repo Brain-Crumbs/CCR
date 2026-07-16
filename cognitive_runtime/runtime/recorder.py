@@ -89,6 +89,11 @@ class DecisionRecord:
     # `None` on every other tick and for every session recorded before this
     # field existed.
     reflex: Optional[Dict[str, Any]] = None
+    #: The arbiter's three-mode switch (issue #95): `Arbiter.as_payload()`
+    #: (mode, the (surprise, pain) reading that drove it, and the surprise
+    #: calibrator's current calibration error), every tick; `None` for
+    #: every session recorded before this field existed.
+    arbiter_mode: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -164,6 +169,15 @@ class EpisodeSummary:
     #: this episode; 0 for `reflex_mode != "on"` and for every episode
     #: recorded before this field existed.
     reflex_activations: int = 0
+    #: The arbiter's mode timeline this episode (issue #95): mode name ->
+    #: ticks it was active. Empty for every episode recorded before this
+    #: field existed.
+    arbiter_mode_counts: Dict[str, int] = field(default_factory=dict)
+    #: The surprise calibrator's Expected Calibration Error at the end of
+    #: this episode (issue #95, task 4); `None` before enough observations
+    #: accumulated for a fit, and for every episode recorded before this
+    #: field existed.
+    surprise_calibration_error: Optional[float] = None
     #: Organism identity (issue #88): `RuntimeConfig.resolve_name()`'s
     #: result for the run this episode belongs to; `None` for every episode
     #: recorded before this field existed (dashboards group those as

@@ -35,6 +35,14 @@ import time
 from typing import Any, Dict, List, Optional
 
 from brain.amygdala import Amygdala
+from brain.arbiter import (
+    ARBITER_MODE_STREAM,
+    ARBITER_MODE_STREAM_SPEC,
+    FIGHT_OR_FLIGHT,
+    INFO_GATHERING,
+    Arbiter,
+    SurpriseCalibrator,
+)
 from brain.neuromod import (
     NAMED_NEUROMODULATOR_STREAM_SPECS,
     compute_acetylcholine,
@@ -123,6 +131,18 @@ ATTENTION_WEIGHTS_STREAM_SPEC = StreamSpec(
     payload_schema="{mode, weights, selected_streams, focus_stream, budget_used, budget_total}",
 )
 
+#: Attention-budget multiplier per arbiter mode (issue #95: "the mode gates
+#: attention breadth"). Info-gathering widens the net to sample broadly;
+#: fight-or-flight narrows it to whatever is most salient right now.
+#: Reward-seeking (and no mode yet, at the very first tick) is the
+#: unscaled baseline -- absent from this map so `.get(mode, 1.0)` covers
+#: it without a redundant entry. Full motor-path precedence is Phase 6's
+#: job; this is the arbiter's only gate.
+ARBITER_ATTENTION_BREADTH_MULTIPLIER: Dict[str, float] = {
+    INFO_GATHERING: 1.5,
+    FIGHT_OR_FLIGHT: 0.6,
+}
+
 
 class CognitiveRuntime:
     def __init__(
@@ -210,6 +230,7 @@ class CognitiveRuntime:
             self.sensory_bus.register(spec)
         for spec in NAMED_NEUROMODULATOR_STREAM_SPECS:
             self.sensory_bus.register(spec)
+        self.sensory_bus.register(ARBITER_MODE_STREAM_SPEC)
         #: Interoceptive modulation signals (issue #58) plus the risk-gated
         #: intrinsic-drive terms derived from them (issue #61): prediction
         #: error, reward-prediction error, learning progress, novelty, risk,
@@ -227,6 +248,22 @@ class CognitiveRuntime:
         #: computes into a two-rate-EMA'd adrenaline level, published as
         #: `internal.adrenaline`.
         self.amygdala = Amygdala()
+        #: The three-mode switch (issue #95): a hand-authored 2x2 lookup
+        #: over (calibrated surprise, amygdala pain) picking reward-seeking
+        #: / info-gathering / fight-or-flight each tick, with hysteresis
+        #: against flapping. Published as `internal.arbiter_mode`.
+        self.arbiter = Arbiter()
+        #: Temperature-scales the raw surprise reading (the same
+        #: prediction-error stand-in `compute_acetylcholine` uses) into a
+        #: calibrated `[0, 1)` probability before it reaches the arbiter
+        #: (issue #95, task 4), reporting Expected Calibration Error as it
+        #: goes.
+        self.surprise_calibrator = SurpriseCalibrator()
+        #: Previous tick's arbiter mode, applied to *this* tick's attention
+        #: budget (issue #95: "the mode gates attention breadth") -- one
+        #: tick lagged like every other internal.* signal, since the mode
+        #: itself isn't known until after this tick's prediction runs.
+        self._arbiter_attention_mode: Optional[str] = None
         #: Optional Program hook (issue #61) that primes a profile-driven
         #: reward engine's `internal.*` view -- see the call site below for
         #: why this can't just flow through the Program's own tick_events.
@@ -251,6 +288,7 @@ class CognitiveRuntime:
                 ATTENTION_WEIGHTS_STREAM_SPEC,
                 *INTERNAL_MODULATION_STREAM_SPECS,
                 *NAMED_NEUROMODULATOR_STREAM_SPECS,
+                ARBITER_MODE_STREAM_SPEC,
             ],
             stream_registry=self.stream_registry,
             mode=attention_mode,
@@ -375,6 +413,9 @@ class CognitiveRuntime:
         self.attention.reset()
         self.reflex.reset()
         self.amygdala.reset()
+        self.arbiter.reset()
+        self.surprise_calibrator.reset()
+        self._arbiter_attention_mode = None
         episode_id = self.recorder.start_episode(episode_index)
 
         ratio = self.config.program_ticks_per_cognitive_tick
@@ -392,6 +433,7 @@ class CognitiveRuntime:
         attention_budget_total = 0.0
         attention_budget_ticks = 0
         attention_focus_counts: Dict[str, int] = {}
+        arbiter_mode_counts: Dict[str, int] = {}
         reflex_activations = 0
         recoverable_error: Optional[str] = None
 
@@ -417,6 +459,7 @@ class CognitiveRuntime:
             decide_start = time.perf_counter()
             window = self.synchronizer.collect(self.sensory_bus)
             self.memory.update(window)
+            self._gate_attention_breadth(self._arbiter_attention_mode)
             attention_state = self.attention.compute(window.tick_index, self.memory.buffer)
             self.memory.set_attention_state(attention_state)
             self.sensory_bus.publish(
@@ -569,6 +612,22 @@ class CognitiveRuntime:
                 self.sensory_bus.publish(
                     stream_id, payload, window.ended_at, source="model"
                 )
+            # The arbiter (issue #95): calibrates this tick's raw surprise
+            # reading (the same prediction-error stand-in acetylcholine
+            # uses above) and feeds it, plus the amygdala's pain reading
+            # (adrenaline) just computed, through the hand-authored 2x2
+            # switch. `self._arbiter_attention_mode` (consumed at the top
+            # of *next* tick) is set here, one tick lagged like every other
+            # internal.* signal.
+            raw_surprise = prediction.prediction_error if prediction.prediction_error is not None else 0.0
+            calibrated_surprise = self.surprise_calibrator.update(raw_surprise)
+            arbiter_mode = self.arbiter.decide(surprise=calibrated_surprise, pain=adrenaline)
+            self._arbiter_attention_mode = arbiter_mode
+            arbiter_payload = self.arbiter.as_payload(self.surprise_calibrator.calibration_error)
+            self.sensory_bus.publish(
+                ARBITER_MODE_STREAM, arbiter_payload, window.ended_at, source="model"
+            )
+            arbiter_mode_counts[arbiter_mode] = arbiter_mode_counts.get(arbiter_mode, 0) + 1
             # `internal.*` streams are computed here, after this tick's
             # `program.step()` already ran -- a Program's own reward
             # evaluation can never see them the same tick it's published, so
@@ -603,6 +662,7 @@ class CognitiveRuntime:
                     ),
                     attention=attention_state.to_dict(),
                     reflex=reflex_decision.to_dict() if reflex_decision is not None else None,
+                    arbiter_mode=arbiter_payload,
                 ),
             )
 
@@ -665,6 +725,8 @@ class CognitiveRuntime:
             attention_mode=self.attention.mode,
             reflex_mode=self.reflex.config.mode,
             reflex_activations=reflex_activations,
+            arbiter_mode_counts=dict(sorted(arbiter_mode_counts.items())),
+            surprise_calibration_error=self.surprise_calibrator.calibration_error,
         )
         self.recorder.write_summary(summary)
         self.recorder.end_episode_file()
@@ -674,6 +736,14 @@ class CognitiveRuntime:
         if not recoverable_error:
             self._end_online_episode()
         return summary
+
+    def _gate_attention_breadth(self, mode: Optional[str]) -> None:
+        """Apply the previous tick's arbiter mode to this tick's attention
+        budget (issue #95: "the mode gates attention breadth"). `None`
+        (before any mode is known) is the unscaled baseline, same as
+        `reward_seeking`."""
+        multiplier = ARBITER_ATTENTION_BREADTH_MULTIPLIER.get(mode, 1.0) if mode else 1.0
+        self.attention.apply_budget_multiplier(multiplier)
 
     def _stream_rates(self, sim_elapsed: float) -> dict:
         """Events/sec per stream_id over the episode's simulated duration."""
