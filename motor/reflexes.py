@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Iterable, List, Mapping, Optional, Sequence
 
 from cognitive_runtime.core.action import Action
+from cognitive_runtime.core.action_registry import ActionRegistry, DEFAULT_ACTION_REGISTRY
 from cognitive_runtime.core.attention import AttentionState
 
 
@@ -151,10 +153,15 @@ DEFAULT_BEARING_DEADZONE_DEG = 15.0
 
 def stimulus_from_attention(attention_state: AttentionState) -> Optional[Stimulus]:
     """The bottom-up attention capture (`core.attention`, issue #59) as a
-    World-declared ``salience-left``/``salience-right`` stimulus -- the
+    single-tick ``salience-left``/``salience-right`` stimulus pulse -- the
     generic input `OrientingReflex` (issue #60) used to orient toward,
     migrated to the stimulus/reflex-config seam. `None` when nothing
-    localizable captured focus this tick."""
+    localizable captured focus this tick.
+
+    `bottom_up_capture` is a one-tick pulse (see `AttentionState`), so a
+    caller wanting `OrientingReflex`'s bounded multi-tick hold instead of a
+    one-tick flick should drive this through :class:`AttentionStimulusSource`
+    rather than calling this function directly every tick."""
     if not attention_state.bottom_up_capture or attention_state.focus_stream is None:
         return None
     reason = attention_state.reasons.get(attention_state.focus_stream)
@@ -166,6 +173,57 @@ def stimulus_from_attention(attention_state: AttentionState) -> Optional[Stimulu
     kind = "salience-right" if bearing > 0 else "salience-left"
     return Stimulus(kind, abs(bearing), source=attention_state.focus_stream,
                     data={"bearing_deg": bearing})
+
+
+class AttentionStimulusSource:
+    """Holds a captured ``salience`` stimulus for `hold_ticks` ticks
+    (`OrientingReflexConfig.hold_ticks`'s old default of 3), so a single
+    bottom-up capture pulse commands a bounded orientation rather than
+    firing the reflex for one tick and vanishing -- `OrientingReflex`'s
+    `_hold_remaining` behavior, migrated to the stateless `ReflexStack` by
+    keeping the hold state in the stimulus source instead."""
+
+    def __init__(self, hold_ticks: int = 3) -> None:
+        if hold_ticks <= 0:
+            raise ValueError(f"hold_ticks must be positive, got {hold_ticks!r}")
+        self.hold_ticks = hold_ticks
+        self._held: Optional[Stimulus] = None
+        self._remaining = 0
+
+    def reset(self) -> None:
+        self._held = None
+        self._remaining = 0
+
+    def poll(self, attention_state: AttentionState) -> Optional[Stimulus]:
+        captured = stimulus_from_attention(attention_state)
+        if captured is not None:
+            self._held = captured
+            self._remaining = self.hold_ticks - 1
+            return captured
+        if self._remaining > 0:
+            self._remaining -= 1
+            return self._held
+        self._held = None
+        return None
+
+
+def eligible_orienting_stimuli(
+    stimuli: Iterable[Stimulus],
+    voluntary: Action,
+    action_registry: ActionRegistry = DEFAULT_ACTION_REGISTRY,
+) -> List[Stimulus]:
+    """Drop ``salience-*`` stimuli when `voluntary` is a *purely*
+    world-changing action (world-changing and not information-gathering) --
+    `OrientingReflex._is_survival_critical`'s veto, migrated so the orienting
+    reflex never suppresses a survival-critical voluntary response (fleeing,
+    eating) with a mere look. Locomotion classified world-changing *and*
+    information-gathering ("walking does both") does not veto. Every other
+    stimulus kind passes through untouched -- this veto is orienting-specific,
+    not a general eligibility gate."""
+    if (action_registry.is_world_changing(voluntary)
+            and not action_registry.is_information_gathering(voluntary)):
+        return [s for s in stimuli if not s.kind.startswith("salience")]
+    return list(stimuli)
 
 
 def stimulus_from_threat(level: float, source: str = "amygdala") -> Stimulus:
@@ -204,14 +262,21 @@ def default_reflex_genome(
     (e.g. water escape). Action names are Program-supplied -- the genome
     reasons about stimulus *kind*, never what an action *is*. `withdraw`
     outranks `hazard-escape`, which outranks orienting: survival-critical
-    responses must never be suppressed by a mere look toward salience."""
+    responses must never be suppressed by a mere look toward salience.
+
+    A bearing exactly at `bearing_deadzone_deg` does not fire, matching
+    `OrientingReflexConfig`'s inclusive deadzone (`abs(bearing) <= deadzone`
+    counts as "already facing it"); `ReflexStack.evaluate`'s threshold check
+    is otherwise inclusive (`>=`), so the orient reflexes' threshold is nudged
+    up by one representable float to keep the boundary itself inert."""
+    orient_threshold = math.nextafter(bearing_deadzone_deg, math.inf)
     genome = [
         ReflexConfig("withdraw", "threat", withdraw_action,
                      threshold=threat_threshold, priority=10),
         ReflexConfig("orient-left", "salience-left", orient_left_action,
-                     threshold=bearing_deadzone_deg, priority=1),
+                     threshold=orient_threshold, priority=1),
         ReflexConfig("orient-right", "salience-right", orient_right_action,
-                     threshold=bearing_deadzone_deg, priority=1),
+                     threshold=orient_threshold, priority=1),
     ]
     if hazard_action is not None:
         genome.insert(1, ReflexConfig("hazard-escape", "hazard", hazard_action,

@@ -1,6 +1,7 @@
 """World-agnostic motor control primitives."""
 
 from motor.reflexes import (
+    AttentionStimulusSource,
     CaregiverChannel,
     CaregiverOverride,
     MotorDecision,
@@ -9,6 +10,7 @@ from motor.reflexes import (
     ReflexStack,
     Stimulus,
     default_reflex_genome,
+    eligible_orienting_stimuli,
     stimulus_from_attention,
     stimulus_from_hazard,
     stimulus_from_threat,
@@ -16,6 +18,7 @@ from motor.reflexes import (
 from motor.voluntary import MPCController, VoluntaryController, build_voluntary_controller
 
 __all__ = [
+    "AttentionStimulusSource",
     "CaregiverChannel",
     "CaregiverOverride",
     "MPCController",
@@ -27,6 +30,7 @@ __all__ = [
     "VoluntaryController",
     "build_voluntary_controller",
     "default_reflex_genome",
+    "eligible_orienting_stimuli",
     "stimulus_from_attention",
     "stimulus_from_hazard",
     "stimulus_from_threat",

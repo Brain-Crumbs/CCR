@@ -1,12 +1,15 @@
 from cognitive_runtime.core.action import NULL_ACTION, Action
+from cognitive_runtime.core.action_registry import ActionDeclaration, ActionRegistry
 from cognitive_runtime.core.attention import AttentionReason, AttentionSignal, AttentionState, StimulusDirection
 from motor.reflexes import (
+    AttentionStimulusSource,
     CaregiverChannel,
     CaregiverOverride,
     ReflexConfig,
     ReflexStack,
     Stimulus,
     default_reflex_genome,
+    eligible_orienting_stimuli,
     stimulus_from_attention,
     stimulus_from_hazard,
     stimulus_from_threat,
@@ -173,3 +176,89 @@ def test_caregiver_channel_injects_at_the_top_of_precedence():
     decision = reflexes.decide(Action("MOVE_FORWARD"), [], channel.drain())
     assert decision.caregiver_override is None
     assert decision.actuated == Action("MOVE_FORWARD")
+
+
+# --------------------------------------------------- OrientingReflex parity fixes
+
+
+def test_bearing_exactly_at_the_deadzone_boundary_does_not_fire():
+    genome = default_reflex_genome(
+        withdraw_action=Action("SPRINT"),
+        orient_left_action=Action("LOOK_LEFT"),
+        orient_right_action=Action("LOOK_RIGHT"),
+        bearing_deadzone_deg=15.0,
+    )
+    reflexes = ReflexStack(genome)
+
+    at_boundary = stimulus_from_attention(_attention_state(bearing_deg=15.0))
+    decision = reflexes.decide(Action("MOVE_FORWARD"), [at_boundary])
+    assert decision.actuated == Action("MOVE_FORWARD")
+    assert decision.reflex is None
+
+    just_past = stimulus_from_attention(_attention_state(bearing_deg=15.0001))
+    decision = reflexes.decide(Action("MOVE_FORWARD"), [just_past])
+    assert decision.actuated == Action("LOOK_RIGHT")
+
+
+def test_attention_stimulus_source_holds_the_capture_across_ticks():
+    source = AttentionStimulusSource(hold_ticks=3)
+    capture = _attention_state(bearing_deg=30.0)
+    quiet = _attention_state(bottom_up_capture=False)
+
+    first = source.poll(capture)
+    assert first.kind == "salience-right"
+
+    # Two more ticks with no fresh capture still hold the same stimulus...
+    second = source.poll(quiet)
+    third = source.poll(quiet)
+    assert second == first
+    assert third == first
+
+    # ...and the hold expires on the fourth tick.
+    assert source.poll(quiet) is None
+
+
+def test_attention_stimulus_source_reset_clears_an_in_progress_hold():
+    source = AttentionStimulusSource(hold_ticks=3)
+    source.poll(_attention_state(bearing_deg=30.0))
+    source.reset()
+    assert source.poll(_attention_state(bottom_up_capture=False)) is None
+
+
+_ACTION_REGISTRY = ActionRegistry([
+    ActionDeclaration("LOOK_LEFT", world_changing=False, information_gathering=True),
+    ActionDeclaration("LOOK_RIGHT", world_changing=False, information_gathering=True),
+    ActionDeclaration("MOVE_FORWARD", world_changing=True, information_gathering=True),
+    ActionDeclaration("ATTACK", world_changing=True, information_gathering=False),
+])
+
+
+def test_eligible_orienting_stimuli_drops_salience_for_a_survival_critical_voluntary_action():
+    stimuli = [stimulus_from_attention(_attention_state(bearing_deg=30.0)), stimulus_from_threat(0.1)]
+
+    # ATTACK is purely world-changing (not information-gathering): orienting
+    # must not substitute a look for it.
+    filtered = eligible_orienting_stimuli(stimuli, Action("ATTACK"), _ACTION_REGISTRY)
+    assert all(not s.kind.startswith("salience") for s in filtered)
+
+    # MOVE_FORWARD is world-changing *and* information-gathering ("walking
+    # does both") -- it does not veto orienting.
+    filtered = eligible_orienting_stimuli(stimuli, Action("MOVE_FORWARD"), _ACTION_REGISTRY)
+    assert any(s.kind.startswith("salience") for s in filtered)
+
+
+def test_eligible_orienting_stimuli_end_to_end_preserves_the_survival_critical_veto():
+    genome = default_reflex_genome(
+        withdraw_action=Action("SPRINT"),
+        orient_left_action=Action("LOOK_LEFT"),
+        orient_right_action=Action("LOOK_RIGHT"),
+    )
+    reflexes = ReflexStack(genome)
+    stimuli = eligible_orienting_stimuli(
+        [stimulus_from_attention(_attention_state(bearing_deg=30.0))],
+        Action("ATTACK"),
+        _ACTION_REGISTRY,
+    )
+    decision = reflexes.decide(Action("ATTACK"), stimuli)
+    assert decision.actuated == Action("ATTACK")
+    assert decision.reflex is None
