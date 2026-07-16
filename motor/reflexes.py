@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from cognitive_runtime.core.action import Action
+from cognitive_runtime.core.attention import AttentionState
 
 
 @dataclass(frozen=True)
@@ -120,3 +121,99 @@ class ReflexStack:
         return {"motor.reflex_activation_rate": self.activation_rate,
                 "motor.reflex_activations": self.reflex_ticks,
                 "motor.ticks": self.ticks}
+
+
+class CaregiverChannel:
+    """The development-stage hook (babbling / guided movement) injects motor
+    commands here; the runtime drains one pending override per tick and hands
+    it to :meth:`ReflexStack.decide`, the top of the precedence stack."""
+
+    def __init__(self) -> None:
+        self._pending: Optional[CaregiverOverride] = None
+
+    def inject(self, action: Action, reason: str = "caregiver") -> None:
+        self._pending = CaregiverOverride(action, reason)
+
+    def clear(self) -> None:
+        self._pending = None
+
+    def drain(self) -> Optional[CaregiverOverride]:
+        override, self._pending = self._pending, None
+        return override
+
+
+#: Bearings within this many degrees of dead ahead count as "already facing
+#: it" (`OrientingReflexConfig.bearing_deadzone_deg`'s old default) -- reused
+#: here as the `orient-left`/`orient-right` reflexes' threshold, since
+#: `stimulus_from_attention`'s intensity *is* `abs(bearing_deg)`.
+DEFAULT_BEARING_DEADZONE_DEG = 15.0
+
+
+def stimulus_from_attention(attention_state: AttentionState) -> Optional[Stimulus]:
+    """The bottom-up attention capture (`core.attention`, issue #59) as a
+    World-declared ``salience-left``/``salience-right`` stimulus -- the
+    generic input `OrientingReflex` (issue #60) used to orient toward,
+    migrated to the stimulus/reflex-config seam. `None` when nothing
+    localizable captured focus this tick."""
+    if not attention_state.bottom_up_capture or attention_state.focus_stream is None:
+        return None
+    reason = attention_state.reasons.get(attention_state.focus_stream)
+    if reason is None or reason.signal.direction is None:
+        return None
+    bearing = reason.signal.direction.bearing_deg
+    if bearing is None:
+        return None
+    kind = "salience-right" if bearing > 0 else "salience-left"
+    return Stimulus(kind, abs(bearing), source=attention_state.focus_stream,
+                    data={"bearing_deg": bearing})
+
+
+def stimulus_from_threat(level: float, source: str = "amygdala") -> Stimulus:
+    """The Amygdala's adrenaline level (`brain.amygdala`, issue #94) as a
+    World-declared ``threat`` stimulus -- the threat/withdrawal response's
+    trigger. Adrenaline is already the appraised, EMA-smoothed reading, so
+    this is a direct wrap, not a re-derivation."""
+    return Stimulus("threat", level, source=source)
+
+
+def stimulus_from_hazard(active: bool, source: str) -> Optional[Stimulus]:
+    """A boolean hazard flag (e.g. Minecraft's ``body.in_water``, the
+    scripted survival policy's water-escape trigger) as a ``hazard``
+    stimulus. `None` when the hazard isn't active -- reflexes only ever see
+    stimuli that are actually present this tick."""
+    return Stimulus("hazard", 1.0, source=source) if active else None
+
+
+def default_reflex_genome(
+    *,
+    withdraw_action: Action,
+    orient_left_action: Action,
+    orient_right_action: Action,
+    hazard_action: Optional[Action] = None,
+    threat_threshold: float = 0.5,
+    bearing_deadzone_deg: float = DEFAULT_BEARING_DEADZONE_DEG,
+    hazard_threshold: float = 0.5,
+) -> list[ReflexConfig]:
+    """The organism's default reflex genome (Phase 6, issue #102): the
+    `withdraw` reflex fires on a `threat` stimulus (migrated from
+    `brain.amygdala`'s adrenaline release), `orient-left`/`orient-right` fire
+    on a `salience-left`/`salience-right` stimulus (migrated from
+    `OrientingReflex`), and an
+    optional `hazard-escape` reflex covers boundary-condition survival
+    behaviours migrated from `policies.scripted.ScriptedSurvivalPolicy`
+    (e.g. water escape). Action names are Program-supplied -- the genome
+    reasons about stimulus *kind*, never what an action *is*. `withdraw`
+    outranks `hazard-escape`, which outranks orienting: survival-critical
+    responses must never be suppressed by a mere look toward salience."""
+    genome = [
+        ReflexConfig("withdraw", "threat", withdraw_action,
+                     threshold=threat_threshold, priority=10),
+        ReflexConfig("orient-left", "salience-left", orient_left_action,
+                     threshold=bearing_deadzone_deg, priority=1),
+        ReflexConfig("orient-right", "salience-right", orient_right_action,
+                     threshold=bearing_deadzone_deg, priority=1),
+    ]
+    if hazard_action is not None:
+        genome.insert(1, ReflexConfig("hazard-escape", "hazard", hazard_action,
+                                       threshold=hazard_threshold, priority=8))
+    return genome
