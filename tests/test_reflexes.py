@@ -65,6 +65,39 @@ def test_reflex_activation_rate_is_exposed_as_session_metric():
     assert reflexes.metrics()["motor.reflex_activation_rate"] == .5
 
 
+# --------------------------------------------------------- issue #103: developmental trend
+
+
+def test_reflex_activation_rate_falls_across_development_on_locomotion_and_threat_scenario():
+    import random
+
+    from motor.reflexes import reflex_activation_series
+
+    def session(threat_probability, ticks=200, seed=0):
+        reflexes = ReflexStack([
+            ReflexConfig("withdraw", "threat", Action("BACK"), threshold=.5, priority=10),
+        ])
+        rng = random.Random(seed)
+        for _ in range(ticks):
+            stimuli = [Stimulus("threat", 1.0)] if rng.random() < threat_probability else []
+            reflexes.decide(Action("FORWARD"), stimuli)
+        return reflexes
+
+    # The cortex "matures" across sessions: it learns to steer clear of the
+    # threat zone voluntarily, so fewer ticks ever present a
+    # threshold-crossing threat stimulus -- the falling activation-rate
+    # curve issue #103 asks the clinic to chart (reflex *integration*,
+    # not the withdraw reflex itself changing).
+    maturity_threat_probabilities = [0.8, 0.6, 0.4, 0.2, 0.05]
+    sessions = [session(p, seed=i) for i, p in enumerate(maturity_threat_probabilities)]
+
+    rates = reflex_activation_series(sessions)
+
+    assert rates == sorted(rates, reverse=True)
+    assert rates[0] > rates[-1]
+    assert rates[-1] < 0.15
+
+
 # ------------------------------------------------------- migrated stimuli (issue #102)
 
 

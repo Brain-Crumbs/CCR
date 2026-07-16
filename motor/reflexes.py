@@ -125,6 +125,17 @@ class ReflexStack:
                 "motor.ticks": self.ticks}
 
 
+def reflex_activation_series(sessions: Sequence[ReflexStack]) -> List[float]:
+    """Reflex-activation rate over development (issue #103): one point per
+    session, taken from each :class:`ReflexStack`'s own
+    ``activation_rate`` (already emitted per-session by
+    :meth:`ReflexStack.metrics`). Expected to trend downward as the cortex
+    learns to pre-empt its reflexes -- human infant reflex integration, as
+    a measured curve, not a metaphor. Feeds the clinic's developmental
+    chart."""
+    return [session.activation_rate for session in sessions]
+
+
 class CaregiverChannel:
     """The development-stage hook (babbling / guided movement) injects motor
     commands here; the runtime drains one pending override per tick and hands
