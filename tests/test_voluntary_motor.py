@@ -35,3 +35,117 @@ def test_mpc_does_not_construct_a_gradient_graph():
     controller.choose(None, [Action.make("A", score=1), Action.make("B", score=2)])
     assert parameter.grad is None
 
+
+# --------------------------------------------------------------- issue #103: real alt controllers
+
+
+def test_active_inference_controller_decodes_the_forecast_that_matches_the_goal():
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    from motor.policy import ActiveInferenceState, build_active_inference_controller
+
+    class FakeCortex:
+        latent_width = 2
+
+        def step(self, latent, action_idx, hidden):
+            targets = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+            return targets[action_idx], hidden
+
+    controller = build_active_inference_controller(FakeCortex(), ["LEFT", "RIGHT"])
+    assert controller.name == "active"
+
+    state = ActiveInferenceState(latent=torch.zeros(1, 2), hidden=None)
+    actions = [Action("LEFT"), Action("RIGHT")]
+    goal = torch.tensor([0.1, 0.9])  # closer to RIGHT's (0, 1) forecast
+    assert controller.choose(state, actions, goal=goal) == Action("RIGHT")
+
+    goal = torch.tensor([0.9, 0.1])  # closer to LEFT's (1, 0) forecast
+    assert controller.choose(state, actions, goal=goal) == Action("LEFT")
+
+
+def test_active_inference_controller_requires_a_goal():
+    import pytest
+
+    pytest.importorskip("torch")
+    from motor.policy import ActiveInferenceState, build_active_inference_controller
+
+    class FakeCortex:
+        latent_width = 2
+
+        def step(self, latent, action_idx, hidden):
+            return latent, hidden
+
+    controller = build_active_inference_controller(FakeCortex(), ["A", "B"])
+    state = ActiveInferenceState(latent=None, hidden=None)
+    with pytest.raises(ValueError):
+        controller.choose(state, [Action("A"), Action("B")])
+
+
+def test_imagination_actor_learns_from_dreamed_rollouts_and_satisfies_seam():
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    from motor.policy import ImaginationActor, build_imagination_controller
+
+    class FakeDreamCortex:
+        """Reward equals the imagined action's own index, so the actor has
+        a clear, deterministic incentive to prefer action 1 over action 0."""
+
+        latent_width = 2
+
+        def step(self, latent, action_idx, hidden):
+            return latent, action_idx
+
+        def heads(self, hidden):
+            reward = hidden.float()
+            zeros = torch.zeros_like(reward)
+            return reward, zeros, zeros, zeros
+
+    torch.manual_seed(0)
+    actor = ImaginationActor(latent_width=2, n_actions=2, hidden_dim=8)
+    cortex = FakeDreamCortex()
+    seed_latent = torch.zeros(1, 2)
+    hidden = torch.zeros(1, dtype=torch.long)
+    generator = torch.Generator().manual_seed(0)
+
+    for _ in range(150):
+        actor.train_on_dream(cortex, seed_latent, hidden, horizon=3, generator=generator)
+
+    controller = build_imagination_controller(actor, ["LEFT", "RIGHT"])
+    assert controller.name == "imagination"
+    chosen = controller.choose(seed_latent, [Action("LEFT"), Action("RIGHT")])
+    assert chosen == Action("RIGHT")
+
+
+def test_policy_controller_wires_the_actor_critic_policy_head():
+    import pytest
+
+    pytest.importorskip("torch")
+    from cognitive_runtime.core.memory import Memory
+    from cognitive_runtime.core.observation import Observation
+    from cognitive_runtime.core.perception import State
+    from cognitive_runtime.core.streams.fusion import LatentState
+    from cognitive_runtime.neural import MLPPolicyModel, MLPValueModel
+    from cognitive_runtime.policies.actor_critic import ActorCriticPolicy, world_feature_width
+    from motor.policy import build_policy_controller
+
+    action_keys = ["NULL", "MOVE_FORWARD", "ATTACK"]
+    wf_width = world_feature_width(action_keys)
+    policy_model = MLPPolicyModel(2, wf_width, len(action_keys), hidden_dim=8)
+    critic_model = MLPValueModel(2, wf_width, hidden_dim=8)
+    policy = ActorCriticPolicy(policy_model, critic_model, action_keys, training=False)
+
+    controller = build_policy_controller(policy)
+    assert controller.name == "policy"
+
+    memory = Memory()
+    memory.set_fused_latent(LatentState(vector=[0.0, 0.0], slices={}, layout_hash="layout-a"))
+    state = State(Observation(timestamp=0.0, tick=0, data={}))
+    action_space = [Action.from_key(key) for key in action_keys]
+
+    chosen = controller.choose((state, memory, None), action_space, goal=None)
+    assert chosen.key() in action_keys
+    if policy.latest_decision.action_key == "NULL":
+        assert chosen == NULL_ACTION
+
