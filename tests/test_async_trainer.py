@@ -28,8 +28,51 @@ from cognitive_runtime.runtime.config import RuntimeConfig  # noqa: E402
 from cognitive_runtime.runtime.loop import CognitiveRuntime  # noqa: E402
 from cognitive_runtime.training.async_trainer import ActorCriticArch, AsyncTrainer  # noqa: E402
 from cognitive_runtime.training.features import ACTION_KEYS  # noqa: E402
+from sleep import Phase, PhasicSleepSchedule  # noqa: E402
+from sleep.async_trainer import AsyncTrainer as SleepTrainer  # noqa: E402
+from sleep.weight_publisher import WeightPublisher as SleepWeightPublisher  # noqa: E402
 
 WORLD_CONFIG = {"episode_ticks": 120, "world_size": 16, "max_mobs": 2}
+
+
+def test_old_trainer_and_publisher_imports_are_shims():
+    """Pre-Phase-5 imports resolve to the canonical sleep implementations."""
+    from cognitive_runtime.neural.weight_publisher import WeightPublisher
+
+    assert AsyncTrainer is SleepTrainer
+    assert WeightPublisher is SleepWeightPublisher
+
+
+def test_phasic_schedule_reads_only_post_consolidation_weights():
+    """No acting or reload is possible while the cortex is being updated."""
+    events = []
+    schedule = PhasicSleepSchedule(wake_ticks=2)
+
+    schedule.act(lambda: events.append("act-1"), wake_update=lambda: events.append("cheap"))
+    schedule.act(lambda: events.append("act-2"), encode_seed=lambda: events.append("seed"))
+    assert schedule.sleep_due
+
+    with pytest.raises(RuntimeError, match="acting is paused"):
+        schedule.act(lambda: events.append("stale-act"))
+
+    def sleep_pass():
+        assert schedule.phase is Phase.SLEEP
+        events.extend(("gradient-1", "gradient-2", "publish-7"))
+        return 7
+
+    def reload_weights():
+        # Reload is after every heavy update and the one final publication.
+        assert events[-1] == "publish-7"
+        events.append("reload-7")
+        return 7
+
+    result = schedule.consolidate(sleep_pass, reload_weights=reload_weights)
+    assert result.published_version == result.loaded_version == 7
+    assert schedule.phase is Phase.WAKE
+    assert events == [
+        "act-1", "cheap", "act-2", "seed",
+        "gradient-1", "gradient-2", "publish-7", "reload-7",
+    ]
 
 
 def _record_session(tmp_path, session_id="sess0", *, seed=0, ticks=120):

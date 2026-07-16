@@ -55,7 +55,7 @@ from cognitive_runtime.neural.replay_buffer import (
     Transition,
 )
 from cognitive_runtime.neural.value import ValueModel
-from cognitive_runtime.neural.weight_publisher import WeightSubscriber
+from sleep.weight_publisher import WeightSubscriber
 
 WORLD_FEATURE_BASE_WIDTH = 4  # [risk, p_death, predicted_reward, prediction_error]
 
