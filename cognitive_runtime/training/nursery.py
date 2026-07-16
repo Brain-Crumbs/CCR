@@ -25,7 +25,6 @@ group nursery runs the same way they already group curriculum-preset runs
 from __future__ import annotations
 
 import json
-import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -38,7 +37,17 @@ from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
 from cognitive_runtime.policies.constant_action import ConstantActionPolicy
 from cognitive_runtime.policies.null_policy import NullPolicy
 from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy
+from cognitive_runtime.programs.crafter.config import CrafterConfig
 from cognitive_runtime.programs.minecraft.adapter import BACKENDS, MinecraftSurvivalBox
+#: Re-exported for back-compat: this gate moved to ``record.quality`` (issue
+#: #90) so it can run world-agnostically; existing imports of
+#: ``EpisodeRecordingQuality``/``measure_recording_quality`` from here still
+#: work unchanged.
+from cognitive_runtime.record.quality import (  # noqa: F401
+    EpisodeRecordingQuality,
+    measure_recording_quality,
+    validate_recordings,
+)
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
 from cognitive_runtime.runtime.replay import list_episodes
@@ -92,6 +101,11 @@ class NurseryConfig:
     holdout_seeds: Sequence[int] = (1000, 1001)
     episode_ticks: int = 400
     world_size: int = 48
+    #: Which Program records the scenario (issue #90): ``"minecraft"`` looks
+    #: scenario names up in ``NURSERY_SCENARIOS``; ``"crafter"`` looks them
+    #: up in ``CRAFTER_SCENARIOS`` and ignores ``backend`` (Crafter has no
+    #: backend choice -- the ``crafter`` package *is* the backend).
+    world: str = "minecraft"
     backend: str = "simulated"
     realtime: bool = False
     horizons: Sequence[int] = (1, 10, 100)
@@ -146,10 +160,14 @@ class ScenarioRecording:
     policy: Any
     program_config_extra: Dict[str, Any] = field(default_factory=dict)
     #: Optional one-shot world-scripting hook, run on the constructed
-    #: ``MinecraftSurvivalBox`` before the episode plays -- for scenarios
-    #: that need scripted entities/terrain beyond what a policy can express
-    #: (``object_permanence``, ``approach_entity``).
-    scene_setup: Optional[Callable[[MinecraftSurvivalBox], None]] = None
+    #: Program before the episode plays -- for scenarios that need scripted
+    #: entities/terrain beyond what a policy can express
+    #: (``object_permanence``, ``approach_entity``). Takes a
+    #: ``MinecraftSurvivalBox`` for scenarios registered in
+    #: ``NURSERY_SCENARIOS``, a ``CrafterWorld`` for ones in
+    #: ``CRAFTER_SCENARIOS`` -- never both, since each scenario is only ever
+    #: built for the world it's registered under.
+    scene_setup: Optional[Callable[[Any], None]] = None
     #: Overrides ``NurseryConfig.episode_ticks`` when a scenario needs a
     #: specific length (e.g. an occlusion cycle with fixed phase lengths).
     episode_ticks: Optional[int] = None
@@ -183,6 +201,11 @@ class NurseryScenario:
     #: expectation): ``turn_in_place`` requires at least one full revolution,
     #: otherwise there is no view-rotation regularity to learn.
     min_yaw_sweep_degrees: float = 0.0
+    #: Discrete-facing equivalent of ``min_yaw_sweep_degrees`` (0 = no
+    #: expectation): Crafter has no continuous view to rotate, so its
+    #: ``turn`` scenario instead requires visiting this many distinct facing
+    #: directions (``spatial.facing``; max 4 on a grid).
+    min_unique_facings: int = 0
     #: Nursery episodes are scripted micro-scenarios; one that terminated
     #: early (the first real turn_in_place train-0 was beaten to death by
     #: mobs at tick 167/400) is not the scenario it claims to be.
@@ -335,128 +358,255 @@ NURSERY_SCENARIOS: Dict[str, NurseryScenario] = {
 }
 
 
+# --------------------------------------------------------------------------- crafter scenario builders
+#
+# Crafter ports of walk_forward/turn/object_permanence/approach_entity
+# (issue #90), registered in the parallel ``CRAFTER_SCENARIOS`` below rather
+# than folded into ``NURSERY_SCENARIOS``: Crafter is a different Program
+# (``programs.crafter.adapter.CrafterWorld``), so its scene-setup hooks take
+# a ``CrafterWorld``, not a ``MinecraftSurvivalBox``.
+#
+# Crafter has no first-person view to rotate, so ``turn_in_place`` isn't
+# ported as-is (Crafter is 2-D top-down; see docs/v2/phases
+# /phase-1-nursery-world.md's "do not smuggle ego-motion back in").  Its
+# discrete analogue, ``turn``, boxes the agent in with stone on all four
+# sides and cycles the four directional actions -- every move is blocked,
+# so only the discrete ``facing`` changes (``crafter.objects.Player._move``
+# sets ``self.facing`` before checking collision, so a blocked move still
+# turns the agent).
+#
+# Crafter's renderer draws objects over terrain regardless of what's
+# underneath them (no line-of-sight occlusion), so ``object_permanence``
+# isn't ported via a literal wall either -- a mob standing on a "wall" tile
+# would still render on top of it.  Its real occlusion is the bounded
+# egocentric view (``CrafterConfig.grid_radius``): a scripted mob walks
+# out past the view radius, holds there, then walks back -- object
+# permanence via genuine limited perceptual range.  Because that relies on
+# view-radius geometry rather than Minecraft's ``vision.entities``/
+# ``EntityTracker`` semantics, Crafter's port does not report the
+# entity-persistence metric (``NurseryScenario.entity_persistence_metric``
+# stays ``False``); only the recording itself is ported here.
+
+
+def _crafter_env(program: Any) -> Any:
+    return program._env
+
+
+def _crafter_clear_terrain(world: Any, cx: int, cy: int, radius: int) -> None:
+    area = world.area
+    for x in range(max(0, cx - radius), min(area[0], cx + radius + 1)):
+        for y in range(max(0, cy - radius), min(area[1], cy + radius + 1)):
+            world[(x, y)] = "grass"
+
+
+def _crafter_neutralize_wildlife(env: Any) -> None:
+    """Stop every non-player creature in ``env`` from moving, disable
+    Crafter's own periodic spawn/despawn balancing (``Env._balance_chunk``,
+    no Minecraft-style ``max_mobs=0`` knob exists), and stop the player's own
+    neglect-driven survival decay (hunger/thirst/energy depletion and the
+    health regen/degen it drives -- ``Player._update_life_stats``/
+    ``_degen_or_regen_health``). A short scripted micro-scenario isn't
+    testing "can the agent feed itself"; over a few hundred ticks of pure
+    ``MOVE_UP`` (issue #90's ``walk_forward``) neglect alone starves the
+    agent to death well before that, which isn't the ego-motion/facing
+    regularity these scenarios exist to capture."""
+    for obj in list(env._world.objects):
+        if obj is not env._player:
+            obj.update = lambda: None
+    env._balance_chunk = lambda chunk, objs: None
+    env._player._update_life_stats = lambda: None
+    env._player._degen_or_regen_health = lambda: None
+
+
+def _crafter_freeze_wildlife(program: Any) -> None:
+    """One-shot hazard neutralization for scenarios that also freeze the
+    env entirely (``_crafter_box_in_player``, ``object_permanence``,
+    ``approach_entity``): those already pin the world to its as-constructed
+    state via ``freeze_reset()`` (ignoring the per-episode seed, like
+    Minecraft's own scripted scenarios hardcoding ``world.reset(0)``), so a
+    single neutralization pass is enough."""
+    env = _crafter_env(program)
+    _crafter_neutralize_wildlife(env)
+    program.freeze_reset()
+
+
+def _crafter_neutralize_wildlife_every_reset(program: Any) -> None:
+    """Like ``_crafter_freeze_wildlife``, but re-applied after every
+    ``reset(seed)`` instead of freezing the env -- for scenarios
+    (``walk_forward``) that still need each seed's own generated terrain,
+    just without wildlife/neglect able to kill the episode outright."""
+    original_reset = program.reset
+
+    def reset_and_neutralize(seed: Optional[int] = None) -> None:
+        original_reset(seed)
+        _crafter_neutralize_wildlife(_crafter_env(program))
+
+    program.reset = reset_and_neutralize
+    _crafter_neutralize_wildlife(_crafter_env(program))  # the env built by __init__
+
+
+def _crafter_box_in_player(program: Any) -> None:
+    """Wall the player in on all four sides with stone -- every MOVE_*
+    attempt is blocked, so only ``facing`` changes (issue #90's discrete
+    ``turn``)."""
+    _crafter_freeze_wildlife(program)
+    env = _crafter_env(program)
+    x, y = int(env._player.pos[0]), int(env._player.pos[1])
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        env._world[(x + dx, y + dy)] = "stone"
+
+
+def _crafter_script_mob_path(mob: Any, path: List[Tuple[int, int]]) -> None:
+    """Replace one Crafter object's per-tick ``update()`` with a scripted
+    position list -- ``path[i]`` is the mob's ``(x, y)`` at update call
+    index ``i``; holds its final position once the path is exhausted.
+    Skips (holds) a step whose target cell is occupied rather than raising
+    -- ``_crafter_freeze_wildlife`` should already prevent collisions, but
+    this stays robust to any it doesn't.  Same shape as
+    ``_install_scripted_mob_path`` below, adapted to ``crafter.World``'s
+    ``move``/``_obj_map``."""
+    import numpy as np
+
+    state = {"i": 0}
+
+    def scripted_update(self: Any) -> None:
+        i = min(state["i"], len(path) - 1)
+        state["i"] += 1
+        target = path[i]
+        if tuple(int(v) for v in self.pos) == target:
+            return
+        if self.world._obj_map[target] == 0:
+            self.world.move(self, np.array(target))
+
+    mob.update = scripted_update.__get__(mob)
+
+
+def _crafter_occlusion_distances(close: int, hidden: int, phase_ticks: int) -> List[int]:
+    """Distances (agent-relative, along one axis) for the three-phase
+    excursion: visible near -> ramps out past the view radius (occluded) ->
+    ramps back to visible near. Mirrors ``_occlusion_dz_sequence`` below."""
+    import numpy as np
+
+    outbound = np.linspace(close, hidden, phase_ticks).round().astype(int).tolist()
+    inbound = np.linspace(hidden, close, phase_ticks).round().astype(int).tolist()
+    return outbound + [hidden] * phase_ticks + inbound
+
+
+_CRAFTER_MOVE_UP = Action("MOVE_UP")
+
+
+def _crafter_walk_forward(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    return ScenarioRecording(
+        policy=ConstantActionPolicy(_CRAFTER_MOVE_UP, seed=seed),
+        scene_setup=_crafter_neutralize_wildlife_every_reset,
+    )
+
+
+def _crafter_turn(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    phase = max(1, cfg.episode_ticks // 4)
+    policy = ScriptedSequencePolicy(
+        [
+            (Action("MOVE_UP"), phase), (Action("MOVE_RIGHT"), phase),
+            (Action("MOVE_DOWN"), phase), (Action("MOVE_LEFT"), phase),
+        ]
+    )
+    return ScenarioRecording(policy=policy, scene_setup=_crafter_box_in_player)
+
+
+def _crafter_approach_entity(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    distance = 6 + (seed % 6)
+
+    def scene_setup(program: Any) -> None:
+        import crafter as crafter_pkg
+
+        env = _crafter_env(program)
+        _crafter_freeze_wildlife(program)
+        x, y = int(env._player.pos[0]), int(env._player.pos[1])
+        target = (x, y - distance)
+        _crafter_clear_terrain(env._world, x, y - distance // 2, radius=distance + 3)
+        cow = crafter_pkg.objects.Cow(env._world, target)
+        env._world.add(cow)
+        cow.update = lambda: None  # frozen: approach_entity's mob never moves
+
+    return ScenarioRecording(policy=ConstantActionPolicy(_CRAFTER_MOVE_UP), scene_setup=scene_setup)
+
+
+def _crafter_object_permanence(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    phase_ticks = max(5, cfg.episode_ticks // 3)
+    close = 2
+    hidden = CrafterConfig().grid_radius + 3 + (seed % 4)
+
+    def scene_setup(program: Any) -> None:
+        import crafter as crafter_pkg
+
+        env = _crafter_env(program)
+        _crafter_freeze_wildlife(program)
+        x, y = int(env._player.pos[0]), int(env._player.pos[1])
+        _crafter_clear_terrain(env._world, x, y, radius=hidden + 3)
+        cow = crafter_pkg.objects.Cow(env._world, (x + close, y))
+        env._world.add(cow)
+        path = [(x + d, y) for d in _crafter_occlusion_distances(close, hidden, phase_ticks)]
+        _crafter_script_mob_path(cow, path)
+
+    return ScenarioRecording(
+        policy=NullPolicy(),
+        scene_setup=scene_setup,
+        episode_ticks=phase_ticks * 3,
+    )
+
+
+CRAFTER_SCENARIOS: Dict[str, NurseryScenario] = {
+    "walk_forward": NurseryScenario(
+        "walk_forward",
+        "constant MOVE_UP over varied terrain seeds -- ego-motion/optical-flow "
+        "regularities (Crafter port of the Minecraft scenario of the same name).",
+        _crafter_walk_forward,
+        # Crafter's world is a small (default 64x64) bounded grid -- a
+        # constant single-direction walk plateaus once it hits the map edge
+        # or an obstacle, diluting the average the longer the episode runs
+        # past that point (mirrors why Minecraft's own thresholds sit well
+        # below a healthy run's rate; this floor just accounts for a smaller
+        # world reaching its plateau sooner).
+        min_blocks_per_tick=0.01,
+        min_unique_frame_fraction=0.05,
+    ),
+    "turn": NurseryScenario(
+        "turn",
+        "boxed in on all four sides, cycling the four directional actions -- "
+        "discrete facing changes with zero displacement (Crafter's re-scoped "
+        "port of turn_in_place: a discrete flip, not continuous rotation).",
+        _crafter_turn,
+        max_blocks_per_tick=0.0,
+        min_unique_facings=4,
+    ),
+    "object_permanence": NurseryScenario(
+        "object_permanence",
+        "a scripted mob walks out past the egocentric view radius and back -- "
+        "genuine limited perceptual range, not a synthetic occluder (Crafter "
+        "port; does not report the entity-persistence metric -- see module "
+        "docstring above).",
+        _crafter_object_permanence,
+    ),
+    "approach_entity": NurseryScenario(
+        "approach_entity",
+        "scripted approach to a frozen entity -- scale change with distance.",
+        _crafter_approach_entity,
+        # The approach distance is fixed (6-11 blocks, seed-dependent) and
+        # the agent naturally stops once blocked by the entity, so the floor
+        # must tolerate a long "arrived and stopped" tail the same way
+        # Minecraft's own approach_entity threshold does.
+        min_blocks_per_tick=0.02,
+    ),
+}
+
+
 # --------------------------------------------------------------------------- data-quality gate
-
-
-@dataclass
-class EpisodeRecordingQuality:
-    """What the gate measures from one recorded episode's stream log."""
-
-    session_dir: str
-    episode_id: str
-    n_frames: int
-    unique_frames: int
-    net_displacement: float
-    duration_ticks: int
-    #: Furthest x/z distance from the episode's starting position -- catches
-    #: an agent that drifted away and back (net displacement ~0) just as
-    #: well as one that walked off.
-    max_displacement: float = 0.0
-    #: Total |wrapped yaw delta| over the episode, in degrees.
-    yaw_sweep_degrees: float = 0.0
-    #: ``summary.success`` -- False when the episode terminated early (death);
-    #: ``None`` for recordings whose summary predates the field or is absent.
-    completed: Optional[bool] = None
-    termination_reason: str = ""
-    #: Pixel provenance reported by the backend (``viewer``/``grid``), empty
-    #: for recordings that predate provenance tracking.
-    pixel_sources: List[str] = field(default_factory=list)
-
-    @property
-    def unique_frame_fraction(self) -> float:
-        return self.unique_frames / self.n_frames if self.n_frames else 0.0
-
-    @property
-    def blocks_per_tick(self) -> float:
-        return self.net_displacement / self.duration_ticks if self.duration_ticks else 0.0
-
-    @property
-    def max_blocks_per_tick(self) -> float:
-        return self.max_displacement / self.duration_ticks if self.duration_ticks else 0.0
-
-
-def _wrapped_degrees(delta: float) -> float:
-    return abs((delta + 180.0) % 360.0 - 180.0)
-
-
-def measure_recording_quality(session_dir: str, episode_id: str) -> EpisodeRecordingQuality:
-    """Scan one episode's stream log for the gate's signals: unique pixel
-    frames (via content-hash ``frame_ref``), x/z displacement (net and max),
-    yaw sweep, episode completion, and pixel provenance."""
-
-    first_pos: Optional[Tuple[float, float]] = None
-    last_pos: Optional[Tuple[float, float]] = None
-    max_displacement = 0.0
-    last_yaw: Optional[float] = None
-    yaw_sweep = 0.0
-    n_frames = 0
-    frame_refs: set = set()
-    streams_path = os.path.join(session_dir, f"{episode_id}.streams.jsonl")
-    with open(streams_path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            stream_id = record.get("stream_id")
-            if stream_id == "vision.frame.pixels":
-                n_frames += 1
-                ref = record.get("frame_ref") or record.get("hash")
-                if ref:
-                    frame_refs.add(ref)
-            elif stream_id == "spatial.position":
-                payload = record.get("payload") or {}
-                pos = (float(payload.get("x", 0.0)), float(payload.get("z", 0.0)))
-                if first_pos is None:
-                    first_pos = pos
-                else:
-                    max_displacement = max(
-                        max_displacement,
-                        math.hypot(pos[0] - first_pos[0], pos[1] - first_pos[1]),
-                    )
-                last_pos = pos
-            elif stream_id == "spatial.rotation":
-                payload = record.get("payload") or {}
-                yaw = payload.get("yaw")
-                if isinstance(yaw, (int, float)):
-                    if last_yaw is not None:
-                        yaw_sweep += _wrapped_degrees(float(yaw) - last_yaw)
-                    last_yaw = float(yaw)
-
-    displacement = (
-        math.hypot(last_pos[0] - first_pos[0], last_pos[1] - first_pos[1])
-        if first_pos is not None and last_pos is not None
-        else 0.0
-    )
-    duration_ticks = 0
-    completed: Optional[bool] = None
-    termination_reason = ""
-    pixel_sources: List[str] = []
-    summary_path = os.path.join(session_dir, f"{episode_id}.summary.json")
-    if os.path.exists(summary_path):
-        with open(summary_path, encoding="utf-8") as fh:
-            summary = json.load(fh)
-        duration_ticks = int(summary.get("duration_ticks", 0))
-        if "success" in summary:
-            completed = bool(summary["success"])
-        termination_reason = str(summary.get("termination_reason", ""))
-        program_stats = summary.get("program_stats") or {}
-        sources = program_stats.get("pixel_sources")
-        if isinstance(sources, list):
-            pixel_sources = [str(s) for s in sources]
-    return EpisodeRecordingQuality(
-        session_dir=session_dir,
-        episode_id=episode_id,
-        n_frames=n_frames,
-        unique_frames=len(frame_refs),
-        net_displacement=displacement,
-        duration_ticks=duration_ticks,
-        max_displacement=max_displacement,
-        yaw_sweep_degrees=yaw_sweep,
-        completed=completed,
-        termination_reason=termination_reason,
-        pixel_sources=pixel_sources,
-    )
+#
+# The gate itself moved to ``cognitive_runtime.record.quality`` (issue #90):
+# a world-agnostic module that reads any Program's stream log the same way.
+# ``EpisodeRecordingQuality``/``measure_recording_quality`` are re-exported
+# here unchanged for back-compat; ``validate_nursery_recordings`` adapts a
+# ``NurseryScenario``'s threshold fields to the generic gate.
 
 
 def _session_backend(session_dir: str) -> str:
@@ -481,6 +631,8 @@ def validate_nursery_recordings(
 ) -> List[str]:
     """Check every recorded episode against the scenario's data-quality
     expectations; returns human-readable issue strings (empty = healthy).
+    Adapts ``NurseryScenario``'s threshold fields to the world-agnostic gate
+    in ``record.quality``.
 
     Exists because of the first real ``walk_forward`` run: recorded against
     the remote backend's persistent world, the agent was stuck against an
@@ -493,88 +645,17 @@ def validate_nursery_recordings(
     checks displacement ceilings, yaw sweep, episode completion, and pixel
     provenance (no mixing, and matching ``expected_pixel_source`` when set).
     """
-    issues: List[str] = []
-    sources_seen: Dict[str, List[str]] = {}
-    for session_dir in session_dirs:
-        for episode_id in list_episodes(session_dir):
-            quality = measure_recording_quality(session_dir, episode_id)
-            where = f"{session_dir}/{episode_id}"
-            if quality.n_frames == 0:
-                issues.append(f"{where}: no pixel frames recorded (record_frames off?)")
-                continue
-            if (
-                scenario.min_unique_frame_fraction > 0.0
-                and quality.unique_frame_fraction < scenario.min_unique_frame_fraction
-            ):
-                issues.append(
-                    f"{where}: only {quality.unique_frames}/{quality.n_frames} unique pixel "
-                    f"frames ({quality.unique_frame_fraction:.1%} < "
-                    f"{scenario.min_unique_frame_fraction:.1%}) -- a near-static view has "
-                    f"no {scenario.name!r} signal to learn"
-                )
-            if (
-                scenario.min_blocks_per_tick > 0.0
-                and quality.duration_ticks > 0
-                and quality.blocks_per_tick < scenario.min_blocks_per_tick
-            ):
-                issues.append(
-                    f"{where}: net displacement {quality.net_displacement:.2f} blocks over "
-                    f"{quality.duration_ticks} ticks ({quality.blocks_per_tick:.4f}/tick < "
-                    f"{scenario.min_blocks_per_tick}/tick) -- the agent barely moved "
-                    f"(stuck against an obstacle?)"
-                )
-            if (
-                scenario.max_blocks_per_tick is not None
-                and quality.duration_ticks > 0
-                and quality.max_blocks_per_tick > scenario.max_blocks_per_tick
-            ):
-                issues.append(
-                    f"{where}: the agent strayed {quality.max_displacement:.2f} blocks from "
-                    f"its start ({quality.max_blocks_per_tick:.4f}/tick > "
-                    f"{scenario.max_blocks_per_tick}/tick) -- {scenario.name!r} expects a "
-                    "stationary agent (live-server knockback/water/mobs?)"
-                )
-            if (
-                scenario.min_yaw_sweep_degrees > 0.0
-                and quality.yaw_sweep_degrees < scenario.min_yaw_sweep_degrees
-            ):
-                issues.append(
-                    f"{where}: total yaw sweep {quality.yaw_sweep_degrees:.0f} degrees < "
-                    f"{scenario.min_yaw_sweep_degrees:.0f} -- {scenario.name!r} needs the "
-                    "view to actually rotate"
-                )
-            if scenario.require_completed and quality.completed is False:
-                issues.append(
-                    f"{where}: episode terminated early "
-                    f"({quality.termination_reason or 'unknown reason'}) -- a nursery "
-                    "recording that died mid-scenario is not the scenario it claims to be"
-                )
-            if quality.pixel_sources:
-                sources_seen[where] = sorted(set(quality.pixel_sources))
-                if len(sources_seen[where]) > 1:
-                    issues.append(
-                        f"{where}: mixed pixel sources within one episode "
-                        f"({sources_seen[where]}) -- the observation distribution changed "
-                        "mid-recording (viewer died and fell back to the grid?)"
-                    )
-                if (
-                    expected_pixel_source is not None
-                    and sources_seen[where] != [expected_pixel_source]
-                ):
-                    issues.append(
-                        f"{where}: pixel source {sources_seen[where]} != expected "
-                        f"{expected_pixel_source!r} -- the requested render path was not "
-                        "the one that produced these frames"
-                    )
-
-    distinct = {tuple(v) for v in sources_seen.values()}
-    if len(distinct) > 1:
-        issues.append(
-            "sessions mix pixel sources across episodes "
-            f"({sorted(sources_seen.items())}) -- do not train one model on frames from "
-            "different render paths"
-        )
-    return issues
+    return validate_recordings(
+        session_dirs,
+        name=scenario.name,
+        min_blocks_per_tick=scenario.min_blocks_per_tick,
+        min_unique_frame_fraction=scenario.min_unique_frame_fraction,
+        max_blocks_per_tick=scenario.max_blocks_per_tick,
+        min_yaw_sweep_degrees=scenario.min_yaw_sweep_degrees,
+        min_unique_facings=scenario.min_unique_facings,
+        require_completed=scenario.require_completed,
+        expected_pixel_source=expected_pixel_source,
+    )
 
 
 def _measured_ticks_per_frame(session_dirs: Sequence[str]) -> float:
@@ -649,6 +730,18 @@ def _occlusion_dz_sequence(offset: float, phase_ticks: int) -> List[float]:
     return [offset] * phase_ticks + [0.0] * phase_ticks + [-offset] * phase_ticks
 
 
+def _build_scenario_program(cfg: NurseryConfig, program_config: Dict[str, Any]) -> Any:
+    """Construct the Program a scenario records against (issue #90's
+    ``--world`` selector): ``MinecraftSurvivalBox`` (default, back-compat) or
+    ``CrafterWorld``. Mirrors ``cli.py``'s ``_build_program`` factory, minus
+    the stream/action-registry return value nursery recording doesn't need."""
+    if cfg.world == "crafter":
+        from cognitive_runtime.programs.crafter.adapter import CrafterWorld
+
+        return CrafterWorld(config=program_config)
+    return MinecraftSurvivalBox(config=program_config, backend=cfg.backend)
+
+
 def _record_scenario_episode(
     record_dir: str, session_id: str, seed: int, scenario: NurseryScenario, cfg: NurseryConfig
 ) -> str:
@@ -668,17 +761,33 @@ def _record_scenario_episode(
         curriculum=f"nursery/{scenario.name}",
         name=cfg.name,
     )
-    program = MinecraftSurvivalBox(config=program_config, backend=cfg.backend)
-    if recording.scene_setup is not None and cfg.backend == "simulated":
+    program = _build_scenario_program(cfg, program_config)
+    # Crafter's scripted scenarios always run against the (only) live env;
+    # Minecraft's scene-setup only makes sense against the simulated
+    # backend's in-process world (a remote server has no scriptable world to
+    # reach into).
+    if recording.scene_setup is not None and (cfg.world == "crafter" or cfg.backend == "simulated"):
         recording.scene_setup(program)
     try:
         CognitiveRuntime(program=program, policy=recording.policy, config=runtime_config).run()
     finally:
-        program.close()
+        close = getattr(program, "close", None)
+        if callable(close):
+            close()
     return os.path.join(record_dir, session_id)
 
 
 # --------------------------------------------------------------------------- benchmark harness
+
+
+def _scenarios_for_world(world: str) -> Dict[str, NurseryScenario]:
+    """``--world`` selector (issue #90): which scenario registry a
+    ``NurseryConfig.world`` records against."""
+    if world == "minecraft":
+        return NURSERY_SCENARIOS
+    if world == "crafter":
+        return CRAFTER_SCENARIOS
+    raise ValueError(f"unknown nursery world {world!r}; choices: ['crafter', 'minecraft']")
 
 
 def run_nursery_scenario(
@@ -690,15 +799,18 @@ def run_nursery_scenario(
     pixel encoder+decoder+next-latent predictor on the train seeds only,
     then evaluate multi-horizon next-frame prediction on held-out seeds
     against copy-last-frame and mean-frame baselines. ``object_permanence``
-    additionally reports an entity-persistence metric."""
+    additionally reports an entity-persistence metric (Minecraft only --
+    Crafter's port doesn't set ``entity_persistence_metric``)."""
 
-    if scenario_name not in NURSERY_SCENARIOS:
-        raise ValueError(
-            f"unknown nursery scenario {scenario_name!r}; choices: {sorted(NURSERY_SCENARIOS)}"
-        )
-    scenario = NURSERY_SCENARIOS[scenario_name]
     cfg = config or NurseryConfig()
-    if cfg.backend not in BACKENDS:
+    scenarios = _scenarios_for_world(cfg.world)
+    if scenario_name not in scenarios:
+        raise ValueError(
+            f"unknown nursery scenario {scenario_name!r} for --world {cfg.world!r}; "
+            f"choices: {sorted(scenarios)}"
+        )
+    scenario = scenarios[scenario_name]
+    if cfg.world == "minecraft" and cfg.backend not in BACKENDS:
         raise ValueError(f"unknown nursery backend {cfg.backend!r}; choices: {sorted(BACKENDS)}")
     if not cfg.horizons:
         raise ValueError("horizons must be non-empty")
@@ -833,12 +945,18 @@ def run_nursery_suite(
     config: Optional[NurseryConfig] = None,
 ) -> Dict[str, NurseryScenarioReport]:
     """``nursery run all``: run every named scenario (default: every
-    registered scenario) unattended, returning one report per scenario."""
+    scenario registered for ``config.world``) unattended, returning one
+    report per scenario."""
 
-    names = list(scenario_names) if scenario_names is not None else sorted(NURSERY_SCENARIOS)
+    cfg = config or NurseryConfig()
+    names = (
+        list(scenario_names)
+        if scenario_names is not None
+        else sorted(_scenarios_for_world(cfg.world))
+    )
     reports: Dict[str, NurseryScenarioReport] = {}
     for name in names:
-        _model, report = run_nursery_scenario(record_dir, name, config)
+        _model, report = run_nursery_scenario(record_dir, name, cfg)
         reports[name] = report
     return reports
 

@@ -28,7 +28,7 @@ _INVENTORY_KEYS = (
 
 OBSERVATION_KEYS = (
     "health", "food", "drink", "energy", "inventory", "sleeping", "alive",
-    "position", "achievements",
+    "position", "facing", "achievements",
 )
 
 
@@ -37,6 +37,7 @@ def build_state(env: Any, grid_radius: int) -> Dict[str, Any]:
     the world (mirrors ``SurvivalBackend.observe``'s pull semantics)."""
     player = env._player
     position = (int(player.pos[0]), int(player.pos[1]))
+    facing = (int(player.facing[0]), int(player.facing[1]))
     return {
         "health": float(player.health),
         "food": float(player.inventory["food"]),
@@ -46,6 +47,12 @@ def build_state(env: Any, grid_radius: int) -> Dict[str, Any]:
         "sleeping": bool(player.sleeping),
         "alive": player.health > 0,
         "position": {"x": position[0], "y": position[1]},
+        # Crafter's facing is a discrete grid direction, flipped on every
+        # directional move *attempt* -- even a blocked one
+        # (``crafter.objects.Player._move`` sets ``self.facing`` before
+        # checking collision) -- so a boxed-in agent can still turn without
+        # displacing (issue #90's discrete-facing ``turn`` scenario).
+        "facing": {"x": facing[0], "y": facing[1]},
         "achievements": dict(player.achievements),
         "grid": crop_semantic_grid(env._sem_view(), position, grid_radius),
     }

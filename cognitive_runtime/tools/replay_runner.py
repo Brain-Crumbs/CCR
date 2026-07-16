@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
+from cognitive_runtime.core.program import Program
 from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
 from cognitive_runtime.programs.minecraft.reward_profile import RewardProfile
 from cognitive_runtime.runtime.replay import (
@@ -16,6 +17,30 @@ from cognitive_runtime.runtime.replay import (
 )
 
 
+def _build_replay_program(
+    metadata: Dict[str, Any], reward_profile: Optional[RewardProfile]
+) -> Program:
+    """Rebuild the Program a session was recorded against, keyed off
+    ``session.json``'s ``program`` field (``ProgramMetadata.name`` --
+    ``cli.py``'s ``--world`` selector determines which one recorded a given
+    session). Reward profiles (``--reward-profile``) are Minecraft-only;
+    Crafter has no reward-profile system (issue #90)."""
+    program_config = metadata.get("program_config") or None
+    program_name = metadata.get("program")
+    if program_name == "MinecraftSurvivalBox":
+        return MinecraftSurvivalBox(config=program_config, reward_profile=reward_profile)
+    if program_name == "CrafterWorld":
+        if reward_profile is not None:
+            raise ValueError(
+                "--reward-profile only applies to MinecraftSurvivalBox sessions "
+                f"(this session's program is {program_name!r})"
+            )
+        from cognitive_runtime.programs.crafter.adapter import CrafterWorld
+
+        return CrafterWorld(config=program_config)
+    raise ValueError(f"unsupported program for replay: {program_name!r}")
+
+
 def replay_session(
     session_dir: str,
     episode_id: str | None = None,
@@ -25,8 +50,6 @@ def replay_session(
     metadata = load_session_metadata(session_dir)
     require_streams_v2(metadata)
     require_deterministic(metadata)
-    if metadata.get("program") != "MinecraftSurvivalBox":
-        raise ValueError(f"unsupported program for replay: {metadata.get('program')}")
     # A session recorded with `--reward-profile` scores `reward.scalar`
     # through `ProfileRewardEngine`, not the default hard-coded
     # `SurvivalReward` -- rebuilding the Program without the same profile
@@ -58,9 +81,7 @@ def replay_session(
     episodes = [episode_id] if episode_id else list_episodes(session_dir)
     results = []
     for episode in episodes:
-        program = MinecraftSurvivalBox(
-            config=metadata.get("program_config") or None, reward_profile=reward_profile,
-        )
+        program = _build_replay_program(metadata, reward_profile)
         results.append(replay_episode(program, session_dir, episode, verify=verify))
     return results
 
