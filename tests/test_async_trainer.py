@@ -75,6 +75,20 @@ def test_phasic_schedule_reads_only_post_consolidation_weights():
     ]
 
 
+def test_phasic_schedule_can_consolidate_partial_wake_at_session_boundary():
+    schedule = PhasicSleepSchedule(wake_ticks=10)
+    schedule.act(lambda: None)
+
+    assert schedule.sleep_due is False
+    assert schedule.request_sleep() is True
+    result = schedule.consolidate(lambda: 3, reload_weights=lambda: 3)
+
+    assert result.published_version == 3
+    assert schedule.phase is Phase.WAKE
+    assert schedule.ticks_in_phase == 0
+    assert schedule.request_sleep() is False
+
+
 def _record_session(tmp_path, session_id="sess0", *, seed=0, ticks=120):
     program = MinecraftSurvivalBox(config=WORLD_CONFIG)
     runtime_config = RuntimeConfig(

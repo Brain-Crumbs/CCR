@@ -1,7 +1,6 @@
 # Phase 5 — Sleep as Continuous Consolidation
 
 > Master plan: [Phase 5](../02-implementation-plan.md#phase-5--sleep-as-continuous-consolidation).
-> Tracking issue: [#108](https://github.com/Brain-Crumbs/CCR/issues/108).
 > **Goal:** the organism trains as it lives, via a wake/sleep cycle, without
 > stalling the tick — and dreaming demonstrably prevents forgetting. **This phase
 > carries the one falsifiable claim of the whole project.**
