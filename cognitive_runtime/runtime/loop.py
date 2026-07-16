@@ -43,6 +43,7 @@ from brain.arbiter import (
     Arbiter,
     SurpriseCalibrator,
 )
+from brain.hippocampus import Hippocampus, SeedTags
 from brain.neuromod import (
     NAMED_NEUROMODULATOR_STREAM_SPECS,
     compute_acetylcholine,
@@ -259,6 +260,12 @@ class CognitiveRuntime:
         #: (issue #95, task 4), reporting Expected Calibration Error as it
         #: goes.
         self.surprise_calibrator = SurpriseCalibrator()
+        #: The episodic seed store (issue #96): every waking tick hands it
+        #: a sparse `(z, actions, tags)` seed, prioritised by this tick's
+        #: neuromodulator tags. Persists across episodes within a run, like
+        #: `self.modulation` -- episodic memory is a property of the
+        #: organism's run, not of any one episode.
+        self.hippocampus = Hippocampus()
         #: Previous tick's arbiter mode, applied to *this* tick's attention
         #: budget (issue #95: "the mode gates attention breadth") -- one
         #: tick lagged like every other internal.* signal, since the mode
@@ -628,6 +635,33 @@ class CognitiveRuntime:
                 ARBITER_MODE_STREAM, arbiter_payload, window.ended_at, source="model"
             )
             arbiter_mode_counts[arbiter_mode] = arbiter_mode_counts.get(arbiter_mode, 0) + 1
+            # The hippocampus (issue #96): a sparse, one-shot seed write
+            # every waking tick -- cheap (a handful of arithmetic ops plus
+            # an O(log capacity) heap insertion), so it never stalls the
+            # tick. `done`/`damage` are read off this tick's raw sensory
+            # events the same way `neural.replay_buffer.
+            # load_session_into_buffer` reads them from a recorded log.
+            fused_latent = self.memory.fused_latent()
+            if fused_latent is not None:
+                died = any(event.stream_id == "event.died" for event in window.events)
+                damaged = any(
+                    event.stream_id == "event.damage_taken" for event in window.events
+                )
+                self.hippocampus.encode(
+                    z=fused_latent.vector,
+                    actions=[action.key() for action in emissions],
+                    tags=SeedTags(
+                        reward=reward_value,
+                        done=died,
+                        damage=damaged,
+                        novelty=novelty,
+                        surprise=calibrated_surprise,
+                        dopamine=modulation.reward_prediction_error,
+                        threat=adrenaline,
+                    ),
+                    tick_index=window.tick_index,
+                    source=self.recorder.session_id,
+                )
             # `internal.*` streams are computed here, after this tick's
             # `program.step()` already ran -- a Program's own reward
             # evaluation can never see them the same tick it's published, so
@@ -727,6 +761,7 @@ class CognitiveRuntime:
             reflex_activations=reflex_activations,
             arbiter_mode_counts=dict(sorted(arbiter_mode_counts.items())),
             surprise_calibration_error=self.surprise_calibrator.calibration_error,
+            hippocampus_seeds=len(self.hippocampus),
         )
         self.recorder.write_summary(summary)
         self.recorder.end_episode_file()
