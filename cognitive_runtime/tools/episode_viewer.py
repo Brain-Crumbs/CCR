@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from brain.neuromod import NAMED_NEUROMODULATOR_STREAM_IDS
 from cognitive_runtime.core.modulation import INTERNAL_MODULATION_STREAM_IDS
 from cognitive_runtime.core.streams.motor import MOTOR_COMMAND_STREAM
 from cognitive_runtime.runtime.replay import (
@@ -12,6 +13,11 @@ from cognitive_runtime.runtime.replay import (
     load_stream_log,
     load_summary,
 )
+
+#: Every `internal.*` scalar stream this viewer renders inline in a tick's
+#: line (issue #58's five raw + derived streams, plus issue #94's three
+#: human-named neuromodulators over the same math).
+_INTERNAL_TICK_STREAM_IDS = INTERNAL_MODULATION_STREAM_IDS + NAMED_NEUROMODULATOR_STREAM_IDS
 
 
 def _motor_label(motor_records: List[Dict[str, Any]]) -> str:
@@ -113,7 +119,7 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
                 payload = record.get("payload")
                 if isinstance(payload, dict):
                     value_estimate = payload.get("value_estimate")
-            elif stream_id in INTERNAL_MODULATION_STREAM_IDS:
+            elif stream_id in _INTERNAL_TICK_STREAM_IDS:
                 payload = record.get("payload")
                 if isinstance(payload, dict) and isinstance(payload.get("value"), (int, float)):
                     internal_values[stream_id] = payload["value"]
@@ -132,7 +138,7 @@ def view_episode(session_dir: str, episode_id: str, tail: int = 10) -> str:
             line += f" novelty={novelty}"
         if value_estimate is not None:
             line += f" value_estimate={value_estimate}"
-        for stream_id in INTERNAL_MODULATION_STREAM_IDS:
+        for stream_id in _INTERNAL_TICK_STREAM_IDS:
             if stream_id in internal_values:
                 line += f" {stream_id}={internal_values[stream_id]}"
         attention = decision.get("attention")

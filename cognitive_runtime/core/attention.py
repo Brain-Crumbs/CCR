@@ -23,6 +23,15 @@ A stream's salience score blends:
 - ``risk``       -- the current ``internal.risk`` stream value (issue #58),
   shared across every stream's signal this tick: a global "state of alert"
   term, not a per-stream one.
+- ``acetylcholine`` -- the current ``internal.acetylcholine`` stream value
+  (issue #94's ``brain.neuromod.compute_acetylcholine``): the Thalamus's
+  precision term, shared across every stream's signal this tick like
+  ``risk``. A negative default coefficient means it *subtracts* from every
+  score uniformly -- weak-scoring streams sink below the budget's
+  zero-clip while the strongest stream(s) barely move, so a rising
+  acetylcholine reading narrows/sharpens which streams the fixed budget
+  actually spends weight on, rather than just shifting every score by a
+  constant.
 - ``recency``    -- a half-life decayed freshness term, same formula
   ``TemporalFusion`` uses for event-modality streams.
 - ``boredom``    -- fraction of the recent window that repeats the same
@@ -53,6 +62,11 @@ from cognitive_runtime.core.streams.temporal_buffer import TemporalBuffer
 
 #: The internal.* stream (issue #58) whose value feeds the shared `risk` term.
 RISK_STREAM_ID = "internal.risk"
+#: The internal.* stream (issue #94, `brain.neuromod.ACETYLCHOLINE_STREAM`)
+#: whose value feeds the shared `acetylcholine` precision term. Declared
+#: locally (not imported from `brain.neuromod`) to keep this module's
+#: existing no-Program-imports discipline -- see `RISK_STREAM_ID` above.
+ACETYLCHOLINE_STREAM_ID = "internal.acetylcholine"
 
 ATTENTION_MODES = frozenset({"off", "budgeted"})
 
@@ -135,6 +149,11 @@ class AttentionSignal:
     #: isn't declared `localization_hint=True` or carries no direction data
     #: this tick.
     direction: Optional[StimulusDirection] = None
+    #: This tick's shared acetylcholine precision reading (issue #94),
+    #: identical across every stream's signal -- a global term like `risk`,
+    #: not a per-stream one. `0.0` (quiescent) when no
+    #: `internal.acetylcholine` reading is available yet.
+    acetylcholine: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -149,6 +168,11 @@ class AttentionCoefficients:
     recency: float = 0.5
     boredom: float = -0.5
     compute_cost: float = -0.5
+    #: Negative by design (issue #94): acetylcholine subtracts uniformly
+    #: from every stream's score, so a rising reading pushes weaker
+    #: streams below the budget's zero-clip while barely denting the
+    #: strongest -- narrowing/sharpening focus, not just shifting scores.
+    acetylcholine: float = -0.5
 
 
 @dataclass(frozen=True)
@@ -339,15 +363,23 @@ class AttentionController:
         value = _scalar(latest.payload)
         return value if value is not None else 0.0
 
+    def _acetylcholine(self, buffer: TemporalBuffer) -> float:
+        latest = buffer.latest(ACETYLCHOLINE_STREAM_ID)
+        if latest is None:
+            return 0.0
+        value = _scalar(latest.payload)
+        return value if value is not None else 0.0
+
     def _signal_for(
         self, stream_id: str, buffer: TemporalBuffer, reference_time: float,
-        reward_series: List[float], risk: float,
+        reward_series: List[float], risk: float, acetylcholine: float,
     ) -> AttentionSignal:
         events = buffer.window(stream_id, self.config.window)
         if not events:
             return AttentionSignal(
                 stream_id=stream_id, novelty=0.0, prediction_error=0.0, uncertainty=None,
                 reward_relevance=0.0, risk=risk, recency=0.0, boredom=1.0, compute_cost=0.0,
+                acetylcholine=acetylcholine,
             )
         latest = events[-1]
         direction = _direction(latest.payload) if self._localization_hint.get(stream_id) else None
@@ -374,6 +406,7 @@ class AttentionController:
             boredom=boredom,
             compute_cost=self._compute_cost.get(stream_id, 0.1),
             direction=direction,
+            acetylcholine=acetylcholine,
         )
 
     def _score(self, signal: AttentionSignal) -> Tuple[float, Dict[str, float]]:
@@ -384,6 +417,7 @@ class AttentionController:
             "uncertainty": c.uncertainty * (signal.uncertainty or 0.0),
             "reward_relevance": c.reward_relevance * signal.reward_relevance,
             "risk": c.risk * signal.risk,
+            "acetylcholine": c.acetylcholine * signal.acetylcholine,
             "recency": c.recency * signal.recency,
             "boredom": c.boredom * signal.boredom,
             "compute_cost": c.compute_cost * signal.compute_cost,
@@ -468,9 +502,12 @@ class AttentionController:
         reference_time = self._reference_time(buffer)
         reward_series = self._reward_series(buffer)
         risk = self._risk(buffer)
+        acetylcholine = self._acetylcholine(buffer)
         reasons: Dict[str, AttentionReason] = {}
         for stream_id in self.stream_ids:
-            signal = self._signal_for(stream_id, buffer, reference_time, reward_series, risk)
+            signal = self._signal_for(
+                stream_id, buffer, reference_time, reward_series, risk, acetylcholine
+            )
             score, components = self._score(signal)
             reasons[stream_id] = AttentionReason(signal=signal, score=score, components=components)
         focus = self._update_focus(reasons)
