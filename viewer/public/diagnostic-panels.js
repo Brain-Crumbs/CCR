@@ -20,21 +20,39 @@ function namedSeries(records, names) {
   });
 }
 
-export function episodeDiagnostics(records = []) {
+export function episodeDiagnostics(records = [], decisions = []) {
   const series = Object.fromEntries(MODULATORS.map((name) => [name, namedSeries(records, [name])]));
-  series.prediction_error = namedSeries(records, ["prediction_error", "reward_prediction_error"]);
+  const recordedErrors = namedSeries(records, ["prediction_error", "reward_prediction_error"]);
+  series.prediction_error = decisions.flatMap((decision, index) => typeof decision.prediction_error === "number"
+    ? [{ tick: tickOf(decision, index), value: decision.prediction_error }] : []);
+  if (!series.prediction_error.length) series.prediction_error = recordedErrors;
   const modes = [], attention = [];
+  const hasDecisionAttention = decisions.some((decision) => decision.attention);
   records.forEach((record, index) => {
     const payload = record.payload ?? record.value ?? record;
     const id = String(record.stream_id || "");
     const mode = id.includes("arbiter") ? (payload?.mode ?? payload?.value ?? (typeof payload === "string" ? payload : null)) : null;
     if (mode) modes.push({ tick: tickOf(record, index), mode: String(mode) });
-    const state = record.attention ?? (id.includes("attention") ? payload : null);
+    // Older/imported recordings may include reasons in the stream payload.
+    // Native streams-v2 keeps the complete state on DecisionRecord instead.
+    const state = !hasDecisionAttention && id.includes("attention") ? payload : null;
     if (state && (state.focus_stream || state.selected_streams || state.reasons)) {
       attention.push({ tick: Number(state.tick_index ?? tickOf(record, index)), focus: state.focus_stream ?? "none",
         selected: state.selected_streams ?? [], reasons: state.reasons ?? {} });
     }
   });
+  decisions.forEach((decision, index) => {
+    const tick = tickOf(decision, index);
+    const mode = decision.arbiter_mode?.mode ?? decision.arbiter_mode?.value;
+    if (mode) modes.push({ tick, mode: String(mode) });
+    const state = decision.attention;
+    if (state && (state.focus_stream || state.selected_streams || state.reasons)) {
+      attention.push({ tick: Number(state.tick_index ?? tick), focus: state.focus_stream ?? "none",
+        selected: state.selected_streams ?? [], reasons: state.reasons ?? {} });
+    }
+  });
+  modes.sort((a, b) => a.tick - b.tick);
+  attention.sort((a, b) => a.tick - b.tick);
   return { series, modes, attention };
 }
 
@@ -76,7 +94,7 @@ export function renderDevelopmentPanel(session) {
   return `<section class="diagnostic development" aria-labelledby="development-title"><h3 id="development-title">Developmental ladder</h3><p>Milestones passed by this organism.</p><ol class="stage-list">${items || '<li class="no-data">no developmental gates recorded</li>'}</ol></section>`;
 }
 
-export function mountDiagnostics(root, records, session) {
-  const diagnostics = episodeDiagnostics(records);
+export function mountDiagnostics(root, records, decisions, session) {
+  const diagnostics = episodeDiagnostics(records, decisions);
   root.innerHTML = renderEEGPanel(diagnostics) + renderAttentionPanel(diagnostics) + renderDevelopmentPanel(session);
 }

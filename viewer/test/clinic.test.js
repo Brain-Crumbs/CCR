@@ -21,6 +21,12 @@ function fixture() {
     { stream_id: "internal.attention.weights", payload: { tick_index: 0, focus_stream: "vision.frame.pixels", selected_streams: ["vision.frame.pixels"], reasons: { "vision.frame.pixels": { components: { novelty: 0.8, boredom: -0.1 } } } }, seq: 0 },
   ];
   fs.writeFileSync(path.join(dir, "episode_00000.streams.jsonl"), records.map(JSON.stringify).join("\n") + "\n");
+  fs.writeFileSync(path.join(dir, "episode_00000.decisions.jsonl"), JSON.stringify({
+    tick_index: 0, prediction_error: 0.35, arbiter_mode: { mode: "curious" }, attention: {
+      tick_index: 0, focus_stream: "vision.frame.pixels", selected_streams: ["vision.frame.pixels"],
+      reasons: { "vision.frame.pixels": { components: { novelty: 0.8, boredom: -0.1 } } },
+    },
+  }) + "\n");
   fs.writeFileSync(path.join(dir, "episode_00000.summary.json"), JSON.stringify({ duration_ticks: 1, success: true, program_stats: { pixel_sources: ["grid"] } }));
   fs.writeFileSync(path.join(dir, "Pixel-predictions_episode_00000.json"), JSON.stringify({ format: "pixel-predictions-v1" }));
   fs.writeFileSync(path.join(dir, "Pixel-dream_episode_00000.json"), JSON.stringify({ format: "pixel-predictions-v1", kind: "dream" }));
@@ -40,6 +46,9 @@ test("service lists by organism and returns streams, exports, and verdict", asyn
   assert.equal((await get(port, "/api/sessions?name=SomeoneElse")).body.sessions.length, 0);
   const detail = (await get(port, "/api/sessions/pixel-session")).body;
   assert.equal(detail.streams.episode_00000[0].stream_id, "vision.frame.pixels");
+  assert.equal(detail.decisions.episode_00000[0].attention.reasons["vision.frame.pixels"].components.novelty, 0.8);
+  const decisionRecords = (await get(port, "/api/sessions/pixel-session/episodes/episode_00000/decisions")).body.records;
+  assert.equal(decisionRecords[0].attention.focus_stream, "vision.frame.pixels");
   assert.equal(detail.exports[0].data.format, "pixel-predictions-v1"); assert.equal(detail.quality.verdict, "red");
 });
 
@@ -78,14 +87,19 @@ test("EEG component renders neuromodulators, prediction error, and mode timeline
   for (const label of ["dopamine", "acetylcholine", "adrenaline", "prediction error", "afraid"]) assert.match(html, new RegExp(label));
 });
 
-test("attention component renders focus and the recorded reason components", async () => {
+test("attention component renders reasons from DecisionRecord rather than the stream payload", async () => {
   const ui = await panels();
-  const model = ui.episodeDiagnostics([{ stream_id: "internal.attention.weights", seq: 4, payload: {
+  const streams = [{ stream_id: "internal.attention.weights", seq: 4, payload: {
+    focus_stream: "vision.frame.pixels", selected_streams: ["vision.frame.pixels", "body.health"],
+  } }];
+  const decisions = [{ tick_index: 4, attention: {
     focus_stream: "vision.frame.pixels", selected_streams: ["vision.frame.pixels", "body.health"],
     reasons: { "vision.frame.pixels": { components: { novelty: .75, boredom: -.1 } } },
-  } }]);
+  } }];
+  const model = ui.episodeDiagnostics(streams, decisions);
   const html = ui.renderAttentionPanel(model);
   assert.match(html, /vision\.frame\.pixels/); assert.match(html, /novelty 0\.75/); assert.match(html, /body\.health/);
+  assert.doesNotMatch(html, /reason unavailable/);
 });
 
 test("developmental component renders passed and pending stage gates", async () => {

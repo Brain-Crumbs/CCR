@@ -98,13 +98,17 @@ function readEpisodeFrames(dir, sid, eid) {
   return { session_id: sid, episode_id: eid, shape, dtype, n_frames: frames.length, frames };
 }
 
-function readStreams(dir, eid) {
+function readEpisodeJSONL(dir, eid, kind) {
   if (!/^episode_\d+$/.test(eid)) return null;
-  const file = path.join(dir, `${eid}.streams.jsonl`); if (!fs.existsSync(file)) return null;
+  if (!new Set(["streams", "decisions"]).has(kind)) return null;
+  const file = path.join(dir, `${eid}.${kind}.jsonl`); if (!fs.existsSync(file)) return [];
   return fs.readFileSync(file, "utf8").split("\n").filter(Boolean).flatMap((line) => {
     try { return [JSON.parse(line)]; } catch { return []; }
   });
 }
+
+function readStreams(dir, eid) { return readEpisodeJSONL(dir, eid, "streams"); }
+function readDecisions(dir, eid) { return readEpisodeJSONL(dir, eid, "decisions"); }
 
 function exportsFor(dir) {
   return fs.readdirSync(dir).filter((f) => f.endsWith(".json") && f !== "session.json" && !f.endsWith(".summary.json"))
@@ -131,9 +135,11 @@ function createServer({ dataDir }) {
         if (p.length === 3) {
           const session = store.describe(p[2]);
           const streams = Object.fromEntries(session.episodes.map((eid) => [eid, readStreams(dir, eid)]));
-          return sendJSON(res, 200, { session, streams, exports: exportsFor(dir), quality: session.quality });
+          const decisions = Object.fromEntries(session.episodes.map((eid) => [eid, readDecisions(dir, eid)]));
+          return sendJSON(res, 200, { session, streams, decisions, exports: exportsFor(dir), quality: session.quality });
         }
         if (p.length === 6 && p[3] === "episodes" && p[5] === "streams") return sendJSON(res, 200, { records: readStreams(dir, p[4]) });
+        if (p.length === 6 && p[3] === "episodes" && p[5] === "decisions") return sendJSON(res, 200, { records: readDecisions(dir, p[4]) });
         if (p.length === 6 && p[3] === "episodes" && p[5] === "frames") return sendJSON(res, 200, readEpisodeFrames(dir, p[2], p[4]));
         if (p.length === 6 && p[3] === "episodes" && p[5] === "predictions") {
           const kind = url.searchParams.get("kind") === "dream" ? "dream" : "predictions";

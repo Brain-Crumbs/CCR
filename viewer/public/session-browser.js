@@ -49,7 +49,7 @@ export function mountSessionBrowser(root, { loadSessions = () => fetch("/api/ses
       const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}`);
       if (!response.ok) throw new Error(`Unable to load diagnostics (${response.status})`);
       const detail = await response.json();
-      mountDiagnostics(diagnostics, detail.streams?.[episode] || [], detail.session || session);
+      mountDiagnostics(diagnostics, detail.streams?.[episode] || [], detail.decisions?.[episode] || [], detail.session || session);
     } catch (error) { diagnostics.textContent = String(error); diagnostics.setAttribute("role", "alert"); }
   }
 
