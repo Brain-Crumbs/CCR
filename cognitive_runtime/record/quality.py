@@ -27,7 +27,17 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
-from cognitive_runtime.runtime.replay import list_episodes
+
+
+def list_episodes(session_dir: str) -> List[str]:
+    """List episode ids directly from the Record without loading a runtime."""
+
+    suffix = ".streams.jsonl"
+    return sorted(
+        name[: -len(suffix)]
+        for name in os.listdir(session_dir)
+        if name.startswith("episode_") and name.endswith(suffix)
+    )
 
 #: How far above a floor (or below a ceiling) counts as "comfortably clear"
 #: rather than "amber -- passed, but close to the line".
@@ -190,6 +200,7 @@ def validate_recording_quality(
     name: str = "recording",
     min_blocks_per_tick: float = 0.0,
     min_unique_frame_fraction: float = 0.0,
+    min_unique_frames: int = 0,
     max_blocks_per_tick: Optional[float] = None,
     min_yaw_sweep_degrees: float = 0.0,
     min_unique_facings: int = 0,
@@ -205,6 +216,11 @@ def validate_recording_quality(
     issues: List[str] = []
     if quality.n_frames == 0:
         return [f"{where}: no pixel frames recorded (record_frames off?)"]
+    if min_unique_frames > 0 and quality.unique_frames < min_unique_frames:
+        issues.append(
+            f"{where}: only {quality.unique_frames} unique pixel frame(s) "
+            f"(< {min_unique_frames}) -- the recording appears frozen"
+        )
     if min_unique_frame_fraction > 0.0 and quality.unique_frame_fraction < min_unique_frame_fraction:
         issues.append(
             f"{where}: only {quality.unique_frames}/{quality.n_frames} unique pixel "
@@ -324,6 +340,15 @@ class RecordingVerdict:
     issues: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
+    def as_dict(self) -> Dict[str, object]:
+        """Return the stable, JSON-safe contract consumed by the clinic."""
+
+        return {
+            "verdict": self.verdict,
+            "issues": list(self.issues),
+            "warnings": list(self.warnings),
+        }
+
 
 def _amber_warnings(
     quality: EpisodeRecordingQuality,
@@ -364,6 +389,7 @@ def verdict_for_session(
     name: str = "recording",
     min_blocks_per_tick: float = 0.0,
     min_unique_frame_fraction: float = 0.0,
+    min_unique_frames: int = 0,
     max_blocks_per_tick: Optional[float] = None,
     min_yaw_sweep_degrees: float = 0.0,
     min_unique_facings: int = 0,
@@ -382,6 +408,7 @@ def verdict_for_session(
             name=name,
             min_blocks_per_tick=min_blocks_per_tick,
             min_unique_frame_fraction=min_unique_frame_fraction,
+            min_unique_frames=min_unique_frames,
             max_blocks_per_tick=max_blocks_per_tick,
             min_yaw_sweep_degrees=min_yaw_sweep_degrees,
             min_unique_facings=min_unique_facings,

@@ -7,7 +7,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check public/pixel-horizon-viewer.js"
+    "check": "node --check server.js && node --check public/session-browser.js && node --check public/pixel-horizon-viewer.js",
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=18"

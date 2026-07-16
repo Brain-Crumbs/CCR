@@ -1,0 +1,16 @@
+:root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: #f4f5f1; color: #172019; }
+body { margin: 0; } main { max-width: 1080px; margin: auto; padding: 48px 24px; }
+h1 { font-size: 2.25rem; margin: 0; letter-spacing: -.04em; } .lede { color: #657068; margin-top: 4px; }
+.organisms { display: grid; gap: 32px; margin-top: 40px; } h2 { font-size: 1.25rem; }
+.session-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+.session { background: white; border: 1px solid #dfe3dd; border-radius: 12px; padding: 18px; box-shadow: 0 2px 10px #1c27150b; }
+.session-title { display: flex; justify-content: space-between; gap: 8px; } .session-title span { color: #657068; }
+.quality { margin-top: 16px; } .badge { display: inline-block; padding: 3px 9px; border-radius: 999px; font-weight: 750; text-transform: uppercase; font-size: 11px; letter-spacing: .08em; }
+.quality--green .badge { background: #d6f2df; color: #12622d; } .quality--amber .badge { background: #fff0bd; color: #784d00; } .quality--red .badge { background: #ffd9d5; color: #8b1d14; }
+.checks { color: #7b2922; padding-left: 20px; margin-bottom: 0; } .checks-ok { color: #497052; margin-left: 10px; font-size: 12px; }
+.empty { margin-top: 36px; padding: 24px; border: 1px dashed #aeb7ad; border-radius: 12px; }
+.episode-links { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.episode-links button, .back { border: 1px solid #b8c2b9; border-radius: 7px; background: #f7faf7; color: #21452a; cursor: pointer; padding: 7px 10px; font: inherit; }
+.episode-links button:hover, .back:hover { background: #e9f3eb; }
+.back { margin: 24px 0 8px; }
+pixel-horizon-viewer { margin-top: 18px; border: 1px solid #dfe3dd; border-radius: 12px; overflow: hidden; }

@@ -1,4 +1,8 @@
-# CCR pixel prediction viewer
+# CCR Clinic
+
+The viewer now opens on a React session browser grouped by the organism name
+recorded in Phase 0. Every card displays the authoritative Record quality
+verdict and its failing checks before the session is used for training.
 
 A lightweight, zero-dependency node server plus a reusable
 `<pixel-horizon-viewer>` web component for inspecting recorded streams-v2
@@ -14,6 +18,11 @@ node viewer/server.js --data-dir /path/to/sessions --port 9000
 ```
 
 Open http://localhost:8787 — pick a session and episode.
+
+The read-only API supports `GET /api/sessions?name=Pixel` and
+`GET /api/sessions/:id`; the detail response contains all recorded stream
+events, JSON exports, and the `record.quality` verdict. Existing episode
+`frames` and `predictions` endpoints remain available to viewer panels.
 
 ## Prediction sources
 
