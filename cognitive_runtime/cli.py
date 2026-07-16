@@ -448,12 +448,12 @@ def _make_async_actor_critic_policy_and_learner(
     """
     from cognitive_runtime.neural.checkpoint import NeuralAgentCheckpoint
     from cognitive_runtime.neural.experience_queue import SharedExperienceRing
-    from cognitive_runtime.neural.weight_publisher import WeightSubscriber
+    from sleep.weight_publisher import WeightSubscriber
     from cognitive_runtime.policies.actor_critic import (
         ActorCriticPolicy,
         AsyncActorCriticLearner,
     )
-    from cognitive_runtime.training.async_trainer import (
+    from sleep.async_trainer import (
         ActorCriticArch,
         build_actor_critic_modules,
         spawn_trainer_process,
@@ -1662,7 +1662,7 @@ def cmd_trainer(args: argparse.Namespace) -> None:
         import multiprocessing as mp
 
         from cognitive_runtime.policies.actor_critic import world_feature_width
-        from cognitive_runtime.training.async_trainer import ActorCriticArch, AsyncTrainer
+        from sleep.async_trainer import ActorCriticArch, AsyncTrainer
     except ImportError as exc:  # torch not installed
         sys.exit(f"the trainer needs PyTorch ({exc}); install '.[neural]'.")
     from cognitive_runtime.core.streams import TemporalFusion

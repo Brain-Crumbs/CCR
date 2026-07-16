@@ -122,7 +122,7 @@ from cognitive_runtime.neural.experience_queue import (
     ExperienceRingStats,
     SharedExperienceRing,
 )
-from cognitive_runtime.neural.weight_publisher import WeightPublisher, WeightSubscriber
+from sleep.weight_publisher import WeightPublisher, WeightSubscriber
 
 __all__ = [
     "StreamEncoderModule",
