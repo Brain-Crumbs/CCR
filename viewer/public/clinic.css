@@ -14,3 +14,14 @@ h1 { font-size: 2.25rem; margin: 0; letter-spacing: -.04em; } .lede { color: #65
 .episode-links button:hover, .back:hover { background: #e9f3eb; }
 .back { margin: 24px 0 8px; }
 pixel-horizon-viewer { margin-top: 18px; border: 1px solid #dfe3dd; border-radius: 12px; overflow: hidden; }
+.diagnostics { display: grid; gap: 18px; margin-top: 24px; }
+.diagnostic { background: white; border: 1px solid #dfe3dd; border-radius: 12px; padding: 18px; }
+.diagnostic h3 { margin: 0; } .diagnostic h3 + p { color: #657068; margin-top: 4px; }
+.traces { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.trace { position: relative; padding: 10px; background: #f7f8f5; border-radius: 8px; }
+.spark { display: block; width: 100%; height: 56px; margin-top: 6px; } .spark polyline { stroke-width: 2; }
+.range { color: #657068; font-size: 11px; } .mode-timeline { display: flex; gap: 4px; list-style: none; padding: 0; overflow-x: auto; }
+.mode { min-width: 72px; border-top: 5px solid #71817a; background: #f2f4f1; padding: 6px 8px; text-transform: capitalize; }
+.mode span { display: block; color: #657068; font-size: 10px; }.mode--curious { border-color: #29818b; }.mode--afraid { border-color: #c34b36; }.mode--bored { border-color: #8d769f; }
+.table-scroll { overflow-x: auto; }.diagnostic table { width: 100%; border-collapse: collapse; }.diagnostic th,.diagnostic td { padding: 8px; border-bottom: 1px solid #e7eae5; text-align: left; }
+.stage-list { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; padding: 0; }.stage { display: grid; grid-template-columns: auto 1fr; gap: 0 7px; min-width: 145px; padding: 10px; border: 1px solid #dfe3dd; border-radius: 8px; }.stage small { grid-column: 2; color: #657068; }.stage--passed { background: #edf8f0; border-color: #9acbaa; }.stage-mark { font-weight: bold; }.no-data { color: #737b75; font-style: italic; }

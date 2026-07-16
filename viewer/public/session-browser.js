@@ -1,5 +1,7 @@
 /** Local, dependency-free session browser for the read-only clinic. */
 
+import { mountDiagnostics } from "./diagnostic-panels.js";
+
 function qualityNode(quality) {
   const wrap = document.createElement("div");
   wrap.className = `quality quality--${quality.verdict}`;
@@ -28,16 +30,27 @@ export function mountSessionBrowser(root, { loadSessions = () => fetch("/api/ses
   if (!r.ok) throw new Error(`Unable to load sessions (${r.status})`);
   return r.json();
 }).then((x) => x.sessions) } = {}) {
-  function showEpisode(session, episode) {
+  async function showEpisode(session, episode) {
     root.replaceChildren();
     const back = document.createElement("button"); back.className = "back"; back.textContent = "← All sessions";
     back.addEventListener("click", () => { location.hash = ""; renderSessions(sessions); });
     const title = document.createElement("h2"); title.textContent = `${session.id} / ${episode}`;
+    const stripTitle = document.createElement("h3"); stripTitle.textContent = "Predicted vs actual";
     const viewer = document.createElement("pixel-horizon-viewer");
     const urls = episodeUrls(session.id, episode);
     viewer.setAttribute("frames-src", urls.frames); viewer.setAttribute("predictions-src", urls.predictions);
-    root.append(back, title, viewer);
+    const dreamTitle = document.createElement("h3"); dreamTitle.textContent = "Dreamed vs actual";
+    const dream = document.createElement("pixel-horizon-viewer");
+    dream.setAttribute("frames-src", urls.frames); dream.setAttribute("predictions-src", `${urls.predictions}?kind=dream`);
+    const diagnostics = document.createElement("div"); diagnostics.className = "diagnostics"; diagnostics.textContent = "Loading diagnostic streams…";
+    root.append(back, title, stripTitle, viewer, dreamTitle, dream, diagnostics);
     location.hash = `${encodeURIComponent(session.id)}/${encodeURIComponent(episode)}`;
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}`);
+      if (!response.ok) throw new Error(`Unable to load diagnostics (${response.status})`);
+      const detail = await response.json();
+      mountDiagnostics(diagnostics, detail.streams?.[episode] || [], detail.session || session);
+    } catch (error) { diagnostics.textContent = String(error); diagnostics.setAttribute("role", "alert"); }
   }
 
   function renderSessions(items) {

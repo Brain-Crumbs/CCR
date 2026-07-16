@@ -53,6 +53,7 @@ function makeStore(dataDir) {
       .map((f) => f.replace(".streams.jsonl", "")).sort();
     return { id, name: meta.name ?? "legacy", curriculum: meta.curriculum ?? null,
       program: meta.program ?? null, tick_rate: meta.tick_rate ?? null, episodes,
+      development: meta.development ?? meta.ladder ?? meta.developmental ?? null,
       quality: qualityVerdict(dir) };
   }
   function list(name = null) {
@@ -135,7 +136,8 @@ function createServer({ dataDir }) {
         if (p.length === 6 && p[3] === "episodes" && p[5] === "streams") return sendJSON(res, 200, { records: readStreams(dir, p[4]) });
         if (p.length === 6 && p[3] === "episodes" && p[5] === "frames") return sendJSON(res, 200, readEpisodeFrames(dir, p[2], p[4]));
         if (p.length === 6 && p[3] === "episodes" && p[5] === "predictions") {
-          const candidates = [`${readJSON(path.join(dir, "session.json")).name}-predictions_${p[4]}.json`, `predictions_${p[4]}.json`];
+          const kind = url.searchParams.get("kind") === "dream" ? "dream" : "predictions";
+          const candidates = [`${readJSON(path.join(dir, "session.json")).name}-${kind}_${p[4]}.json`, `${kind}_${p[4]}.json`];
           const file = candidates.map((n) => path.join(dir, n)).find(fs.existsSync);
           if (!file) return sendJSON(res, 404, { error: "no predictions exported for this episode" });
           return sendJSON(res, 200, readJSON(file));
