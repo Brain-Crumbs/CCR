@@ -34,7 +34,7 @@ crafter = ["crafter>=1.8,<2"]
 ccr = "cognitive_runtime.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["cognitive_runtime*", "brain*"]
+include = ["cognitive_runtime*", "brain*", "sleep*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
