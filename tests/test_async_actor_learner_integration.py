@@ -24,6 +24,7 @@ from cognitive_runtime.neural.checkpoint import NeuralAgentCheckpoint, read_chec
 from cognitive_runtime.neural.experience_queue import SharedExperienceRing  # noqa: E402
 from cognitive_runtime.neural.replay_buffer import Transition  # noqa: E402
 from cognitive_runtime.neural.weight_publisher import WeightSubscriber  # noqa: E402
+from sleep.weight_publisher import ema_publish_path  # noqa: E402
 from cognitive_runtime.policies.actor_critic import (  # noqa: E402
     ActorCriticPolicy,
     AsyncActorCriticLearner,
@@ -221,7 +222,10 @@ def test_concurrent_schedule_publishes_ema_weights_and_bounds_actor_staleness(tm
             ckpt_path, layout_hash=arch.layout_hash, action_keys=arch.action_keys,
             policy=policy_model, critic=critic_model,
         )
-        subscriber = WeightSubscriber(path=ckpt_path, bundle=actor_bundle)
+        # The trainer's EMA publisher never writes EMA weights into
+        # `ckpt_path` itself -- that file is also its own resume checkpoint
+        # (issue #100 review) -- so the actor polls the separate EMA path.
+        subscriber = WeightSubscriber(path=ema_publish_path(ckpt_path), bundle=actor_bundle)
         policy = ActorCriticPolicy(
             policy_model, critic_model, list(arch.action_keys), history=8, training=True, seed=1,
         )
@@ -247,8 +251,8 @@ def test_concurrent_schedule_publishes_ema_weights_and_bounds_actor_staleness(tm
         assert summaries[0].duration_ticks == WORLD_CONFIG["episode_ticks"]
         assert summaries[0].missed_ticks == 0
 
-        assert _wait_for_checkpoint_version_above(ckpt_path, -1) is not None, (
-            "trainer never published"
+        assert _wait_for_checkpoint_version_above(ema_publish_path(ckpt_path), -1) is not None, (
+            "trainer never published an EMA snapshot"
         )
 
         deadline = time.time() + 10

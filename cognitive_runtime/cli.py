@@ -569,12 +569,18 @@ def _make_concurrent_actor_critic_policy_and_learner(
     """
     from cognitive_runtime.neural.checkpoint import NeuralAgentCheckpoint
     from cognitive_runtime.neural.experience_queue import SharedExperienceRing
-    from sleep.weight_publisher import WeightSubscriber
+    from sleep.weight_publisher import WeightSubscriber, ema_publish_path
     from cognitive_runtime.policies.actor_critic import (
         ActorCriticPolicy,
         AsyncActorCriticLearner,
     )
     from sleep.async_trainer import ActorCriticArch, TrainerSupervisor, build_actor_critic_modules
+
+    # `EMAWeightPublisher` only validates this inside the spawned trainer
+    # process, which the parent would then supervise/restart forever
+    # without it ever reporting the real error back to the CLI user.
+    if not 0.0 < args.async_ema_decay < 1.0:
+        sys.exit(f"--async-ema-decay must be in (0, 1), got {args.async_ema_decay!r}")
 
     trainer_arch = ActorCriticArch(
         fused_width=arch["fused_width"],
@@ -611,7 +617,11 @@ def _make_concurrent_actor_critic_policy_and_learner(
         model_path, layout_hash=layout_hash, action_keys=action_keys,
         policy=policy_model, critic=critic_model,
     )
-    subscriber = WeightSubscriber(path=model_path, bundle=actor_bundle)
+    # The trainer's `EMAWeightPublisher` never writes EMA weights to
+    # `model_path` itself -- that path doubles as the trainer's own resume
+    # checkpoint, which must always stay raw (see EMAWeightPublisher's
+    # docstring). The actor polls the separate EMA snapshot file instead.
+    subscriber = WeightSubscriber(path=ema_publish_path(model_path), bundle=actor_bundle)
     # A resumed checkpoint is already a completed snapshot; load it before
     # the first tick rather than waiting for the first background publish.
     subscriber.maybe_reload()

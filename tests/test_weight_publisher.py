@@ -162,7 +162,7 @@ def test_ema_publisher_first_publish_seeds_the_shadow_with_raw_weights(tmp_path)
     path = str(tmp_path / "trainer.pt")
     policy, critic, optimizer, trainer_bundle = _trainer_side(path)
     publisher = EMAWeightPublisher(trainer_bundle, decay=0.9)
-    actor_policy, actor_critic, subscriber = _actor_side(path)
+    actor_policy, actor_critic, subscriber = _actor_side(publisher.publish_path)
 
     optimizer.step(_random_batch())
     trainer_bundle.training_ticks = optimizer.step_count
@@ -184,7 +184,7 @@ def test_ema_publisher_smooths_subsequent_publishes(tmp_path):
     policy, critic, optimizer, trainer_bundle = _trainer_side(path)
     decay = 0.7
     publisher = EMAWeightPublisher(trainer_bundle, decay=decay)
-    _actor_policy, _actor_critic, subscriber = _actor_side(path)
+    _actor_policy, _actor_critic, subscriber = _actor_side(publisher.publish_path)
 
     optimizer.step(_random_batch())
     trainer_bundle.training_ticks = optimizer.step_count
@@ -232,6 +232,45 @@ def test_ema_publisher_never_mutates_the_live_training_weights(tmp_path):
     for pre, post in zip(after_first_step, policy.parameters()):
         assert torch.equal(pre, post)
     assert any(not torch.equal(a, b) for a, b in zip(before, policy.parameters()))
+
+
+def test_ema_publisher_never_writes_ema_weights_into_the_resume_checkpoint(tmp_path):
+    """Review finding (issue #100 PR #127): the raw resume checkpoint --
+    what ``AsyncTrainer.resume_if_checkpoint_exists`` reads on restart --
+    must never be the EMA snapshot. Conflating the two would mean every
+    restart resumes from the lagging EMA target while keeping optimizer/
+    Adam-moment state that was actually produced by the raw trajectory."""
+    path = str(tmp_path / "trainer.pt")
+    policy, _critic, optimizer, trainer_bundle = _trainer_side(path)
+    publisher = EMAWeightPublisher(trainer_bundle, decay=0.1)  # heavy smoothing
+    assert publisher.publish_path != path
+
+    for _ in range(2):
+        optimizer.step(_random_batch())
+        trainer_bundle.training_ticks = optimizer.step_count
+        publisher.publish(reason="tick")
+    raw_after = [p.clone() for p in policy.parameters()]
+
+    # A fresh bundle resuming from `path` (mirrors
+    # AsyncTrainer.resume_if_checkpoint_exists) must see the raw trajectory.
+    resumed_policy = MLPPolicyModel(FUSED_WIDTH, WORLD_FEATURE_WIDTH, N_ACTIONS)
+    resumed_critic = MLPValueModel(FUSED_WIDTH, WORLD_FEATURE_WIDTH)
+    resumed_bundle = NeuralAgentCheckpoint(
+        path, layout_hash=LAYOUT_HASH, action_keys=ACTION_KEYS,
+        policy=resumed_policy, critic=resumed_critic,
+    )
+    resumed_bundle.load()
+    for raw, resumed in zip(raw_after, resumed_policy.parameters()):
+        assert torch.equal(raw, resumed)
+
+    # The actor-facing EMA snapshot, loaded from the separate publish path,
+    # is a real blend -- distinct from the raw trajectory once training has
+    # actually moved the weights.
+    _actor_policy, _actor_critic, subscriber = _actor_side(publisher.publish_path)
+    subscriber.maybe_reload()
+    assert any(
+        not torch.equal(a, b) for a, b in zip(raw_after, _actor_policy.parameters())
+    )
 
 
 def test_ema_publisher_keeps_the_version_monotonic_across_publishes(tmp_path):
