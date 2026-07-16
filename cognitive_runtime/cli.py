@@ -440,11 +440,13 @@ def _make_async_actor_critic_policy_and_learner(
     action_keys: list,
     action_space: list,
 ):
-    """``--policy actor-critic --async-trainer`` (issue #37): spawns a
-    background trainer process and wires the actor side (inference-only
-    policy + :class:`AsyncActorCriticLearner`) to it via a shared-memory
-    live-experience ring and a polling weight subscriber, instead of the
-    synchronous in-tick ``ActorCriticLearner``.
+    """Build the phasic actor/trainer split used by ``--async-trainer``.
+
+    Acting remains inference-only during each wake phase.  Between wake
+    phases, the runtime blocks before the next acting tick while the trainer
+    drains experience and performs a bounded consolidation pass.  Only the
+    completed pass is published and reloaded, so an acting tick can never see
+    intermediate or stale consolidation weights.
     """
     from cognitive_runtime.neural.checkpoint import NeuralAgentCheckpoint
     from cognitive_runtime.neural.experience_queue import SharedExperienceRing
@@ -453,11 +455,8 @@ def _make_async_actor_critic_policy_and_learner(
         ActorCriticPolicy,
         AsyncActorCriticLearner,
     )
-    from sleep.async_trainer import (
-        ActorCriticArch,
-        build_actor_critic_modules,
-        spawn_trainer_process,
-    )
+    from sleep import PhasicSleepSchedule
+    from sleep.async_trainer import ActorCriticArch, AsyncTrainer, build_actor_critic_modules
 
     trainer_arch = ActorCriticArch(
         fused_width=arch["fused_width"],
@@ -470,21 +469,20 @@ def _make_async_actor_critic_policy_and_learner(
     )
 
     ring = SharedExperienceRing(args.async_ring_capacity, arch["fused_width"])
-    trainer_process, trainer_stop_event = spawn_trainer_process(
+    trainer = AsyncTrainer(
         trainer_arch,
         model_path,
         live_ring_handle=ring.handle(),
-        trainer_kwargs={
-            "lr": args.actor_critic_lr,
-            "gamma": args.actor_critic_gamma,
-            "entropy_coef": args.actor_critic_entropy_coef,
-            "grad_clip_norm": args.actor_critic_grad_clip_norm,
-            "seed": args.seed,
-            "batch_size": args.async_batch_size,
-            "min_buffer_size": args.async_min_buffer_size,
-            "publish_every_steps": args.async_publish_every,
-        },
+        lr=args.actor_critic_lr,
+        gamma=args.actor_critic_gamma,
+        entropy_coef=args.actor_critic_entropy_coef,
+        grad_clip_norm=args.actor_critic_grad_clip_norm,
+        seed=args.seed,
+        batch_size=args.async_batch_size,
+        min_buffer_size=args.async_min_buffer_size,
+        publish_every_steps=args.async_publish_every,
     )
+    trainer.resume_if_checkpoint_exists()
 
     policy_model, critic_model, _world_model, _optimizer = build_actor_critic_modules(
         trainer_arch, seed=args.seed,
@@ -494,36 +492,60 @@ def _make_async_actor_critic_policy_and_learner(
         policy=policy_model, critic=critic_model,
     )
     subscriber = WeightSubscriber(path=model_path, bundle=actor_bundle)
+    # A resumed checkpoint is already a completed snapshot; load it before
+    # the first wake tick rather than waiting for the first sleep boundary.
+    subscriber.maybe_reload()
 
     policy = ActorCriticPolicy(
         policy_model, critic_model, action_keys, action_space=action_space,
         history=args.actor_critic_history, training=args.actor_critic_train, seed=args.seed,
     )
-    learner = AsyncActorCriticLearner(
-        policy, ring, weight_subscriber=subscriber,
-        reload_every_ticks=args.async_reload_every_ticks,
-    )
-    # Stashed for `cmd_run`'s shutdown; not part of the `Learner` contract.
-    learner.async_resources = (ring, trainer_process, trainer_stop_event)
+    actor_learner = AsyncActorCriticLearner(policy, ring, weight_subscriber=None)
+    schedule = PhasicSleepSchedule(wake_ticks=args.async_wake_ticks)
+
+    class _PhasicLearner:
+        """Learner adapter: the loop's update boundary is between acting ticks."""
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(actor_learner, name)
+
+        def update(self, window: Any) -> None:
+            schedule.act(lambda: actor_learner.update(window))
+            if schedule.sleep_due:
+                schedule.consolidate(
+                    lambda: trainer.consolidate(args.async_consolidation_steps),
+                    reload_weights=subscriber.maybe_reload,
+                )
+
+        def reset(self) -> None:
+            actor_learner.reset()
+
+        def model_metadata(self) -> Dict[str, Any]:
+            return actor_learner.model_metadata()
+
+    learner = _PhasicLearner()
+    # Stashed for `cmd_run` cleanup; not part of the `Learner` contract.
+    learner.async_resources = (ring,)
+    learner.phasic_schedule = schedule
+    learner.sleep_trainer = trainer
     return policy, learner
 
 
 def _shutdown_async_trainer(learner: Optional[Any]) -> None:
     """Best-effort, always-runs cleanup for ``--async-trainer``: ask the
-    trainer process to stop (it publishes once more on its way out -- see
-    ``AsyncTrainer.run_forever``), then release the shared-memory ring. A
-    trainer that already died (e.g. a deliberate ``kill -9`` during a
-    supervised run) is simply already gone; nothing here depends on it
-    being alive."""
+    trainer process to stop when using the legacy process resources, then
+    release the shared-memory ring."""
     resources = getattr(learner, "async_resources", None)
     if resources is None:
         return
-    ring, trainer_process, trainer_stop_event = resources
-    trainer_stop_event.set()
-    trainer_process.join(timeout=10)
-    if trainer_process.is_alive():
-        trainer_process.terminate()
-        trainer_process.join(timeout=5)
+    ring = resources[0]
+    if len(resources) == 3:
+        _, trainer_process, trainer_stop_event = resources
+        trainer_stop_event.set()
+        trainer_process.join(timeout=10)
+        if trainer_process.is_alive():
+            trainer_process.terminate()
+            trainer_process.join(timeout=5)
     ring.close()
     ring.unlink()
 
@@ -1952,10 +1974,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="run actor-critic in eval mode without mutating weights")
     p_run.add_argument("--async-trainer", dest="actor_critic_async", action="store_true",
                        default=False,
-                       help="actor/learner split (issue #37): run gradient steps in a "
-                            "separate trainer process instead of inline in the tick; the "
-                            "loop only does inference and pushes transitions to a shared "
-                            "live-experience ring")
+                       help="phasic actor/learner split: collect experience during wake "
+                            "ticks, then pause acting for bounded sleep consolidation")
     p_run.add_argument("--async-ring-capacity", type=int, default=20_000,
                        help="live-experience ring buffer capacity (transitions); "
                             "drop-oldest once full")
@@ -1968,7 +1988,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="trainer process publishes a new weight snapshot every N "
                             "gradient steps")
     p_run.add_argument("--async-reload-every-ticks", type=int, default=5,
-                       help="actor polls for a newer published snapshot every N ticks")
+                       help="deprecated compatibility option; phasic runs reload exactly "
+                            "once after each completed consolidation")
+    p_run.add_argument("--async-wake-ticks", type=int, default=50,
+                       help="number of acting ticks between sleep consolidation passes")
+    p_run.add_argument("--async-consolidation-steps", type=int, default=50,
+                       help="maximum gradient steps in each sleep consolidation pass")
     _add_world_args(p_run)
     _add_world_selector_arg(p_run)
     _add_world_model_arg(p_run)
