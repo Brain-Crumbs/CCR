@@ -85,6 +85,7 @@ class ReflexStack:
         self.reflex_ticks = 0
 
     def evaluate(self, stimuli: Iterable[Stimulus]) -> Optional[ReflexDecision]:
+        stimuli = tuple(stimuli)
         candidates: list[tuple[int, int, ReflexConfig, Stimulus]] = []
         for order, config in enumerate(self.configs):
             for stimulus in stimuli:

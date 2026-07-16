@@ -25,6 +25,18 @@ def test_precedence_is_caregiver_then_priority_reflex_then_voluntary():
     assert reflexes.decide(Action("FORWARD")).actuated == Action("FORWARD")
 
 
+def test_one_shot_stimuli_iterable_considers_every_reflex():
+    stimuli = (stimulus for stimulus in [
+        Stimulus("salience", 1),
+        Stimulus("threat", 1),
+    ])
+
+    decision = stack().decide(Action("FORWARD"), stimuli)
+
+    assert decision.reflex.name == "withdraw"
+    assert decision.actuated == Action("BACK")
+
+
 def test_null_remains_an_explicit_recorded_voluntary_choice():
     decision = stack().decide(NULL_ACTION)
     assert decision.voluntary == NULL_ACTION
@@ -37,4 +49,3 @@ def test_reflex_activation_rate_is_exposed_as_session_metric():
     reflexes.decide(Action("GO"), [Stimulus("threat", 1)])
     reflexes.decide(Action("GO"))
     assert reflexes.metrics()["motor.reflex_activation_rate"] == .5
-
