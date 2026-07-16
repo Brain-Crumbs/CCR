@@ -30,6 +30,7 @@ from cognitive_runtime.training.async_trainer import ActorCriticArch, AsyncTrain
 from cognitive_runtime.training.features import ACTION_KEYS  # noqa: E402
 from sleep import Phase, PhasicSleepSchedule  # noqa: E402
 from sleep.async_trainer import AsyncTrainer as SleepTrainer  # noqa: E402
+from sleep.weight_publisher import EMAWeightPublisher  # noqa: E402
 from sleep.weight_publisher import WeightPublisher as SleepWeightPublisher  # noqa: E402
 
 WORLD_CONFIG = {"episode_ticks": 120, "world_size": 16, "max_mobs": 2}
@@ -184,6 +185,49 @@ def test_resume_from_checkpoint_continues_the_step_count(tmp_path):
     assert second_stats["step_count"] == 20
 
 
+# ------------------------------------------------------- concurrent (#100)
+
+
+def test_ema_decay_selects_the_ema_publisher(tmp_path):
+    """Concurrent schedule (issue #100): passing ``ema_decay`` swaps in
+    ``EMAWeightPublisher``; phasic's default (``ema_decay=None``) keeps the
+    raw ``WeightPublisher`` untouched -- phasic never publishes mid-update,
+    so it has no oscillation to smooth."""
+    program = MinecraftSurvivalBox(config=WORLD_CONFIG)
+    arch, _fusion = _arch(program)
+
+    phasic = AsyncTrainer(arch, str(tmp_path / "phasic.pt"), seed=0)
+    assert type(phasic.publisher) is SleepWeightPublisher
+
+    concurrent = AsyncTrainer(arch, str(tmp_path / "concurrent.pt"), seed=0, ema_decay=0.99)
+    assert isinstance(concurrent.publisher, EMAWeightPublisher)
+    assert concurrent.publisher.decay == 0.99
+
+
+def test_concurrent_trainer_publishes_ema_weights_with_increasing_version(tmp_path):
+    session_dir, program = _record_session(tmp_path)
+    arch, _fusion = _arch(program)
+    ckpt_path = str(tmp_path / "trainer.pt")
+
+    trainer = AsyncTrainer(
+        arch, ckpt_path, session_dirs=[session_dir], batch_size=16,
+        min_buffer_size=1, publish_every_steps=1, seed=0, ema_decay=0.5,
+    )
+    trainer.load_recorded_sessions()
+    assert isinstance(trainer.publisher, EMAWeightPublisher)
+
+    versions = []
+    for _ in range(5):
+        trainer.train_step()
+        versions.append(trainer.publish(reason="tick"))
+
+    # Monotonic version, one publish per gradient step here.
+    assert versions == sorted(versions)
+    assert len(set(versions)) == len(versions)
+    # The publisher actually built up EMA state across every publish.
+    assert trainer.publisher._shadow
+
+
 # ------------------------------------------------------------- live ingestion
 
 
@@ -252,6 +296,25 @@ def test_cli_run_async_trainer_produces_a_checkpoint_and_no_missed_ticks(tmp_pat
         "--actor-critic-model", model_path,
         "--async-min-buffer-size", "16", "--async-batch-size", "16",
         "--async-publish-every", "3", "--async-reload-every-ticks", "2",
+        "--world-size", "16", "--max-mobs", "2",
+    ])
+    assert os.path.exists(model_path)
+    assert os.path.exists(model_path + ".json")
+
+
+def test_cli_run_async_trainer_concurrent_schedule_produces_a_checkpoint(tmp_path):
+    """``--async-schedule concurrent`` (issue #100): the trainer runs in its
+    own process the whole time (no phasic pause), publishing EMA-averaged
+    snapshots the actor polls for continuously."""
+    model_path = str(tmp_path / "concurrent-model.pt")
+    main([
+        "run", "--policy", "actor-critic", "--async-trainer",
+        "--async-schedule", "concurrent",
+        "--episodes", "1", "--episode-ticks", "80", "--no-record",
+        "--actor-critic-model", model_path,
+        "--async-min-buffer-size", "16", "--async-batch-size", "16",
+        "--async-publish-every", "3", "--async-reload-every-ticks", "2",
+        "--async-ema-decay", "0.9",
         "--world-size", "16", "--max-mobs", "2",
     ])
     assert os.path.exists(model_path)

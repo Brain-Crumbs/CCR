@@ -53,7 +53,7 @@ from cognitive_runtime.neural.optimizer import ActorCriticOptimizer
 from cognitive_runtime.neural.policy import MLPPolicyModel
 from cognitive_runtime.neural.replay_buffer import ReplayBuffer, load_session_into_buffer
 from cognitive_runtime.neural.value import MLPValueModel
-from sleep.weight_publisher import WeightPublisher
+from sleep.weight_publisher import EMAWeightPublisher, WeightPublisher
 from cognitive_runtime.neural.world_model import MLPWorldModel
 
 
@@ -148,6 +148,7 @@ class AsyncTrainer:
         min_buffer_size: int = 1,
         publish_every_steps: int = 20,
         drain_max_items: Optional[int] = None,
+        ema_decay: Optional[float] = None,
     ):
         if publish_every_steps <= 0:
             raise ValueError(f"publish_every_steps must be positive, got {publish_every_steps!r}")
@@ -167,7 +168,16 @@ class AsyncTrainer:
             online_optimizer=self.optimizer,
             extra_metadata={"actor_critic": arch.to_dict()},
         )
-        self.publisher = WeightPublisher(self.checkpoint)
+        # Concurrent schedule (issue #100): publish an EMA-averaged snapshot
+        # -- a slow-moving target -- instead of raw in-training weights, so a
+        # continuously-polling actor doesn't see tick-to-tick oscillation.
+        # Phasic consolidation never publishes mid-update, so it has no
+        # staleness/oscillation problem to begin with and leaves this unset.
+        self.publisher = (
+            EMAWeightPublisher(self.checkpoint, decay=ema_decay)
+            if ema_decay is not None
+            else WeightPublisher(self.checkpoint)
+        )
         self.replay_buffer = replay_buffer if replay_buffer is not None else ReplayBuffer()
         self.live_ring: Optional[SharedExperienceRing] = (
             SharedExperienceRing.attach(**live_ring_handle) if live_ring_handle else None

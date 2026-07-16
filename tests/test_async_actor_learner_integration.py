@@ -194,3 +194,84 @@ def test_trainer_kill_9_does_not_affect_the_actor_and_restart_resumes(tmp_path):
         process.join(timeout=5)
         ring.close()
         ring.unlink()
+
+
+def test_concurrent_schedule_publishes_ema_weights_and_bounds_actor_staleness(tmp_path):
+    """Issue #100: concurrent mode publishes an EMA-averaged snapshot with an
+    increasing version while the actor keeps acting (never pausing), and the
+    actor's staleness (versions behind the latest publish) is a bounded,
+    reported quantity -- it resets to caught-up rather than growing without
+    limit across the run."""
+    program = MinecraftSurvivalBox(config=WORLD_CONFIG)
+    arch, _fusion = _arch(program)
+    ckpt_path = str(tmp_path / "trainer.pt")
+
+    ring = SharedExperienceRing(capacity=5000, latent_dim=arch.fused_width)
+    trainer_process, stop_event = spawn_trainer_process(
+        arch, ckpt_path,
+        live_ring_handle=ring.handle(),
+        trainer_kwargs={
+            "batch_size": 16, "min_buffer_size": 16, "publish_every_steps": 3,
+            "seed": 0, "ema_decay": 0.9,
+        },
+    )
+    try:
+        policy_model, critic_model, _wm, _opt = build_actor_critic_modules(arch, seed=1)
+        actor_bundle = NeuralAgentCheckpoint(
+            ckpt_path, layout_hash=arch.layout_hash, action_keys=arch.action_keys,
+            policy=policy_model, critic=critic_model,
+        )
+        subscriber = WeightSubscriber(path=ckpt_path, bundle=actor_bundle)
+        policy = ActorCriticPolicy(
+            policy_model, critic_model, list(arch.action_keys), history=8, training=True, seed=1,
+        )
+        learner = AsyncActorCriticLearner(
+            policy, ring, weight_subscriber=subscriber, reload_every_ticks=5,
+        )
+        initial_params = [p.clone() for p in policy_model.parameters()]
+
+        runtime = CognitiveRuntime(
+            program=program,
+            policy=policy,
+            config=RuntimeConfig(
+                episodes=1, seed=0, max_ticks_per_episode=WORLD_CONFIG["episode_ticks"],
+                record=False, program_config=WORLD_CONFIG, realtime=False,
+            ),
+            learner=learner,
+        )
+        summaries = runtime.run()
+
+        # Same no-missed-tick acceptance criterion as the raw-weights path:
+        # EMA smoothing and per-tick staleness tracking must not cost
+        # realtime-shaped ticks.
+        assert summaries[0].duration_ticks == WORLD_CONFIG["episode_ticks"]
+        assert summaries[0].missed_ticks == 0
+
+        assert _wait_for_checkpoint_version_above(ckpt_path, -1) is not None, (
+            "trainer never published"
+        )
+
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if subscriber.maybe_reload() is not None:
+                break
+            time.sleep(0.1)
+
+        changed = any(
+            not torch.equal(a, b) for a, b in zip(initial_params, policy_model.parameters())
+        )
+        assert changed, "the actor must pick up the trainer's EMA-averaged weights"
+        stats = subscriber.stats()
+        assert stats["reload_count"] > 0, "actor must pick up published snapshots"
+        # "bounds how stale" (issue #100): the gap was tracked (not None/
+        # unmeasured) during the run, and is caught up again -- 0 -- right
+        # after this final reload, rather than drifting upward forever.
+        assert stats["max_staleness"] is not None
+        assert subscriber.staleness() == 0
+    finally:
+        stop_event.set()
+        trainer_process.join(timeout=10)
+        if trainer_process.is_alive():
+            trainer_process.terminate()
+        ring.close()
+        ring.unlink()
