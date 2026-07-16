@@ -7,14 +7,10 @@
 </head>
 <body>
   <main><h1>CCR Clinic</h1><p class="lede">Read-only session Record</p><div id="clinic">Loading sessions…</div></main>
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script type="module" src="/pixel-horizon-viewer.js"></script>
   <script type="module">
-    import { createSessionBrowser } from "/session-browser.js";
-    const SessionBrowser = createSessionBrowser(window.React);
-    ReactDOM.createRoot(document.getElementById("clinic")).render(
-      React.createElement(SessionBrowser, { loadSessions: () => fetch("/api/sessions").then(r => r.json()).then(x => x.sessions) })
-    );
+    import { mountSessionBrowser } from "/session-browser.js";
+    mountSessionBrowser(document.getElementById("clinic"));
   </script>
 </body>
 </html>

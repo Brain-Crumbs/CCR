@@ -200,6 +200,7 @@ def validate_recording_quality(
     name: str = "recording",
     min_blocks_per_tick: float = 0.0,
     min_unique_frame_fraction: float = 0.0,
+    min_unique_frames: int = 0,
     max_blocks_per_tick: Optional[float] = None,
     min_yaw_sweep_degrees: float = 0.0,
     min_unique_facings: int = 0,
@@ -215,6 +216,11 @@ def validate_recording_quality(
     issues: List[str] = []
     if quality.n_frames == 0:
         return [f"{where}: no pixel frames recorded (record_frames off?)"]
+    if min_unique_frames > 0 and quality.unique_frames < min_unique_frames:
+        issues.append(
+            f"{where}: only {quality.unique_frames} unique pixel frame(s) "
+            f"(< {min_unique_frames}) -- the recording appears frozen"
+        )
     if min_unique_frame_fraction > 0.0 and quality.unique_frame_fraction < min_unique_frame_fraction:
         issues.append(
             f"{where}: only {quality.unique_frames}/{quality.n_frames} unique pixel "
@@ -383,6 +389,7 @@ def verdict_for_session(
     name: str = "recording",
     min_blocks_per_tick: float = 0.0,
     min_unique_frame_fraction: float = 0.0,
+    min_unique_frames: int = 0,
     max_blocks_per_tick: Optional[float] = None,
     min_yaw_sweep_degrees: float = 0.0,
     min_unique_facings: int = 0,
@@ -401,6 +408,7 @@ def verdict_for_session(
             name=name,
             min_blocks_per_tick=min_blocks_per_tick,
             min_unique_frame_fraction=min_unique_frame_fraction,
+            min_unique_frames=min_unique_frames,
             max_blocks_per_tick=max_blocks_per_tick,
             min_yaw_sweep_degrees=min_yaw_sweep_degrees,
             min_unique_facings=min_unique_facings,

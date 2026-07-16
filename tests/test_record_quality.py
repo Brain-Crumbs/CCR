@@ -147,6 +147,13 @@ def test_verdict_for_session_is_red_for_a_frozen_recording(tmp_path):
     assert verdict.issues
 
 
+def test_world_agnostic_unique_frame_count_gate_rejects_frozen_pixels(tmp_path):
+    session_dir = _record_crafter_stationary(tmp_path)
+    verdict = verdict_for_session(session_dir, min_unique_frames=2)
+    assert verdict.verdict == "red"
+    assert any("recording appears frozen" in issue for issue in verdict.issues)
+
+
 def test_verdict_for_session_is_amber_when_provenance_predates_tracking(tmp_path):
     session_dir = _record_crafter_walk(tmp_path)
     episode_id = list_episodes(session_dir)[0]
