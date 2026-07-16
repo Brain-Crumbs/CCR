@@ -27,7 +27,17 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
-from cognitive_runtime.runtime.replay import list_episodes
+
+
+def list_episodes(session_dir: str) -> List[str]:
+    """List episode ids directly from the Record without loading a runtime."""
+
+    suffix = ".streams.jsonl"
+    return sorted(
+        name[: -len(suffix)]
+        for name in os.listdir(session_dir)
+        if name.startswith("episode_") and name.endswith(suffix)
+    )
 
 #: How far above a floor (or below a ceiling) counts as "comfortably clear"
 #: rather than "amber -- passed, but close to the line".
@@ -323,6 +333,15 @@ class RecordingVerdict:
     verdict: str  # "green" | "amber" | "red"
     issues: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+
+    def as_dict(self) -> Dict[str, object]:
+        """Return the stable, JSON-safe contract consumed by the clinic."""
+
+        return {
+            "verdict": self.verdict,
+            "issues": list(self.issues),
+            "warnings": list(self.warnings),
+        }
 
 
 def _amber_warnings(
