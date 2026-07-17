@@ -457,6 +457,30 @@ def test_overridden_stage_never_builds_the_actor_critic_policy(tmp_path, monkeyp
     assert not ac_learner_calls, "overridden babbling must not construct an ActorCriticLearner"
 
 
+def test_overridden_stage_runs_the_scenarios_own_scripted_policy_not_random(monkeypatch):
+    """A uniform-random substitute would let Babbling/Crawling promote
+    without ever running their registered ``turn``/``walk_forward`` nursery
+    scenario -- the runner must reuse the *same* scripted policy that
+    scenario's own recording uses (``cognitive_runtime.training.nursery``),
+    not a stage-agnostic random policy."""
+    from cognitive_runtime.policies.constant_action import ConstantActionPolicy
+    from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy
+    from development.runner import _scripted_policy_for_stage
+
+    babbling, crawling = GESTATION_TO_FORAGING.stages[1], GESTATION_TO_FORAGING.stages[2]
+    action_space = [Action("MOVE_UP"), Action("MOVE_RIGHT"), Action("MOVE_DOWN"), Action("MOVE_LEFT")]
+
+    babbling_policy = _scripted_policy_for_stage(babbling, action_space, seed=0)
+    assert isinstance(babbling_policy, ScriptedSequencePolicy), (
+        "babbling's 'turn' scenario is a scripted direction-cycling sequence, not random"
+    )
+
+    crawling_policy = _scripted_policy_for_stage(crawling, action_space, seed=0)
+    assert isinstance(crawling_policy, ConstantActionPolicy), (
+        "crawling's 'walk_forward' scenario is a constant-direction walk, not random"
+    )
+
+
 def test_learned_stage_raises_without_a_voluntary_controller_factory(tmp_path):
     """"learned" (Objects/Foraging) needs the real Phase 6 voluntary path,
     which development.runner cannot build on its own (no trained predictive

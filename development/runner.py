@@ -168,6 +168,44 @@ def _new_actor_critic_stack(stage: CurriculumStageSpec, seed: int, *, lr: float,
     return fusion, action_keys, policy_model, critic_model, optimizer, arch
 
 
+def _scripted_policy_for_stage(stage: CurriculumStageSpec, action_space: Sequence[Action], *, seed: int):
+    """The scripted motor policy an ``"overridden"`` stage's episodes
+    actually run under: the *same* scripted policy ``stage.scenario``'s
+    nursery recording uses (``cognitive_runtime.training.nursery``'s
+    ``CRAFTER_SCENARIOS``/``NURSERY_SCENARIOS`` registries), e.g. Babbling's
+    ``turn`` cycles the four directional actions and Crawling's
+    ``walk_forward`` walks a constant direction -- not a uniform-random
+    substitute. Without this, the runner could record unrelated random
+    experience while ``milestone_metrics`` promotes the stage against
+    separately-generated, scenario-correct nursery data (issue #133 review),
+    letting a stage pass without the organism ever having run its declared
+    developmental task.
+
+    Falls back to a stage-agnostic :class:`RandomPolicy` only when the stage
+    has no scenario registered against a nursery world (e.g. a non-ladder
+    curriculum that declares ``motor_freedom="overridden"`` without a
+    nursery scenario) -- some scripted/caregiver-driven policy still
+    satisfies the freedom generically.
+    """
+    if stage.scenario is not None:
+        from cognitive_runtime.training.nursery import (
+            CRAFTER_SCENARIOS,
+            NURSERY_SCENARIOS,
+            NurseryConfig,
+        )
+
+        world = stage.world or "minecraft"
+        registry = CRAFTER_SCENARIOS if world == "crafter" else NURSERY_SCENARIOS
+        scenario = registry.get(stage.scenario)
+        if scenario is not None:
+            cfg = NurseryConfig(
+                episode_ticks=stage.world_config.get("episode_ticks", NurseryConfig.episode_ticks),
+                world=world, seed=seed,
+            )
+            return scenario.build(seed, cfg).policy
+    return RandomPolicy(list(action_space), seed=seed)
+
+
 def _stage_policy_and_learner(
     stage: CurriculumStageSpec,
     action_space: Sequence[Action],
@@ -195,12 +233,7 @@ def _stage_policy_and_learner(
         return build_stage_policy(stage, action_space), NullLearner()
 
     if stage.motor_freedom == "overridden":
-        # Any scripted/caregiver-driven policy satisfies "overridden" --
-        # unlike "learned", the freedom itself doesn't specify *which*
-        # scripted behaviour, so a stage-agnostic random policy is a
-        # legitimate generic default (and matches the phase doc's own
-        # "random, overridden" table entry for Babbling).
-        scripted = RandomPolicy(list(action_space), seed=seed)
+        scripted = _scripted_policy_for_stage(stage, action_space, seed=seed)
         return build_stage_policy(stage, action_space, scripted=scripted), NullLearner()
 
     assert stage.motor_freedom == "learned"
