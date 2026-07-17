@@ -131,16 +131,18 @@ _CRAWLING = _stage(
 #:
 #: Gate: ``reflex_override_precedence`` rather than ``forgetting_score``.
 #: The phase doc's own example list ("later stages on the forgetting
-#: metric, reflex-override behaviour, etc.") offers both, but issue #99's
-#: tracking comment records that the forgetting metric has no real,
-#: computable implementation in this repo yet (no
-#: ``test_generative_replay.py``/``test_forgetting_metric.py``) -- wiring a
-#: gate to a metric nothing computes would violate task 4's "not a stub"
-#: intent worse than picking a different real Phase 6 milestone. Objects is
-#: the ladder's first ``learned``-motor stage with caregiver-guided stages
-#: behind it, so proving the caregiver-override precedence contract
+#: metric, reflex-override behaviour, etc.") offers both; issue #99 has
+#: since landed a real, computable forgetting metric
+#: (``cognitive_runtime.training.forgetting``, backed by
+#: ``sleep.replay``'s gated generative replay -- see
+#: ``tests/test_forgetting_metric.py``/``tests/test_generative_replay.py``),
+#: but it operates on latent-transition reservoirs, not this runner's
+#: per-scenario nursery evaluation, so wiring it into a ``milestone_metrics``
+#: gate here is separate follow-up work rather than a drop-in swap. Objects
+#: is the ladder's first ``learned``-motor stage with caregiver-guided
+#: stages behind it, so proving the caregiver-override precedence contract
 #: (``motor.reflexes.ReflexStack``: caregiver always wins) still holds is a
-#: real, honestly-computable stand-in.
+#: real, honestly-computable stand-in in the meantime.
 _OBJECTS = _stage(
     "objects", "approach_entity",
     senses=("vision", "proprioception"),

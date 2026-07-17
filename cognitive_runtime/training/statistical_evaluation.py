@@ -269,6 +269,20 @@ def flagged_regressions(comparisons: Sequence[MetricComparison]) -> List[MetricC
     return [c for c in comparisons if c.regressed]
 
 
+def compare_scalar_metrics(
+    metric: str, baseline: MetricStats, candidate: MetricStats, higher_is_better: bool,
+) -> MetricComparison:
+    """The same CI-overlap regression rule :func:`compare_statistics` applies
+    to its core/tier metric catalogue, for one metric computed outside a
+    full :class:`PolicyStatistics` (e.g. ``sleep.replay``'s next-latent
+    quality or ``training.forgetting``'s old-scenario retention check)."""
+    return MetricComparison(
+        metric=metric, baseline=baseline, candidate=candidate,
+        higher_is_better=higher_is_better,
+        direction=_direction(baseline, candidate, higher_is_better),
+    )
+
+
 # ------------------------------------------------------------- cortex scoring
 
 
