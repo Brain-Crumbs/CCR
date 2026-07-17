@@ -43,7 +43,7 @@ from __future__ import annotations
 import multiprocessing
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -51,8 +51,9 @@ from cognitive_runtime.neural.checkpoint import NeuralAgentCheckpoint
 from cognitive_runtime.neural.experience_queue import MP_CONTEXT, SharedExperienceRing
 from cognitive_runtime.neural.optimizer import ActorCriticOptimizer
 from cognitive_runtime.neural.policy import MLPPolicyModel
-from cognitive_runtime.neural.replay_buffer import ReplayBuffer, load_session_into_buffer
+from cognitive_runtime.neural.replay_buffer import ReplayBuffer, Transition, load_session_into_buffer
 from cognitive_runtime.neural.value import MLPValueModel
+from sleep.replay import DreamFractionGate, evaluate_next_latent_quality, sample_generative_replay_batch
 from sleep.weight_publisher import EMAWeightPublisher, WeightPublisher
 from cognitive_runtime.neural.world_model import MLPWorldModel
 
@@ -149,6 +150,8 @@ class AsyncTrainer:
         publish_every_steps: int = 20,
         drain_max_items: Optional[int] = None,
         ema_decay: Optional[float] = None,
+        dream_source: Optional[Callable[[int], Sequence[Transition]]] = None,
+        dream_gate: DreamFractionGate = DreamFractionGate(),
     ):
         if publish_every_steps <= 0:
             raise ValueError(f"publish_every_steps must be positive, got {publish_every_steps!r}")
@@ -189,6 +192,16 @@ class AsyncTrainer:
         self.min_buffer_size = min_buffer_size
         self.publish_every_steps = publish_every_steps
         self.drain_max_items = drain_max_items
+        # Generative replay (issue #99): opt-in -- with no `dream_source`,
+        # `train_step` draws real-only minibatches exactly as before. When
+        # one is supplied (and a `world_model` head exists to dream *into*;
+        # policy/critic minibatches are unaffected either way), the dream
+        # fraction is gated on the world model's own current held-out
+        # quality, self-measured against a fresh real sample each step --
+        # the bootstrap guardrail applied to whatever caller wires in a real
+        # generator (e.g. a hippocampus-backed one), not a hardcoded source.
+        self.dream_source = dream_source
+        self.dream_gate = dream_gate
 
         self.resumed = False
         self.pretrain_transitions_loaded = 0
@@ -241,7 +254,23 @@ class AsyncTrainer:
         if len(self.replay_buffer) < self.min_buffer_size:
             return None
         batch_size = min(self.batch_size, len(self.replay_buffer))
-        batch = self.replay_buffer.sample_batch(batch_size, self.arch.n_actions)
+        dream_fraction = 0.0
+        if self.dream_source is not None and self.world_model is not None:
+            # Self-measured quality: a fresh real sample stands in for a
+            # dedicated held-out set (this trainer has no separate one),
+            # gating the dream fraction on the *world model's* current
+            # competence rather than a hardcoded constant.
+            quality = evaluate_next_latent_quality(
+                self.world_model, self.replay_buffer.sample(batch_size), self.arch.n_actions,
+            )
+            batch, n_dream = sample_generative_replay_batch(
+                self.replay_buffer, self.dream_source,
+                batch_size=batch_size, n_actions=self.arch.n_actions,
+                quality_ratio=quality["model_over_copy_last_mse"], gate=self.dream_gate,
+            )
+            dream_fraction = n_dream / batch_size
+        else:
+            batch = self.replay_buffer.sample_batch(batch_size, self.arch.n_actions)
         # The buffer only stores fused-latent references (issue #28), not
         # the live decision's world features; degrade to zero, the same
         # convention `ActorCriticLearner._replay_update` uses.
@@ -249,6 +278,7 @@ class AsyncTrainer:
         batch["world_features"] = zeros
         batch["next_world_features"] = zeros.clone()
         self.last_metrics = self.optimizer.step(batch)
+        self.last_metrics["dream_fraction"] = dream_fraction
         return self.last_metrics
 
     def consolidate(self, steps: int) -> int:

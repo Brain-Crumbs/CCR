@@ -49,11 +49,16 @@ class ForgettingReport:
 
     @property
     def retained(self) -> bool:
-        """True iff the model still beats the copy-last baseline on
-        ``old_scenario`` after training ``new_scenario`` -- it has not been
-        forgotten to the point of being no better than predicting no
-        change at all."""
-        return self.after.mean < self.copy_last_mse
+        """True iff ``after``'s confidence interval sits confidently on the
+        useful side of the copy-last baseline on ``old_scenario`` -- not
+        just its point estimate, which sampling noise could otherwise put
+        on the wrong side of the bar. Honors the metric's own direction
+        (``comparison.higher_is_better``), so an accuracy-style metric
+        (higher is better) and an MSE-style one (lower is better) are each
+        judged correctly instead of always applying the MSE convention."""
+        if self.comparison.higher_is_better:
+            return self.after.ci_low > self.copy_last_mse
+        return self.after.ci_high < self.copy_last_mse
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -95,7 +100,20 @@ def compute_forgetting_metric(
 
 def compare_forgetting_conditions(staged: ForgettingReport, flat: ForgettingReport) -> bool:
     """Milestone 5's measured claim: staged+replay retains the previously
-    mastered scenario while flat training on the same new data does not."""
+    mastered scenario while flat training on the same new data does not.
+
+    Requires both (a) each condition's own CI-backed ``retained`` verdict
+    against the copy-last bar and (b) a statistically significant
+    separation between the two conditions' ``after`` scores themselves
+    (non-overlapping confidence intervals, not just two point estimates
+    straddling copy-last) -- otherwise sampling noise near the bar could
+    manufacture the claim even when staged and flat are not meaningfully
+    different from each other.
+    """
     if staged.old_scenario != flat.old_scenario or staged.new_scenario != flat.new_scenario:
         raise ValueError("staged and flat reports must cover the same scenario pair")
-    return staged.retained and not flat.retained
+    if staged.copy_last_mse != flat.copy_last_mse:
+        raise ValueError("staged and flat reports must share the same copy-last baseline")
+    higher_is_better = staged.comparison.higher_is_better
+    separation = compare_scalar_metrics("staged_vs_flat_after", flat.after, staged.after, higher_is_better)
+    return staged.retained and not flat.retained and separation.direction == "improved"

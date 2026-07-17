@@ -32,6 +32,7 @@ from sleep import Phase, PhasicSleepSchedule  # noqa: E402
 from sleep.async_trainer import AsyncTrainer as SleepTrainer  # noqa: E402
 from sleep.async_trainer import TrainerSupervisor  # noqa: E402
 import sleep.async_trainer as sleep_async_trainer_module  # noqa: E402
+from sleep.replay import DreamFractionGate  # noqa: E402
 from sleep.weight_publisher import EMAWeightPublisher  # noqa: E402
 from sleep.weight_publisher import WeightPublisher as SleepWeightPublisher  # noqa: E402
 
@@ -287,6 +288,57 @@ def test_trainer_supervisor_poll_restarts_without_blocking_on_backoff(monkeypatc
     assert time.monotonic() - before < 0.05, "the restart itself must not block either"
     assert len(spawned) == 2
     assert supervisor.restart_count == 1
+
+
+# --------------------------------------------------------- generative replay (#99)
+
+
+def test_train_step_mixes_dreamed_transitions_when_a_dream_source_is_configured(tmp_path):
+    """Issue #99 review: the production phasic path (`AsyncTrainer.train_step`)
+    must be able to actually request dreams and apply the quality gate --
+    not just the standalone `sleep.replay` helpers exercised by their own
+    unit tests. With no `dream_source`, behavior is unchanged (real-only)."""
+    program = MinecraftSurvivalBox(config=WORLD_CONFIG)
+    arch, _fusion = _arch(program, has_world_model=True)
+    ckpt_path = str(tmp_path / "trainer.pt")
+
+    dream_calls = []
+
+    def dream_source(n):
+        dream_calls.append(n)
+        return [
+            Transition(
+                latent=[0.0] * arch.fused_width, action=0, reward=0.0,
+                next_latent=[0.0] * arch.fused_width, done=False,
+            )
+            for _ in range(n)
+        ]
+
+    def _seed_buffer(trainer):
+        for i in range(20):
+            trainer.replay_buffer.add(Transition(
+                latent=[float(i)] * arch.fused_width, action=i % arch.n_actions,
+                reward=float(i), next_latent=[float(i) + 1] * arch.fused_width, done=False,
+            ))
+
+    # No dream_source: unchanged real-only behavior.
+    plain = AsyncTrainer(arch, ckpt_path + ".plain", batch_size=16, min_buffer_size=1, seed=0)
+    _seed_buffer(plain)
+    plain_metrics = plain.train_step()
+    assert plain_metrics["dream_fraction"] == 0.0
+    assert not dream_calls
+
+    # A dream_source is configured, with the gate forced wide open (a very
+    # high margin/floor) so a freshly-initialized world model's untrained
+    # quality ratio -- whatever it happens to be -- still opens the gate.
+    dreaming = AsyncTrainer(
+        arch, ckpt_path + ".dreaming", batch_size=16, min_buffer_size=1, seed=0,
+        dream_source=dream_source, dream_gate=DreamFractionGate(margin=1e6, floor_ratio=1e5, cap=0.5),
+    )
+    _seed_buffer(dreaming)
+    dreaming_metrics = dreaming.train_step()
+    assert dreaming_metrics["dream_fraction"] > 0.0
+    assert dream_calls, "the configured dream_source must actually be called"
 
 
 # ------------------------------------------------------------- live ingestion

@@ -124,10 +124,15 @@ def evaluate_next_latent_quality(
     ``DreamFractionGate.fraction`` directly from held-out replay data."""
     if not transitions:
         raise ValueError("cannot evaluate quality over an empty transition set")
-    latents = torch.tensor([t.latent for t in transitions], dtype=torch.float32)
-    next_latents = torch.tensor([t.next_latent for t in transitions], dtype=torch.float32)
-    actions = torch.tensor([t.action for t in transitions], dtype=torch.long)
-    action_onehot = F.one_hot(actions, num_classes=n_actions).float()
+    # Match `sleep.dream`'s convention: derive device/dtype from the model's
+    # own parameters rather than defaulting to CPU float32, so this runs
+    # against an accelerator-resident model without a device-mismatch error.
+    parameter = next(model.parameters())
+    device, dtype = parameter.device, parameter.dtype
+    latents = torch.tensor([t.latent for t in transitions], dtype=dtype, device=device)
+    next_latents = torch.tensor([t.next_latent for t in transitions], dtype=dtype, device=device)
+    actions = torch.tensor([t.action for t in transitions], dtype=torch.long, device=device)
+    action_onehot = F.one_hot(actions, num_classes=n_actions).to(dtype=dtype)
 
     was_training = model.training
     model.eval()
