@@ -376,6 +376,7 @@ def run_curriculum(
     name: Optional[str] = None,
     milestone_metrics: Optional[MilestoneMetricsFn] = None,
     voluntary_controller: Optional[VoluntaryControllerFactory] = None,
+    world_model_checkpoint_paths: Sequence[str] = (),
 ) -> CurriculumRunResult:
     """Run (or resume) ``definition`` against ``checkpoint_path``.
 
@@ -413,6 +414,19 @@ def run_curriculum(
     path, which needs a trained predictive cortex this module does not build
     on its own) -- a ``"learned"`` stage run without one raises rather than
     silently defaulting to the actor/critic loop.
+
+    ``world_model_checkpoint_paths`` (issue #134) declares where a caller's
+    ``milestone_metrics`` provider persists any predictive-cortex checkpoint
+    it trains against (e.g.
+    ``development.ladder.ladder_cortex_checkpoint_paths(checkpoint_path).values()``)
+    -- purely for this checkpoint's own provenance. Before Phase 7,
+    ``extra_metadata["actor_critic"]["has_world_model"]`` was hardcoded
+    ``False`` even once a milestone gate had genuinely trained and persisted
+    a world model, because the gate's model lived entirely outside this
+    checkpoint. After every attempt, if any of these paths now exist on
+    disk, this flips to ``True`` -- so the checkpoint's own metadata
+    honestly reflects whether a world model backs the milestones it was
+    promoted on, instead of always claiming there is none.
     """
     fusion, action_keys, policy_model, critic_model, optimizer, arch = (
         _new_actor_critic_stack(definition.stages[0], model_seed, lr=ac_lr, entropy_coef=ac_entropy_coef)
@@ -485,6 +499,10 @@ def run_curriculum(
             )
             summary = EvaluationSummary.from_episodes(stage.name, eval_episodes)
             met_criteria, value, threshold, metric = _evaluate_stage(stage, summary, milestone_metrics)
+            if not arch["has_world_model"] and any(
+                os.path.exists(p) for p in world_model_checkpoint_paths
+            ):
+                arch["has_world_model"] = True
             state.attempts_at_stage += 1
             forced = force_this_attempt and not met_criteria
             promoted = met_criteria or force_this_attempt

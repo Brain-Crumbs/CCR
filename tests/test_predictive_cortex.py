@@ -12,6 +12,7 @@ action-ablation harness actually detecting a real action dependency.
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 
 import numpy as np
@@ -241,3 +242,53 @@ def test_run_action_ablation_eval_rejects_eval_scenario_outside_train_scenarios(
             eval_scenario="turn_in_place",
             config=_small_nursery_config(),
         )
+
+
+def test_run_action_ablation_eval_warm_starts_the_with_actions_cortex(tmp_path, monkeypatch):
+    """issue #134: the with-actions run used to be a fresh, disposable model
+    every call, discarding any progress -- ``cortex_checkpoint_path``
+    warm-starts it from (and saves it back to) a persisted checkpoint, so
+    repeated calls keep improving the same cortex. The without-actions
+    control must stay fresh every time (it exists to prove the with-actions
+    run's action-conditioning matters, not to represent anything carried
+    forward)."""
+    import cognitive_runtime.training.nursery as nursery_module
+
+    checkpoint_path = str(tmp_path / "cortex.pt")
+    cfg = _small_nursery_config(episode_ticks=26, horizons=(1,))
+
+    captured = []
+    original = nursery_module.train_action_world_model
+
+    def spy(dataset, config=None, *, initial_model=None):
+        captured.append((config.withhold_actions, initial_model))
+        return original(dataset, config, initial_model=initial_model)
+
+    monkeypatch.setattr(nursery_module, "train_action_world_model", spy)
+
+    run_action_ablation_eval(
+        str(tmp_path),
+        train_scenarios=["walk_forward", "turn_in_place"],
+        eval_scenario="turn_in_place",
+        config=cfg,
+        model_config=_small_model_config(),
+        cortex_checkpoint_path=checkpoint_path,
+    )
+    assert os.path.exists(checkpoint_path), "first call must save the with-actions cortex"
+    (with_flag_1, initial_1), (without_flag_1, initial_2) = captured
+    assert with_flag_1 is False and initial_1 is None
+    assert without_flag_1 is True and initial_2 is None
+
+    run_action_ablation_eval(
+        str(tmp_path),
+        train_scenarios=["walk_forward", "turn_in_place"],
+        eval_scenario="turn_in_place",
+        config=cfg,
+        model_config=_small_model_config(),
+        cortex_checkpoint_path=checkpoint_path,
+    )
+    (with_flag_2, initial_3), (without_flag_2, initial_4) = captured[2:]
+    assert with_flag_2 is False
+    assert initial_3 is not None, "with-actions run must warm-start from the saved checkpoint"
+    assert without_flag_2 is True
+    assert initial_4 is None, "without-actions control must never warm-start"

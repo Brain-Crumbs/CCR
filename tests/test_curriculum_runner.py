@@ -248,6 +248,31 @@ def _impossible_stage(name: str, **overrides) -> dict:
     return stage
 
 
+def test_has_world_model_flips_true_once_a_world_model_checkpoint_exists(tmp_path):
+    """issue #134: ``has_world_model`` was hardcoded ``False`` even once a
+    milestone gate had genuinely trained and persisted a predictive-cortex
+    checkpoint elsewhere -- ``world_model_checkpoint_paths`` lets the
+    organism's own checkpoint honestly report whether one now backs it."""
+    definition = load_curriculum_definition(TOY_CURRICULUM_PATH)
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+    world_model_path = tmp_path / "cortex.pt"
+
+    run_curriculum(
+        definition, checkpoint_path=checkpoint_path, record_dir=str(tmp_path / "sessions"),
+        world_model_checkpoint_paths=[str(world_model_path)],
+    )
+    meta = read_checkpoint_metadata(checkpoint_path)
+    assert meta["extra"]["actor_critic"]["has_world_model"] is False
+
+    world_model_path.write_bytes(b"stand-in for a real cortex checkpoint")
+    run_curriculum(
+        definition, checkpoint_path=checkpoint_path, record_dir=str(tmp_path / "sessions"),
+        world_model_checkpoint_paths=[str(world_model_path)], fresh=True,
+    )
+    meta = read_checkpoint_metadata(checkpoint_path)
+    assert meta["extra"]["actor_critic"]["has_world_model"] is True
+
+
 def test_two_stage_toy_curriculum_promotes_through_both_stages(tmp_path):
     definition = load_curriculum_definition(TOY_CURRICULUM_PATH)
     checkpoint_path = str(tmp_path / "curriculum.pt")

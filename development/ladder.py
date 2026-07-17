@@ -19,7 +19,7 @@ stays dependency-free.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, Mapping
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional
 
 from development.definitions import CurriculumDefinition, CurriculumStageSpec, PromotionCriteria
 
@@ -214,26 +214,45 @@ def _ladder_model_config(**overrides: Any) -> Any:
     return ActionWorldModelConfig(**base)
 
 
-def _cortex_beats_copy_last(stage: CurriculumStageSpec, record_dir: str) -> float:
+def _cortex_beats_copy_last(
+    stage: CurriculumStageSpec, record_dir: str, *, cortex_checkpoint_path: Optional[str] = None,
+) -> float:
     """``1.0`` iff the stage's nursery scenario's held-out next-frame
     prediction beats the copy-last-frame baseline at *every* evaluated
     horizon, else ``0.0`` (see :data:`_GESTATION`'s docstring for why this
-    encoding, not the raw per-horizon bool mapping)."""
+    encoding, not the raw per-horizon bool mapping).
+
+    ``cortex_checkpoint_path`` (issue #134), when given, warm-starts this
+    call from (and saves back to) that path instead of training a fresh,
+    disposable model every attempt -- see ``run_nursery_scenario``'s own
+    docstring.
+    """
     from cognitive_runtime.training.nursery import run_nursery_scenario
 
     assert stage.scenario is not None
     _model, report = run_nursery_scenario(
         record_dir, stage.scenario, config=_ladder_nursery_config(world=stage.world or "crafter"),
+        cortex_checkpoint_path=cortex_checkpoint_path,
     )
     beats = [entry["beats_copy_last"] for entry in report.horizon_metrics.values()]
     return 1.0 if beats and all(beats) else 0.0
 
 
-def _action_ablation_margin(stage: CurriculumStageSpec, record_dir: str) -> float:
+def _action_ablation_margin(
+    stage: CurriculumStageSpec, record_dir: str, *, cortex_checkpoint_path: Optional[str] = None,
+) -> float:
     """Mean held-out MSE degradation from withholding the action stream
     during training, averaged over the evaluated horizons -- positive means
     action-conditioning measurably helps (see :data:`_BABBLING`'s
-    docstring)."""
+    docstring).
+
+    ``cortex_checkpoint_path`` (issue #134), when given, warm-starts the
+    with-actions cortex from (and saves it back to) that path instead of
+    training a fresh, disposable model every attempt -- see
+    ``run_action_ablation_eval``'s own docstring. The without-actions
+    control is never warm-started (by design: it's a matched, disposable
+    baseline, not something the organism carries forward).
+    """
     from cognitive_runtime.training.nursery import run_action_ablation_eval
 
     assert stage.scenario is not None
@@ -243,6 +262,7 @@ def _action_ablation_margin(stage: CurriculumStageSpec, record_dir: str) -> floa
         eval_scenario=stage.scenario,
         config=_ladder_nursery_config(world=stage.world or "crafter"),
         model_config=_ladder_model_config(),
+        cortex_checkpoint_path=cortex_checkpoint_path,
     )
     margins = [
         report.without_actions_stats[h].mean - report.with_actions_stats[h].mean
@@ -303,21 +323,64 @@ def _voluntary_reliance_score(
     return 1.0 - reflexes.activation_rate
 
 
+#: Which gate each carries a persisted world-model checkpoint for (issue
+#: #134). Keyed by milestone metric name so :func:`ladder_cortex_checkpoint_paths`
+#: and :func:`ladder_milestone_metrics` derive the same filenames from one
+#: base path, and ``development.runner.run_curriculum`` can watch the same
+#: paths to know whether the organism's own checkpoint should honestly
+#: report ``has_world_model=True``.
+_CORTEX_CHECKPOINT_SUFFIXES = {
+    "cortex_beats_copy_last": ".ladder-visual-cortex.pt",
+    "action_ablation_margin": ".ladder-action-cortex.pt",
+}
+
+
+def ladder_cortex_checkpoint_paths(base_path: str) -> Dict[str, str]:
+    """The world-model checkpoint paths :func:`ladder_milestone_metrics`
+    warm-starts from and saves to, derived from one ``base_path`` (e.g. the
+    ladder's own ``checkpoint_path``) so a caller passes the *same* base
+    into both ``functools.partial(ladder_milestone_metrics,
+    cortex_checkpoint_base=base_path)`` and
+    ``development.runner.run_curriculum(...,
+    world_model_checkpoint_paths=ladder_cortex_checkpoint_paths(base_path).values())``
+    -- one source of truth for the filenames instead of two call sites
+    guessing the same suffix independently.
+    """
+    return {metric: base_path + suffix for metric, suffix in _CORTEX_CHECKPOINT_SUFFIXES.items()}
+
+
 def ladder_milestone_metrics(
     stage: CurriculumStageSpec, summary: "EvaluationSummary", *, record_dir: str,
+    cortex_checkpoint_base: Optional[str] = None,
 ) -> Mapping[str, float]:
     """The ladder's real ``milestone_metrics`` provider
     (``development.runner.run_curriculum``'s hook): computes only the
     metric(s) ``stage.gates`` actually references, using the real Phase 2/6
     computations documented on each stage constant above. ``record_dir``
     must be a real directory -- the nursery-backed metrics record and train
-    against it."""
+    against it.
+
+    ``cortex_checkpoint_base`` (issue #134), when given, is expanded via
+    :func:`ladder_cortex_checkpoint_paths` into per-gate checkpoint paths:
+    each predictive gate then warm-starts from (and saves back to) *its
+    own* persisted model across attempts/stages instead of training a
+    fresh, disposable one every call -- so the organism's own learning can
+    actually improve the gate, and a later attempt's promotion reflects
+    that history rather than an unrelated temporary model.
+    """
     gate_names = {gate.metric for gate in stage.gates}
+    checkpoint_paths = (
+        ladder_cortex_checkpoint_paths(cortex_checkpoint_base) if cortex_checkpoint_base else {}
+    )
     metrics: Dict[str, float] = {}
     if "cortex_beats_copy_last" in gate_names:
-        metrics["cortex_beats_copy_last"] = _cortex_beats_copy_last(stage, record_dir)
+        metrics["cortex_beats_copy_last"] = _cortex_beats_copy_last(
+            stage, record_dir, cortex_checkpoint_path=checkpoint_paths.get("cortex_beats_copy_last"),
+        )
     if "action_ablation_margin" in gate_names:
-        metrics["action_ablation_margin"] = _action_ablation_margin(stage, record_dir)
+        metrics["action_ablation_margin"] = _action_ablation_margin(
+            stage, record_dir, cortex_checkpoint_path=checkpoint_paths.get("action_ablation_margin"),
+        )
     if "reflex_override_precedence" in gate_names:
         metrics["reflex_override_precedence"] = _reflex_override_precedence()
     if "reflex_activation_rate" in gate_names:
