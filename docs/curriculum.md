@@ -178,12 +178,18 @@ covered end to end in `tests/test_program_streams.py`.
 ## Curriculum runner (issue #43)
 
 The presets above are single-stage tuning: pick one, run it, look at the
-metrics. The **curriculum runner**
-(`cognitive_runtime/training/curriculum_runner.py`) chains stages together
-unattended: train an actor/critic on a stage, evaluate it, and promote to the
-next stage only when a metric clears a threshold -- holding (and logging why)
-otherwise, never spinning silently. The same policy/critic/optimizer -- the
-"brain" -- carries across every stage; only the world/reward config changes.
+metrics. The **curriculum runner** chains stages together unattended: train
+an actor/critic on a stage, evaluate it, and promote to the next stage only
+when its gate(s) pass -- holding (and logging why) otherwise, never spinning
+silently. The same policy/critic/optimizer -- the "brain" -- carries across
+every stage; only the world/reward config changes.
+
+The implementation lives in `development/` (`development.definitions` for
+the stage/definition dataclasses and validation, `development.runner` for
+the train/evaluate/promote loop) -- issue #104 generalised it out of
+`cognitive_runtime/training/curriculum_runner.py`, which is now a
+compatibility shim re-exporting the same names so existing imports keep
+working.
 
 A **curriculum definition** is a YAML/JSON file, distinct from a
 `CurriculumPreset` above (which only carries world/reward overrides, no
@@ -220,7 +226,57 @@ stages:
 - All stages must share the same `world_size` (and any other knob that
   reshapes the stream catalog) -- `load_curriculum_definition` checks this at
   load time, since a stream-layout change would make the checkpoint
-  incompatible mid-curriculum.
+  incompatible mid-curriculum. A stage's `world` (below) also feeds this
+  check: mixing `world: minecraft` and `world: crafter` stages fails at load
+  time the same way, since neither's stream catalog carries a checkpoint
+  across the other's.
+
+### Phase 7: staged-ontogeny fields (issue #104)
+
+A stage can additionally declare the shape of a staged-ontogeny rung
+(`docs/v2/phases/phase-7-development-ladder.md`) instead of (or alongside)
+the legacy `world_config`/`promotion` shape above. All of these are optional
+and default to the pre-Phase-7 behavior, which is how old curriculum
+definitions keep loading unchanged:
+
+```yaml
+stages:
+  - name: crawling
+    world: crafter                  # one of: minecraft (default), crafter
+    scenario: walk_forward          # a training/nursery.py scenario name
+    senses: [vision, proprioception]
+    motor_freedom: overridden       # one of: frozen, overridden, learned
+    losses: [prediction, action_conditioning]
+    gates:                          # milestone gates -- ALL must pass to promote
+      - metric: cortex_beats_copy_last
+        threshold: 1.0
+        sample_size: 3
+      - metric: action_ablation_margin
+        threshold: 0.1
+        sample_size: 3
+```
+
+- `world` / `scenario` name which `Program` (`--world` selector, issue #89)
+  and nursery scenario the stage runs.
+- `senses` / `losses` are free-form, declarative lists (non-empty, no
+  duplicates) describing which sense streams and loss terms are active for
+  the stage; issue #104 only validates the shape, wiring them into the
+  runtime is the ladder's job (issue #105).
+- `motor_freedom` is one of `frozen` (no motor output), `overridden`
+  (caregiver/scripted controls the body), or `learned` (the voluntary path,
+  Phase 6, is in charge).
+- `gates` generalises `promotion` to "not a single scalar": a stage with
+  `gates` promotes only when *every* gate passes, and a gate's `metric` can
+  name either the plain evaluation-episode metrics (`average_reward`,
+  `average_ticks`, `total_reward`, `total_ticks`, `survival_rate`) or a
+  Phase 2-6 milestone metric (`cortex_beats_copy_last`,
+  `action_ablation_margin`, `calibrated_surprise_ece`, `forgetting_score`,
+  `reflex_activation_rate`, `reflex_override_precedence`). A stage's
+  `promotion.sample_size` still controls how many eval episodes each attempt
+  runs; milestone metrics beyond the built-in evaluation-episode ones need a
+  `milestone_metrics` callable passed to `run_curriculum(...)` that computes
+  them -- omitting one a stage's gate references is a definition error
+  (raised immediately), not a hold.
 
 Curriculum progress (current stage, attempts, promotion history) is stored in
 the checkpoint bundle's `training_stats["curriculum"]` (issue #20), so
