@@ -213,11 +213,14 @@ class GenerativeReplayMixer:
         of dreamed seeds, guaranteed to include at least one real sample.
 
         ``batch_size`` real samples are always available to fall back on
-        (the reservoir is sampled with replacement), so the only two ways
-        this can fail to produce a full batch are an empty reservoir (no real
-        transitions to train on at all) or a hippocampus with fewer stored
-        seeds than the requested dream share -- both raise rather than
-        silently degrading into a smaller or dream-only batch.
+        (the reservoir is sampled with replacement), so the only ways this
+        can fail to produce a full batch are an empty reservoir (no real
+        transitions to train on at all), a hippocampus with fewer eligible
+        seeds (``len(seed.actions) >= dream_length``) than the requested
+        dream share, or a reservoir sample whose action-sequence length
+        isn't exactly ``dream_length`` (real and dreamed samples must share
+        one sequence length to stack into a batch) -- all three raise rather
+        than silently degrading into a smaller, ragged, or dream-only batch.
         """
         if batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {batch_size!r}")
@@ -232,17 +235,30 @@ class GenerativeReplayMixer:
         n_dream = min(int(fraction * batch_size), batch_size - 1)
         n_real = batch_size - n_dream
 
-        seeds = self.hippocampus.seeds()
+        # A seed with fewer than `dream_length` replayable actions (e.g. a
+        # tick with no emitted motor command -- `Hippocampus.encode` permits
+        # `actions=[]`) cannot be dreamed at this length; exclude it from
+        # both the count check and the draw rather than let a random draw
+        # crash consolidation on an otherwise-healthy hippocampus.
+        seeds = [s for s in self.hippocampus.seeds() if len(s.actions) >= dream_length]
         if n_dream > 0 and not seeds:
             n_dream = 0
             n_real = batch_size
         elif n_dream > len(seeds):
             raise ValueError(
                 f"quality gate wants {n_dream} dreamed samples but the hippocampus "
-                f"holds only {len(seeds)} seeds"
+                f"holds only {len(seeds)} seeds with >= {dream_length} replayable actions"
             )
 
         real_samples = self.reservoir.sample(n_real, self._rng)
+        for sample in real_samples:
+            if len(sample.actions) != dream_length:
+                raise ValueError(
+                    f"reservoir sample has {len(sample.actions)} actions, but this "
+                    f"batch's dream_length is {dream_length} -- real and dreamed "
+                    "samples must share one action-sequence length to stack into a "
+                    "batch; store reservoir samples with actions of length dream_length"
+                )
         dream_seeds = self._rng.sample(seeds, n_dream) if n_dream else []
         dream_samples = [self._dream_sample(s, dream_length) for s in dream_seeds]
 

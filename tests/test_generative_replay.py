@@ -222,3 +222,45 @@ def test_mix_batch_raises_when_hippocampus_has_fewer_seeds_than_requested():
     )
     with pytest.raises(ValueError, match="hippocampus holds only"):
         mixer.mix_batch(4, quality_margin=100.0)
+
+
+def test_zero_action_seeds_are_excluded_from_dream_candidates_not_sampled_and_crashed_on():
+    """`Hippocampus.encode` permits `actions=[]` (a tick with no emitted
+    motor command); such a seed can never be dreamed forward one step and
+    must not be a candidate `mix_batch` can randomly draw and then choke on.
+    """
+    model = _cortex()
+    reservoir = Reservoir(capacity=8)
+    for i in range(8):
+        reservoir.add(_real_sample(model, value=float(i)))
+    hippocampus = Hippocampus()
+    # Mostly zero-action seeds, with just enough eligible (>=1 action) seeds
+    # to satisfy a small dream request -- a random draw over *all* seeds
+    # would very likely pick a zero-action one and crash without filtering.
+    for i in range(20):
+        hippocampus.encode(z=[0.0] * model.latent_width, actions=[], tags=SeedTags(reward=1.0), tick_index=i)
+    for i in range(2):
+        hippocampus.encode(
+            z=torch.randn(model.latent_width).tolist(), actions=["wait"],
+            tags=SeedTags(reward=1.0), tick_index=100 + i,
+        )
+    mixer = GenerativeReplayMixer(
+        reservoir=reservoir, hippocampus=hippocampus, dream_cortex=model, cap=0.5, seed=1,
+    )
+    batch = mixer.mix_batch(4, quality_margin=100.0)
+    assert batch.n_dream == 2  # exactly the two eligible (non-zero-action) seeds
+    assert batch.n_real == 2
+
+
+def test_mix_batch_rejects_reservoir_samples_whose_action_length_mismatches_dream_length():
+    model = _cortex()
+    reservoir = Reservoir(capacity=4)
+    two_step_targets = torch.zeros(2, model.latent_width)
+    reservoir.add(
+        ReplaySample(z0=[0.0] * model.latent_width, actions=["wait", "left"], targets=two_step_targets, source="real")
+    )
+    mixer = GenerativeReplayMixer(
+        reservoir=reservoir, hippocampus=_hippocampus_with_seeds(model, 4), dream_cortex=model, cap=0.5, seed=1,
+    )
+    with pytest.raises(ValueError, match="dream_length"):
+        mixer.mix_batch(2, quality_margin=0.0)  # dream_length defaults to 1
