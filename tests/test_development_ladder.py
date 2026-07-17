@@ -14,7 +14,12 @@ import functools
 
 import pytest
 
-from development.definitions import MILESTONE_METRICS, CurriculumDefinition, CurriculumStageSpec
+from development.definitions import (
+    MILESTONE_METRICS,
+    CurriculumDefinition,
+    CurriculumDefinitionError,
+    CurriculumStageSpec,
+)
 from development.ladder import GESTATION_TO_FORAGING
 from motor.organism_policy import MotorFreedomPolicy, build_stage_policy
 from motor.reflexes import CaregiverChannel, CaregiverOverride, ReflexConfig, ReflexStack, Stimulus
@@ -234,6 +239,7 @@ pytest.importorskip("torch")
 pytest.importorskip("crafter")
 
 from cognitive_runtime.neural import read_checkpoint_metadata  # noqa: E402
+from cognitive_runtime.policies.actor_critic import ActorCriticLearner, ActorCriticPolicy  # noqa: E402
 from development.ladder import ladder_milestone_metrics  # noqa: E402
 from development.runner import run_curriculum  # noqa: E402
 
@@ -388,3 +394,127 @@ def test_real_milestone_metrics_provider_promotes_babbling_on_genuine_gate_value
     assert entry["promoted"] is True
     assert entry["metric"] == ["action_ablation_margin"]
     assert entry["value"]["action_ablation_margin"] >= entry["threshold"]["action_ablation_margin"]
+
+
+# --------------------------------------------------------------------------
+# issue #133: `_run_stage_episodes` used to ignore `stage.motor_freedom`
+# entirely and always ran the actor/critic loop, so Gestation was never
+# genuinely frozen and Babbling/Crawling never ran their scripted/caregiver
+# path. These prove the real runner now drives each stage's declared freedom.
+
+
+def _spy_init(monkeypatch, cls) -> list:
+    """Wraps ``cls.__init__`` to record one entry per real construction,
+    still delegating to the original -- lets a test assert "never built"
+    without disturbing behaviour when it is."""
+    calls: list = []
+    original_init = cls.__init__
+
+    def wrapper(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        return original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(cls, "__init__", wrapper)
+    return calls
+
+
+def test_frozen_stage_never_builds_the_actor_critic_policy(tmp_path, monkeypatch):
+    """Gestation is ``motor_freedom="frozen"``: before the fix, its episodes
+    still ran through a freshly-built ``ActorCriticPolicy``/``ActorCriticLearner``
+    exactly like every other stage."""
+    ac_policy_calls = _spy_init(monkeypatch, ActorCriticPolicy)
+    ac_learner_calls = _spy_init(monkeypatch, ActorCriticLearner)
+
+    definition = _first_n_stages(1)  # "gestation" alone
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+    result = run_curriculum(
+        definition, checkpoint_path=checkpoint_path, record_dir=None,
+        milestone_metrics=_stub_milestone_metrics,
+    )
+
+    assert result.status == "completed"
+    assert not ac_policy_calls, "frozen gestation must not construct an ActorCriticPolicy"
+    assert not ac_learner_calls, "frozen gestation must not construct an ActorCriticLearner"
+
+
+def test_overridden_stage_never_builds_the_actor_critic_policy(tmp_path, monkeypatch):
+    """Babbling is ``motor_freedom="overridden"``: before the fix it ran
+    through the learned actor/critic loop instead of a scripted/random
+    motor input."""
+    ac_policy_calls = _spy_init(monkeypatch, ActorCriticPolicy)
+    ac_learner_calls = _spy_init(monkeypatch, ActorCriticLearner)
+
+    babbling = GESTATION_TO_FORAGING.stages[1]
+    definition = CurriculumDefinition(name="babbling-only", stages=(babbling,))
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+    result = run_curriculum(
+        definition, checkpoint_path=checkpoint_path, record_dir=None,
+        milestone_metrics=_stub_milestone_metrics,
+    )
+
+    assert result.status == "completed"
+    assert not ac_policy_calls, "overridden babbling must not construct an ActorCriticPolicy"
+    assert not ac_learner_calls, "overridden babbling must not construct an ActorCriticLearner"
+
+
+def test_overridden_stage_runs_the_scenarios_own_scripted_policy_not_random(monkeypatch):
+    """A uniform-random substitute would let Babbling/Crawling promote
+    without ever running their registered ``turn``/``walk_forward`` nursery
+    scenario -- the runner must reuse the *same* scripted policy that
+    scenario's own recording uses (``cognitive_runtime.training.nursery``),
+    not a stage-agnostic random policy."""
+    from cognitive_runtime.policies.constant_action import ConstantActionPolicy
+    from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy
+    from development.runner import _scripted_policy_for_stage
+
+    babbling, crawling = GESTATION_TO_FORAGING.stages[1], GESTATION_TO_FORAGING.stages[2]
+    action_space = [Action("MOVE_UP"), Action("MOVE_RIGHT"), Action("MOVE_DOWN"), Action("MOVE_LEFT")]
+
+    babbling_policy = _scripted_policy_for_stage(babbling, action_space, seed=0)
+    assert isinstance(babbling_policy, ScriptedSequencePolicy), (
+        "babbling's 'turn' scenario is a scripted direction-cycling sequence, not random"
+    )
+
+    crawling_policy = _scripted_policy_for_stage(crawling, action_space, seed=0)
+    assert isinstance(crawling_policy, ConstantActionPolicy), (
+        "crawling's 'walk_forward' scenario is a constant-direction walk, not random"
+    )
+
+
+def test_learned_stage_raises_without_a_voluntary_controller_factory(tmp_path):
+    """"learned" (Objects/Foraging) needs the real Phase 6 voluntary path,
+    which development.runner cannot build on its own (no trained predictive
+    cortex) -- it must raise, not silently fall back to the actor/critic
+    loop the way it used to for every stage."""
+    objects_stage = GESTATION_TO_FORAGING.stages[3]
+    definition = CurriculumDefinition(name="objects-only", stages=(objects_stage,))
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+
+    with pytest.raises(CurriculumDefinitionError, match="voluntary_controller"):
+        run_curriculum(
+            definition, checkpoint_path=checkpoint_path, record_dir=None,
+            milestone_metrics=lambda stage, summary: {"reflex_override_precedence": 1.0},
+        )
+
+
+def test_learned_stage_runs_under_a_supplied_voluntary_controller(tmp_path, monkeypatch):
+    """Given a real ``voluntary_controller`` factory, a "learned" stage
+    promotes through it instead of raising -- and, like frozen/overridden,
+    never touches the actor/critic loop."""
+    ac_policy_calls = _spy_init(monkeypatch, ActorCriticPolicy)
+
+    objects_stage = GESTATION_TO_FORAGING.stages[3]
+    definition = CurriculumDefinition(name="objects-only", stages=(objects_stage,))
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+
+    def controller_factory(stage, action_space):
+        return CallableController("stub", lambda state, actions, goal: actions[0])
+
+    result = run_curriculum(
+        definition, checkpoint_path=checkpoint_path, record_dir=None,
+        milestone_metrics=lambda stage, summary: {"reflex_override_precedence": 1.0},
+        voluntary_controller=controller_factory,
+    )
+
+    assert result.status == "completed"
+    assert not ac_policy_calls, "learned objects stage must not construct an ActorCriticPolicy"
