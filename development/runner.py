@@ -5,10 +5,15 @@ by issue #104).
 Extends the world/config presets (issue #30, ``programs/minecraft/curriculum.py``)
 into an unattended orchestrator: an ordered list of *stages* (world config +
 reward config/profile (issue #41) + promotion criteria), where the runner
-trains an actor/critic stack on a stage, evaluates it over N episodes, and
-either promotes to the next stage (its gate(s) passed) or holds the stage and
-logs why. The same policy/critic/optimizer weights -- the "brain" -- carry
-across stage boundaries; only the world/reward config changes.
+trains a stage, evaluates it over N episodes, and either promotes to the
+next stage (its gate(s) passed) or holds the stage and logs why. Legacy
+stages (no declared ``motor_freedom``, issue #43's original shape) train and
+carry an actor/critic stack -- the same policy/critic/optimizer weights --
+across stage boundaries; only the world/reward config changes. A stage that
+declares a ``motor_freedom`` (issue #104/#105's ladder) instead runs under
+that freedom (frozen / caregiver-scripted-overridden / voluntary-learned,
+see ``run_curriculum``'s docstring) and does not train the actor/critic
+stack, which those stages never act through.
 
 Promotion here still gates on the plain mean of one or more summary metrics
 over a fixed sample size (:class:`~development.definitions.PromotionCriteria`)
@@ -46,10 +51,13 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 import torch
 
+from cognitive_runtime.core.action import Action
+from cognitive_runtime.core.learner import Learner, NullLearner
+from cognitive_runtime.core.policy import Policy
 from cognitive_runtime.core.streams import TemporalFusion, default_encoder_registry
 from cognitive_runtime.neural import (
     ActorCriticOptimizer,
@@ -66,6 +74,7 @@ from cognitive_runtime.policies.actor_critic import (
     ActorCriticPolicy,
     world_feature_width,
 )
+from cognitive_runtime.policies.random_policy import RandomPolicy
 from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
@@ -78,6 +87,21 @@ from development.definitions import (
     CurriculumStageSpec,
     CurriculumState,
 )
+from motor.organism_policy import build_stage_policy
+from motor.voluntary import VoluntaryController
+
+#: Optional per-run factory for a ``"learned"`` stage's voluntary controller
+#: (``run_curriculum``'s ``voluntary_controller`` hook): given the stage and
+#: its action space, return the Phase 6 controller to hand control to. There
+#: is no generic default -- unlike ``"overridden"`` (any scripted/caregiver
+#: policy satisfies the freedom), ``"learned"`` specifically means the real
+#: voluntary path (MPC-over-cortex or an alternative controller, issue
+#: #103), which needs a trained predictive cortex the runner does not itself
+#: build. A stage that declares ``"learned"`` without one is a wiring bug,
+#: not something to default around (see ``build_stage_policy``'s own
+#: docstring) -- so it raises rather than silently falling back to the
+#: actor/critic loop.
+VoluntaryControllerFactory = Callable[[CurriculumStageSpec, Sequence[Action]], VoluntaryController]
 
 #: Type of the optional per-stage milestone-metrics provider: given the
 #: stage and its plain evaluation summary, return the *additional* metrics
@@ -144,19 +168,69 @@ def _new_actor_critic_stack(stage: CurriculumStageSpec, seed: int, *, lr: float,
     return fusion, action_keys, policy_model, critic_model, optimizer, arch
 
 
+def _stage_policy_and_learner(
+    stage: CurriculumStageSpec,
+    action_space: Sequence[Action],
+    policy_model, critic_model, optimizer, action_keys,
+    *, train: bool, seed: int,
+    voluntary_controller: Optional[VoluntaryControllerFactory],
+) -> tuple[Policy, Learner]:
+    """The ``Policy``/``Learner`` pair a stage's episodes actually run
+    against (issue #133 bug fix): stages that declare a ``motor_freedom``
+    (Phase 7) run under :func:`build_stage_policy`, not the actor/critic
+    loop -- Gestation must genuinely freeze, Babbling/Crawling must be
+    caregiver/scripted-driven, and none of the three trains the actor/critic
+    stack (there is nothing for it to learn from: no action came from its
+    own logits). Legacy stages (``motor_freedom is None``) keep the
+    pre-Phase-7 behaviour unchanged.
+    """
+    if stage.motor_freedom is None:
+        policy = ActorCriticPolicy(
+            policy_model, critic_model, action_keys,
+            action_space=action_space, training=train, seed=seed,
+        )
+        return policy, ActorCriticLearner(optimizer, policy, training=train)
+
+    if stage.motor_freedom == "frozen":
+        return build_stage_policy(stage, action_space), NullLearner()
+
+    if stage.motor_freedom == "overridden":
+        # Any scripted/caregiver-driven policy satisfies "overridden" --
+        # unlike "learned", the freedom itself doesn't specify *which*
+        # scripted behaviour, so a stage-agnostic random policy is a
+        # legitimate generic default (and matches the phase doc's own
+        # "random, overridden" table entry for Babbling).
+        scripted = RandomPolicy(list(action_space), seed=seed)
+        return build_stage_policy(stage, action_space, scripted=scripted), NullLearner()
+
+    assert stage.motor_freedom == "learned"
+    if voluntary_controller is None:
+        raise CurriculumDefinitionError(
+            f"stage {stage.name!r} declares motor_freedom='learned', but no "
+            "voluntary_controller factory was passed to run_curriculum() -- "
+            "development.runner does not build a real Phase 6 voluntary "
+            "controller on its own (that needs a trained predictive cortex); "
+            "pass one via run_curriculum(..., voluntary_controller=...) "
+            "rather than silently falling back to the actor/critic loop"
+        )
+    voluntary = voluntary_controller(stage, action_space)
+    return build_stage_policy(stage, action_space, voluntary=voluntary), NullLearner()
+
+
 def _run_stage_episodes(
     stage: CurriculumStageSpec,
     policy_model, critic_model, optimizer, action_keys,
     episodes: int, seed: int, *, train: bool,
     record_dir: Optional[str], session_id: Optional[str], stage_index: int,
     name: Optional[str] = None,
+    voluntary_controller: Optional[VoluntaryControllerFactory] = None,
 ) -> List[EpisodeSummary]:
     program = _program_for_stage(stage)
-    policy = ActorCriticPolicy(
-        policy_model, critic_model, action_keys,
-        action_space=program.metadata().action_space, training=train, seed=seed,
+    policy, learner = _stage_policy_and_learner(
+        stage, program.metadata().action_space,
+        policy_model, critic_model, optimizer, action_keys,
+        train=train, seed=seed, voluntary_controller=voluntary_controller,
     )
-    learner = ActorCriticLearner(optimizer, policy, training=train)
     runtime_config = RuntimeConfig(
         episodes=episodes,
         seed=seed,
@@ -268,13 +342,24 @@ def run_curriculum(
     record_dir: Optional[str] = None,
     name: Optional[str] = None,
     milestone_metrics: Optional[MilestoneMetricsFn] = None,
+    voluntary_controller: Optional[VoluntaryControllerFactory] = None,
 ) -> CurriculumRunResult:
     """Run (or resume) ``definition`` against ``checkpoint_path``.
 
     Trains each stage, evaluates its promotion gate(s) over one or more
     attempts (bounded by the stage's ``max_attempts`` -- "no silent spin"),
-    and promotes or holds. The same policy/critic/optimizer carry across
-    every stage; only the world/reward config changes per stage.
+    and promotes or holds.
+
+    A stage with no declared ``motor_freedom`` (the pre-Phase-7 shape) keeps
+    the legacy behaviour: the same actor/critic policy/critic/optimizer
+    carry across every stage and learn online, only the world/reward config
+    changing per stage. A stage that *does* declare a ``motor_freedom``
+    (issue #105's ladder) instead runs under
+    :func:`motor.organism_policy.build_stage_policy` -- frozen, caregiver/
+    scripted-overridden, or (given ``voluntary_controller``) the Phase 6
+    voluntary path -- and does not train the actor/critic stack, which those
+    stages never act through (issue #133: ``_run_stage_episodes`` used to
+    ignore ``motor_freedom`` entirely and always ran the actor/critic loop).
 
     ``start_stage`` overrides where to begin (``--stage``); ``force_promote``
     promotes on the first attempt of the starting stage regardless of the
@@ -286,6 +371,15 @@ def run_curriculum(
     plain :class:`EvaluationSummary` and returns the additional metrics (e.g.
     ``cortex_beats_copy_last``) those gates reference. Stages with no
     ``gates`` ignore it and keep the legacy single-``promotion`` behaviour.
+
+    ``voluntary_controller`` (issue #133) is called once per attempt for any
+    stage declaring ``motor_freedom="learned"``: given the stage and its
+    action space, it must return the :class:`~motor.voluntary.VoluntaryController`
+    that stage hands control to. There is no generic default (unlike
+    ``"overridden"``, "learned" specifically means the real Phase 6 voluntary
+    path, which needs a trained predictive cortex this module does not build
+    on its own) -- a ``"learned"`` stage run without one raises rather than
+    silently defaulting to the actor/critic loop.
     """
     fusion, action_keys, policy_model, critic_model, optimizer, arch = (
         _new_actor_critic_stack(definition.stages[0], model_seed, lr=ac_lr, entropy_coef=ac_entropy_coef)
@@ -348,13 +442,13 @@ def run_curriculum(
                 stage, policy_model, critic_model, optimizer, action_keys,
                 stage.train_episodes, train_seed_i, train=True,
                 record_dir=record_dir, session_id=None, stage_index=state.stage_index,
-                name=name,
+                name=name, voluntary_controller=voluntary_controller,
             )
             eval_episodes = _run_stage_episodes(
                 stage, policy_model, critic_model, optimizer, action_keys,
                 stage.promotion.sample_size, eval_seed_i, train=False,
                 record_dir=record_dir, session_id=None, stage_index=state.stage_index,
-                name=name,
+                name=name, voluntary_controller=voluntary_controller,
             )
             summary = EvaluationSummary.from_episodes(stage.name, eval_episodes)
             met_criteria, value, threshold, metric = _evaluate_stage(stage, summary, milestone_metrics)
