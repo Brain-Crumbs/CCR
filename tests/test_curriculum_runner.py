@@ -248,11 +248,18 @@ def _impossible_stage(name: str, **overrides) -> dict:
     return stage
 
 
-def test_has_world_model_flips_true_once_a_world_model_checkpoint_exists(tmp_path):
-    """issue #134: ``has_world_model`` was hardcoded ``False`` even once a
-    milestone gate had genuinely trained and persisted a predictive-cortex
-    checkpoint elsewhere -- ``world_model_checkpoint_paths`` lets the
-    organism's own checkpoint honestly report whether one now backs it."""
+def test_world_model_checkpoint_paths_recorded_once_they_exist(tmp_path):
+    """issue #134: a milestone gate could genuinely train and persist a
+    world model elsewhere with no trace of that in the ladder's own
+    checkpoint metadata at all -- ``world_model_checkpoint_paths`` lets the
+    organism's own checkpoint honestly report which ones now back it.
+
+    Deliberately a separate field from ``extra.actor_critic.has_world_model``
+    (PR #155 review): that flag means *this* checkpoint embeds an
+    ``MLPWorldModel`` -- conflating the two would make ``cli.py``/
+    ``sleep/async_trainer.py`` try to construct and load one that was never
+    actually saved here.
+    """
     definition = load_curriculum_definition(TOY_CURRICULUM_PATH)
     checkpoint_path = str(tmp_path / "curriculum.pt")
     world_model_path = tmp_path / "cortex.pt"
@@ -262,6 +269,7 @@ def test_has_world_model_flips_true_once_a_world_model_checkpoint_exists(tmp_pat
         world_model_checkpoint_paths=[str(world_model_path)],
     )
     meta = read_checkpoint_metadata(checkpoint_path)
+    assert meta["extra"]["ladder_world_model_checkpoints"] == []
     assert meta["extra"]["actor_critic"]["has_world_model"] is False
 
     world_model_path.write_bytes(b"stand-in for a real cortex checkpoint")
@@ -270,7 +278,8 @@ def test_has_world_model_flips_true_once_a_world_model_checkpoint_exists(tmp_pat
         world_model_checkpoint_paths=[str(world_model_path)], fresh=True,
     )
     meta = read_checkpoint_metadata(checkpoint_path)
-    assert meta["extra"]["actor_critic"]["has_world_model"] is True
+    assert meta["extra"]["ladder_world_model_checkpoints"] == [str(world_model_path)]
+    assert meta["extra"]["actor_critic"]["has_world_model"] is False
 
 
 def test_two_stage_toy_curriculum_promotes_through_both_stages(tmp_path):

@@ -399,12 +399,12 @@ def test_real_milestone_metrics_provider_promotes_babbling_on_genuine_gate_value
 
 def test_real_milestone_metrics_provider_persists_and_warm_starts_its_cortex(tmp_path, monkeypatch):
     """issue #134: the gate used to train a fresh, disposable cortex on
-    every call, entirely outside the ladder's own checkpoint (which always
-    reported ``has_world_model: False``). Wiring ``cortex_checkpoint_base``
-    through the real ``ladder_milestone_metrics`` provider and
+    every call, entirely outside the ladder's own checkpoint (which carried
+    no trace of it at all). Wiring ``cortex_checkpoint_base`` through the
+    real ``ladder_milestone_metrics`` provider and
     ``world_model_checkpoint_paths`` through ``run_curriculum`` fixes both:
     a second attempt warm-starts from the first's cortex, and the ladder's
-    own checkpoint metadata reports a world model actually backs it."""
+    own checkpoint metadata records that a world model actually backs it."""
     import cognitive_runtime.training.nursery as nursery_module
     from development.ladder import ladder_cortex_checkpoint_paths
 
@@ -433,7 +433,8 @@ def test_real_milestone_metrics_provider_persists_and_warm_starts_its_cortex(tmp
     )
     assert result_1.status == "completed"
     assert any(os.path.exists(p) for p in cortex_paths), "a cortex checkpoint must be persisted"
-    assert read_checkpoint_metadata(checkpoint_path_1)["extra"]["actor_critic"]["has_world_model"] is True
+    recorded = read_checkpoint_metadata(checkpoint_path_1)["extra"]["ladder_world_model_checkpoints"]
+    assert recorded and all(os.path.exists(p) for p in recorded)
     assert captured[0] is None, "nothing to warm-start from on the very first attempt"
 
     calls_before_second_run = len(captured)

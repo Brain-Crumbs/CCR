@@ -419,14 +419,19 @@ def run_curriculum(
     ``milestone_metrics`` provider persists any predictive-cortex checkpoint
     it trains against (e.g.
     ``development.ladder.ladder_cortex_checkpoint_paths(checkpoint_path).values()``)
-    -- purely for this checkpoint's own provenance. Before Phase 7,
-    ``extra_metadata["actor_critic"]["has_world_model"]`` was hardcoded
-    ``False`` even once a milestone gate had genuinely trained and persisted
-    a world model, because the gate's model lived entirely outside this
-    checkpoint. After every attempt, if any of these paths now exist on
-    disk, this flips to ``True`` -- so the checkpoint's own metadata
-    honestly reflects whether a world model backs the milestones it was
-    promoted on, instead of always claiming there is none.
+    -- purely for this checkpoint's own provenance. Before Phase 7, a
+    milestone gate could genuinely train and persist a world model
+    elsewhere with no trace of that in this checkpoint's own metadata at
+    all -- the gate's model lived entirely outside it. After every attempt,
+    any of these paths that now exist on disk are recorded under
+    ``extra_metadata["ladder_world_model_checkpoints"]``, so this
+    checkpoint's own metadata honestly reflects whether (and where) a world
+    model backs the milestones it was promoted on. This is deliberately a
+    *separate* field from ``extra_metadata["actor_critic"]["has_world_model"]``
+    -- that flag means this checkpoint itself embeds an ``MLPWorldModel``
+    (``cli.py``/``sleep/async_trainer.py`` construct one and load its
+    optimizer state whenever it's set), which a ladder run's external,
+    differently-shaped cortex checkpoint is not.
     """
     fusion, action_keys, policy_model, critic_model, optimizer, arch = (
         _new_actor_critic_stack(definition.stages[0], model_seed, lr=ac_lr, entropy_coef=ac_entropy_coef)
@@ -499,10 +504,16 @@ def run_curriculum(
             )
             summary = EvaluationSummary.from_episodes(stage.name, eval_episodes)
             met_criteria, value, threshold, metric = _evaluate_stage(stage, summary, milestone_metrics)
-            if not arch["has_world_model"] and any(
-                os.path.exists(p) for p in world_model_checkpoint_paths
-            ):
-                arch["has_world_model"] = True
+            if world_model_checkpoint_paths:
+                # A *separate* field from arch["has_world_model"] (issue
+                # #134 review): that flag means this checkpoint embeds an
+                # MLPWorldModel, which an external ladder cortex checkpoint
+                # is not -- conflating the two would make cli.py/
+                # sleep/async_trainer.py try to construct and load one that
+                # was never actually saved here.
+                checkpoint.extra_metadata["ladder_world_model_checkpoints"] = sorted(
+                    p for p in world_model_checkpoint_paths if os.path.exists(p)
+                )
             state.attempts_at_stage += 1
             forced = force_this_attempt and not met_criteria
             promoted = met_criteria or force_this_attempt

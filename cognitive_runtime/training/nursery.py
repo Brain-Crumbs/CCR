@@ -1239,9 +1239,16 @@ def run_action_ablation_eval(
     bundle (if it exists) and saves the result back to it afterward, so a
     caller reusing the same path across calls actually keeps improving the
     same cortex instead of measuring a fresh, disposable one every attempt.
-    The *without-actions* run is always a fresh, freshly-initialized control
-    -- it exists to prove the with-actions run's action-conditioning helps,
-    not to represent anything the organism carries forward.
+
+    The *without-actions* control warm-starts from (and saves to) its own
+    sibling path (``cortex_checkpoint_path + ".control"``) rather than the
+    with-actions path -- it must never see the with-actions run's weights or
+    actions, but it does need the *same accumulated training budget* across
+    repeated calls (PR #155 review): warm-starting only the with-actions run
+    would let it accumulate strictly more total training than a
+    freshly-initialized control every attempt, so ``action_ablation_margin``
+    could turn positive from more training alone rather than from access to
+    actions -- exactly the confound this ablation exists to rule out.
     """
     cfg = config or NurseryConfig()
     if eval_scenario not in train_scenarios:
@@ -1316,17 +1323,30 @@ def run_action_ablation_eval(
     with_actions_cfg = replace(base_model_cfg, withhold_actions=False)
     without_actions_cfg = replace(base_model_cfg, withhold_actions=True)
 
-    initial_model = None
+    without_actions_checkpoint_path = (
+        cortex_checkpoint_path + ".control" if cortex_checkpoint_path is not None else None
+    )
+
+    with_initial = None
     if cortex_checkpoint_path is not None and os.path.exists(cortex_checkpoint_path):
-        initial_model, _ = load_action_world_model(cortex_checkpoint_path)
+        with_initial, _ = load_action_world_model(cortex_checkpoint_path)
     model_with, stats_with = train_action_world_model(
-        dataset, with_actions_cfg, initial_model=initial_model,
+        dataset, with_actions_cfg, initial_model=with_initial,
     )
     if cortex_checkpoint_path is not None:
         save_action_world_model(cortex_checkpoint_path, model_with, stats_with)
-    # The without-actions run is always a fresh control (see docstring) --
-    # never warm-started, never saved.
-    model_without, _stats_without = train_action_world_model(dataset, without_actions_cfg)
+
+    # The control warm-starts from its own sibling checkpoint (never the
+    # with-actions one) so it accumulates the *same* total training budget
+    # across repeated calls while still never seeing actions (see docstring).
+    without_initial = None
+    if without_actions_checkpoint_path is not None and os.path.exists(without_actions_checkpoint_path):
+        without_initial, _ = load_action_world_model(without_actions_checkpoint_path)
+    model_without, stats_without = train_action_world_model(
+        dataset, without_actions_cfg, initial_model=without_initial,
+    )
+    if without_actions_checkpoint_path is not None:
+        save_action_world_model(without_actions_checkpoint_path, model_without, stats_without)
 
     holdout_dataset = build_action_sequence_dataset(
         eval_sessions[eval_scenario], action_keys=model_with.action_keys

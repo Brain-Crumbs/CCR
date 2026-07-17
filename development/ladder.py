@@ -249,9 +249,9 @@ def _action_ablation_margin(
     ``cortex_checkpoint_path`` (issue #134), when given, warm-starts the
     with-actions cortex from (and saves it back to) that path instead of
     training a fresh, disposable model every attempt -- see
-    ``run_action_ablation_eval``'s own docstring. The without-actions
-    control is never warm-started (by design: it's a matched, disposable
-    baseline, not something the organism carries forward).
+    ``run_action_ablation_eval``'s own docstring, which also warm-starts the
+    without-actions control from its own sibling path so both runs keep an
+    equal accumulated training budget across attempts (PR #155 review).
     """
     from cognitive_runtime.training.nursery import run_action_ablation_eval
 
@@ -327,8 +327,8 @@ def _voluntary_reliance_score(
 #: #134). Keyed by milestone metric name so :func:`ladder_cortex_checkpoint_paths`
 #: and :func:`ladder_milestone_metrics` derive the same filenames from one
 #: base path, and ``development.runner.run_curriculum`` can watch the same
-#: paths to know whether the organism's own checkpoint should honestly
-#: report ``has_world_model=True``.
+#: paths to record which ones actually exist under its own
+#: ``extra_metadata["ladder_world_model_checkpoints"]``.
 _CORTEX_CHECKPOINT_SUFFIXES = {
     "cortex_beats_copy_last": ".ladder-visual-cortex.pt",
     "action_ablation_margin": ".ladder-action-cortex.pt",
