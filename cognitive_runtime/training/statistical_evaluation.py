@@ -269,6 +269,28 @@ def flagged_regressions(comparisons: Sequence[MetricComparison]) -> List[MetricC
     return [c for c in comparisons if c.regressed]
 
 
+def metric_statistics(values: Sequence[float], confidence: float = DEFAULT_CONFIDENCE) -> MetricStats:
+    """Public entry point for ad-hoc metrics that don't fit
+    :class:`PolicyStatistics`'s fixed schema (e.g. the Phase 5 forgetting
+    metric, ``sleep.forgetting``) -- same mean +/- CI machinery as every
+    other metric family here."""
+    return _mean_ci(values, confidence)
+
+
+def compare_metric(
+    baseline: MetricStats, candidate: MetricStats, *, metric: str, higher_is_better: bool,
+) -> MetricComparison:
+    """Public :class:`MetricComparison` constructor for a metric outside the
+    ``compare_statistics``/``compare_cortex_horizon_statistics`` fixed
+    families -- same CI-overlap regression rule (see
+    :class:`MetricComparison`/:func:`_direction`)."""
+    return MetricComparison(
+        metric=metric, baseline=baseline, candidate=candidate,
+        higher_is_better=higher_is_better,
+        direction=_direction(baseline, candidate, higher_is_better),
+    )
+
+
 # ------------------------------------------------------------- cortex scoring
 
 

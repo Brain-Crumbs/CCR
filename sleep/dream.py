@@ -46,6 +46,42 @@ def _action_indices(seed: Seed, length: int, cortex: Any, device: torch.device) 
     )
 
 
+def dream_latents(
+    seed: Seed,
+    length: int,
+    cortex: Any,
+    hidden: Optional[Any] = None,
+) -> torch.Tensor:
+    """The undecoded counterpart of :func:`dream`: ``length`` predicted
+    latents (``Tensor[length, latent_width]``) from ``seed``'s stored latent
+    and replayed actions, with no pixel decode.
+
+    Generative replay (``sleep.replay_mix``) trains directly against these
+    latents -- decoding to pixel space would be pure overhead for a loss that
+    never looks at pixels -- so this is factored out of :func:`dream` rather
+    than having callers decode-then-discard.
+    """
+    device, dtype = _model_device_and_dtype(cortex)
+    actions = _action_indices(seed, length, cortex, device)
+    if length == 0:
+        return torch.empty(0, cortex.latent_width, device=device, dtype=dtype)
+
+    latent = torch.as_tensor(seed.z, dtype=dtype, device=device).reshape(1, -1)
+    if latent.shape[1] != cortex.latent_width:
+        raise ValueError(
+            f"seed latent width {latent.shape[1]} does not match cortex width {cortex.latent_width}"
+        )
+    state = cortex.initial_state(1) if hidden is None else hidden
+    was_training = cortex.training
+    cortex.eval()
+    try:
+        with torch.no_grad():
+            latents, _ = cortex.rollout(latent, actions, state)
+        return latents.squeeze(0)
+    finally:
+        cortex.train(was_training)
+
+
 def dream(
     seed: Seed,
     length: int,
@@ -59,23 +95,14 @@ def dream(
     encoder is consulted: after construction the rollout is wholly generative.
     Returned frames have shape ``[C, H, W]`` in the cortex reconstruction space.
     """
-    device, dtype = _model_device_and_dtype(cortex)
-    actions = _action_indices(seed, length, cortex, device)
     if length == 0:
         return
-
-    latent = torch.as_tensor(seed.z, dtype=dtype, device=device).reshape(1, -1)
-    if latent.shape[1] != cortex.latent_width:
-        raise ValueError(
-            f"seed latent width {latent.shape[1]} does not match cortex width {cortex.latent_width}"
-        )
-    state = cortex.initial_state(1) if hidden is None else hidden
+    latents = dream_latents(seed, length, cortex, hidden)
     was_training = cortex.training
     cortex.eval()
     try:
         with torch.no_grad():
-            latents, _ = cortex.rollout(latent, actions, state)
-            decoded = cortex.decoder(latents.squeeze(0))
+            decoded = cortex.decoder(latents)
         for frame in decoded:
             yield frame
     finally:
