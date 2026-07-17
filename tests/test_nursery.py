@@ -366,6 +366,38 @@ def test_run_nursery_scenario_can_skip_prediction_export(tmp_path):
         assert not [f for f in os.listdir(session_dir) if f.startswith("predictions_")]
 
 
+def test_run_nursery_scenario_warm_starts_from_a_cortex_checkpoint(tmp_path, monkeypatch):
+    """issue #134: ``run_nursery_scenario`` used to train a fresh, disposable
+    model every call, discarding any progress -- ``cortex_checkpoint_path``
+    warm-starts from (and saves back to) a persisted model instead, so
+    repeated calls (one per milestone-gate attempt) actually keep improving
+    the same model."""
+    import cognitive_runtime.training.nursery as nursery_module
+
+    cfg = _small_config()
+    checkpoint_path = str(tmp_path / "cortex.pt")
+
+    captured = []
+    original = nursery_module.train_pixel_encoder_pretraining
+
+    def spy(dataset, config=None, *, initial_model=None):
+        captured.append(initial_model)
+        return original(dataset, config, initial_model=initial_model)
+
+    monkeypatch.setattr(nursery_module, "train_pixel_encoder_pretraining", spy)
+
+    run_nursery_scenario(
+        str(tmp_path), "walk_forward", cfg, cortex_checkpoint_path=checkpoint_path,
+    )
+    assert os.path.exists(checkpoint_path), "first call must save a cortex checkpoint"
+    assert captured[0] is None, "nothing to warm-start from on the first call"
+
+    run_nursery_scenario(
+        str(tmp_path), "walk_forward", cfg, cortex_checkpoint_path=checkpoint_path,
+    )
+    assert captured[1] is not None, "second call must warm-start from the saved checkpoint"
+
+
 def test_full_visual_model_round_trips_and_re_exports(tmp_path):
     import base64
 

@@ -61,6 +61,8 @@ from cognitive_runtime.training.action_world_model import (
     evaluate_action_world_model,
     horizons_ticks_to_frames,
     linear_probe_yaw,
+    load_action_world_model,
+    save_action_world_model,
     train_action_world_model,
 )
 from cognitive_runtime.training.ego_motion_canary import (
@@ -73,7 +75,11 @@ from cognitive_runtime.training.entity_persistence import (
     build_entity_persistence_dataset,
     train_entity_persistence_model,
 )
-from cognitive_runtime.training.prediction_export import export_session_predictions
+from cognitive_runtime.training.prediction_export import (
+    export_session_predictions,
+    load_full_visual_model,
+    save_full_visual_model,
+)
 from cognitive_runtime.training.statistical_evaluation import (
     MetricComparison,
     MetricStats,
@@ -800,13 +806,25 @@ def run_nursery_scenario(
     record_dir: str,
     scenario_name: str,
     config: Optional[NurseryConfig] = None,
+    *,
+    cortex_checkpoint_path: Optional[str] = None,
 ) -> Tuple[VisualRepresentationModel, NurseryScenarioReport]:
     """Record train/holdout episodes for one nursery scenario, pretrain a
     pixel encoder+decoder+next-latent predictor on the train seeds only,
     then evaluate multi-horizon next-frame prediction on held-out seeds
     against copy-last-frame and mean-frame baselines. ``object_permanence``
     additionally reports an entity-persistence metric (Minecraft only --
-    Crafter's port doesn't set ``entity_persistence_metric``)."""
+    Crafter's port doesn't set ``entity_persistence_metric``).
+
+    ``cortex_checkpoint_path`` (issue #134), when given, warm-starts
+    pretraining from that path's previously-saved
+    ``prediction_export.save_full_visual_model`` bundle (if it exists)
+    instead of a fresh random model, and saves the result back to it
+    afterward -- so a caller that reuses the same path across repeated
+    calls (e.g. one milestone-gate attempt per stage attempt) is actually
+    continuing to train *the same* model, not discarding it and measuring a
+    disposable one every time.
+    """
 
     cfg = config or NurseryConfig()
     scenarios = _scenarios_for_world(cfg.world)
@@ -878,7 +896,12 @@ def run_nursery_scenario(
         hidden_dim=cfg.hidden_dim,
         reconstruction_size=cfg.reconstruction_size,
     )
-    model, pretraining_stats = train_pixel_encoder_pretraining(train_dataset, visual_config)
+    initial_model = None
+    if cortex_checkpoint_path is not None and os.path.exists(cortex_checkpoint_path):
+        initial_model = load_full_visual_model(cortex_checkpoint_path)
+    model, pretraining_stats = train_pixel_encoder_pretraining(
+        train_dataset, visual_config, initial_model=initial_model,
+    )
 
     consistency_stats: Dict[str, List[float]] = {}
     if cfg.consistency_epochs > 0:
@@ -891,6 +914,8 @@ def run_nursery_scenario(
             batch_size=cfg.batch_size,
             seed=cfg.seed,
         )
+    if cortex_checkpoint_path is not None:
+        save_full_visual_model(model, cortex_checkpoint_path)
 
     max_horizon = max(horizon_frames)
     for session_dir in holdout_sessions:
@@ -1193,6 +1218,8 @@ def run_action_ablation_eval(
     eval_scenario: str = "turn_in_place",
     config: Optional[NurseryConfig] = None,
     model_config: Optional[ActionWorldModelConfig] = None,
+    *,
+    cortex_checkpoint_path: Optional[str] = None,
 ) -> ActionAblationReport:
     """Train the joint cortex twice on identical recorded data -- with and
     without the action stream reaching the model during training -- and
@@ -1205,6 +1232,23 @@ def run_action_ablation_eval(
     artifact of noise or a different random init. ``eval_scenario`` must be
     one of ``train_scenarios`` -- the claim is "harder to predict the
     scenario it trained on", not zero-shot generality.
+
+    ``cortex_checkpoint_path`` (issue #134), when given, warm-starts the
+    *with-actions* run from that path's previously-saved
+    :func:`~cognitive_runtime.training.action_world_model.save_action_world_model`
+    bundle (if it exists) and saves the result back to it afterward, so a
+    caller reusing the same path across calls actually keeps improving the
+    same cortex instead of measuring a fresh, disposable one every attempt.
+
+    The *without-actions* control warm-starts from (and saves to) its own
+    sibling path (``cortex_checkpoint_path + ".control"``) rather than the
+    with-actions path -- it must never see the with-actions run's weights or
+    actions, but it does need the *same accumulated training budget* across
+    repeated calls (PR #155 review): warm-starting only the with-actions run
+    would let it accumulate strictly more total training than a
+    freshly-initialized control every attempt, so ``action_ablation_margin``
+    could turn positive from more training alone rather than from access to
+    actions -- exactly the confound this ablation exists to rule out.
     """
     cfg = config or NurseryConfig()
     if eval_scenario not in train_scenarios:
@@ -1279,8 +1323,30 @@ def run_action_ablation_eval(
     with_actions_cfg = replace(base_model_cfg, withhold_actions=False)
     without_actions_cfg = replace(base_model_cfg, withhold_actions=True)
 
-    model_with, _stats_with = train_action_world_model(dataset, with_actions_cfg)
-    model_without, _stats_without = train_action_world_model(dataset, without_actions_cfg)
+    without_actions_checkpoint_path = (
+        cortex_checkpoint_path + ".control" if cortex_checkpoint_path is not None else None
+    )
+
+    with_initial = None
+    if cortex_checkpoint_path is not None and os.path.exists(cortex_checkpoint_path):
+        with_initial, _ = load_action_world_model(cortex_checkpoint_path)
+    model_with, stats_with = train_action_world_model(
+        dataset, with_actions_cfg, initial_model=with_initial,
+    )
+    if cortex_checkpoint_path is not None:
+        save_action_world_model(cortex_checkpoint_path, model_with, stats_with)
+
+    # The control warm-starts from its own sibling checkpoint (never the
+    # with-actions one) so it accumulates the *same* total training budget
+    # across repeated calls while still never seeing actions (see docstring).
+    without_initial = None
+    if without_actions_checkpoint_path is not None and os.path.exists(without_actions_checkpoint_path):
+        without_initial, _ = load_action_world_model(without_actions_checkpoint_path)
+    model_without, stats_without = train_action_world_model(
+        dataset, without_actions_cfg, initial_model=without_initial,
+    )
+    if without_actions_checkpoint_path is not None:
+        save_action_world_model(without_actions_checkpoint_path, model_without, stats_without)
 
     holdout_dataset = build_action_sequence_dataset(
         eval_sessions[eval_scenario], action_keys=model_with.action_keys

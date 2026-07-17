@@ -320,6 +320,8 @@ def _episode_tensors(dataset: ActionSequenceDataset, reconstruction_shape):
 def train_action_world_model(
     dataset: ActionSequenceDataset,
     config: Optional[ActionWorldModelConfig] = None,
+    *,
+    initial_model: Optional[Any] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     """Train the action-conditioned world model with short-rollout scheduled
     sampling over every episode in ``dataset``.
@@ -329,6 +331,15 @@ def train_action_world_model(
     latent of the true frame -- the pixel term keeps predictions decodable,
     the latent term keeps rollouts on the encoder's manifold without the
     100-step compositions that drove the old predictor to the identity.
+
+    ``initial_model`` (issue #134), when given, continues training that
+    ``PredictiveCortex`` in place instead of building a fresh one -- a
+    caller warm-starting from :func:`load_action_world_model` and saving
+    the result back via :func:`save_action_world_model` actually improves
+    the same persisted cortex across calls, rather than discarding it and
+    training a disposable one every time. Its shape/vocabulary must match
+    the dataset (a mismatch is a wiring bug, not something to silently
+    reinitialize around).
     """
     torch, F = _torch()
 
@@ -344,7 +355,20 @@ def train_action_world_model(
     torch.manual_seed(cfg.seed)
     generator = torch.Generator().manual_seed(cfg.seed)
 
-    model = build_action_world_model(dataset.pixel_shape, dataset.action_keys, cfg)
+    if initial_model is not None:
+        if tuple(initial_model.pixel_shape) != tuple(dataset.pixel_shape):
+            raise ValueError(
+                f"initial_model pixel shape {initial_model.pixel_shape} does not match "
+                f"dataset pixel shape {dataset.pixel_shape}"
+            )
+        if list(initial_model.action_keys) != list(dataset.action_keys):
+            raise ValueError(
+                f"initial_model action_keys {initial_model.action_keys} does not match "
+                f"dataset action_keys {dataset.action_keys}"
+            )
+        model = initial_model
+    else:
+        model = build_action_world_model(dataset.pixel_shape, dataset.action_keys, cfg)
     episodes = _episode_tensors(dataset, model.reconstruction_shape)
 
     window = cfg.warmup_frames + cfg.rollout_frames

@@ -167,8 +167,21 @@ def contrastive_consistency_loss(
 def train_pixel_encoder_pretraining(
     dataset: PixelSequenceDataset,
     config: Optional[VisualPretrainingConfig] = None,
+    *,
+    initial_model: Optional[VisualRepresentationModel] = None,
 ) -> Tuple[VisualRepresentationModel, Dict[str, Any]]:
-    """Pretrain ``PixelStreamEncoder`` with reconstruction/prediction/contrastive losses."""
+    """Pretrain ``PixelStreamEncoder`` with reconstruction/prediction/contrastive losses.
+
+    ``initial_model`` (issue #134), when given, continues training that
+    model in place instead of constructing a fresh one -- a caller that
+    warm-starts from a previously-saved checkpoint (see
+    ``prediction_export.load_full_visual_model``) and saves the result back
+    (``prediction_export.save_full_visual_model``) actually improves the
+    same persisted model across calls, rather than discarding it and
+    training a disposable one every time. Its shape must match the dataset
+    (a fresh model built for the wrong recording is a wiring bug, not
+    something to silently reinitialize around).
+    """
     if len(dataset) == 0:
         raise ValueError("pixel sequence dataset is empty; record sessions with --record-frames")
     cfg = config or VisualPretrainingConfig()
@@ -179,12 +192,25 @@ def train_pixel_encoder_pretraining(
 
     pixels = torch.stack([pixels_to_chw(p) for p in dataset.pixels])
     next_pixels = torch.stack([pixels_to_chw(p) for p in dataset.next_pixels])
-    model = VisualRepresentationModel(
-        pixel_shape,
-        latent_width=cfg.latent_width,
-        reconstruction_shape=reconstruction_shape,
-        hidden_dim=cfg.hidden_dim,
-    )
+    if initial_model is not None:
+        if tuple(initial_model.pixel_shape) != pixel_shape:
+            raise ValueError(
+                f"initial_model pixel shape {initial_model.pixel_shape} does not match "
+                f"dataset pixel shape {pixel_shape}"
+            )
+        if tuple(initial_model.reconstruction_shape) != tuple(reconstruction_shape):
+            raise ValueError(
+                f"initial_model reconstruction shape {initial_model.reconstruction_shape} "
+                f"does not match configured {reconstruction_shape}"
+            )
+        model = initial_model
+    else:
+        model = VisualRepresentationModel(
+            pixel_shape,
+            latent_width=cfg.latent_width,
+            reconstruction_shape=reconstruction_shape,
+            hidden_dim=cfg.hidden_dim,
+        )
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     curves: Dict[str, List[float]] = {
         "total_loss": [],
