@@ -94,8 +94,31 @@ def _seed_for(base: int, stage_index: int, attempt: int, unit: int) -> int:
     return base + stage_index * 1_000_000 + attempt * max(unit, 1)
 
 
-def _new_actor_critic_stack(world_config: Dict[str, Any], seed: int, *, lr: float, entropy_coef: float):
-    program = MinecraftSurvivalBox(config=world_config)
+def _program_for_stage(stage: CurriculumStageSpec):
+    """Construct the ``Program`` a stage trains/evaluates against, honoring
+    ``stage.world`` (issue #105: the pre-#105 runner hardcoded
+    ``MinecraftSurvivalBox`` here and silently ignored a Crafter-world
+    stage's ``world``/``scenario``/``motor_freedom`` declarations). Mirrors
+    ``cli.py``'s ``--world`` factory and
+    ``development.definitions._program_for_layout``, which computes the same
+    Program (minus reward wiring, Minecraft-only) for the layout-hash check
+    at definition-load time -- kept as a separate copy here rather than
+    imported, since this one also wires up reward config/profile."""
+    if stage.world in (None, "minecraft"):
+        return MinecraftSurvivalBox(
+            config=stage.world_config,
+            reward_config=stage.build_reward_config(),
+            reward_profile=stage.build_reward_profile(),
+        )
+    if stage.world == "crafter":
+        from cognitive_runtime.programs.crafter.adapter import CrafterWorld
+
+        return CrafterWorld(config=stage.world_config)
+    raise AssertionError(f"unreachable: unknown world {stage.world!r} (validated in __post_init__)")
+
+
+def _new_actor_critic_stack(stage: CurriculumStageSpec, seed: int, *, lr: float, entropy_coef: float):
+    program = _program_for_stage(stage)
     fusion = TemporalFusion(program.stream_catalog(), default_encoder_registry())
     action_keys = [action.key() for action in program.metadata().action_space]
     wf_width = world_feature_width(action_keys)
@@ -128,11 +151,7 @@ def _run_stage_episodes(
     record_dir: Optional[str], session_id: Optional[str], stage_index: int,
     name: Optional[str] = None,
 ) -> List[EpisodeSummary]:
-    program = MinecraftSurvivalBox(
-        config=stage.world_config,
-        reward_config=stage.build_reward_config(),
-        reward_profile=stage.build_reward_profile(),
-    )
+    program = _program_for_stage(stage)
     policy = ActorCriticPolicy(
         policy_model, critic_model, action_keys,
         action_space=program.metadata().action_space, training=train, seed=seed,
@@ -269,7 +288,7 @@ def run_curriculum(
     ``gates`` ignore it and keep the legacy single-``promotion`` behaviour.
     """
     fusion, action_keys, policy_model, critic_model, optimizer, arch = (
-        _new_actor_critic_stack(definition.stages[0].world_config, model_seed, lr=ac_lr, entropy_coef=ac_entropy_coef)
+        _new_actor_critic_stack(definition.stages[0], model_seed, lr=ac_lr, entropy_coef=ac_entropy_coef)
     )
     checkpoint = NeuralAgentCheckpoint(
         checkpoint_path,
