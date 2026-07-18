@@ -280,6 +280,82 @@ def test_build_stage_policy_rejects_a_stage_with_no_declared_motor_freedom():
 
 
 # --------------------------------------------------------------------------
+# issue #136: `_reflex_override_precedence`/`_voluntary_reliance_score` used
+# to run a hand-rolled `ReflexStack` disconnected from the organism, the
+# stage, and the attempt's real outcome -- structurally guaranteed to return
+# the same passing value before and after training. These prove the real
+# gates now run the production `build_stage_policy` seam and vary with real
+# per-attempt data. Torch/crafter-free: `motor.organism_policy`/
+# `motor.reflexes`/`motor.voluntary` need neither.
+
+from development.ladder import _reflex_override_precedence, _voluntary_reliance_score  # noqa: E402
+from cognitive_runtime.training.online_q_acceptance import EvaluationSummary  # noqa: E402
+
+
+def test_reflex_override_precedence_is_a_genuine_bidirectional_contract_check():
+    """Runs the real ``objects`` stage's ``build_stage_policy`` seam, not a
+    bypass -- proves the value is computed (``1.0`` only because the real
+    precedence contract genuinely holds), not returned by construction."""
+    objects = GESTATION_TO_FORAGING.stages[3]
+    assert objects.motor_freedom == "learned"
+    assert _reflex_override_precedence(objects) == 1.0
+
+
+def test_reflex_override_precedence_would_fail_if_the_real_contract_broke():
+    """Same check, but against a stage whose real ``motor_freedom`` is
+    ``"overridden"`` with no scripted policy declared -- ``build_stage_policy``
+    can't build a working ``"learned"`` seam for it, proving this metric
+    actually depends on the real stage it's given rather than always
+    fabricating ``1.0``."""
+    babbling = GESTATION_TO_FORAGING.stages[1]
+    with pytest.raises(ValueError, match="overridden"):
+        _reflex_override_precedence(babbling)
+
+
+def _summary(termination_reasons):
+    return EvaluationSummary(
+        policy="foraging", total_reward=0.0, total_ticks=0,
+        average_reward=0.0, average_ticks=0.0, termination_reasons=termination_reasons,
+    )
+
+
+def test_voluntary_reliance_score_tracks_the_attempts_real_outcome_not_a_constant():
+    """issue #136: the old version returned the identical passing value
+    regardless of ``summary`` (it never even accepted one). The real gate
+    must genuinely differ between an attempt whose held-out episode
+    survived and one that died -- and a death-heavy attempt must be able to
+    fail :data:`~development.ladder._FORAGING`'s ``0.85`` threshold."""
+    foraging = GESTATION_TO_FORAGING.stages[4]
+    survived = _voluntary_reliance_score(foraging, _summary(["timeout"]))
+    died = _voluntary_reliance_score(foraging, _summary(["death:health"]))
+
+    assert survived != died
+    assert survived >= 0.85
+    assert died < 0.85
+
+
+def test_ladder_milestone_metrics_computes_real_reflex_gates_for_objects_and_foraging(tmp_path):
+    """End-to-end through the public ``ladder_milestone_metrics`` seam
+    (not the private helpers directly): both gates resolve to real,
+    attempt-dependent values, and Foraging's failing case genuinely holds
+    the stage (task 4's acceptance: "a failing metric holds the organism")."""
+    from development.ladder import ladder_milestone_metrics
+
+    objects = GESTATION_TO_FORAGING.stages[3]
+    foraging = GESTATION_TO_FORAGING.stages[4]
+    record_dir = str(tmp_path / "nursery")
+
+    objects_metrics = ladder_milestone_metrics(objects, _summary(["timeout"]), record_dir=record_dir)
+    assert objects_metrics == {"reflex_override_precedence": 1.0}
+    assert objects.evaluate_gates(objects_metrics)["reflex_override_precedence"] is True
+
+    surviving_metrics = ladder_milestone_metrics(foraging, _summary(["timeout"]), record_dir=record_dir)
+    dying_metrics = ladder_milestone_metrics(foraging, _summary(["death:health"]), record_dir=record_dir)
+    assert foraging.evaluate_gates(surviving_metrics)["reflex_activation_rate"] is True
+    assert foraging.evaluate_gates(dying_metrics)["reflex_activation_rate"] is False
+
+
+# --------------------------------------------------------------------------
 # Torch+crafter-gated: the real train/evaluate/promote/resume runner.
 
 pytest.importorskip("torch")
