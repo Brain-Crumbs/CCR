@@ -141,11 +141,12 @@ _CRAWLING = _stage(
 #: computable implementation in this repo yet (no
 #: ``test_generative_replay.py``/``test_forgetting_metric.py``) -- wiring a
 #: gate to a metric nothing computes would violate task 4's "not a stub"
-#: intent worse than picking a different real Phase 6 milestone. Objects is
-#: the ladder's first ``learned``-motor stage with caregiver-guided stages
-#: behind it, so proving the caregiver-override precedence contract
-#: (``motor.reflexes.ReflexStack``: caregiver always wins) still holds is a
-#: real, honestly-computable stand-in.
+#: intent worse than picking a different real Phase 6 milestone. Objects
+#: declares ``motor_freedom="learned"``, so (issue #136) its real precedence
+#: contract is reflex-over-voluntary, not caregiver-over-everything --
+#: ``motor.organism_policy.MotorFreedomPolicy`` deliberately never drains a
+#: caregiver channel on a ``learned`` stage, so Objects never exercises that
+#: path for real; see :func:`_reflex_override_precedence`.
 _OBJECTS = _stage(
     "objects", "approach_entity",
     senses=("vision", "proprioception"),
@@ -170,7 +171,9 @@ _OBJECTS = _stage(
 #: under this same key -- a "voluntary-reliance score" where higher is
 #: better -- and the threshold (``0.85``) requires the *raw* rate to sit at
 #: or below ``0.15``, the same ceiling that test asserts a matured session
-#: settles under.
+#: settles under. The per-tick threat rate driving this check is derived
+#: from the attempt's own real eval-episode outcome (issue #136), not a
+#: fixed constant chosen to pass -- see :func:`_voluntary_reliance_score`.
 _FORAGING = _stage(
     "foraging", "approach_entity",
     senses=("vision", "proprioception"),
@@ -295,55 +298,106 @@ def _action_ablation_margin(
     return sum(margins) / len(margins) if margins else 0.0
 
 
-def _reflex_override_precedence() -> float:
-    """Structural proof, not a measured trend: ``ReflexStack``'s contract
-    (``motor/reflexes.py``: ``caregiver > priority reflex > voluntary``)
-    means an injected caregiver override always wins. This runs a short
-    scripted session that injects an override on alternating ticks while a
-    reflex-triggering stimulus is present every tick (so a passing result
-    proves the override beat a live reflex, not merely an idle stack), and
-    returns the fraction of overridden ticks where the actuated action was
-    indeed the injected one -- always ``1.0`` by contract; the value exists
-    to prove the contract holds for real, not because it varies."""
-    from cognitive_runtime.core.action import Action
-    from motor.reflexes import CaregiverChannel, ReflexConfig, ReflexStack, Stimulus
+def _reflex_override_precedence(stage: CurriculumStageSpec) -> float:
+    """Real, bidirectional check of the precedence contract a
+    ``motor_freedom="learned"`` stage (Objects/Foraging) actually runs
+    under: :meth:`motor.organism_policy.MotorFreedomPolicy.decide` hands
+    every tick's voluntary choice to :meth:`motor.reflexes.ReflexStack.decide`,
+    which must override it whenever a stimulus crosses its reflex's
+    threshold and leave it untouched otherwise. (A caregiver-override check
+    would not be honest here -- ``MotorFreedomPolicy`` deliberately never
+    drains a caregiver channel on a ``learned`` stage, so Objects/Foraging
+    never exercise that path for real; issue #136.)
 
-    reflexes = ReflexStack([ReflexConfig("withdraw", "threat", Action("BACK"), threshold=0.5, priority=10)])
-    channel = CaregiverChannel()
-    overridden_ticks = 0
-    correct_ticks = 0
-    for tick in range(20):
-        stimuli = [Stimulus("threat", 1.0)]  # would otherwise fire `withdraw` every tick
-        if tick % 2 == 0:
-            channel.inject(Action("GUIDED"), reason="ladder-objects-stage")
-            overridden_ticks += 1
-        decision = reflexes.decide(Action("FORWARD"), stimuli, channel.drain())
-        if tick % 2 == 0 and decision.actuated == Action("GUIDED"):
-            correct_ticks += 1
-    return correct_ticks / overridden_ticks if overridden_ticks else 0.0
+    Drives the real :func:`~motor.organism_policy.build_stage_policy` seam
+    (not a hand-rolled ``ReflexStack`` bypass) with the organism's actual
+    :func:`~motor.reflexes.default_reflex_genome`, alternating a ``threat``
+    stimulus above and below the ``withdraw`` reflex's threshold each tick,
+    and returns the fraction of ticks where the actuated action matched the
+    contract's prediction. Unlike the previous version this is not
+    guaranteed ``1.0`` by construction -- a real precedence regression (a
+    reflex firing below its threshold, or failing to override above it)
+    shows up as a value under ``1.0``.
+    """
+    from cognitive_runtime.core.action import Action
+    from motor.organism_policy import build_stage_policy
+    from motor.reflexes import ReflexStack, Stimulus, default_reflex_genome
+    from motor.voluntary import CallableController
+
+    voluntary_action = Action("FORWARD")
+    withdraw_action = Action("BACK")
+    reflexes = ReflexStack(
+        default_reflex_genome(
+            withdraw_action=withdraw_action,
+            orient_left_action=Action("TURN_LEFT"),
+            orient_right_action=Action("TURN_RIGHT"),
+        )
+    )
+    voluntary = CallableController("ladder-objects-probe", lambda state, actions, goal: voluntary_action)
+    policy = build_stage_policy(
+        stage, [voluntary_action, withdraw_action], voluntary=voluntary, reflexes=reflexes,
+    )
+
+    total = 20
+    correct = 0
+    for tick in range(total):
+        above_threshold = tick % 2 == 0
+        policy.stimuli = (Stimulus("threat", 1.0 if above_threshold else 0.0),)
+        actuated = policy.decide(None, None, None)
+        expected = withdraw_action if above_threshold else voluntary_action
+        correct += actuated == expected
+    return correct / total
 
 
 def _voluntary_reliance_score(
-    *, threat_probability: float = 0.05, ticks: int = 200, seed: int = 0,
+    stage: CurriculumStageSpec, summary: "EvaluationSummary", *, ticks: int = 200, seed: int = 0,
 ) -> float:
-    """``1.0 - ReflexStack.activation_rate`` over a short synthetic session
-    with a *low* threat-stimulus rate -- the matured-organism regime
-    ``tests/test_reflexes.py::test_reflex_activation_rate_falls_across_
-    development_on_locomotion_and_threat_scenario`` exercises (its lowest
-    ``threat_probability`` there is also ``0.05``, asserting the resulting
-    rate settles under ``0.15``). Returns the *inverted* rate so
-    :data:`_FORAGING`'s ``>= threshold`` gate reads naturally as "voluntary
-    reliance" rather than needing a less-than comparison."""
+    """``1.0 - ReflexStack.activation_rate`` over a session run through the
+    real ``motor_freedom="learned"`` seam (:func:`~motor.organism_policy.
+    build_stage_policy`, the organism's actual :func:`~motor.reflexes.
+    default_reflex_genome`), inverted so :data:`_FORAGING`'s ``>= threshold``
+    gate reads naturally as "voluntary reliance".
+
+    The previous version drove a hand-rolled ``ReflexStack`` with a
+    hardcoded ``threat_probability=0.05`` -- low enough to pass regardless
+    of whether the organism had trained at all, so the gate returned the
+    same value before and after training (issue #136). This version instead
+    derives the per-tick threat rate from ``summary``, the real evaluation
+    outcome ``ladder_milestone_metrics`` already computed for *this*
+    attempt: an attempt whose held-out eval episode(s) ended in death faces
+    a harder reflex gate than one that survived, so the score tracks how
+    this attempt's real run actually went rather than a fixed constant.
+    """
     import random
 
     from cognitive_runtime.core.action import Action
-    from motor.reflexes import ReflexConfig, ReflexStack, Stimulus
+    from motor.organism_policy import build_stage_policy
+    from motor.reflexes import ReflexStack, Stimulus, default_reflex_genome
+    from motor.voluntary import CallableController
 
-    reflexes = ReflexStack([ReflexConfig("withdraw", "threat", Action("BACK"), threshold=0.5, priority=10)])
+    reasons = summary.termination_reasons
+    death_rate = sum(1 for r in reasons if r.startswith("death")) / len(reasons) if reasons else 0.0
+    threat_probability = 0.05 + 0.5 * death_rate
+
+    voluntary_action = Action("FORWARD")
+    withdraw_action = Action("BACK")
+    reflexes = ReflexStack(
+        default_reflex_genome(
+            withdraw_action=withdraw_action,
+            orient_left_action=Action("TURN_LEFT"),
+            orient_right_action=Action("TURN_RIGHT"),
+        )
+    )
+    voluntary = CallableController("ladder-foraging-probe", lambda state, actions, goal: voluntary_action)
+    policy = build_stage_policy(
+        stage, [voluntary_action, withdraw_action], voluntary=voluntary, reflexes=reflexes,
+    )
+
     rng = random.Random(seed)
     for _ in range(ticks):
-        stimuli = [Stimulus("threat", 1.0)] if rng.random() < threat_probability else []
-        reflexes.decide(Action("FORWARD"), stimuli)
+        intensity = 1.0 if rng.random() < threat_probability else 0.0
+        policy.stimuli = (Stimulus("threat", intensity),)
+        policy.decide(None, None, None)
     return 1.0 - reflexes.activation_rate
 
 
@@ -406,7 +460,7 @@ def ladder_milestone_metrics(
             stage, record_dir, cortex_checkpoint_path=checkpoint_paths.get("action_ablation_margin"),
         )
     if "reflex_override_precedence" in gate_names:
-        metrics["reflex_override_precedence"] = _reflex_override_precedence()
+        metrics["reflex_override_precedence"] = _reflex_override_precedence(stage)
     if "reflex_activation_rate" in gate_names:
-        metrics["reflex_activation_rate"] = _voluntary_reliance_score()
+        metrics["reflex_activation_rate"] = _voluntary_reliance_score(stage, summary)
     return metrics
