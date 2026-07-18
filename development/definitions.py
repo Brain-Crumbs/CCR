@@ -78,7 +78,21 @@ MILESTONE_METRICS = (
     "action_ablation_margin",      # Phase 2 action-conditioning ablation gap (#92)
     "calibrated_surprise_ece",     # Phase 3 Arbiter's calibrated surprise (#95)
     "forgetting_score",            # Phase 5 generative-replay forgetting metric (#99)
-    "reflex_activation_rate",      # Phase 6 reflex-activation-rate metric (#103)
+    "reflex_activation_rate",      # Phase 6 reflex-activation-rate metric (#103), raw
+                                    # ReflexStack.activation_rate (lower is better). Kept
+                                    # registered for custom curricula/milestone providers
+                                    # that compute the true raw value under this name (and
+                                    # for old serialized stage gates that reference it) --
+                                    # the *built-in* ladder no longer emits a value under
+                                    # this key; see voluntary_reliance_rate below.
+    "voluntary_reliance_rate",     # Phase 6 reflex-activation-rate metric (#103), inverted
+                                    # + separately named (issue #137): the ladder's Foraging
+                                    # gate needs 1.0 - activation_rate (since
+                                    # PromotionCriteria.evaluate is always value >=
+                                    # threshold), and stashing that under the raw
+                                    # reflex_activation_rate key silently reversed the raw
+                                    # metric's meaning for anyone else reading it -- see
+                                    # development.ladder._voluntary_reliance_score.
     "reflex_override_precedence",  # Phase 6 caregiver-override precedence (#102)
 )
 

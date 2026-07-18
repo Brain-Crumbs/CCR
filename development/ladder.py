@@ -161,25 +161,30 @@ _OBJECTS = _stage(
 #: Objects is motor freedom (fully ``learned``, no caregiver anywhere in the
 #: ladder from here on) and the gate.
 #:
-#: Gate: ``reflex_activation_rate`` -- but the raw metric is *lower-is-
-#: better* (a maturing organism relies less on reflex withdrawal, see
+#: Gate: ``voluntary_reliance_rate`` -- the underlying reflex metric
+#: (``ReflexStack.activation_rate``) is *lower-is-better* (a maturing
+#: organism relies less on reflex withdrawal, see
 #: ``tests/test_reflexes.py::test_reflex_activation_rate_falls_across_
 #: development_on_locomotion_and_threat_scenario``), while
 #: ``PromotionCriteria.evaluate`` is always ``value >= threshold``. To keep
-#: that polarity honest without a second metric name,
-#: ``ladder_milestone_metrics`` stores ``1.0 - reflex_activation_rate``
-#: under this same key -- a "voluntary-reliance score" where higher is
-#: better -- and the threshold (``0.85``) requires the *raw* rate to sit at
-#: or below ``0.15``, the same ceiling that test asserts a matured session
-#: settles under. The per-tick threat rate driving this check is derived
-#: from the attempt's own real eval-episode outcome (issue #136), not a
-#: fixed constant chosen to pass -- see :func:`_voluntary_reliance_score`.
+#: that polarity honest, ``ladder_milestone_metrics`` stores
+#: ``1.0 - activation_rate`` under this *differently-named* metric -- a
+#: "voluntary-reliance score" where higher is better -- rather than reusing
+#: the raw ``reflex_activation_rate`` key with inverted meaning (issue #137:
+#: the previous version did exactly that, so anything reading
+#: ``reflex_activation_rate`` off this gate's output got the opposite of
+#: what the name promises). The threshold (``0.85``) requires the *raw*
+#: rate to sit at or below ``0.15``, the same ceiling that test asserts a
+#: matured session settles under. The per-tick threat rate driving this
+#: check is derived from the attempt's own real eval-episode outcome (issue
+#: #136), not a fixed constant chosen to pass -- see
+#: :func:`_voluntary_reliance_score`.
 _FORAGING = _stage(
     "foraging", "approach_entity",
     senses=("vision", "proprioception"),
     motor_freedom="learned",
     losses=("prediction", "action_conditioning"),
-    gates=(PromotionCriteria(metric="reflex_activation_rate", threshold=0.85, sample_size=_EVAL_SAMPLE_SIZE),),
+    gates=(PromotionCriteria(metric="voluntary_reliance_rate", threshold=0.85, sample_size=_EVAL_SAMPLE_SIZE),),
 )
 
 #: The five-stage Gestation->Foraging ladder (Speaking deferred). One named
@@ -473,6 +478,6 @@ def ladder_milestone_metrics(
         )
     if "reflex_override_precedence" in gate_names:
         metrics["reflex_override_precedence"] = _reflex_override_precedence(stage)
-    if "reflex_activation_rate" in gate_names:
-        metrics["reflex_activation_rate"] = _voluntary_reliance_score(stage, summary)
+    if "voluntary_reliance_rate" in gate_names:
+        metrics["voluntary_reliance_rate"] = _voluntary_reliance_score(stage, summary)
     return metrics

@@ -87,15 +87,18 @@ def test_crawling_gates_on_both_copy_last_and_action_ablation():
 
 
 def test_foraging_gate_expresses_low_reflex_activation_as_a_lower_bound():
-    """``reflex_activation_rate`` is lower-is-better but ``PromotionCriteria``
-    is always ``value >= threshold`` -- the ladder's encoding (documented on
-    ``development.ladder._FORAGING``) stores ``1 - rate`` under the same
-    metric name, so the threshold itself must read as a *high* bar (close to
+    """``ReflexStack.activation_rate`` is lower-is-better but
+    ``PromotionCriteria`` is always ``value >= threshold`` -- the ladder's
+    encoding (documented on ``development.ladder._FORAGING``) stores
+    ``1 - rate`` under the differently-named ``voluntary_reliance_rate``
+    metric (issue #137: reusing the raw ``reflex_activation_rate`` key with
+    inverted meaning silently flipped what that name means to any other
+    reader), so the threshold itself must read as a *high* bar (close to
     1.0), not a low one -- a low threshold here would silently invert the
     intended gate."""
     stage = GESTATION_TO_FORAGING.stages[4]
     gate = stage.gates[0]
-    assert gate.metric == "reflex_activation_rate"
+    assert gate.metric == "voluntary_reliance_rate"
     assert gate.threshold > 0.5
 
 
@@ -351,8 +354,8 @@ def test_ladder_milestone_metrics_computes_real_reflex_gates_for_objects_and_for
 
     surviving_metrics = ladder_milestone_metrics(foraging, _summary(["timeout"]), record_dir=record_dir)
     dying_metrics = ladder_milestone_metrics(foraging, _summary(["death:health"]), record_dir=record_dir)
-    assert foraging.evaluate_gates(surviving_metrics)["reflex_activation_rate"] is True
-    assert foraging.evaluate_gates(dying_metrics)["reflex_activation_rate"] is False
+    assert foraging.evaluate_gates(surviving_metrics)["voluntary_reliance_rate"] is True
+    assert foraging.evaluate_gates(dying_metrics)["voluntary_reliance_rate"] is False
 
 
 # --------------------------------------------------------------------------
