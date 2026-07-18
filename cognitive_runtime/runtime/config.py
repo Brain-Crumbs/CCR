@@ -81,6 +81,16 @@ class RuntimeConfig:
     #: Bulky frame streams elided from the log unless ``record_frames`` is set.
     FRAME_STREAMS = ("vision.frame.grid", "vision.frame.pixels")
 
+    #: Static per-stream weight overrides (issue #135), independent of the
+    #: dynamic ``AttentionController`` below: composed into (multiplied with)
+    #: whatever weights the controller produces this tick before either
+    #: reaches ``TemporalFusion.fuse``'s ``attention_weights`` -- a weight of
+    #: ``0.0`` silences a stream's contribution to the fused vector without
+    #: touching the fusion layout/width. ``None`` (default) leaves the
+    #: controller's own weights untouched. e.g. ``development/runner.py``
+    #: zeroes the streams outside a curriculum stage's declared ``senses``.
+    sense_stream_weights: Optional[Dict[str, float]] = None
+
     #: Attention ablation (issue #59): ``"off"`` gives every agent-input
     #: stream uniform weight ``1.0`` (the pre-#59 behavior, byte-identical
     #: fused output); ``"budgeted"`` runs the deterministic

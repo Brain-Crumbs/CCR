@@ -21,7 +21,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional
 
-from development.definitions import CurriculumDefinition, CurriculumStageSpec, PromotionCriteria
+from development.definitions import (
+    CurriculumDefinition,
+    CurriculumDefinitionError,
+    CurriculumStageSpec,
+    PromotionCriteria,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import
     from cognitive_runtime.training.online_q_acceptance import EvaluationSummary
@@ -214,6 +219,23 @@ def _ladder_model_config(**overrides: Any) -> Any:
     return ActionWorldModelConfig(**base)
 
 
+def _require_losses(stage: CurriculumStageSpec, *required: str) -> None:
+    """A milestone metric below trains/evaluates a cortex under a specific
+    loss objective -- computing it for a stage that doesn't declare that
+    loss active would promote/hold the stage on a metric its own ``losses``
+    never asked for (issue #135: changing a stage's ``losses`` used to have
+    no effect on anything). Raises *before* the lazy torch/nursery import
+    each caller makes next, so a mis-declared curriculum fails fast and
+    torch-free rather than silently computing a metric its losses disclaim.
+    """
+    missing = [loss for loss in required if loss not in stage.losses]
+    if missing:
+        raise CurriculumDefinitionError(
+            f"stage {stage.name!r}: computing this gate's metric needs "
+            f"{missing} declared in the stage's losses (have {list(stage.losses)})"
+        )
+
+
 def _cortex_beats_copy_last(
     stage: CurriculumStageSpec, record_dir: str, *, cortex_checkpoint_path: Optional[str] = None,
 ) -> float:
@@ -227,6 +249,7 @@ def _cortex_beats_copy_last(
     disposable model every attempt -- see ``run_nursery_scenario``'s own
     docstring.
     """
+    _require_losses(stage, "prediction")
     from cognitive_runtime.training.nursery import run_nursery_scenario
 
     assert stage.scenario is not None
@@ -253,6 +276,7 @@ def _action_ablation_margin(
     without-actions control from its own sibling path so both runs keep an
     equal accumulated training budget across attempts (PR #155 review).
     """
+    _require_losses(stage, "prediction", "action_conditioning")
     from cognitive_runtime.training.nursery import run_action_ablation_eval
 
     assert stage.scenario is not None

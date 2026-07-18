@@ -489,16 +489,28 @@ class CognitiveRuntime:
                     attention_focus_counts[attention_state.focus_stream] = (
                         attention_focus_counts.get(attention_state.focus_stream, 0) + 1
                     )
+            # issue #135: `sense_stream_weights` (e.g. a curriculum stage's
+            # declared `senses`) composes into the controller's own weights
+            # rather than replacing them -- a stream silenced by one stays
+            # silenced regardless of what the other says. The published
+            # ATTENTION_WEIGHTS_STREAM telemetry above still reports the
+            # controller's own weights unchanged: that stream documents the
+            # dynamic salience system, not this static per-stage override.
+            fuse_weights = attention_state.weights
+            if self.config.sense_stream_weights:
+                fuse_weights = dict(attention_state.weights)
+                for stream_id, weight in self.config.sense_stream_weights.items():
+                    fuse_weights[stream_id] = fuse_weights.get(stream_id, 1.0) * weight
             if self.learned_fusion is not None:
                 self.memory.set_fused_latent(
                     self.learned_fusion.fuse(
-                        window, self.memory.buffer, attention_weights=attention_state.weights
+                        window, self.memory.buffer, attention_weights=fuse_weights
                     )
                 )
             else:
                 self.memory.set_fused_latent(
                     self.fusion.fuse(
-                        None, self.memory.buffer, attention_weights=attention_state.weights
+                        None, self.memory.buffer, attention_weights=fuse_weights
                     )
                 )
             # The policy's State is derived from stream state, not pulled from
@@ -578,7 +590,7 @@ class CognitiveRuntime:
                     window,
                     self.memory.buffer,
                     reward=window_training_reward(window),
-                    attention_weights=attention_state.weights,
+                    attention_weights=fuse_weights,
                 )
 
             reward_value = window_reward(window)

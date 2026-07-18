@@ -30,7 +30,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
-from cognitive_runtime.core.streams import TemporalFusion, default_encoder_registry
+from cognitive_runtime.core.streams import StreamSpec, TemporalFusion, default_encoder_registry
 from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
 from cognitive_runtime.programs.minecraft.reward_profile import (
     RewardProfile,
@@ -47,6 +47,20 @@ KNOWN_WORLDS = ("minecraft", "crafter")
 #: output), overridden (caregiver/scripted controls the body), or learned
 #: (the voluntary path, Phase 6, is in charge).
 MOTOR_FREEDOMS = ("frozen", "overridden", "learned")
+
+#: Which ``StreamSpec.modality`` values a declared sense governs (issue
+#: #135): ``"vision"`` covers a Program's ``vision.*``-modality streams
+#: (e.g. ``vision.frame.grid``/``vision.frame.pixels``); ``"proprioception"``
+#: covers ``"spatial"``-modality streams -- ``cognitive_runtime.core.streams
+#: .registry.DEFAULT_STREAM_REGISTRY``'s own note on ``spatial.*`` calls this
+#: out explicitly ("proprioception (the agent's own embodiment)"). Only these
+#: two modalities are sense-gated; body vitals/reward/event streams are not
+#: part of either sense's vocabulary and stay active regardless of which
+#: senses a stage declares (see :func:`sense_stream_mask`).
+SENSE_MODALITIES: Dict[str, tuple] = {
+    "vision": ("vision",),
+    "proprioception": ("spatial",),
+}
 
 #: Metrics :class:`PromotionCriteria` can read off a plain
 #: ``EvaluationSummary`` (the pre-Phase-7 actor/critic eval): the raw
@@ -163,14 +177,19 @@ class CurriculumStageSpec:
     #: Which nursery scenario (``training/nursery.py``'s registry) this
     #: stage trains/evaluates against, e.g. ``"walk_forward"``.
     scenario: Optional[str] = None
-    #: Active sense/stream names for this stage (declarative; Phase 7 does
-    #: not itself gate which streams the runtime feeds the fusion -- that is
-    #: the ladder's job, issue #105).
+    #: Active sense names for this stage, drawn from :data:`SENSE_MODALITIES`
+    #: (issue #135: ``development.runner`` zeroes every stream outside these
+    #: senses' modalities via :func:`sense_stream_mask`, so this is no longer
+    #: a pure label -- an empty tuple, the pre-Phase-7 default, silences
+    #: nothing).
     senses: Sequence[str] = ()
     #: One of :data:`MOTOR_FREEDOMS`; ``None`` keeps the pre-Phase-7 default
     #: (the actor/critic loop always learns its own motor output).
     motor_freedom: Optional[str] = None
-    #: Active loss terms for this stage, e.g. ``("prediction", "action_conditioning")``.
+    #: Active loss terms for this stage, e.g. ``("prediction", "action_conditioning")``
+    #: (issue #135: ``development.ladder``'s milestone-metric helpers now
+    #: require the loss(es) their computation presupposes to be declared here
+    #: -- see ``development.ladder._require_losses``).
     losses: Sequence[str] = ()
     #: Milestone gates (issue #104): when non-empty, promotion requires
     #: *every* gate to pass against the stage's computed metrics, replacing
@@ -201,6 +220,12 @@ class CurriculumStageSpec:
                 f"expected one of {MOTOR_FREEDOMS}"
             )
         self._check_names("senses", self.senses)
+        unknown_senses = sorted(set(self.senses) - set(SENSE_MODALITIES))
+        if unknown_senses:
+            raise ValueError(
+                f"stage {self.name!r}: unknown sense(s) {unknown_senses}; expected a "
+                f"subset of {sorted(SENSE_MODALITIES)}"
+            )
         self._check_names("losses", self.losses)
         gate_metrics = [gate.metric for gate in self.gates]
         if len(set(gate_metrics)) != len(gate_metrics):
@@ -246,6 +271,37 @@ class CurriculumStageSpec:
         from cognitive_runtime.programs.minecraft.rewards import SurvivalRewardConfig
 
         return dataclasses.replace(SurvivalRewardConfig(), **self.reward_config)
+
+
+def sense_stream_mask(senses: Sequence[str], catalog: Sequence[StreamSpec]) -> Dict[str, float]:
+    """Per-stream weight overrides (issue #135) that silence a Program's
+    streams whose modality belongs to a sense's vocabulary (:data:`SENSE_MODALITIES`)
+    but isn't among the declared ``senses`` -- e.g. a Gestation stage
+    declaring only ``senses=("vision",)`` zeroes every ``"spatial"``-modality
+    (proprioceptive) stream's contribution.
+
+    Reuses ``TemporalFusion.fuse``'s existing ``attention_weights`` seam
+    (issue #59): a weight of ``0.0`` scales an encoded stream's slice to all
+    zeros without touching the fusion layout, width, or ``layout_hash`` -- so
+    the one checkpoint/policy carried across every ladder stage (task 3)
+    still sees a fixed-width input regardless of which senses are active.
+
+    An empty ``senses`` (the pre-Phase-7 default, and every legacy
+    non-staged-ontogeny stage) returns an empty mapping: no stream is
+    silenced, exactly the behaviour before this field existed. A non-empty
+    ``senses`` only restricts modalities *governed* by the known sense
+    vocabulary -- body vitals, reward, and event streams are not sense-gated
+    and stay active regardless of which senses a stage declares.
+    """
+    if not senses:
+        return {}
+    allowed_modalities = {modality for sense in senses for modality in SENSE_MODALITIES[sense]}
+    governed_modalities = {modality for modalities in SENSE_MODALITIES.values() for modality in modalities}
+    return {
+        spec.stream_id: 0.0
+        for spec in catalog
+        if spec.modality in governed_modalities and spec.modality not in allowed_modalities
+    }
 
 
 @dataclass(frozen=True)

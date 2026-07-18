@@ -20,6 +20,7 @@ from development.definitions import (
     CurriculumDefinition,
     CurriculumDefinitionError,
     CurriculumStageSpec,
+    PromotionCriteria,
 )
 from development.ladder import GESTATION_TO_FORAGING
 from motor.organism_policy import MotorFreedomPolicy, build_stage_policy
@@ -120,6 +121,51 @@ def test_ladder_validates_via_shared_layout_check():
     from development.definitions import _validate_shared_layout
 
     _validate_shared_layout("development.ladder.GESTATION_TO_FORAGING", GESTATION_TO_FORAGING)
+
+
+# --------------------------------------------------------------------------
+# issue #135: `stage.losses` used to be a label `ladder_milestone_metrics`
+# never consulted -- a stage could gate on `cortex_beats_copy_last`/
+# `action_ablation_margin` regardless of whether it declared the loss those
+# metrics actually train under. `_require_losses` (called by
+# `_cortex_beats_copy_last`/`_action_ablation_margin` before their lazy
+# torch/nursery import) raises instead, torch-free.
+
+def test_beats_copy_last_gate_requires_prediction_loss():
+    from development.ladder import ladder_milestone_metrics
+
+    stage = CurriculumStageSpec(
+        name="gestation-like", world="crafter", scenario="object_permanence",
+        senses=("vision",), motor_freedom="frozen", losses=(),
+        gates=(PromotionCriteria(metric="cortex_beats_copy_last", threshold=1.0),),
+    )
+    with pytest.raises(CurriculumDefinitionError, match="prediction"):
+        ladder_milestone_metrics(stage, summary=None, record_dir="unused")
+
+
+def test_action_ablation_margin_gate_requires_action_conditioning_loss():
+    from development.ladder import ladder_milestone_metrics
+
+    stage = CurriculumStageSpec(
+        name="babbling-like", world="crafter", scenario="turn",
+        senses=("vision", "proprioception"), motor_freedom="overridden", losses=("prediction",),
+        gates=(PromotionCriteria(metric="action_ablation_margin", threshold=1e-4),),
+    )
+    with pytest.raises(CurriculumDefinitionError, match="action_conditioning"):
+        ladder_milestone_metrics(stage, summary=None, record_dir="unused")
+
+
+def test_ladder_stages_declare_losses_their_own_gates_require():
+    """The real ladder table must itself satisfy the same precondition --
+    otherwise Milestone 7's real run would hit this exact error."""
+    from development.ladder import _require_losses
+
+    for stage in GESTATION_TO_FORAGING.stages:
+        gate_metrics = {gate.metric for gate in stage.gates}
+        if "cortex_beats_copy_last" in gate_metrics:
+            _require_losses(stage, "prediction")
+        if "action_ablation_margin" in gate_metrics:
+            _require_losses(stage, "prediction", "action_conditioning")
 
 
 # --------------------------------------------------------------------------

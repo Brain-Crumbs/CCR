@@ -86,6 +86,7 @@ from development.definitions import (
     CurriculumRunResult,
     CurriculumStageSpec,
     CurriculumState,
+    sense_stream_mask,
 )
 from motor.organism_policy import build_stage_policy
 from motor.voluntary import VoluntaryController
@@ -275,6 +276,12 @@ def _run_stage_episodes(
         curriculum=stage.name,
         curriculum_stage_index=stage_index,
         name=name,
+        # issue #135: a stage's declared `senses` used to be a label nobody
+        # consulted -- every stage fused the full stream catalog regardless.
+        # Zeroing the streams outside the declared senses (fixed layout/width,
+        # so the checkpoint carried across stages, task 3, is unaffected)
+        # makes changing `senses` actually change what the organism runs on.
+        sense_stream_weights=sense_stream_mask(stage.senses, program.stream_catalog()) or None,
     )
     recorder = None if record_dir is not None else NullRecorder()
     return CognitiveRuntime(
