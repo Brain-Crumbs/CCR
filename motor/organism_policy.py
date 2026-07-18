@@ -105,7 +105,8 @@ class MotorFreedomPolicy(SingleActionPolicy):
             assert self.scripted is not None
             voluntary_action = _single_action(self.scripted, state, memory, prediction)
             if self.reflexes is None:
-                return voluntary_action
+                caregiver_override = self.caregiver.drain() if self.caregiver is not None else None
+                return caregiver_override.action if caregiver_override is not None else voluntary_action
             caregiver_override = self.caregiver.drain() if self.caregiver is not None else None
             return self.reflexes.decide(voluntary_action, self.stimuli, caregiver_override).actuated
 
