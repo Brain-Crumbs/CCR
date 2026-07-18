@@ -78,7 +78,10 @@ MILESTONE_METRICS = (
     "action_ablation_margin",      # Phase 2 action-conditioning ablation gap (#92)
     "calibrated_surprise_ece",     # Phase 3 Arbiter's calibrated surprise (#95)
     "forgetting_score",            # Phase 5 generative-replay forgetting metric (#99)
-    "reflex_activation_rate",      # Phase 6 reflex-activation-rate metric (#103)
+    "voluntary_reliance_rate",     # Phase 6 reflex-activation-rate metric (#103), inverted +
+                                    # renamed (issue #137) so a higher value/"passing" gate
+                                    # actually means what its name says -- see
+                                    # development.ladder._voluntary_reliance_score.
     "reflex_override_precedence",  # Phase 6 caregiver-override precedence (#102)
 )
 
