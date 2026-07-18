@@ -323,6 +323,27 @@ def _summary_metrics(summary: EvaluationSummary) -> Dict[str, float]:
     }
 
 
+def _eval_sample_size(stage: CurriculumStageSpec) -> int:
+    """How many eval episodes an attempt runs to satisfy this stage's
+    promotion gate(s) (issue #138: the runner used to always take this from
+    ``stage.promotion.sample_size``, ignoring milestone ``gates``' own
+    ``sample_size`` entirely -- a gate declared as an N-episode aggregate
+    silently promoted from whatever the legacy ``promotion`` field happened
+    to carry instead).
+
+    One evaluation pass produces one :class:`EvaluationSummary`/metrics
+    mapping shared by every gate a stage declares, so there is one sample
+    size per attempt, not one per gate -- the largest ``sample_size`` any
+    gate requires, so each gate's own floor is met (running a few extra
+    episodes for a smaller-sample-size gate only strengthens its aggregate).
+    Stages with no ``gates`` keep reading the legacy ``promotion.sample_size``
+    unchanged.
+    """
+    if stage.gates:
+        return max(gate.sample_size for gate in stage.gates)
+    return stage.promotion.sample_size
+
+
 def _evaluate_stage(
     stage: CurriculumStageSpec,
     summary: EvaluationSummary,
@@ -495,7 +516,8 @@ def run_curriculum(
         while True:
             attempt = state.attempts_at_stage
             train_seed_i = _seed_for(train_seed, state.stage_index, attempt, stage.train_episodes)
-            eval_seed_i = _seed_for(eval_seed, state.stage_index, attempt, stage.promotion.sample_size)
+            eval_sample_size = _eval_sample_size(stage)
+            eval_seed_i = _seed_for(eval_seed, state.stage_index, attempt, eval_sample_size)
 
             _run_stage_episodes(
                 stage, policy_model, critic_model, optimizer, action_keys,
@@ -505,7 +527,7 @@ def run_curriculum(
             )
             eval_episodes = _run_stage_episodes(
                 stage, policy_model, critic_model, optimizer, action_keys,
-                stage.promotion.sample_size, eval_seed_i, train=False,
+                eval_sample_size, eval_seed_i, train=False,
                 record_dir=record_dir, session_id=None, stage_index=state.stage_index,
                 name=name, voluntary_controller=voluntary_controller,
             )

@@ -463,9 +463,12 @@ def test_stage_override_out_of_range_raises(tmp_path):
 
 # --------------------------------------------------------------------------
 # Phase 7 (issue #104): milestone-gated promotion, torch-gated (exercises
-# the real train/evaluate loop). ``promotion.sample_size`` still controls
-# how many eval episodes run each attempt; the *gate* decision comes from
-# ``gates`` instead of ``promotion`` whenever a stage declares any.
+# the real train/evaluate loop). A stage with no ``gates`` still takes its
+# eval episode count from ``promotion.sample_size``; a stage that *does*
+# declare ``gates`` instead runs the largest ``sample_size`` any one gate
+# requires (issue #138: the runner used to always read ``promotion
+# .sample_size`` here even when gates replaced promotion for the pass/hold
+# decision, so a gate's own, possibly larger, sample_size had no effect).
 
 def _gated_stage(name: str, gates, **overrides) -> dict:
     stage = _stage(name, promotion={"metric": "average_ticks", "threshold": 0.0, "sample_size": 1})
@@ -554,3 +557,58 @@ def test_milestone_gate_without_a_metrics_provider_raises_a_clear_error(tmp_path
 
     with pytest.raises(CurriculumDefinitionError, match="cortex_beats_copy_last"):
         run_curriculum(definition, checkpoint_path=checkpoint_path, record_dir=None)
+
+
+def test_milestone_gate_sample_size_controls_eval_episode_count(tmp_path):
+    """issue #138's reproduction, verbatim: a milestone gate declares
+    ``sample_size=5`` while the stage's legacy ``promotion`` (irrelevant to
+    the actual pass/hold decision once ``gates`` is set, but still present on
+    every stage) carries ``sample_size=1``. The runner must evaluate 5
+    episodes -- the gate's own requirement -- not silently fall back to 1."""
+    definition = curriculum_definition_from_dict({
+        "name": "gate-sample-size",
+        "stages": [_gated_stage("crawling", gates=[
+            {"metric": "cortex_beats_copy_last", "threshold": 0.0, "sample_size": 5},
+        ])],
+    })
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+    seen_episode_counts = []
+
+    def milestone_metrics(stage, summary):
+        seen_episode_counts.append(len(summary.termination_reasons))
+        return {"cortex_beats_copy_last": 1.0}
+
+    result = run_curriculum(
+        definition, checkpoint_path=checkpoint_path, record_dir=None,
+        milestone_metrics=milestone_metrics,
+    )
+
+    assert result.status == "completed"
+    assert seen_episode_counts == [5]
+
+
+def test_milestone_gate_sample_size_takes_the_max_across_gates(tmp_path):
+    """Two gates on one stage with different ``sample_size`` share a single
+    evaluation pass -- the runner must satisfy the larger of the two, not
+    just the first-declared gate's requirement."""
+    definition = curriculum_definition_from_dict({
+        "name": "gate-sample-size-max",
+        "stages": [_gated_stage("crawling", gates=[
+            {"metric": "average_ticks", "threshold": 0.0, "sample_size": 2},
+            {"metric": "cortex_beats_copy_last", "threshold": 0.0, "sample_size": 4},
+        ])],
+    })
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+    seen_episode_counts = []
+
+    def milestone_metrics(stage, summary):
+        seen_episode_counts.append(len(summary.termination_reasons))
+        return {"cortex_beats_copy_last": 1.0}
+
+    result = run_curriculum(
+        definition, checkpoint_path=checkpoint_path, record_dir=None,
+        milestone_metrics=milestone_metrics,
+    )
+
+    assert result.status == "completed"
+    assert seen_episode_counts == [4]
