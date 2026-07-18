@@ -769,3 +769,27 @@ def test_ladder_flag_runs_the_real_ladder_with_gates_auto_attached(tmp_path, mon
     cortex_checkpoint = checkpoint_path + ".ladder-visual-cortex.pt"
     assert os.path.exists(cortex_checkpoint), "the real gate must persist its cortex checkpoint"
     assert meta["extra"]["ladder_world_model_checkpoints"] == [cortex_checkpoint]
+
+
+def test_ladder_flag_gives_a_cli_appropriate_error_on_a_learned_stage(tmp_path):
+    """PR #161 review: Objects/Foraging need a real Phase 6 voluntary
+    controller that --ladder has no flag to supply. development.runner's own
+    error tells a caller to 'pass one via run_curriculum(...)', which isn't
+    something a CLI user can do -- cmd_curriculum_run must augment that
+    message with CLI-appropriate context instead of surfacing Python-call
+    advice verbatim."""
+    from cognitive_runtime.cli import build_parser, cmd_curriculum_run
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "curriculum-run", "--ladder", "--fresh", "--stage", "3",
+        "--checkpoint", str(tmp_path / "curriculum.pt"),
+        "--record-dir", str(tmp_path / "sessions"),
+    ])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_curriculum_run(args)
+
+    message = str(exc_info.value)
+    assert "voluntary_controller factory" in message  # the underlying error, unchanged
+    assert "--ladder has no flag yet" in message  # this PR's added CLI context

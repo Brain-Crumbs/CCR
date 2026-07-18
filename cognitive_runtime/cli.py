@@ -1947,6 +1947,13 @@ def cmd_curriculum_run(args: argparse.Namespace) -> None:
     before this, the only way to invoke that ladder with working gates was a
     custom Python call that partially applied the provider itself; nothing
     on the CLI surface exposed the ladder or wired its milestone metrics up.
+
+    A run that reaches Objects or Foraging (``motor_freedom="learned"``)
+    stops there with a clear error: those stages need a real Phase 6
+    voluntary controller (MPC-over-cortex or an alternative), which needs a
+    trained predictive cortex and has no ``--ladder`` flag to supply one yet
+    (PR #161 review; tracked separately). Milestone 7's own acceptance bar
+    -- Gestation, Babbling, Crawling -- doesn't need one.
     """
     try:
         from development.definitions import CurriculumDefinitionError
@@ -1996,7 +2003,25 @@ def cmd_curriculum_run(args: argparse.Namespace) -> None:
             world_model_checkpoint_paths=world_model_checkpoint_paths,
         )
     except (CurriculumDefinitionError, ValueError) as exc:
-        sys.exit(str(exc))
+        message = str(exc)
+        if args.ladder and "voluntary_controller factory" in message:
+            # PR #161 review: the ladder's Objects/Foraging stages declare
+            # motor_freedom="learned" and need a real Phase 6 voluntary
+            # controller (MPC-over-cortex or an alternative), which needs a
+            # trained predictive cortex development.runner does not build on
+            # its own -- and which --ladder has no flag to supply yet. The
+            # underlying error's "pass one via run_curriculum(...)" is
+            # Python-call advice that doesn't map to any flag on this CLI
+            # surface, so a --ladder user would otherwise be told to do
+            # something they have no way to do here.
+            message += (
+                "\n\n--ladder has no flag yet to supply a voluntary controller for "
+                "Objects/Foraging; a run that reaches either of them from the CLI "
+                "will stop here until that wiring is added (tracked separately -- "
+                "see issue #103's real Phase 6 controllers). Gestation, Babbling, "
+                "and Crawling (Milestone 7's own acceptance bar) don't need one."
+            )
+        sys.exit(message)
 
     print(f"curriculum: {definition.name}  ({'resumed' if result.resumed else 'fresh start'})")
     print(f"status: {result.status}")
@@ -2256,7 +2281,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="run the built-in Gestation->Foraging ladder (issue #105) instead of "
              "--curriculum-file, with its real Phase 2-6 milestone gates "
              "auto-attached (issue #139); needs session recording (no --no-record) "
-             "since the gates train/evaluate against the recorded sessions",
+             "since the gates train/evaluate against the recorded sessions. Stops "
+             "with a clear error on reaching Objects/Foraging: those "
+             "motor_freedom='learned' stages need a real Phase 6 voluntary "
+             "controller this flag can't supply yet -- Milestone 7's own bar "
+             "(Gestation/Babbling/Crawling) doesn't need one",
     )
     p_curriculum_run.add_argument(
         "--checkpoint", required=True,
