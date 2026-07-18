@@ -463,9 +463,12 @@ def test_stage_override_out_of_range_raises(tmp_path):
 
 # --------------------------------------------------------------------------
 # Phase 7 (issue #104): milestone-gated promotion, torch-gated (exercises
-# the real train/evaluate loop). ``promotion.sample_size`` still controls
-# how many eval episodes run each attempt; the *gate* decision comes from
-# ``gates`` instead of ``promotion`` whenever a stage declares any.
+# the real train/evaluate loop). A stage with no ``gates`` still takes its
+# eval episode count from ``promotion.sample_size``; a stage that *does*
+# declare ``gates`` instead runs the largest ``sample_size`` any one gate
+# requires (issue #138: the runner used to always read ``promotion
+# .sample_size`` here even when gates replaced promotion for the pass/hold
+# decision, so a gate's own, possibly larger, sample_size had no effect).
 
 def _gated_stage(name: str, gates, **overrides) -> dict:
     stage = _stage(name, promotion={"metric": "average_ticks", "threshold": 0.0, "sample_size": 1})
@@ -554,3 +557,106 @@ def test_milestone_gate_without_a_metrics_provider_raises_a_clear_error(tmp_path
 
     with pytest.raises(CurriculumDefinitionError, match="cortex_beats_copy_last"):
         run_curriculum(definition, checkpoint_path=checkpoint_path, record_dir=None)
+
+
+def test_milestone_gate_sample_size_controls_eval_episode_count(tmp_path):
+    """issue #138's reproduction, verbatim: a milestone gate declares
+    ``sample_size=5`` while the stage's legacy ``promotion`` (irrelevant to
+    the actual pass/hold decision once ``gates`` is set, but still present on
+    every stage) carries ``sample_size=1``. The runner must evaluate 5
+    episodes -- the gate's own requirement -- not silently fall back to 1."""
+    definition = curriculum_definition_from_dict({
+        "name": "gate-sample-size",
+        "stages": [_gated_stage("crawling", gates=[
+            {"metric": "cortex_beats_copy_last", "threshold": 0.0, "sample_size": 5},
+        ])],
+    })
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+    seen_episode_counts = []
+
+    def milestone_metrics(stage, summary):
+        seen_episode_counts.append(len(summary.termination_reasons))
+        return {"cortex_beats_copy_last": 1.0}
+
+    result = run_curriculum(
+        definition, checkpoint_path=checkpoint_path, record_dir=None,
+        milestone_metrics=milestone_metrics,
+    )
+
+    assert result.status == "completed"
+    assert seen_episode_counts == [5]
+
+
+def test_milestone_gate_sample_size_takes_the_max_across_gates(tmp_path):
+    """Two gates on one stage with different ``sample_size`` share a single
+    evaluation pass -- the runner must satisfy the larger of the two, not
+    just the first-declared gate's requirement."""
+    definition = curriculum_definition_from_dict({
+        "name": "gate-sample-size-max",
+        "stages": [_gated_stage("crawling", gates=[
+            {"metric": "average_ticks", "threshold": 0.0, "sample_size": 2},
+            {"metric": "cortex_beats_copy_last", "threshold": 0.0, "sample_size": 4},
+        ])],
+    })
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+    seen_episode_counts = []
+
+    def milestone_metrics(stage, summary):
+        seen_episode_counts.append(len(summary.termination_reasons))
+        return {"cortex_beats_copy_last": 1.0}
+
+    result = run_curriculum(
+        definition, checkpoint_path=checkpoint_path, record_dir=None,
+        milestone_metrics=milestone_metrics,
+    )
+
+    assert result.status == "completed"
+    assert seen_episode_counts == [4]
+
+
+def test_eval_seed_stride_keeps_at_least_the_legacy_promotion_sample_size(tmp_path, monkeypatch):
+    """PR #159 review: a checkpoint progressed under the pre-#138 runner
+    always used ``promotion.sample_size`` as *both* the eval episode count
+    and the per-attempt seed stride, so its recorded attempts occupy
+    contiguous ``promotion.sample_size``-wide seed blocks. If a stage's gate
+    ``sample_size`` is smaller than that, the stride must still stay at
+    least as large as ``promotion.sample_size`` -- shrinking it would let a
+    resumed attempt replay a seed an earlier attempt already evaluated on,
+    breaking ``_seed_for``'s non-colliding-retry contract."""
+    import development.runner as runner_module
+
+    seen_eval_seeds = []
+    real_run_stage_episodes = runner_module._run_stage_episodes
+
+    def spy_eval(*args, **kwargs):
+        # positional signature: (stage, policy_model, critic_model, optimizer,
+        # action_keys, episodes, seed, *, train, ...)
+        episodes, seed, train = args[5], args[6], kwargs["train"]
+        if not train:
+            seen_eval_seeds.append((seed, episodes))
+        return real_run_stage_episodes(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "_run_stage_episodes", spy_eval)
+
+    definition = curriculum_definition_from_dict({
+        "name": "gate-sample-size-stride",
+        "stages": [_gated_stage(
+            "crawling",
+            gates=[{"metric": "average_ticks", "threshold": 1_000_000.0, "sample_size": 1}],
+            promotion={"metric": "average_ticks", "threshold": 0.0, "sample_size": 3},
+            max_attempts=2,
+        )],
+    })
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+
+    result = run_curriculum(definition, checkpoint_path=checkpoint_path, record_dir=None)
+
+    assert result.status == "held"
+    assert len(seen_eval_seeds) == 2
+    (seed_0, episodes_0), (seed_1, episodes_1) = seen_eval_seeds
+    assert episodes_0 == episodes_1 == 1  # the gate's own sample_size
+    # The stride between attempts must be >= the legacy promotion sample
+    # size (3), not the gate's smaller sample_size (1): a resumed old-code
+    # checkpoint's attempt 0 would have consumed seeds [seed_0, seed_0+2].
+    assert seed_1 - seed_0 >= 3
+    assert seed_1 > seed_0 + episodes_0 - 1  # no overlap with attempt 0's episode(s)

@@ -323,6 +323,44 @@ def _summary_metrics(summary: EvaluationSummary) -> Dict[str, float]:
     }
 
 
+def _eval_sample_size(stage: CurriculumStageSpec) -> int:
+    """How many eval episodes an attempt runs to satisfy this stage's
+    promotion gate(s) (issue #138: the runner used to always take this from
+    ``stage.promotion.sample_size``, ignoring milestone ``gates``' own
+    ``sample_size`` entirely -- a gate declared as an N-episode aggregate
+    silently promoted from whatever the legacy ``promotion`` field happened
+    to carry instead).
+
+    One evaluation pass produces one :class:`EvaluationSummary`/metrics
+    mapping shared by every gate a stage declares, so there is one sample
+    size per attempt, not one per gate -- the largest ``sample_size`` any
+    gate requires, so each gate's own floor is met (running a few extra
+    episodes for a smaller-sample-size gate only strengthens its aggregate).
+    Stages with no ``gates`` keep reading the legacy ``promotion.sample_size``
+    unchanged.
+    """
+    if stage.gates:
+        return max(gate.sample_size for gate in stage.gates)
+    return stage.promotion.sample_size
+
+
+def _eval_seed_stride(stage: CurriculumStageSpec) -> int:
+    """The ``unit`` :func:`_seed_for` spaces attempts by for this stage's
+    eval pass -- at least ``stage.promotion.sample_size`` even when
+    :func:`_eval_sample_size` (the actual episode count) is smaller (PR #159
+    review): a checkpoint progressed under the pre-#138 runner has already
+    consumed seeds in contiguous ``promotion.sample_size``-wide blocks per
+    attempt (that was the *only* stride the old code ever used). Shrinking
+    the stride to match a smaller gate ``sample_size`` after upgrading would
+    let a resumed attempt replay a seed an earlier attempt already evaluated
+    on, violating :func:`_seed_for`'s non-colliding-retry contract. Since the
+    new stride is always >= the old one, each attempt's new block starts at
+    or past where every prior attempt's old-stride block ended, regardless
+    of how many attempts ran before the upgrade.
+    """
+    return max(_eval_sample_size(stage), stage.promotion.sample_size)
+
+
 def _evaluate_stage(
     stage: CurriculumStageSpec,
     summary: EvaluationSummary,
@@ -495,7 +533,8 @@ def run_curriculum(
         while True:
             attempt = state.attempts_at_stage
             train_seed_i = _seed_for(train_seed, state.stage_index, attempt, stage.train_episodes)
-            eval_seed_i = _seed_for(eval_seed, state.stage_index, attempt, stage.promotion.sample_size)
+            eval_sample_size = _eval_sample_size(stage)
+            eval_seed_i = _seed_for(eval_seed, state.stage_index, attempt, _eval_seed_stride(stage))
 
             _run_stage_episodes(
                 stage, policy_model, critic_model, optimizer, action_keys,
@@ -505,7 +544,7 @@ def run_curriculum(
             )
             eval_episodes = _run_stage_episodes(
                 stage, policy_model, critic_model, optimizer, action_keys,
-                stage.promotion.sample_size, eval_seed_i, train=False,
+                eval_sample_size, eval_seed_i, train=False,
                 record_dir=record_dir, session_id=None, stage_index=state.stage_index,
                 name=name, voluntary_controller=voluntary_controller,
             )
