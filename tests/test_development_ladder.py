@@ -243,6 +243,36 @@ def test_learned_reflex_can_still_override_the_voluntary_choice():
     assert policy.decide(None, None, None) == Action("BACK")
 
 
+def test_motor_policy_accepts_fresh_world_stimuli_each_tick_and_resets_reflex_metrics():
+    voluntary = CallableController("stub", lambda state, actions, goal: Action("FORWARD"))
+    reflexes = _reflex_stack()
+    policy = build_stage_policy(
+        GESTATION_TO_FORAGING.stages[3], _ACTIONS,
+        voluntary=voluntary, reflexes=reflexes,
+    )
+
+    assert policy.decide(None, None, None) == Action("FORWARD")
+    policy.update_runtime_stimuli(None, threat=1.0)
+    assert policy.decide(None, None, None) == Action("BACK")
+    policy.update_runtime_stimuli(None, threat=0.0)
+    assert policy.decide(None, None, None) == Action("FORWARD")
+    assert reflexes.metrics()["motor.ticks"] == 3
+
+    policy.reset()
+    assert reflexes.metrics()["motor.ticks"] == 0
+
+
+def test_ladder_cortex_vocabulary_uses_every_crafter_action_across_stages():
+    from cognitive_runtime.programs.crafter.actions import ACTION_SPACE
+    from cognitive_runtime.training.nursery import _action_keys_for_world
+
+    expected = [action.key() for action in ACTION_SPACE]
+    assert _action_keys_for_world("crafter") == expected
+    # Babbling's turn and Crawling's walk recordings may exercise different
+    # subsets, but both now build checkpoints with these actions present.
+    assert {"MOVE_LEFT", "MOVE_RIGHT", "MOVE_UP", "MOVE_DOWN"} <= set(expected)
+
+
 def test_learned_requires_a_voluntary_controller():
     with pytest.raises(ValueError, match="learned"):
         build_stage_policy(GESTATION_TO_FORAGING.stages[3], _ACTIONS)

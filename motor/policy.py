@@ -49,8 +49,27 @@ def _encode_goal(cortex: Any, goal: Any) -> torch.Tensor:
     CPU round-trip, so a CUDA-resident goal encodes on-device."""
     if not isinstance(goal, torch.Tensor):
         raise ValueError("active-inference goal must be a tensor (pixel frame or latent)")
-    if goal.dim() <= 2 and goal.shape[-1] == cortex.latent_width:
-        return goal.reshape(1, -1)
+    if goal.dim() == 0:
+        raise ValueError("active-inference goal must be at least 1D, got a scalar tensor")
+    if goal.dim() == 1:
+        if goal.shape[0] != cortex.latent_width:
+            raise ValueError(
+                "active-inference latent goal width must match cortex.latent_width "
+                f"({cortex.latent_width}), got {goal.shape[0]}"
+            )
+        return goal.unsqueeze(0)
+    if goal.dim() == 2 and goal.shape[-1] == cortex.latent_width:
+        if goal.shape[0] != 1:
+            raise ValueError(
+                "active-inference controller accepts one latent goal at a time; "
+                f"got batch shape {tuple(goal.shape)}"
+            )
+        return goal
+    if goal.dim() != 3:
+        raise ValueError(
+            "active-inference pixel goal must have H x W x C shape; "
+            f"got {tuple(goal.shape)}"
+        )
     with torch.no_grad():
         chw = goal.permute(2, 0, 1).float() / 255.0
         return cortex.encoder(chw.unsqueeze(0))
@@ -124,7 +143,8 @@ class ImaginationActor(torch.nn.Module):
         by :func:`build_imagination_controller`; never mutates weights."""
         with torch.no_grad():
             logits = self.actor(latent)
-            return int(torch.argmax(logits[0]).item())
+            action_logits = logits if logits.dim() == 1 else logits[0]
+            return int(torch.argmax(action_logits).item())
 
     def train_on_dream(
         self,
