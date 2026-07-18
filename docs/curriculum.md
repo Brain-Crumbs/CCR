@@ -271,7 +271,8 @@ stages:
   `average_ticks`, `total_reward`, `total_ticks`, `survival_rate`) or a
   Phase 2-6 milestone metric (`cortex_beats_copy_last`,
   `action_ablation_margin`, `calibrated_surprise_ece`, `forgetting_score`,
-  `voluntary_reliance_rate`, `reflex_override_precedence`). A stage's
+  `reflex_activation_rate`, `voluntary_reliance_rate`, `reflex_override_precedence`).
+  A stage's
   `promotion.sample_size` still controls how many eval episodes each attempt
   runs; milestone metrics beyond the built-in evaluation-episode ones need a
   `milestone_metrics` callable passed to `run_curriculum(...)` that computes
