@@ -18,7 +18,7 @@ import argparse
 import dataclasses
 import os
 import sys
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from cognitive_runtime.core.attention import ATTENTION_MODES
 from cognitive_runtime.core.orienting_reflex import REFLEX_MODES
@@ -1938,20 +1938,47 @@ def cmd_evaluation_gates(args: argparse.Namespace) -> None:
 def cmd_curriculum_run(args: argparse.Namespace) -> None:
     """The curriculum runner (issue #43): train/evaluate/promote (or hold) an
     actor/critic checkpoint through an ordered list of staged world/reward
-    configs, unattended. See docs/curriculum.md for the definition schema."""
+    configs, unattended. See docs/curriculum.md for the definition schema.
+
+    ``--ladder`` (issue #139) runs the built-in Gestation->Foraging ladder
+    (``development.ladder.GESTATION_TO_FORAGING``) instead of a
+    ``--curriculum-file``, with its real Phase 2-6 milestone gates
+    auto-attached via ``development.ladder.ladder_milestone_metrics`` --
+    before this, the only way to invoke that ladder with working gates was a
+    custom Python call that partially applied the provider itself; nothing
+    on the CLI surface exposed the ladder or wired its milestone metrics up.
+    """
     try:
-        from cognitive_runtime.training.curriculum_runner import (
-            CurriculumDefinitionError,
-            load_curriculum_definition,
-            run_curriculum,
-        )
+        from development.definitions import CurriculumDefinitionError
+        from development.runner import run_curriculum
     except ImportError as exc:  # torch not installed
         sys.exit(f"the curriculum runner needs PyTorch ({exc}); install '.[neural]'.")
 
-    try:
-        definition = load_curriculum_definition(args.curriculum_file)
-    except CurriculumDefinitionError as exc:
-        sys.exit(str(exc))
+    milestone_metrics = None
+    world_model_checkpoint_paths: Sequence[str] = ()
+    if args.ladder:
+        import functools
+
+        from development.ladder import (
+            GESTATION_TO_FORAGING,
+            ladder_cortex_checkpoint_paths,
+            ladder_milestone_metrics,
+        )
+
+        if args.no_record:
+            sys.exit("--ladder needs session recording for its milestone metrics; drop --no-record.")
+        definition = GESTATION_TO_FORAGING
+        milestone_metrics = functools.partial(
+            ladder_milestone_metrics, record_dir=args.record_dir, cortex_checkpoint_base=args.checkpoint,
+        )
+        world_model_checkpoint_paths = tuple(ladder_cortex_checkpoint_paths(args.checkpoint).values())
+    else:
+        from development.definitions import load_curriculum_definition
+
+        try:
+            definition = load_curriculum_definition(args.curriculum_file)
+        except CurriculumDefinitionError as exc:
+            sys.exit(str(exc))
 
     try:
         result = run_curriculum(
@@ -1965,6 +1992,8 @@ def cmd_curriculum_run(args: argparse.Namespace) -> None:
             fresh=args.fresh,
             record_dir=None if args.no_record else args.record_dir,
             name=args.name,
+            milestone_metrics=milestone_metrics,
+            world_model_checkpoint_paths=world_model_checkpoint_paths,
         )
     except (CurriculumDefinitionError, ValueError) as exc:
         sys.exit(str(exc))
@@ -2219,7 +2248,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_curriculum_run.add_argument(
         "--curriculum-file", default="goals/curricula/toy_two_stage.yaml",
         help="curriculum definition YAML/JSON: ordered stages, each a world/reward "
-             "config plus promotion criteria (docs/curriculum.md)",
+             "config plus promotion criteria (docs/curriculum.md); ignored with "
+             "--ladder",
+    )
+    p_curriculum_run.add_argument(
+        "--ladder", action="store_true",
+        help="run the built-in Gestation->Foraging ladder (issue #105) instead of "
+             "--curriculum-file, with its real Phase 2-6 milestone gates "
+             "auto-attached (issue #139); needs session recording (no --no-record) "
+             "since the gates train/evaluate against the recorded sessions",
     )
     p_curriculum_run.add_argument(
         "--checkpoint", required=True,
