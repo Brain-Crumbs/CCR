@@ -223,6 +223,35 @@ def test_overridden_caregiver_override_takes_precedence_when_injected():
     assert policy.decide(None, None, None) == Action("BACK")
 
 
+def test_overridden_caregiver_override_still_wins_with_no_reflex_stack():
+    """Issue #140 (BB-109-11): with ``reflexes=None`` the ``decide()``
+    method used to return the scripted action directly, never draining
+    ``self.caregiver`` -- an injected override was silently dropped instead
+    of outranking the scripted policy, breaking "caregiver always wins"."""
+    from cognitive_runtime.policies.constant_action import ConstantActionPolicy
+
+    channel = CaregiverChannel()
+    policy = build_stage_policy(
+        GESTATION_TO_FORAGING.stages[1], _ACTIONS,
+        scripted=ConstantActionPolicy(Action("FORWARD")),
+        caregiver=channel,
+    )
+    channel.inject(Action("GUIDED"), reason="babbling")
+    assert policy.decide(None, None, None) == Action("GUIDED")
+    # One-shot: drained, so the next tick falls back to the scripted action.
+    assert policy.decide(None, None, None) == Action("FORWARD")
+
+
+def test_overridden_falls_back_to_scripted_with_no_reflex_stack_and_nothing_injected():
+    from cognitive_runtime.policies.constant_action import ConstantActionPolicy
+
+    policy = build_stage_policy(
+        GESTATION_TO_FORAGING.stages[1], _ACTIONS,
+        scripted=ConstantActionPolicy(Action("FORWARD")), caregiver=CaregiverChannel(),
+    )
+    assert policy.decide(None, None, None) == Action("FORWARD")
+
+
 def test_overridden_requires_a_scripted_policy():
     with pytest.raises(ValueError, match="overridden"):
         build_stage_policy(GESTATION_TO_FORAGING.stages[1], _ACTIONS)
