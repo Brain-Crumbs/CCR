@@ -18,7 +18,7 @@ import argparse
 import dataclasses
 import os
 import sys
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from cognitive_runtime.core.attention import ATTENTION_MODES
 from cognitive_runtime.core.orienting_reflex import REFLEX_MODES
@@ -1938,20 +1938,54 @@ def cmd_evaluation_gates(args: argparse.Namespace) -> None:
 def cmd_curriculum_run(args: argparse.Namespace) -> None:
     """The curriculum runner (issue #43): train/evaluate/promote (or hold) an
     actor/critic checkpoint through an ordered list of staged world/reward
-    configs, unattended. See docs/curriculum.md for the definition schema."""
+    configs, unattended. See docs/curriculum.md for the definition schema.
+
+    ``--ladder`` (issue #139) runs the built-in Gestation->Foraging ladder
+    (``development.ladder.GESTATION_TO_FORAGING``) instead of a
+    ``--curriculum-file``, with its real Phase 2-6 milestone gates
+    auto-attached via ``development.ladder.ladder_milestone_metrics`` --
+    before this, the only way to invoke that ladder with working gates was a
+    custom Python call that partially applied the provider itself; nothing
+    on the CLI surface exposed the ladder or wired its milestone metrics up.
+
+    A run that reaches Objects or Foraging (``motor_freedom="learned"``)
+    stops there with a clear error: those stages need a real Phase 6
+    voluntary controller (MPC-over-cortex or an alternative), which needs a
+    trained predictive cortex and has no ``--ladder`` flag to supply one yet
+    (PR #161 review; tracked separately). Milestone 7's own acceptance bar
+    -- Gestation, Babbling, Crawling -- doesn't need one.
+    """
     try:
-        from cognitive_runtime.training.curriculum_runner import (
-            CurriculumDefinitionError,
-            load_curriculum_definition,
-            run_curriculum,
-        )
+        from development.definitions import CurriculumDefinitionError
+        from development.runner import run_curriculum
     except ImportError as exc:  # torch not installed
         sys.exit(f"the curriculum runner needs PyTorch ({exc}); install '.[neural]'.")
 
-    try:
-        definition = load_curriculum_definition(args.curriculum_file)
-    except CurriculumDefinitionError as exc:
-        sys.exit(str(exc))
+    milestone_metrics = None
+    world_model_checkpoint_paths: Sequence[str] = ()
+    if args.ladder:
+        import functools
+
+        from development.ladder import (
+            GESTATION_TO_FORAGING,
+            ladder_cortex_checkpoint_paths,
+            ladder_milestone_metrics,
+        )
+
+        if args.no_record:
+            sys.exit("--ladder needs session recording for its milestone metrics; drop --no-record.")
+        definition = GESTATION_TO_FORAGING
+        milestone_metrics = functools.partial(
+            ladder_milestone_metrics, record_dir=args.record_dir, cortex_checkpoint_base=args.checkpoint,
+        )
+        world_model_checkpoint_paths = tuple(ladder_cortex_checkpoint_paths(args.checkpoint).values())
+    else:
+        from development.definitions import load_curriculum_definition
+
+        try:
+            definition = load_curriculum_definition(args.curriculum_file)
+        except CurriculumDefinitionError as exc:
+            sys.exit(str(exc))
 
     try:
         result = run_curriculum(
@@ -1965,9 +1999,29 @@ def cmd_curriculum_run(args: argparse.Namespace) -> None:
             fresh=args.fresh,
             record_dir=None if args.no_record else args.record_dir,
             name=args.name,
+            milestone_metrics=milestone_metrics,
+            world_model_checkpoint_paths=world_model_checkpoint_paths,
         )
     except (CurriculumDefinitionError, ValueError) as exc:
-        sys.exit(str(exc))
+        message = str(exc)
+        if args.ladder and "voluntary_controller factory" in message:
+            # PR #161 review: the ladder's Objects/Foraging stages declare
+            # motor_freedom="learned" and need a real Phase 6 voluntary
+            # controller (MPC-over-cortex or an alternative), which needs a
+            # trained predictive cortex development.runner does not build on
+            # its own -- and which --ladder has no flag to supply yet. The
+            # underlying error's "pass one via run_curriculum(...)" is
+            # Python-call advice that doesn't map to any flag on this CLI
+            # surface, so a --ladder user would otherwise be told to do
+            # something they have no way to do here.
+            message += (
+                "\n\n--ladder has no flag yet to supply a voluntary controller for "
+                "Objects/Foraging; a run that reaches either of them from the CLI "
+                "will stop here until that wiring is added (tracked separately -- "
+                "see issue #103's real Phase 6 controllers). Gestation, Babbling, "
+                "and Crawling (Milestone 7's own acceptance bar) don't need one."
+            )
+        sys.exit(message)
 
     print(f"curriculum: {definition.name}  ({'resumed' if result.resumed else 'fresh start'})")
     print(f"status: {result.status}")
@@ -2219,7 +2273,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_curriculum_run.add_argument(
         "--curriculum-file", default="goals/curricula/toy_two_stage.yaml",
         help="curriculum definition YAML/JSON: ordered stages, each a world/reward "
-             "config plus promotion criteria (docs/curriculum.md)",
+             "config plus promotion criteria (docs/curriculum.md); ignored with "
+             "--ladder",
+    )
+    p_curriculum_run.add_argument(
+        "--ladder", action="store_true",
+        help="run the built-in Gestation->Foraging ladder (issue #105) instead of "
+             "--curriculum-file, with its real Phase 2-6 milestone gates "
+             "auto-attached (issue #139); needs session recording (no --no-record) "
+             "since the gates train/evaluate against the recorded sessions. Stops "
+             "with a clear error on reaching Objects/Foraging: those "
+             "motor_freedom='learned' stages need a real Phase 6 voluntary "
+             "controller this flag can't supply yet -- Milestone 7's own bar "
+             "(Gestation/Babbling/Crawling) doesn't need one",
     )
     p_curriculum_run.add_argument(
         "--checkpoint", required=True,

@@ -696,3 +696,100 @@ def test_learned_stage_runs_under_a_supplied_voluntary_controller(tmp_path, monk
 
     assert result.status == "completed"
     assert not ac_policy_calls, "learned objects stage must not construct an ActorCriticPolicy"
+
+
+# --------------------------------------------------------------------------
+# issue #139: the CLI's `curriculum-run --ladder` surface, which is supposed
+# to be the one supported way to invoke this ladder with its real gates
+# auto-attached (previously only reachable via a custom Python call that
+# partially applied ladder_milestone_metrics itself).
+
+def test_curriculum_run_parser_accepts_ladder_flag():
+    from cognitive_runtime.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "curriculum-run", "--ladder", "--checkpoint", "/tmp/does-not-matter.pt",
+    ])
+    assert args.ladder is True
+    assert args.func.__name__ == "cmd_curriculum_run"
+
+
+def test_ladder_flag_rejects_no_record(tmp_path):
+    """The ladder's real gates train/evaluate against recorded sessions
+    (``ladder_milestone_metrics``'s own ``record_dir`` requirement) -- unlike
+    the plain curriculum-run path, ``--no-record`` can't be honored."""
+    from cognitive_runtime.cli import build_parser, cmd_curriculum_run
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "curriculum-run", "--ladder", "--no-record",
+        "--checkpoint", str(tmp_path / "curriculum.pt"),
+    ])
+    with pytest.raises(SystemExit, match="no-record"):
+        cmd_curriculum_run(args)
+
+
+def test_ladder_flag_runs_the_real_ladder_with_gates_auto_attached(tmp_path, monkeypatch):
+    """The bug's own reproduction: before this, the only way to run
+    ``GESTATION_TO_FORAGING`` with working milestone gates was a custom
+    Python call manually supplying a partially-applied provider and record
+    dir; nothing on the CLI surface exposed the ladder or wired that up.
+    Scoped to Gestation alone (the ladder's own first stage, one real gate,
+    no cortex-checkpoint shared with a later stage) so this proves the CLI
+    wiring genuinely drives the real ``ladder_milestone_metrics`` end to end
+    without also depending on multi-stage cortex-checkpoint reuse working."""
+    import development.ladder as ladder_module
+    from cognitive_runtime.cli import build_parser, cmd_curriculum_run
+
+    gestation_only = CurriculumDefinition(
+        name="gestation-only", stages=(GESTATION_TO_FORAGING.stages[0],),
+    )
+    monkeypatch.setattr(ladder_module, "GESTATION_TO_FORAGING", gestation_only)
+
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+    record_dir = str(tmp_path / "sessions")
+    parser = build_parser()
+    args = parser.parse_args([
+        "curriculum-run", "--ladder",
+        "--checkpoint", checkpoint_path,
+        "--record-dir", record_dir,
+    ])
+
+    cmd_curriculum_run(args)  # must not raise/sys.exit
+
+    meta = read_checkpoint_metadata(checkpoint_path)
+    curriculum_stats = meta["training_stats"]["curriculum"]
+    assert curriculum_stats["definition_name"] == "gestation-only"
+    entry = curriculum_stats["history"][0]
+    assert entry["metric"] == ["cortex_beats_copy_last"]
+    # The real gate actually ran (not a stub): its value is 0.0 or 1.0 per
+    # _cortex_beats_copy_last's own encoding, never an unset/missing metric.
+    assert entry["value"]["cortex_beats_copy_last"] in (0.0, 1.0)
+    cortex_checkpoint = checkpoint_path + ".ladder-visual-cortex.pt"
+    assert os.path.exists(cortex_checkpoint), "the real gate must persist its cortex checkpoint"
+    assert meta["extra"]["ladder_world_model_checkpoints"] == [cortex_checkpoint]
+
+
+def test_ladder_flag_gives_a_cli_appropriate_error_on_a_learned_stage(tmp_path):
+    """PR #161 review: Objects/Foraging need a real Phase 6 voluntary
+    controller that --ladder has no flag to supply. development.runner's own
+    error tells a caller to 'pass one via run_curriculum(...)', which isn't
+    something a CLI user can do -- cmd_curriculum_run must augment that
+    message with CLI-appropriate context instead of surfacing Python-call
+    advice verbatim."""
+    from cognitive_runtime.cli import build_parser, cmd_curriculum_run
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "curriculum-run", "--ladder", "--fresh", "--stage", "3",
+        "--checkpoint", str(tmp_path / "curriculum.pt"),
+        "--record-dir", str(tmp_path / "sessions"),
+    ])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cmd_curriculum_run(args)
+
+    message = str(exc_info.value)
+    assert "voluntary_controller factory" in message  # the underlying error, unchanged
+    assert "--ladder has no flag yet" in message  # this PR's added CLI context
