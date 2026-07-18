@@ -344,6 +344,23 @@ def _eval_sample_size(stage: CurriculumStageSpec) -> int:
     return stage.promotion.sample_size
 
 
+def _eval_seed_stride(stage: CurriculumStageSpec) -> int:
+    """The ``unit`` :func:`_seed_for` spaces attempts by for this stage's
+    eval pass -- at least ``stage.promotion.sample_size`` even when
+    :func:`_eval_sample_size` (the actual episode count) is smaller (PR #159
+    review): a checkpoint progressed under the pre-#138 runner has already
+    consumed seeds in contiguous ``promotion.sample_size``-wide blocks per
+    attempt (that was the *only* stride the old code ever used). Shrinking
+    the stride to match a smaller gate ``sample_size`` after upgrading would
+    let a resumed attempt replay a seed an earlier attempt already evaluated
+    on, violating :func:`_seed_for`'s non-colliding-retry contract. Since the
+    new stride is always >= the old one, each attempt's new block starts at
+    or past where every prior attempt's old-stride block ended, regardless
+    of how many attempts ran before the upgrade.
+    """
+    return max(_eval_sample_size(stage), stage.promotion.sample_size)
+
+
 def _evaluate_stage(
     stage: CurriculumStageSpec,
     summary: EvaluationSummary,
@@ -517,7 +534,7 @@ def run_curriculum(
             attempt = state.attempts_at_stage
             train_seed_i = _seed_for(train_seed, state.stage_index, attempt, stage.train_episodes)
             eval_sample_size = _eval_sample_size(stage)
-            eval_seed_i = _seed_for(eval_seed, state.stage_index, attempt, eval_sample_size)
+            eval_seed_i = _seed_for(eval_seed, state.stage_index, attempt, _eval_seed_stride(stage))
 
             _run_stage_episodes(
                 stage, policy_model, critic_model, optimizer, action_keys,

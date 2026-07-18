@@ -612,3 +612,51 @@ def test_milestone_gate_sample_size_takes_the_max_across_gates(tmp_path):
 
     assert result.status == "completed"
     assert seen_episode_counts == [4]
+
+
+def test_eval_seed_stride_keeps_at_least_the_legacy_promotion_sample_size(tmp_path, monkeypatch):
+    """PR #159 review: a checkpoint progressed under the pre-#138 runner
+    always used ``promotion.sample_size`` as *both* the eval episode count
+    and the per-attempt seed stride, so its recorded attempts occupy
+    contiguous ``promotion.sample_size``-wide seed blocks. If a stage's gate
+    ``sample_size`` is smaller than that, the stride must still stay at
+    least as large as ``promotion.sample_size`` -- shrinking it would let a
+    resumed attempt replay a seed an earlier attempt already evaluated on,
+    breaking ``_seed_for``'s non-colliding-retry contract."""
+    import development.runner as runner_module
+
+    seen_eval_seeds = []
+    real_run_stage_episodes = runner_module._run_stage_episodes
+
+    def spy_eval(*args, **kwargs):
+        # positional signature: (stage, policy_model, critic_model, optimizer,
+        # action_keys, episodes, seed, *, train, ...)
+        episodes, seed, train = args[5], args[6], kwargs["train"]
+        if not train:
+            seen_eval_seeds.append((seed, episodes))
+        return real_run_stage_episodes(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "_run_stage_episodes", spy_eval)
+
+    definition = curriculum_definition_from_dict({
+        "name": "gate-sample-size-stride",
+        "stages": [_gated_stage(
+            "crawling",
+            gates=[{"metric": "average_ticks", "threshold": 1_000_000.0, "sample_size": 1}],
+            promotion={"metric": "average_ticks", "threshold": 0.0, "sample_size": 3},
+            max_attempts=2,
+        )],
+    })
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+
+    result = run_curriculum(definition, checkpoint_path=checkpoint_path, record_dir=None)
+
+    assert result.status == "held"
+    assert len(seen_eval_seeds) == 2
+    (seed_0, episodes_0), (seed_1, episodes_1) = seen_eval_seeds
+    assert episodes_0 == episodes_1 == 1  # the gate's own sample_size
+    # The stride between attempts must be >= the legacy promotion sample
+    # size (3), not the gate's smaller sample_size (1): a resumed old-code
+    # checkpoint's attempt 0 would have consumed seeds [seed_0, seed_0+2].
+    assert seed_1 - seed_0 >= 3
+    assert seed_1 > seed_0 + episodes_0 - 1  # no overlap with attempt 0's episode(s)
