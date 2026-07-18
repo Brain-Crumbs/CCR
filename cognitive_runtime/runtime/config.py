@@ -89,6 +89,16 @@ class RuntimeConfig:
     #: touching the fusion layout/width. ``None`` (default) leaves the
     #: controller's own weights untouched. e.g. ``development/runner.py``
     #: zeroes the streams outside a curriculum stage's declared ``senses``.
+    #: Only a genuine mask under the default fixed-fusion path
+    #: (``CognitiveRuntime.fusion``): ``--fusion learned``
+    #: (``cognitive_runtime.neural.live_fusion.LiveLearnedFusion``, issue
+    #: #57) never forwards ``attention_weights`` into the latents it builds
+    #: either -- pre-existing to this field, it only appends them as an
+    #: extra input feature the model may learn to use, so a silenced stream
+    #: still reaches (and still trains) the fusion MLP under that mode. No
+    #: caller combines the two today (``development/runner.py`` never
+    #: requests ``--fusion learned``); genuinely masking learned fusion too
+    #: is issue #59's gap to close, not this field's.
     sense_stream_weights: Optional[Dict[str, float]] = None
 
     #: Attention ablation (issue #59): ``"off"`` gives every agent-input

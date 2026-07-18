@@ -496,6 +496,11 @@ class CognitiveRuntime:
             # ATTENTION_WEIGHTS_STREAM telemetry above still reports the
             # controller's own weights unchanged: that stream documents the
             # dynamic salience system, not this static per-stage override.
+            # `fuse_weights` only genuinely masks under the default fixed
+            # `self.fusion` below -- `self.learned_fusion` (`--fusion
+            # learned`) never forwards attention_weights into its own
+            # latents either (pre-existing to this field: see
+            # `RuntimeConfig.sense_stream_weights`'s docstring).
             fuse_weights = attention_state.weights
             if self.config.sense_stream_weights:
                 fuse_weights = dict(attention_state.weights)
