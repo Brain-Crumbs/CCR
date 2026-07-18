@@ -318,19 +318,27 @@ def _reflex_override_precedence(stage: CurriculumStageSpec) -> float:
     guaranteed ``1.0`` by construction -- a real precedence regression (a
     reflex firing below its threshold, or failing to override above it)
     shows up as a value under ``1.0``.
+
+    Uses the real Crafter action names (every ladder stage declares
+    ``world="crafter"``, see :func:`_stage`) rather than placeholder
+    Minecraft-style ones -- ``CrafterWorld`` never sees this probe (it runs
+    entirely through ``MotorFreedomPolicy``/``ReflexStack``, no World
+    involved), but a scoring stand-in built from actions the stage's own
+    World doesn't recognise would silently decouple this gate from what
+    Objects/Foraging can actually actuate.
     """
     from cognitive_runtime.core.action import Action
     from motor.organism_policy import build_stage_policy
     from motor.reflexes import ReflexStack, Stimulus, default_reflex_genome
     from motor.voluntary import CallableController
 
-    voluntary_action = Action("FORWARD")
-    withdraw_action = Action("BACK")
+    voluntary_action = Action("MOVE_UP")
+    withdraw_action = Action("MOVE_DOWN")
     reflexes = ReflexStack(
         default_reflex_genome(
             withdraw_action=withdraw_action,
-            orient_left_action=Action("TURN_LEFT"),
-            orient_right_action=Action("TURN_RIGHT"),
+            orient_left_action=Action("MOVE_LEFT"),
+            orient_right_action=Action("MOVE_RIGHT"),
         )
     )
     voluntary = CallableController("ladder-objects-probe", lambda state, actions, goal: voluntary_action)
@@ -379,13 +387,17 @@ def _voluntary_reliance_score(
     death_rate = sum(1 for r in reasons if r.startswith("death")) / len(reasons) if reasons else 0.0
     threat_probability = 0.05 + 0.5 * death_rate
 
-    voluntary_action = Action("FORWARD")
-    withdraw_action = Action("BACK")
+    # Real Crafter action names (every ladder stage declares world="crafter",
+    # see _stage), not placeholder Minecraft-style ones -- see
+    # _reflex_override_precedence's docstring for why that matters even
+    # though this probe never touches CrafterWorld directly.
+    voluntary_action = Action("MOVE_UP")
+    withdraw_action = Action("MOVE_DOWN")
     reflexes = ReflexStack(
         default_reflex_genome(
             withdraw_action=withdraw_action,
-            orient_left_action=Action("TURN_LEFT"),
-            orient_right_action=Action("TURN_RIGHT"),
+            orient_left_action=Action("MOVE_LEFT"),
+            orient_right_action=Action("MOVE_RIGHT"),
         )
     )
     voluntary = CallableController("ladder-foraging-probe", lambda state, actions, goal: voluntary_action)
