@@ -81,6 +81,26 @@ class RuntimeConfig:
     #: Bulky frame streams elided from the log unless ``record_frames`` is set.
     FRAME_STREAMS = ("vision.frame.grid", "vision.frame.pixels")
 
+    #: Static per-stream weight overrides (issue #135), independent of the
+    #: dynamic ``AttentionController`` below: composed into (multiplied with)
+    #: whatever weights the controller produces this tick before either
+    #: reaches ``TemporalFusion.fuse``'s ``attention_weights`` -- a weight of
+    #: ``0.0`` silences a stream's contribution to the fused vector without
+    #: touching the fusion layout/width. ``None`` (default) leaves the
+    #: controller's own weights untouched. e.g. ``development/runner.py``
+    #: zeroes the streams outside a curriculum stage's declared ``senses``.
+    #: Only a genuine mask under the default fixed-fusion path
+    #: (``CognitiveRuntime.fusion``): ``--fusion learned``
+    #: (``cognitive_runtime.neural.live_fusion.LiveLearnedFusion``, issue
+    #: #57) never forwards ``attention_weights`` into the latents it builds
+    #: either -- pre-existing to this field, it only appends them as an
+    #: extra input feature the model may learn to use, so a silenced stream
+    #: still reaches (and still trains) the fusion MLP under that mode. No
+    #: caller combines the two today (``development/runner.py`` never
+    #: requests ``--fusion learned``); genuinely masking learned fusion too
+    #: is issue #59's gap to close, not this field's.
+    sense_stream_weights: Optional[Dict[str, float]] = None
+
     #: Attention ablation (issue #59): ``"off"`` gives every agent-input
     #: stream uniform weight ``1.0`` (the pre-#59 behavior, byte-identical
     #: fused output); ``"budgeted"`` runs the deterministic

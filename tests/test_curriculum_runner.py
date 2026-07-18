@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from cognitive_runtime.core.streams import StreamSpec
 from cognitive_runtime.training.curriculum_runner import (
     CurriculumDefinition,
     CurriculumDefinitionError,
@@ -155,9 +156,68 @@ def test_stage_spec_rejects_duplicate_senses():
         CurriculumStageSpec(name="s", senses=("vision", "vision"))
 
 
+def test_stage_spec_rejects_unknown_sense():
+    with pytest.raises(ValueError, match="unknown sense"):
+        CurriculumStageSpec(name="s", senses=("smell",))
+
+
 def test_stage_spec_rejects_duplicate_losses():
     with pytest.raises(ValueError, match="duplicate losses"):
         CurriculumStageSpec(name="s", losses=("prediction", "prediction"))
+
+
+# --------------------------------------------------------------------------
+# issue #135: a stage's declared `senses`/`losses` used to be pure labels --
+# `development.runner`/`development.ladder` never consulted them, so
+# changing a stage's world/senses/losses had no effect on the organism's
+# actual training run. `sense_stream_mask` is the fix's core primitive: the
+# per-stream weight overrides `development.runner._run_stage_episodes` feeds
+# `RuntimeConfig.sense_stream_weights`, which `runtime/loop.py` composes into
+# `TemporalFusion.fuse`'s existing `attention_weights` seam (issue #59) to
+# silence streams outside the declared senses without changing fusion width.
+
+def test_sense_stream_mask_empty_senses_silences_nothing():
+    from development.definitions import sense_stream_mask
+
+    catalog = [
+        StreamSpec("vision.frame.grid", "vision"),
+        StreamSpec("spatial.position", "spatial"),
+        StreamSpec("body.health", "body"),
+    ]
+    assert sense_stream_mask((), catalog) == {}
+
+
+def test_sense_stream_mask_silences_streams_outside_declared_senses():
+    from development.definitions import sense_stream_mask
+
+    catalog = [
+        StreamSpec("vision.frame.grid", "vision"),
+        StreamSpec("vision.frame.pixels", "vision"),
+        StreamSpec("spatial.position", "spatial"),
+        StreamSpec("spatial.facing", "spatial"),
+        StreamSpec("body.health", "body"),
+        StreamSpec("reward.scalar", "reward"),
+    ]
+    mask = sense_stream_mask(("vision",), catalog)
+    assert mask == {"spatial.position": 0.0, "spatial.facing": 0.0}
+
+
+def test_sense_stream_mask_leaves_body_and_reward_streams_untouched():
+    """Only the sense-governed modalities (vision/spatial) are ever masked --
+    body vitals and reward aren't part of either sense's vocabulary and stay
+    active no matter which senses a stage declares."""
+    from development.definitions import sense_stream_mask
+
+    catalog = [StreamSpec("body.health", "body"), StreamSpec("reward.scalar", "reward")]
+    assert sense_stream_mask(("vision",), catalog) == {}
+    assert sense_stream_mask(("vision", "proprioception"), catalog) == {}
+
+
+def test_sense_stream_mask_all_known_senses_declared_silences_nothing():
+    from development.definitions import sense_stream_mask
+
+    catalog = [StreamSpec("vision.frame.grid", "vision"), StreamSpec("spatial.position", "spatial")]
+    assert sense_stream_mask(("vision", "proprioception"), catalog) == {}
 
 
 def test_stage_spec_rejects_duplicate_gate_metrics():
