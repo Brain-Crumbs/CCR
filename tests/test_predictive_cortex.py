@@ -232,6 +232,9 @@ def test_run_action_ablation_eval_reports_valid_structure(tmp_path):
         assert comparison.metric == f"horizon_{h}_model_mse"
         assert comparison.direction in {"improved", "regressed", "no_significant_difference"}
     assert isinstance(report.action_withholding_degrades, bool)
+    assert set(report.representation_diagnostics["latent"]) >= {
+        "mean_variance", "effective_rank", "matrix_rank"
+    }
 
 
 def test_run_action_ablation_eval_rejects_eval_scenario_outside_train_scenarios(tmp_path):

@@ -291,6 +291,13 @@ def _action_ablation_margin(
         model_config=_ladder_model_config(),
         cortex_checkpoint_path=cortex_checkpoint_path,
     )
+    representation = report.representation_diagnostics
+    if not representation.get("gate_evaluable", False) or not representation.get("passed", False):
+        # A predictive score cannot promote a cortex without a valid
+        # orientation probe or whose representation has collapsed.  The
+        # metric's normal passing region is >= 0, so a finite negative
+        # sentinel cleanly fails the existing ladder gate.
+        return -1.0
     margins = [
         report.without_actions_stats[h].mean - report.with_actions_stats[h].mean
         for h in report.with_actions_stats

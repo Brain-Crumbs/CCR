@@ -61,6 +61,8 @@ from cognitive_runtime.training.action_world_model import (
     evaluate_action_world_model,
     horizons_ticks_to_frames,
     linear_probe_yaw,
+    linear_probe_orientation,
+    representation_collapse_diagnostics,
     load_action_world_model,
     save_action_world_model,
     train_action_world_model,
@@ -1034,6 +1036,10 @@ class JointNurseryReport:
     zero_shot_metrics: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     #: Does the representation linearly decode the agent's heading?
     yaw_probe: Dict[str, Any] = field(default_factory=dict)
+    #: Heading probe using yaw or Crafter's discrete facing stream.
+    orientation_probe: Dict[str, Any] = field(default_factory=dict)
+    #: Promotion-grade yaw + latent variance/effective-rank collapse gate.
+    representation_diagnostics: Dict[str, Any] = field(default_factory=dict)
     horizon_frames: List[int] = field(default_factory=list)
     ticks_per_frame: float = 1.0
 
@@ -1176,6 +1182,10 @@ def run_nursery_joint(
         [d for dirs in eval_sessions.values() for d in dirs], action_keys=model.action_keys
     )
     yaw_probe = linear_probe_yaw(model, probe_dataset)
+    orientation_probe = linear_probe_orientation(model, probe_dataset)
+    representation_diagnostics = representation_collapse_diagnostics(
+        model, probe_dataset, config=model_cfg
+    )
 
     return model, JointNurseryReport(
         train_scenarios=train_names,
@@ -1188,6 +1198,8 @@ def run_nursery_joint(
         scenario_metrics=scenario_metrics,
         zero_shot_metrics=zero_shot_metrics,
         yaw_probe=yaw_probe,
+        orientation_probe=orientation_probe,
+        representation_diagnostics=representation_diagnostics,
         horizon_frames=horizon_frames,
         ticks_per_frame=ticks_per_frame,
     )
@@ -1223,6 +1235,8 @@ class ActionAblationReport:
     #: True when withholding actions raises ``eval_scenario``'s held-out
     #: model MSE at every evaluated horizon -- the Milestone 2 assertion.
     action_withholding_degrades: bool
+    #: Held-out representation gate for the promoted with-actions cortex.
+    representation_diagnostics: Dict[str, Any] = field(default_factory=dict)
 
 
 def run_action_ablation_eval(
@@ -1330,7 +1344,11 @@ def run_action_ablation_eval(
     horizon_frames = horizons_ticks_to_frames(cfg.horizons, dataset.ticks_per_frame)
 
     with_actions_cfg = replace(base_model_cfg, withhold_actions=False)
-    without_actions_cfg = replace(base_model_cfg, withhold_actions=True)
+    # The intentionally-deprived control must remain measurable even if its
+    # representation collapses; promotion gates the real with-actions model.
+    without_actions_cfg = replace(
+        base_model_cfg, withhold_actions=True, collapse_gate_enabled=False
+    )
 
     without_actions_checkpoint_path = (
         cortex_checkpoint_path + ".control" if cortex_checkpoint_path is not None else None
@@ -1376,6 +1394,9 @@ def run_action_ablation_eval(
         > with_actions_metrics["horizons"][h]["model_mse"]
         for h in horizon_frames
     )
+    representation_diagnostics = representation_collapse_diagnostics(
+        model_with, holdout_dataset, config=with_actions_cfg
+    )
 
     return ActionAblationReport(
         train_scenarios=list(train_scenarios),
@@ -1386,6 +1407,7 @@ def run_action_ablation_eval(
         without_actions_stats=without_actions_stats,
         comparisons=comparisons,
         action_withholding_degrades=degrades,
+        representation_diagnostics=representation_diagnostics,
     )
 
 
