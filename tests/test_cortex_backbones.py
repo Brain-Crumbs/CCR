@@ -96,6 +96,21 @@ def test_backbone_satisfies_step_readout_contract(name):
 
 
 @pytest.mark.parametrize("name", BACKBONES)
+def test_backbone_forward_sequence_returns_all_causal_positions(name):
+    backbone = build_backbone(name, input_dim=10, hidden_dim=12, context_length=5)
+    backbone.eval()
+    inputs = torch.randn(2, 7, 10)
+    with torch.no_grad():
+        output = backbone.forward_sequence(inputs)
+        changed_future = inputs.clone()
+        changed_future[:, 5:] += 100.0
+        output_changed = backbone.forward_sequence(changed_future)
+    assert output.shape == (2, 7, 12)
+    # Causality: changing tokens after position 4 cannot alter its prefix.
+    assert torch.allclose(output[:, :5], output_changed[:, :5])
+
+
+@pytest.mark.parametrize("name", BACKBONES)
 def test_backbone_context_length_max_matches_windowed_or_unbounded(name):
     backbone = build_backbone(name, input_dim=6, hidden_dim=8, context_length=5)
     if name == "gru":
@@ -159,6 +174,24 @@ def test_predictive_cortex_forward_horizons_identical_shape_across_backbones(nam
 
 
 @pytest.mark.parametrize("name", BACKBONES)
+def test_predictive_cortex_sequence_heads_predict_every_position(name):
+    cfg = PredictiveCortexConfig(
+        latent_width=8, hidden_dim=12, reconstruction_size=4,
+        horizons_ticks=(1, 3), backbone=name, context_length=4,
+    )
+    model = PredictiveCortex(PIXEL_SHAPE, ACTION_KEYS, cfg)
+    hidden = model.forward_sequence(
+        torch.randn(2, 6, 8), torch.randint(0, len(ACTION_KEYS), (2, 6))
+    )
+    assert hidden.shape == (2, 6, 12)
+    for horizon in (1, 3):
+        prediction = model.sequence_prediction(hidden, horizon)
+        assert prediction.latent.shape == (2, 6, 8)
+        assert prediction.decoded.shape[:2] == (2, 6)
+        assert prediction.reward.shape == (2, 6)
+
+
+@pytest.mark.parametrize("name", BACKBONES)
 def test_predictive_cortex_rollout_and_step_are_the_same_state_object(name):
     """``rollout`` and repeated ``step`` calls must agree: rollout is just
     ``step`` called in a loop, for any backbone."""
@@ -215,6 +248,18 @@ def test_train_and_evaluate_report_identical_structure_across_backbones(turn_ses
     assert set(report["rollout_health"]) >= {
         "prediction_dispersion", "target_dispersion", "frozen_rollout",
     }
+
+
+@pytest.mark.parametrize("name", BACKBONES)
+def test_autoregressive_objective_trains_every_backbone(turn_session, name):
+    dataset = build_action_sequence_dataset([turn_session])
+    cfg = _small_model_config(
+        backbone=name, training_objective="autoregressive", horizons_ticks=(1, 3),
+    )
+    _model, stats = train_action_world_model(dataset, cfg)
+    assert stats["training_objective"] == "autoregressive"
+    assert stats["autoregressive_horizons"] == [1, 3]
+    assert len(stats["loss_curves"]["closed_loop_loss"]) == cfg.epochs
 
 
 # --------------------------------------------------------------- context-length curriculum

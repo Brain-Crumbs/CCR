@@ -68,6 +68,15 @@ class TemporalBackbone(nn.Module):
     def readout(self, state: Any) -> torch.Tensor:
         raise NotImplementedError
 
+    def forward_sequence(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Return a causal hidden state for every input position.
+
+        ``inputs`` is ``[batch, time, input_dim]`` and the result is
+        ``[batch, time, hidden_dim]``.  ``step`` remains the live-tick and
+        closed-loop-rollout API; this surface is for all-prefix training.
+        """
+        raise NotImplementedError
+
     def set_context_length(self, n: Optional[int]) -> None:
         """No-op unless overridden by a windowed backbone."""
 
@@ -90,6 +99,16 @@ class GRUBackbone(TemporalBackbone):
 
     def readout(self, state: torch.Tensor) -> torch.Tensor:
         return state
+
+    def forward_sequence(self, inputs: torch.Tensor) -> torch.Tensor:
+        if inputs.ndim != 3:
+            raise ValueError(f"inputs must be [B, T, D], got {tuple(inputs.shape)}")
+        state = self.initial_state(inputs.shape[0])
+        hidden = []
+        for index in range(inputs.shape[1]):
+            output, state = self.step(inputs[:, index], state)
+            hidden.append(output)
+        return torch.stack(hidden, dim=1)
 
 
 class _WindowedBackbone(TemporalBackbone):
@@ -176,6 +195,22 @@ class DilatedConvBackbone(_WindowedBackbone):
         hidden = h[:, :, -1]
         return hidden, (buffer, hidden)
 
+    def forward_sequence(self, inputs: torch.Tensor) -> torch.Tensor:
+        if inputs.ndim != 3:
+            raise ValueError(f"inputs must be [B, T, D], got {tuple(inputs.shape)}")
+        h = self.input_proj(inputs).transpose(1, 2)
+        # Every convolution is left-padded, so all positions are computed in
+        # one causal pass and never see a future input.
+        for conv, dilation in zip(self.conv_layers, self.dilations):
+            # Match the context curriculum: layers whose dilation would
+            # reach beyond the current causal window remain inactive until
+            # that window is exposed.
+            if dilation >= self._current_context:
+                break
+            pad = dilation * (conv.kernel_size[0] - 1)
+            h = self.activation(conv(F.pad(h, (pad, 0))))
+        return h.transpose(1, 2)
+
 
 class TransformerBackbone(_WindowedBackbone):
     """A small causal transformer encoder over the window: full pairwise
@@ -219,6 +254,22 @@ class TransformerBackbone(_WindowedBackbone):
         encoded = self.encoder(projected, mask=causal_mask)
         hidden = encoded[:, -1]
         return hidden, (buffer, hidden)
+
+    def forward_sequence(self, inputs: torch.Tensor) -> torch.Tensor:
+        if inputs.ndim != 3:
+            raise ValueError(f"inputs must be [B, T, D], got {tuple(inputs.shape)}")
+        length = inputs.shape[1]
+        # C1 trains every prefix in one attention call.  Positions repeat at
+        # the configured window length; C3 replaces this bounded embedding
+        # with a length-extrapolating position encoding.
+        positions = torch.arange(length, device=inputs.device) % self.context_length_max
+        projected = self.input_proj(inputs) + self.position_embedding(positions).unsqueeze(0)
+        indices = torch.arange(length, device=inputs.device)
+        distance = indices[:, None] - indices[None, :]
+        visible = (distance >= 0) & (distance < self._current_context)
+        mask = torch.zeros(length, length, device=inputs.device)
+        mask.masked_fill_(~visible, float("-inf"))
+        return self.encoder(projected, mask=mask)
 
 
 _BACKBONES.update(
