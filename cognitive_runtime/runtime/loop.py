@@ -159,6 +159,7 @@ class CognitiveRuntime:
         stream_registry: Optional[StreamRegistry] = None,
         learned_fusion: Optional[Any] = None,
         action_registry: Optional[ActionRegistry] = None,
+        hippocampus: Optional[Hippocampus] = None,
     ):
         self.program = program
         self.policy = policy
@@ -265,7 +266,12 @@ class CognitiveRuntime:
         #: neuromodulator tags. Persists across episodes within a run, like
         #: `self.modulation` -- episodic memory is a property of the
         #: organism's run, not of any one episode.
-        self.hippocampus = Hippocampus()
+        #: Shared with a live `sleep.cortex_consolidation.CortexConsolidator`
+        #: (issue #175) when one is wired into the CLI's `--world-model
+        #: cortex:` path: the consolidator's dream mixer needs the *same*
+        #: hippocampus instance this loop writes seeds into, not an empty one.
+        #: Defaults to a fresh instance for every other caller (unchanged).
+        self.hippocampus = hippocampus if hippocampus is not None else Hippocampus()
         configure_retrieval = getattr(self.world_model, "configure_retrieval", None)
         if callable(configure_retrieval):
             configure_retrieval(self.hippocampus)
