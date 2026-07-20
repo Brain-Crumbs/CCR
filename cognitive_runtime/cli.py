@@ -195,7 +195,10 @@ def _make_world_model(
       hidden state persists across ticks and resets on each episode boundary.
       `--async-trainer` (issue #175) additionally wires a live
       `sleep.cortex_consolidation.CortexConsolidator` into it, so the cortex
-      itself is the online learner instead of a separate actor/critic stack.
+      itself is the online learner instead of a separate actor/critic stack;
+      consolidated weights are persisted back to the same checkpoint path on
+      every publish (`CortexWorldModel.checkpoint_path` defaults from the
+      loaded path), so the run survives an episode end, crash, or interrupt.
     - `--world-model PATH` bridges the memoryless `MLPWorldModel` (issue #26).
 
     `--world-model` is unset unless the caller opts in. `hippocampus` is only

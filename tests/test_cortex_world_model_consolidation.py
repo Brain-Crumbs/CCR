@@ -50,8 +50,16 @@ class FakeConsolidator:
         return len(self.consolidate_calls)
 
     def publish_to(self, world_model):
+        # Mirror the real `CortexConsolidator.publish_to`: it resets the
+        # world model's rolling state so fresh weights take effect cleanly
+        # (issue #175 review: this is exactly what used to silently wipe
+        # `_latent` and drop every post-consolidation transition).
+        world_model.reset()
         self.publish_calls += 1
         return self.publish_calls
+
+    def stats(self):
+        return {"consolidations": len(self.consolidate_calls), "publishes": self.publish_calls}
 
 
 def _small_cortex(pixel_shape=(8, 8, 3), horizons=(1, 4)) -> PredictiveCortex:
@@ -189,3 +197,69 @@ def test_consolidator_none_default_is_byte_for_byte_unchanged():
         assert pred_a.next_latent == pred_b.next_latent
         assert pred_a.risk == pred_b.risk
         assert pred_a.predicted_reward == pred_b.predicted_reward
+
+
+def test_record_transition_keeps_firing_after_every_consolidation_cadence():
+    """Issue #175 review (P2): `publish_to` resets the world model's rolling
+    state, which used to wipe `_latent` too -- dropping the transition
+    immediately following *every* consolidation, permanently at
+    `consolidate_every_ticks=1` (a no-op forever: the reservoir never
+    receives anything). `_latent` must survive the reset so the very next
+    tick can still record its transition."""
+    cortex = _small_cortex()
+    fake = FakeConsolidator()
+    wm = CortexWorldModel(
+        cortex, action_keys=_ACTION_KEYS, consolidator=fake,
+        consolidate_every_ticks=1, consolidation_steps=1,
+    )
+
+    _run_ticks(wm, 5)
+
+    # Ticks 1..5 all trigger consolidation (cadence 1); tick 1 has no prior
+    # latent to record (episode start), but ticks 2-5 each still record a
+    # transition despite the consolidation between every pair of ticks.
+    assert fake.consolidate_calls == [1, 1, 1, 1, 1]
+    assert len(fake.recorded) == 4
+
+
+def test_consolidation_publish_persists_checkpoint_to_disk(tmp_path):
+    """Issue #175 review (P1): with `--async-trainer`, `publish_to`'s
+    in-memory weight update was the only hand-off -- nothing wrote the
+    consolidated cortex back to disk, so a completed run (or a crash/
+    KeyboardInterrupt) silently discarded all online learning. A
+    `checkpoint_path` must be persisted on every publish."""
+    from cognitive_runtime.training.action_world_model import load_action_world_model
+
+    cortex = _small_cortex()
+    fake = FakeConsolidator()
+    checkpoint_path = str(tmp_path / "cortex.pt")
+    wm = CortexWorldModel(
+        cortex, action_keys=_ACTION_KEYS, consolidator=fake,
+        consolidate_every_ticks=2, consolidation_steps=1,
+        checkpoint_path=checkpoint_path,
+    )
+
+    _run_ticks(wm, 3)
+
+    assert fake.publish_calls == 1
+    reloaded, stats = load_action_world_model(checkpoint_path)
+    assert reloaded.action_keys == _ACTION_KEYS
+    assert stats == fake.stats()
+
+
+def test_checkpoint_path_defaults_from_a_string_model_argument(tmp_path):
+    """Loading `CortexWorldModel` from a checkpoint path (the
+    `--world-model cortex:PATH` CLI case) defaults the consolidation save
+    target to that same path, with no extra CLI wiring needed."""
+    from cognitive_runtime.training.action_world_model import save_action_world_model
+
+    checkpoint_path = str(tmp_path / "cortex.pt")
+    save_action_world_model(checkpoint_path, _small_cortex(), {})
+
+    wm = CortexWorldModel(checkpoint_path, action_keys=_ACTION_KEYS)
+    assert wm.checkpoint_path == checkpoint_path
+
+    wm_override = CortexWorldModel(
+        checkpoint_path, action_keys=_ACTION_KEYS, checkpoint_path=str(tmp_path / "other.pt"),
+    )
+    assert wm_override.checkpoint_path == str(tmp_path / "other.pt")

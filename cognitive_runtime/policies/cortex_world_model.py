@@ -63,15 +63,25 @@ class CortexWorldModel(CoreWorldModel):
         consolidator: Optional[Any] = None,
         consolidate_every_ticks: int = 0,
         consolidation_steps: int = 1,
+        checkpoint_path: Optional[str] = None,
     ):
+        # A string `model` is a checkpoint path (--world-model cortex:PATH):
+        # default the online-consolidation save target to that same path, so
+        # `--async-trainer` persists consolidated weights back where the run
+        # loaded them from unless the caller overrides `checkpoint_path`
+        # explicitly (issue #175 review: without this, in-memory-only
+        # `publish_to` weights are lost on episode end/crash/interrupt).
         if isinstance(model, str):
             from cognitive_runtime.training.action_world_model import (
                 load_action_world_model,
             )
 
+            if checkpoint_path is None:
+                checkpoint_path = model
             model, _stats = load_action_world_model(model)
         self.model = model
         self.model.eval()
+        self.checkpoint_path = checkpoint_path
 
         keys = list(action_keys) if action_keys is not None else list(model.action_keys)
         if not keys:
@@ -242,7 +252,30 @@ class CortexWorldModel(CoreWorldModel):
             and self._tick % self.consolidate_every_ticks == 0
         ):
             self.consolidator.consolidate(self.consolidation_steps)
+            # `publish_to` calls `self.reset()` to clear the rolling backbone
+            # state under the fresh weights -- but that also wipes `_latent`,
+            # this tick's own encoded observation, which the *next* tick's
+            # `record_transition` needs as z0. Losing it would drop exactly
+            # the one transition following every consolidation (all of them,
+            # forever, at `--async-wake-ticks 1`) -- preserve it across the
+            # reset; it's still a valid (if slightly stale, pre-update)
+            # encoding of this tick's real observation.
+            pending_latent = self._latent
             self.consolidator.publish_to(self)
+            self._latent = pending_latent
+            if self.checkpoint_path is not None:
+                # In-memory-only weights are lost on episode end, a crash, or
+                # KeyboardInterrupt -- persist every publish so a completed
+                # consolidation always survives the process, not only a
+                # graceful shutdown (mirrors the old async trainer's periodic
+                # checkpoint-write cadence).
+                from cognitive_runtime.training.action_world_model import (
+                    save_action_world_model,
+                )
+
+                save_action_world_model(
+                    self.checkpoint_path, self.model, self.consolidator.stats(),
+                )
 
         return Prediction(
             # ``risk_head`` is softplus'd (non-negative, unbounded); clamp into
