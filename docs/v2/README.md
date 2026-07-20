@@ -21,6 +21,17 @@ Read in order:
    `cognitive_runtime/` code, each with numbered tasks, tests, and its milestone
    gate.
 
+For onboarding and presentation:
+
+5. [**03-onboarding-guide.md**](03-onboarding-guide.md) — a from-scratch mental
+   model of the system, repository tour, setup, workflows, current assembly
+   boundary, and explicit deferrals.
+6. [**04-contracts-and-data-flow.md**](04-contracts-and-data-flow.md) — the exact
+   Python, tensor, stream, disk, HTTP, checkpoint, development, and mineflayer
+   contracts, plus one complete action-to-training-target trace.
+7. [**05-presentation-runbook.md**](05-presentation-runbook.md) — a 75–90 minute
+   teaching sequence, live-demo script, slide outline, and presenter cautions.
+
 **Design commitments** (the choices these docs are built on): re-architect +
 rename rather than rewrite; predict in latent space but always decode to the
 same-shaped input; action-conditioned recurrent world model; a fast Crafter
