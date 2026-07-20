@@ -9,6 +9,7 @@ publishes cortex-sourced novelty/prediction-error telemetry.
 from __future__ import annotations
 
 import os
+import copy
 
 import numpy as np
 import pytest
@@ -16,10 +17,13 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from brain.cortex.predictive import PredictiveCortex, PredictiveCortexConfig  # noqa: E402
+from brain.amygdala import Amygdala  # noqa: E402
+from brain.hippocampus import Hippocampus, SeedTags  # noqa: E402
 from cognitive_runtime.core.action import Action  # noqa: E402
 from cognitive_runtime.core.memory import Memory  # noqa: E402
 from cognitive_runtime.core.perception import State  # noqa: E402
 from cognitive_runtime.core.streams.events import StreamEvent  # noqa: E402
+from cognitive_runtime.core.streams.fusion import LatentState  # noqa: E402
 from cognitive_runtime.neural.pixel_stream_encoder import PIXEL_STREAM_ID  # noqa: E402
 from cognitive_runtime.policies import ScriptedSurvivalPolicy  # noqa: E402
 from cognitive_runtime.policies.cortex_world_model import CortexWorldModel  # noqa: E402
@@ -134,6 +138,73 @@ def test_mismatched_pixel_shape_is_rejected():
     _push_frame(memory, np.zeros((10, 10, 3), dtype=np.uint8), 0)
     with pytest.raises(ValueError, match="pixel-frame shape"):
         wm.predict(State(observation=None), memory)
+
+
+def _memory_with_frame_and_fused(frame, fused):
+    memory = Memory()
+    _push_frame(memory, frame, 0)
+    memory.set_fused_latent(LatentState(vector=list(fused), slices={}, layout_hash="test"))
+    return memory
+
+
+def test_novel_context_is_identical_with_retrieval_enabled_but_gated_out():
+    model = _small_cortex(horizons=(1,))
+    baseline = CortexWorldModel(copy.deepcopy(model), action_keys=_ACTION_KEYS)
+    augmented = CortexWorldModel(copy.deepcopy(model), action_keys=_ACTION_KEYS)
+    hippocampus = Hippocampus()
+    hippocampus.encode(
+        z=[1.0] + [0.0] * 7,
+        actions=["turn_left"],
+        tags=SeedTags(threat=0.9),
+        cortex_version=0,
+    )
+    augmented.configure_retrieval(hippocampus)
+    augmented.set_retrieval_surprise(1.0)
+    frame = np.zeros((8, 8, 3), dtype=np.uint8)
+    novel = [0.0, 1.0] + [0.0] * 6
+
+    plain = baseline.predict(State(observation=None), _memory_with_frame_and_fused(frame, novel))
+    gated = augmented.predict(State(observation=None), _memory_with_frame_and_fused(frame, novel))
+    assert gated.recalled_seed_count == 0
+    assert gated.next_latent == pytest.approx(plain.next_latent)
+    assert gated.risk == pytest.approx(plain.risk)
+
+
+def test_recalled_threat_raises_amygdala_before_live_threat_arrives():
+    model = _small_cortex(horizons=(1,))
+    with torch.no_grad():
+        model.risk_head.weight.zero_()
+        model.risk_head.bias.fill_(-20.0)
+    world_model = CortexWorldModel(model, action_keys=_ACTION_KEYS, cortex_version=7)
+    hippocampus = Hippocampus()
+    workspace_cue = [1.0] + [0.0] * 9
+    cortex_token = [0.5] + [0.0] * 7
+    hippocampus.encode(
+        z=workspace_cue,
+        actions=["turn_left"],
+        tags=SeedTags(threat=0.95),
+        tick_index=3,
+        cortex_version=7,
+        context_z=cortex_token,
+    )
+    world_model.configure_retrieval(hippocampus)
+    world_model.set_retrieval_surprise(1.0)
+
+    prediction = world_model.predict(
+        State(observation=None),
+        _memory_with_frame_and_fused(
+            np.zeros((8, 8, 3), dtype=np.uint8), workspace_cue
+        ),
+    )
+    calm_amygdala = Amygdala()
+    calm = calm_amygdala.appraise(risk=0.0)
+    recalled_amygdala = Amygdala()
+    warned = recalled_amygdala.appraise(risk=prediction.risk)
+
+    assert prediction.recalled_seed_count == 1
+    assert prediction.recalled_threat == pytest.approx(0.95)
+    assert prediction.risk >= 0.95
+    assert warned > calm
 
 
 def test_cortex_bridges_prediction_into_recorded_session(tmp_path):

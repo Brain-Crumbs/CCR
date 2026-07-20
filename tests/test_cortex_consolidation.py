@@ -273,9 +273,14 @@ class _FakeWorldModel:
     def __init__(self, cortex: PredictiveCortex):
         self.model = cortex
         self._hidden = "stale-state"
+        self.cortex_version = 0
 
     def reset(self) -> None:
         self._hidden = None
+
+    def set_cortex_version(self, version: int) -> None:
+        self.cortex_version = version
+        self.reset()
 
 
 def test_publish_to_hands_raw_weights_back_and_resets_world_state():
@@ -292,6 +297,7 @@ def test_publish_to_hands_raw_weights_back_and_resets_world_state():
     version = consolidator.publish_to(live)
 
     assert version == consolidator.version
+    assert live.cortex_version == version
     assert live._hidden is None  # rolling state reset for the fresh weights
     for published, trained in zip(
         live.model.state_dict().values(), consolidator.cortex.state_dict().values()

@@ -42,6 +42,11 @@ class Prediction:
     #: the legacy ``MLPWorldModel`` bridge), in which case consumers fall
     #: back to ``prediction_error`` as the closest available stand-in.
     predicted_uncertainty: Optional[float] = None
+    #: Online hippocampal-retrieval telemetry. Zero/``None`` for world models
+    #: without recall or when all similarity/surprise/provenance gates reject.
+    recalled_seed_count: int = 0
+    retrieval_similarity: Optional[float] = None
+    recalled_threat: Optional[float] = None
 
 
 class WorldModel(abc.ABC):

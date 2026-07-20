@@ -445,8 +445,8 @@ is not considered evidence that dynamics were learned.
 The autoregressive-latent revision proposal goes further: use the full fused
 workspace latent as the token and train every causal prefix and every prediction
 horizon in parallel, LLM-style. That proposal is not the current training
-implementation. It also proposes online hippocampal retrieval into the rolling
-context window; retrieval remains deferred.
+implementation. Online hippocampal retrieval is implemented separately: gated
+cosine kNN recall prepends matching seeds to the rolling cortex context.
 
 ## The three behavioral modes
 
@@ -511,7 +511,6 @@ These are design boundaries, not accidental omissions:
 - language/Speaking;
 - cross-world weight transfer from top-down Crafter pixels to first-person
   Minecraft pixels;
-- context-cued hippocampal retrieval during wake;
 - learned attention and learned neuromodulator scoring as the default;
 - extra neurochemistry without a behavior that needs it;
 - byte-exact determinism as a learning-quality gate;

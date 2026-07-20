@@ -305,8 +305,9 @@ checkpoint across stages, which 5 and 6 must land first.
 ## What this plan deliberately defers
 
 - **Speaking / language** (developmental Stage 5) — after Foraging works.
-- **Hippocampal *retrieval*** (context-cued recall of a relevant past episode) —
-  Phase 4 builds the store and dreaming; cued retrieval is a follow-up.
+- **Hippocampal *retrieval*** (context-cued recall of a relevant past episode)
+  is implemented as a guarded follow-up to Phase 4: cosine kNN over fused
+  latent keys, surprise/provenance gating, and prepend-to-cortex context.
 - **Neural attention** and **learned neuromodulator scoring** — the deterministic
   versions ship first; learned successors stay gated until there's data to learn
   from (unchanged from the current roadmap's stance).

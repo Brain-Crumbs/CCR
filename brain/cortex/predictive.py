@@ -77,10 +77,11 @@ class PredictiveCortexConfig:
     #: convolutions over a window), or ``"transformer"`` (causal
     #: self-attention over a window). See ``brain.cortex.backbones``.
     backbone: str = "gru"
-    #: Window size (in frame steps) the windowed backbones
-    #: (``dilated_conv``/``transformer``) attend over; ignored by ``"gru"``.
-    #: Persisted with the checkpoint so a reloaded model's window matches
-    #: what it was trained with.
+    #: Ring-buffer capacity (in frame steps) for the windowed backbones;
+    #: ignored by ``"gru"``. At runtime ``set_context_length`` controls the
+    #: effective attended width between 1 and this build-time maximum. The
+    #: buffer rolls continuously, dropping its oldest input when full. See
+    #: "The window" in ``docs/v2/proposal-autoregressive-latent-cortex.md``.
     context_length: int = 8
     #: Extra backbone-specific constructor kwargs (e.g. ``kernel_size``,
     #: ``n_layers``, ``n_heads``); not persisted with the checkpoint.
@@ -217,7 +218,8 @@ class PredictiveCortex(nn.Module):
     def set_context_length(self, n: Optional[int]) -> None:
         """Context-length curriculum hook (issue #93, task 5): a no-op for
         the ``"gru"`` backbone, else restricts the windowed backbone's
-        attended-over window to the last ``n`` steps of its buffer."""
+        attended-over window to the last ``n`` steps of its buffer. Values
+        below one clamp to one; ``None`` restores the configured maximum."""
         self.transition_backbone.set_context_length(n)
 
     @property
@@ -242,6 +244,25 @@ class PredictiveCortex(nn.Module):
         x = torch.cat([latent, embedded], dim=-1)
         hidden_repr, next_state = self.transition_backbone.step(x, hidden)
         return self.latent_head(hidden_repr), next_state
+
+    def inject_context(
+        self,
+        latents: torch.Tensor,
+        action_idx: torch.Tensor,
+        state: Any,
+    ) -> Any:
+        """Prepend recalled ``(latent, action)`` tokens to a live state.
+
+        ``latents`` is ``[B, R, latent_width]`` and ``action_idx`` is
+        ``[B, R]``. Windowed backbones load them into the ring buffer without
+        treating recall as an elapsed live tick; recurrent backbones replay
+        them through their ordinary transition contract.
+        """
+        if latents.ndim != 3 or action_idx.shape != latents.shape[:2]:
+            raise ValueError("recalled latents/actions must be [B, R, L] and [B, R]")
+        embedded = self.action_embedding(action_idx)
+        inputs = torch.cat([latents, embedded], dim=-1)
+        return self.transition_backbone.inject_context(inputs, state)
 
     def forward_sequence(self, latents: torch.Tensor, action_idx: torch.Tensor) -> torch.Tensor:
         """Causally encode every ``(z_t, a_t)`` prefix in parallel.

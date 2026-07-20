@@ -343,7 +343,9 @@ class ActionWorldModelConfig:
     #: Temporal backbone (issue #93): ``"gru"`` (default), ``"dilated_conv"``,
     #: or ``"transformer"``. See ``brain.cortex.backbones``.
     backbone: str = "gru"
-    #: Window size the windowed backbones attend over; ignored by ``"gru"``.
+    #: Build-time ring-buffer capacity for windowed backbones; ignored by
+    #: ``"gru"``. The curriculum below changes only the effective attended
+    #: width, not this capacity.
     context_length: int = 8
     #: Extra backbone-specific constructor kwargs, forwarded verbatim to
     #: ``brain.cortex.backbones.build_backbone``.
@@ -1588,7 +1590,15 @@ def load_action_world_model(path: str):
     allowed_missing = {
         key for key in model.state_dict() if key.startswith("multi_token_heads.")
     }
-    unexpected = set(incompatibility.unexpected_keys)
+    # C3 replaced the transformer's learned absolute position table with
+    # parameter-free ALiBi. It is safe to discard precisely that obsolete
+    # tensor from pre-C3 checkpoints; all learned content weights still load.
+    allowed_unexpected = (
+        {"transition_backbone.position_embedding.weight"}
+        if cfg.backbone == "transformer"
+        else set()
+    )
+    unexpected = set(incompatibility.unexpected_keys) - allowed_unexpected
     missing = set(incompatibility.missing_keys) - allowed_missing
     if missing or unexpected:
         details = []

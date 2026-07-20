@@ -266,6 +266,9 @@ class CognitiveRuntime:
         #: `self.modulation` -- episodic memory is a property of the
         #: organism's run, not of any one episode.
         self.hippocampus = Hippocampus()
+        configure_retrieval = getattr(self.world_model, "configure_retrieval", None)
+        if callable(configure_retrieval):
+            configure_retrieval(self.hippocampus)
         #: Previous tick's arbiter mode, applied to *this* tick's attention
         #: budget (issue #95: "the mode gates attention breadth") -- one
         #: tick lagged like every other internal.* signal, since the mode
@@ -665,6 +668,11 @@ class CognitiveRuntime:
             else:
                 raw_surprise = 0.0
             calibrated_surprise = self.surprise_calibrator.update(raw_surprise)
+            set_retrieval_surprise = getattr(
+                self.world_model, "set_retrieval_surprise", None
+            )
+            if callable(set_retrieval_surprise):
+                set_retrieval_surprise(calibrated_surprise)
             arbiter_mode = self.arbiter.decide(surprise=calibrated_surprise, pain=adrenaline)
             self._arbiter_attention_mode = arbiter_mode
             arbiter_payload = self.arbiter.as_payload(self.surprise_calibrator.calibration_error)
@@ -684,6 +692,9 @@ class CognitiveRuntime:
                 damaged = any(
                     event.stream_id == "event.damage_taken" for event in window.events
                 )
+                context_latent = getattr(
+                    self.world_model, "hippocampal_context_latent", None
+                )
                 self.hippocampus.encode(
                     z=fused_latent.vector,
                     actions=[action.key() for action in emissions],
@@ -698,6 +709,8 @@ class CognitiveRuntime:
                     ),
                     tick_index=window.tick_index,
                     source=self.recorder.session_id,
+                    cortex_version=getattr(self.world_model, "cortex_version", None),
+                    context_z=(context_latent() if callable(context_latent) else None),
                 )
             # `internal.*` streams are computed here, after this tick's
             # `program.step()` already ran -- a Program's own reward
