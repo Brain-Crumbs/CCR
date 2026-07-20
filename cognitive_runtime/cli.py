@@ -1631,6 +1631,7 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
         backbone=args.backbone,
         context_length=args.context_length,
         ema_target_decay=args.ema_target_decay,
+        training_objective=args.training_objective,
     )
     print(
         f"nursery joint: training one action-conditioned world model "
@@ -2529,6 +2530,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_joint.add_argument(
         "--ema-target-decay", type=float, default=None,
         help="enable a Polyak target encoder for latent targets (e.g. 0.99); off by default",
+    )
+    p_nursery_joint.add_argument(
+        "--training-objective", choices=["windowed_rollout", "autoregressive"],
+        default="windowed_rollout", help="cortex training objective",
     )
     p_nursery_joint.add_argument("--neural-lr", type=float, default=1e-3)
     p_nursery_joint.add_argument("--batch-size", type=int, default=32)

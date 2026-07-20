@@ -294,6 +294,12 @@ class ActionWorldModelConfig:
     #: Probability a rollout step feeds its own prediction instead of the
     #: observed latent (scheduled sampling).
     scheduled_sampling_p: float = 0.5
+    #: ``"windowed_rollout"`` preserves the original short scheduled-
+    #: sampling trainer; ``"autoregressive"`` trains every causal prefix
+    #: and every configured direct horizon in one sequence pass (C1).
+    training_objective: str = "windowed_rollout"
+    #: Small exposure-bias term retained by the autoregressive objective.
+    autoregressive_rollout_weight: float = 0.1
     pixel_loss_weight: float = 1.0
     latent_loss_weight: float = 1.0
     #: Weights for the previously-untrained heads (issue #169): reward MSE
@@ -421,6 +427,187 @@ def _episode_head_targets(episode: EpisodeActionFrames, n_frames: int) -> Tuple[
     return _column(episode.reward), _column(episode.terminal), _column(episode.risk), has_targets
 
 
+def _update_ema_target_encoder(target_encoder: Any, model: Any, decay: float) -> None:
+    torch, _F = _torch()
+    with torch.no_grad():
+        for target_param, online_param in zip(target_encoder.parameters(), model.encoder.parameters()):
+            target_param.mul_(decay).add_(online_param, alpha=1.0 - decay)
+        for target_buffer, online_buffer in zip(target_encoder.buffers(), model.encoder.buffers()):
+            target_buffer.copy_(online_buffer)
+
+
+def _train_autoregressive_objective(
+    model: Any,
+    episodes: Sequence[Any],
+    head_targets: Sequence[Any],
+    cfg: ActionWorldModelConfig,
+    target_encoder: Optional[Any],
+    generator: Any,
+    max_context: Optional[int],
+    curriculum_epochs: int,
+    ticks_per_frame: float,
+) -> Dict[str, Any]:
+    """Train all causal prefixes and configured direct horizons (C1)."""
+    torch, F = _torch()
+    horizons_ticks = tuple(model.horizons_ticks)
+    if not horizons_ticks or horizons_ticks[0] < 1:
+        raise ValueError(
+            f"autoregressive objective needs positive horizons, got {horizons_ticks!r}"
+        )
+    if 1 not in horizons_ticks:
+        raise ValueError(
+            "autoregressive objective requires horizon 1 so the live one-step "
+            "latent/head path remains trained"
+        )
+    # The model's direct heads remain keyed by tick horizons, while episode
+    # tensors are indexed in recorded frames.  Convert each horizon separately
+    # so two tick heads that share a frame offset are both trained.
+    horizon_frames = tuple(
+        horizons_ticks_to_frames((horizon,), ticks_per_frame)[0]
+        for horizon in horizons_ticks
+    )
+    if all(
+        pixels.shape[0] <= min(horizon_frames)
+        for _episode, pixels, _targets, _actions in episodes
+    ):
+        raise ValueError("no autoregressive targets: episodes are shorter than the first horizon")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    curves: Dict[str, List[float]] = {
+        "total_loss": [], "pixel_loss": [], "latent_loss": [],
+        "reward_loss": [], "terminal_loss": [], "risk_loss": [], "uncertainty_loss": [],
+        "closed_loop_loss": [],
+    }
+    model.train()
+    for epoch_idx in range(cfg.epochs):
+        if cfg.context_length_curriculum and max_context:
+            progress = min(epoch_idx / max(curriculum_epochs - 1, 1), 1.0)
+            model.set_context_length(max(1, round(1 + progress * (max_context - 1))))
+        epoch = {key: 0.0 for key in curves}
+        seen = 0
+        for episode_index in torch.randperm(len(episodes), generator=generator).tolist():
+            _episode, pixels, targets, actions = episodes[episode_index]
+            rewards, terminals, risks, has_targets = head_targets[episode_index]
+            if pixels.shape[0] <= min(horizon_frames):
+                continue
+            optimizer.zero_grad()
+            latents = model.encoder(pixels).unsqueeze(0)
+            target_latents = latents
+            if target_encoder is not None:
+                with torch.no_grad():
+                    target_latents = target_encoder(pixels).unsqueeze(0)
+            actions_b = actions.unsqueeze(0)
+            if cfg.withhold_actions:
+                actions_b = torch.zeros_like(actions_b)
+            hidden = model.forward_sequence(latents[:, :-1], actions_b)
+
+            latent_terms = []
+            pixel_terms = []
+            reward_terms = []
+            terminal_terms = []
+            risk_terms = []
+            uncertainty_terms = []
+            for horizon_tick, horizon_frame in zip(horizons_ticks, horizon_frames):
+                positions = pixels.shape[0] - horizon_frame
+                if positions <= 0:
+                    continue
+                prediction = model.sequence_prediction(hidden[:, :positions], horizon_tick)
+                target_latent = target_latents[:, horizon_frame:].detach()
+                per_error = (
+                    F.normalize(prediction.latent, dim=-1) - F.normalize(target_latent, dim=-1)
+                ).pow(2).mean(dim=-1)
+                latent_terms.append(per_error.mean())
+                pixel_terms.append(F.mse_loss(
+                    prediction.decoded, targets[horizon_frame:].unsqueeze(0)
+                ))
+                uncertainty_terms.append(F.mse_loss(prediction.uncertainty, per_error.detach()))
+                if has_targets:
+                    reward_terms.append(F.mse_loss(
+                        prediction.reward, rewards[horizon_frame:].unsqueeze(0)
+                    ))
+                    terminal_terms.append(F.binary_cross_entropy_with_logits(
+                        prediction.terminal_logit, terminals[horizon_frame:].unsqueeze(0)
+                    ))
+                    risk_terms.append(F.mse_loss(
+                        prediction.risk, risks[horizon_frame:].unsqueeze(0)
+                    ))
+
+            def _mean_or_zero(terms: Sequence[Any]) -> Any:
+                return torch.stack(list(terms)).mean() if terms else pixels.new_zeros(())
+
+            latent_loss = _mean_or_zero(latent_terms)
+            pixel_loss = _mean_or_zero(pixel_terms)
+            reward_loss = _mean_or_zero(reward_terms)
+            terminal_loss = _mean_or_zero(terminal_terms)
+            risk_loss = _mean_or_zero(risk_terms)
+            uncertainty_loss = _mean_or_zero(uncertainty_terms)
+
+            closed_loop_loss = pixels.new_zeros(())
+            if cfg.autoregressive_rollout_weight > 0:
+                state = model.initial_state(1)
+                warmup = min(max(cfg.warmup_frames - 1, 0), actions_b.shape[1] - 1)
+                for index in range(warmup):
+                    _prediction, state = model.step(latents[:, index], actions_b[:, index], state)
+                latent_in = latents[:, warmup]
+                rollout_steps = min(cfg.rollout_frames, actions_b.shape[1] - warmup)
+                rollout_terms = []
+                for offset in range(rollout_steps):
+                    index = warmup + offset
+                    predicted, state = model.step(latent_in, actions_b[:, index], state)
+                    rollout_terms.append((
+                        F.normalize(predicted, dim=-1)
+                        - F.normalize(target_latents[:, index + 1].detach(), dim=-1)
+                    ).pow(2).mean())
+                    latent_in = (
+                        predicted
+                        if float(torch.rand((), generator=generator)) < cfg.scheduled_sampling_p
+                        else latents[:, index + 1]
+                    )
+                closed_loop_loss = _mean_or_zero(rollout_terms)
+
+            total = (
+                cfg.pixel_loss_weight * pixel_loss
+                + cfg.latent_loss_weight * latent_loss
+                + cfg.reward_loss_weight * reward_loss
+                + cfg.terminal_loss_weight * terminal_loss
+                + cfg.risk_loss_weight * risk_loss
+                + cfg.uncertainty_loss_weight * uncertainty_loss
+                + cfg.autoregressive_rollout_weight * closed_loop_loss
+            )
+            total.backward()
+            optimizer.step()
+            if target_encoder is not None:
+                _update_ema_target_encoder(target_encoder, model, float(cfg.ema_target_decay))
+
+            seen += 1
+            for key, value in (
+                ("total_loss", total), ("pixel_loss", pixel_loss), ("latent_loss", latent_loss),
+                ("reward_loss", reward_loss), ("terminal_loss", terminal_loss),
+                ("risk_loss", risk_loss), ("uncertainty_loss", uncertainty_loss),
+                ("closed_loop_loss", closed_loop_loss),
+            ):
+                epoch[key] += float(value.detach())
+        for key in curves:
+            curves[key].append(round(epoch[key] / max(seen, 1), 6))
+
+    if cfg.context_length_curriculum and max_context:
+        model.set_context_length(max_context)
+    return {
+        "samples": float(sum(
+            max(0, pixels.shape[0] - min(horizon_frames))
+            for _e, pixels, _t, _a in episodes
+        )),
+        "episodes": float(len(episodes)), "epochs": float(cfg.epochs),
+        "action_keys": list(model.action_keys), "warmup_frames": cfg.warmup_frames,
+        "rollout_frames": cfg.rollout_frames, "loss_curves": curves,
+        "training_objective": "autoregressive",
+        "autoregressive_horizons": list(horizon_frames),
+        "autoregressive_horizons_ticks": list(horizons_ticks),
+        "ema_target_enabled": target_encoder is not None, "ema_target_decay": cfg.ema_target_decay,
+        **{f"final_{key}": curves[key][-1] for key in curves},
+    }
+
+
 def train_action_world_model(
     dataset: ActionSequenceDataset,
     config: Optional[ActionWorldModelConfig] = None,
@@ -463,6 +650,11 @@ def train_action_world_model(
             "ema_target_decay must be None or in [0, 1), got "
             f"{cfg.ema_target_decay!r}"
         )
+    if cfg.training_objective not in {"windowed_rollout", "autoregressive"}:
+        raise ValueError(
+            "training_objective must be 'windowed_rollout' or 'autoregressive', got "
+            f"{cfg.training_objective!r}"
+        )
     torch.manual_seed(cfg.seed)
     generator = torch.Generator().manual_seed(cfg.seed)
 
@@ -492,6 +684,20 @@ def train_action_world_model(
         _episode_head_targets(episode, pixels.shape[0]) for episode, pixels, _t, _a in episodes
     ]
 
+    max_context = getattr(model, "context_length_max", None)
+    curriculum_epochs = max(cfg.context_length_curriculum_epochs or cfg.epochs, 1)
+    if cfg.training_objective == "autoregressive":
+        stats = _train_autoregressive_objective(
+            model, episodes, head_targets, cfg, target_encoder, generator,
+            max_context, curriculum_epochs, dataset.ticks_per_frame,
+        )
+        stats["ticks_per_frame"] = dataset.ticks_per_frame
+        diagnostics = representation_collapse_diagnostics(model, dataset, config=cfg)
+        stats["representation_diagnostics"] = diagnostics
+        if cfg.collapse_gate_enabled and diagnostics["gate_evaluable"] and not diagnostics["passed"]:
+            raise RepresentationCollapseError(diagnostics)
+        return model, stats
+
     window = cfg.warmup_frames + cfg.rollout_frames
     starts: List[Tuple[int, int]] = []  # (episode index, start frame)
     for e_idx, (_episode, pixels, _targets, _actions) in enumerate(episodes):
@@ -519,9 +725,6 @@ def train_action_world_model(
     #: 1 to the configured maximum over training, rather than the full
     #: window from epoch zero -- ``None`` on "gru" (unbounded context, no
     #: window to ramp) leaves this a no-op.
-    max_context = getattr(model, "context_length_max", None)
-    curriculum_epochs = max(cfg.context_length_curriculum_epochs or cfg.epochs, 1)
-
     model.train()
     for epoch_idx in range(cfg.epochs):
         if cfg.context_length_curriculum and max_context:
@@ -652,16 +855,7 @@ def train_action_world_model(
             total.backward()
             optimizer.step()
             if target_encoder is not None:
-                decay = float(cfg.ema_target_decay)
-                with torch.no_grad():
-                    for target_param, online_param in zip(
-                        target_encoder.parameters(), model.encoder.parameters()
-                    ):
-                        target_param.mul_(decay).add_(online_param, alpha=1.0 - decay)
-                    for target_buffer, online_buffer in zip(
-                        target_encoder.buffers(), model.encoder.buffers()
-                    ):
-                        target_buffer.copy_(online_buffer)
+                _update_ema_target_encoder(target_encoder, model, float(cfg.ema_target_decay))
 
             seen += batch_n
             epoch["total_loss"] += float(total.detach()) * batch_n
@@ -699,6 +893,7 @@ def train_action_world_model(
         "final_uncertainty_loss": curves["uncertainty_loss"][-1],
         "ema_target_enabled": target_encoder is not None,
         "ema_target_decay": cfg.ema_target_decay,
+        "training_objective": "windowed_rollout",
     }
     diagnostics = representation_collapse_diagnostics(model, dataset, config=cfg)
     stats["representation_diagnostics"] = diagnostics
@@ -1166,7 +1361,7 @@ def _linear_probe_orientation(
                         source, angle = "facing", math.atan2(facing[1], facing[0])
                 if angle is not None:
                     latent_rows.append(latents[i])
-                    hidden_rows.append(hidden.squeeze(0))
+                    hidden_rows.append(model.transition_backbone.readout(hidden).squeeze(0))
                     targets_rows.append(
                         torch.tensor([math.sin(angle), math.cos(angle)])
                     )
@@ -1385,5 +1580,21 @@ def load_action_world_model(path: str):
     model = build_action_world_model(
         tuple(payload["pixel_shape"]), payload["action_keys"], cfg
     )
-    model.load_state_dict(payload["state_dict"])
+    # C1 added direct heads for tick horizons > 1.  Older v1 checkpoints
+    # naturally lack only these freshly initialized modules; allow precisely
+    # that omission while retaining strict corruption detection everywhere
+    # else.
+    incompatibility = model.load_state_dict(payload["state_dict"], strict=False)
+    allowed_missing = {
+        key for key in model.state_dict() if key.startswith("multi_token_heads.")
+    }
+    unexpected = set(incompatibility.unexpected_keys)
+    missing = set(incompatibility.missing_keys) - allowed_missing
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing keys: {sorted(missing)}")
+        if unexpected:
+            details.append(f"unexpected keys: {sorted(unexpected)}")
+        raise ValueError("incompatible action world model checkpoint (" + "; ".join(details) + ")")
     return model, payload.get("training_stats", {})

@@ -120,6 +120,18 @@ class CortexRolloutOutput:
         return self.horizons[horizon]
 
 
+@dataclass(frozen=True)
+class CortexSequencePrediction:
+    """Direct prediction at every causal sequence position for one horizon."""
+
+    latent: torch.Tensor
+    decoded: torch.Tensor
+    reward: torch.Tensor
+    terminal_logit: torch.Tensor
+    risk: torch.Tensor
+    uncertainty: torch.Tensor
+
+
 class PredictiveCortex(nn.Module):
     """Encoder + action-conditioned GRU transition + decoder, with
     multi-horizon reward/terminal/risk/uncertainty heads.
@@ -186,6 +198,18 @@ class PredictiveCortex(nn.Module):
         #: calibratable sigma the phase doc asks for in place of an
         #: ensemble.
         self.uncertainty_head = nn.Linear(cfg.hidden_dim, 1)
+        # C1's direct multi-token heads predict farther future positions
+        # without forcing a deep composition through the one-step head.
+        self.multi_token_heads = nn.ModuleDict()
+        for horizon in self.horizons_ticks:
+            if horizon > 1:
+                self.multi_token_heads[str(horizon)] = nn.ModuleDict({
+                    "latent": nn.Linear(cfg.hidden_dim, cfg.latent_width),
+                    "reward": nn.Linear(cfg.hidden_dim, 1),
+                    "terminal": nn.Linear(cfg.hidden_dim, 1),
+                    "risk": nn.Linear(cfg.hidden_dim, 1),
+                    "uncertainty": nn.Linear(cfg.hidden_dim, 1),
+                })
 
     def initial_state(self, batch: int) -> Any:
         return self.transition_backbone.initial_state(batch)
@@ -218,6 +242,61 @@ class PredictiveCortex(nn.Module):
         x = torch.cat([latent, embedded], dim=-1)
         hidden_repr, next_state = self.transition_backbone.step(x, hidden)
         return self.latent_head(hidden_repr), next_state
+
+    def forward_sequence(self, latents: torch.Tensor, action_idx: torch.Tensor) -> torch.Tensor:
+        """Causally encode every ``(z_t, a_t)`` prefix in parallel.
+
+        ``latents`` is ``[B, T, latent_width]`` and ``action_idx`` is
+        ``[B, T]``; each output position predicts a future token from that
+        prefix.  The live ``step`` API remains separate for closed-loop use.
+        """
+        if latents.ndim != 3:
+            raise ValueError(f"latents must be [B, T, L], got {tuple(latents.shape)}")
+        if action_idx.shape != latents.shape[:2]:
+            raise ValueError(
+                "action_idx must be [B, T] matching latents, got "
+                f"{tuple(action_idx.shape)} for {tuple(latents.shape)}"
+            )
+        embedded = self.action_embedding(action_idx)
+        return self.transition_backbone.forward_sequence(torch.cat([latents, embedded], dim=-1))
+
+    def sequence_prediction(self, hidden: torch.Tensor, horizon: int) -> CortexSequencePrediction:
+        """Apply direct horizon heads to every sequence position."""
+        if horizon < 1:
+            raise ValueError(f"horizon must be positive, got {horizon}")
+        if horizon == 1:
+            latent = self.latent_head(hidden)
+            reward = self.reward_head(hidden).squeeze(-1)
+            terminal_logit = self.terminal_head(hidden).squeeze(-1)
+            risk = F.softplus(self.risk_head(hidden)).squeeze(-1)
+            uncertainty = F.softplus(self.uncertainty_head(hidden)).squeeze(-1)
+        else:
+            try:
+                heads = self.multi_token_heads[str(horizon)]
+            except KeyError:
+                raise ValueError(
+                    f"horizon {horizon} has no direct head; configured horizons are "
+                    f"{list(self.horizons_ticks)}"
+                ) from None
+            latent = heads["latent"](hidden)
+            reward = heads["reward"](hidden).squeeze(-1)
+            terminal_logit = heads["terminal"](hidden).squeeze(-1)
+            risk = F.softplus(heads["risk"](hidden)).squeeze(-1)
+            uncertainty = F.softplus(heads["uncertainty"](hidden)).squeeze(-1)
+        if latent.ndim != 3:
+            raise ValueError(f"sequence hidden must be [B, T, H], got {tuple(hidden.shape)}")
+        decoded = self.decoder(latent.reshape(-1, self.latent_width)).reshape(
+            latent.shape[0], latent.shape[1], self.reconstruction_shape[2],
+            self.reconstruction_shape[0], self.reconstruction_shape[1],
+        )
+        return CortexSequencePrediction(
+            latent=latent,
+            decoded=decoded,
+            reward=reward,
+            terminal_logit=terminal_logit,
+            risk=risk,
+            uncertainty=uncertainty,
+        )
 
     def heads(self, hidden: Any) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reward / terminal-logit / risk / uncertainty read off one rollout
