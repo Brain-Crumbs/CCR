@@ -38,7 +38,7 @@ runtime stays torch-free.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence, Union
+from typing import Any, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -60,15 +60,28 @@ class CortexWorldModel(CoreWorldModel):
         model: Union["PredictiveCortex", str],  # noqa: F821 -- lazy torch type
         action_keys: Optional[Sequence[str]] = None,
         horizons: Optional[Sequence[int]] = None,
+        consolidator: Optional[Any] = None,
+        consolidate_every_ticks: int = 0,
+        consolidation_steps: int = 1,
+        checkpoint_path: Optional[str] = None,
     ):
+        # A string `model` is a checkpoint path (--world-model cortex:PATH):
+        # default the online-consolidation save target to that same path, so
+        # `--async-trainer` persists consolidated weights back where the run
+        # loaded them from unless the caller overrides `checkpoint_path`
+        # explicitly (issue #175 review: without this, in-memory-only
+        # `publish_to` weights are lost on episode end/crash/interrupt).
         if isinstance(model, str):
             from cognitive_runtime.training.action_world_model import (
                 load_action_world_model,
             )
 
+            if checkpoint_path is None:
+                checkpoint_path = model
             model, _stats = load_action_world_model(model)
         self.model = model
         self.model.eval()
+        self.checkpoint_path = checkpoint_path
 
         keys = list(action_keys) if action_keys is not None else list(model.action_keys)
         if not keys:
@@ -100,6 +113,17 @@ class CortexWorldModel(CoreWorldModel):
         # the same pre-advance starting point.
         self._latent: Optional[torch.Tensor] = None
         self._pre_advance_hidden = None
+
+        # Optional online-consolidation wiring (issue #175): a live
+        # `sleep.cortex_consolidation.CortexConsolidator` feeding real
+        # `(z0, actions, next_latents)` transitions from every tick and
+        # running a bounded sleep pass (then publishing the result back into
+        # this adapter) every `consolidate_every_ticks` ticks. `0` disables
+        # it -- the default, byte-for-byte unchanged behavior.
+        self.consolidator = consolidator
+        self.consolidate_every_ticks = consolidate_every_ticks
+        self.consolidation_steps = consolidation_steps
+        self._tick = 0
 
     def _workspace_modalities(self, memory: Memory) -> dict[str, torch.Tensor]:
         """Bind the runtime's actual fused workspace plus efference copy."""
@@ -174,6 +198,23 @@ class CortexWorldModel(CoreWorldModel):
             if self._predicted_latent is not None:
                 prediction_error = float(F.mse_loss(latent, self._predicted_latent))
 
+            # The action emitted since last tick's encoded latent -- computed
+            # once and reused both for recording the real transition below
+            # (issue #175) and for the rollout's steady-state repeat.
+            action_col = self._last_action_column(memory)
+
+            # Feed the live consolidator the real transition that just
+            # completed: last tick's latent + the action taken since ->
+            # this tick's actually-observed latent (dream_length=1). Must
+            # happen before ``self._latent`` below overwrites the previous
+            # tick's value.
+            if self.consolidator is not None and self._latent is not None:
+                self.consolidator.record_transition(
+                    z0=self._latent.squeeze(0).tolist(),
+                    actions=[self.action_keys[int(action_col.item())]],
+                    next_latents=latent.detach(),
+                )
+
             # Snapshot for cortex MPC (issue #168): the encoded observation
             # and the hidden state *before* the one-step advance below.
             self._latent = latent
@@ -184,7 +225,6 @@ class CortexWorldModel(CoreWorldModel):
             # first step is the *real* advance whose hidden state and latent
             # forecast we persist; further steps are what-if look-ahead that
             # must not corrupt the rolling state.
-            action_col = self._last_action_column(memory)
             hidden = self._hidden
             latent_i = latent
             first_hidden = None
@@ -199,6 +239,43 @@ class CortexWorldModel(CoreWorldModel):
             self._predicted_latent = first_latent
 
             reward, terminal_logit, risk, uncertainty = self.model.heads(first_hidden)
+
+        # Sleep-phase consolidation (issue #175): outside `no_grad` above --
+        # `consolidate()` takes real gradient steps. Phasic/synchronous by
+        # design: this blocks the tick until the pass (and the weight
+        # publish back into `self`) completes, exactly the integration
+        # `CortexConsolidator`'s own docstring describes.
+        self._tick += 1
+        if (
+            self.consolidator is not None
+            and self.consolidate_every_ticks > 0
+            and self._tick % self.consolidate_every_ticks == 0
+        ):
+            self.consolidator.consolidate(self.consolidation_steps)
+            # `publish_to` calls `self.reset()` to clear the rolling backbone
+            # state under the fresh weights -- but that also wipes `_latent`,
+            # this tick's own encoded observation, which the *next* tick's
+            # `record_transition` needs as z0. Losing it would drop exactly
+            # the one transition following every consolidation (all of them,
+            # forever, at `--async-wake-ticks 1`) -- preserve it across the
+            # reset; it's still a valid (if slightly stale, pre-update)
+            # encoding of this tick's real observation.
+            pending_latent = self._latent
+            self.consolidator.publish_to(self)
+            self._latent = pending_latent
+            if self.checkpoint_path is not None:
+                # In-memory-only weights are lost on episode end, a crash, or
+                # KeyboardInterrupt -- persist every publish so a completed
+                # consolidation always survives the process, not only a
+                # graceful shutdown (mirrors the old async trainer's periodic
+                # checkpoint-write cadence).
+                from cognitive_runtime.training.action_world_model import (
+                    save_action_world_model,
+                )
+
+                save_action_world_model(
+                    self.checkpoint_path, self.model, self.consolidator.stats(),
+                )
 
         return Prediction(
             # ``risk_head`` is softplus'd (non-negative, unbounded); clamp into

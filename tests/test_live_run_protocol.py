@@ -6,6 +6,18 @@ checkpoint that a rerun resumes from, and the ``review`` command compares a
 run against baseline sessions on the same curriculum.  Driven entirely
 through the Python fake bridge (``bridge/fake/sim_bridge.py``) -- no
 Minecraft, no Node.
+
+The protocol itself is policy-agnostic (``_enforce_live_run_protocol`` gates
+on any policy in ``_CHECKPOINTED_POLICIES``); these tests drive it through
+``--policy online``, the only CLI-selectable checkpointed online policy left
+after issue #175 retired ``--policy actor-critic`` (online learning now lives
+in the predictive cortex, via ``--world-model cortex:`` + ``--async-trainer``,
+not in the motor path). The ``model.value_estimate`` stream test is genuinely
+actor/critic-specific plumbing (only a policy with a
+``latest_decision.value_estimate`` publishes it) and is no longer reachable
+through the CLI at all, so it drives :class:`ActorCriticPolicy`/
+:class:`ActorCriticLearner` directly against :class:`CognitiveRuntime`
+instead, the same pattern ``tests/test_actor_critic_runtime.py`` uses.
 """
 
 from __future__ import annotations
@@ -22,7 +34,17 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from cognitive_runtime.cli import main  # noqa: E402
-from cognitive_runtime.neural.checkpoint import read_checkpoint_metadata  # noqa: E402
+from cognitive_runtime.core.streams import TemporalFusion, default_encoder_registry  # noqa: E402
+from cognitive_runtime.models.online_q import OnlineQModel  # noqa: E402
+from cognitive_runtime.neural import ActorCriticOptimizer, MLPPolicyModel, MLPValueModel  # noqa: E402
+from cognitive_runtime.policies.actor_critic import (  # noqa: E402
+    ActorCriticLearner,
+    ActorCriticPolicy,
+    world_feature_width,
+)
+from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox  # noqa: E402
+from cognitive_runtime.runtime.config import RuntimeConfig  # noqa: E402
+from cognitive_runtime.runtime.loop import CognitiveRuntime  # noqa: E402
 from cognitive_runtime.runtime.replay import iter_cognitive_ticks  # noqa: E402
 from cognitive_runtime.tools.review import review_run  # noqa: E402
 
@@ -42,12 +64,12 @@ def test_live_run_without_checkpoint_or_fresh_exits_with_actionable_message(
     tmp_path, monkeypatch
 ):
     _use_fake_remote(monkeypatch)
-    checkpoint = tmp_path / "actor-critic.pt"
+    checkpoint = tmp_path / "online-q.json"
     with pytest.raises(SystemExit, match="--fresh"):
         main([
-            "run", "--backend", "remote", "--policy", "actor-critic",
+            "run", "--backend", "remote", "--policy", "online",
             "--episodes", "1", "--episode-ticks", "5", "--world-size", "16",
-            "--actor-critic-model", str(checkpoint),
+            "--online-model", str(checkpoint),
             "--record-dir", str(tmp_path), "--session-id", "live-no-checkpoint",
         ])
     assert not checkpoint.exists()
@@ -55,11 +77,11 @@ def test_live_run_without_checkpoint_or_fresh_exits_with_actionable_message(
 
 def test_live_run_with_fresh_flag_starts_a_new_checkpoint(tmp_path, monkeypatch):
     _use_fake_remote(monkeypatch)
-    checkpoint = tmp_path / "actor-critic.pt"
+    checkpoint = tmp_path / "online-q.json"
     main([
-        "run", "--backend", "remote", "--policy", "actor-critic", "--fresh",
+        "run", "--backend", "remote", "--policy", "online", "--fresh",
         "--episodes", "1", "--episode-ticks", "10", "--world-size", "16",
-        "--actor-critic-model", str(checkpoint),
+        "--online-model", str(checkpoint),
         "--record-dir", str(tmp_path), "--session-id", "live-fresh",
     ])
     assert checkpoint.exists()
@@ -67,24 +89,24 @@ def test_live_run_with_fresh_flag_starts_a_new_checkpoint(tmp_path, monkeypatch)
 
 def test_live_run_with_existing_checkpoint_does_not_need_fresh(tmp_path, monkeypatch):
     _use_fake_remote(monkeypatch)
-    checkpoint = tmp_path / "actor-critic.pt"
+    checkpoint = tmp_path / "online-q.json"
     main([
-        "run", "--backend", "remote", "--policy", "actor-critic", "--fresh",
+        "run", "--backend", "remote", "--policy", "online", "--fresh",
         "--episodes", "1", "--episode-ticks", "10", "--world-size", "16",
-        "--actor-critic-model", str(checkpoint),
+        "--online-model", str(checkpoint),
         "--record-dir", str(tmp_path), "--session-id", "live-seed",
     ])
-    first_step = read_checkpoint_metadata(str(checkpoint))["online_optimizer"]["step"]
+    first_ticks = OnlineQModel.load(str(checkpoint)).training_ticks
 
     # No --fresh this time: an existing checkpoint satisfies the gate.
     main([
-        "run", "--backend", "remote", "--policy", "actor-critic",
+        "run", "--backend", "remote", "--policy", "online",
         "--episodes", "1", "--episode-ticks", "10", "--world-size", "16",
-        "--actor-critic-model", str(checkpoint),
+        "--online-model", str(checkpoint),
         "--record-dir", str(tmp_path), "--session-id", "live-resume",
     ])
-    second_step = read_checkpoint_metadata(str(checkpoint))["online_optimizer"]["step"]
-    assert second_step > first_step
+    second_ticks = OnlineQModel.load(str(checkpoint)).training_ticks
+    assert second_ticks > first_ticks
 
 
 # --------------------------------------------------- always record, with frames
@@ -92,22 +114,22 @@ def test_live_run_with_existing_checkpoint_does_not_need_fresh(tmp_path, monkeyp
 
 def test_live_run_without_no_record_flag_rejects_no_record(tmp_path, monkeypatch):
     _use_fake_remote(monkeypatch)
-    checkpoint = tmp_path / "actor-critic.pt"
+    checkpoint = tmp_path / "online-q.json"
     with pytest.raises(SystemExit, match="recorded"):
         main([
-            "run", "--backend", "remote", "--policy", "actor-critic", "--fresh",
+            "run", "--backend", "remote", "--policy", "online", "--fresh",
             "--episodes", "1", "--episode-ticks", "5", "--world-size", "16",
-            "--actor-critic-model", str(checkpoint), "--no-record",
+            "--online-model", str(checkpoint), "--no-record",
         ])
 
 
 def test_live_run_auto_records_frames_without_the_flag(tmp_path, monkeypatch):
     _use_fake_remote(monkeypatch)
-    checkpoint = tmp_path / "actor-critic.pt"
+    checkpoint = tmp_path / "online-q.json"
     main([
-        "run", "--backend", "remote", "--policy", "actor-critic", "--fresh",
+        "run", "--backend", "remote", "--policy", "online", "--fresh",
         "--episodes", "1", "--episode-ticks", "10", "--world-size", "16",
-        "--actor-critic-model", str(checkpoint),
+        "--online-model", str(checkpoint),
         "--record-dir", str(tmp_path), "--session-id", "live-frames",
     ])
     session_dir = str(tmp_path / "live-frames")
@@ -123,14 +145,42 @@ def test_live_run_auto_records_frames_without_the_flag(tmp_path, monkeypatch):
 # --------------------------------------------------------- value estimate stream
 
 
-def test_actor_critic_publishes_value_estimate_stream(tmp_path):
-    checkpoint = tmp_path / "actor-critic.pt"
-    main([
-        "run", "--policy", "actor-critic",
-        "--episodes", "1", "--episode-ticks", "15", "--world-size", "16",
-        "--actor-critic-model", str(checkpoint),
-        "--record-dir", str(tmp_path), "--session-id", "value-estimate",
-    ])
+def test_actor_critic_policy_publishes_value_estimate_stream(tmp_path):
+    """``model.value_estimate`` is published whenever the policy's
+    ``latest_decision`` carries a ``value_estimate`` (currently only
+    :class:`ActorCriticPolicy`, wired here directly against
+    :class:`CognitiveRuntime` since ``--policy actor-critic`` is no longer a
+    CLI option -- issue #175 retired the actor/critic online-CLI path)."""
+    program_config = {"episode_ticks": 15, "world_size": 16}
+    program = MinecraftSurvivalBox(config=program_config)
+    fusion = TemporalFusion(program.stream_catalog(), default_encoder_registry())
+    action_space = list(program.metadata().action_space)
+    action_keys = [action.key() for action in action_space]
+    wf_width = world_feature_width(action_keys)
+
+    torch.manual_seed(0)
+    policy_model = MLPPolicyModel(
+        fusion.width, wf_width, len(action_keys),
+        hidden_dim=16, layout_hash=fusion.layout_hash, action_keys=action_keys,
+    )
+    critic_model = MLPValueModel(
+        fusion.width, wf_width, hidden_dim=16, layout_hash=fusion.layout_hash, action_keys=action_keys,
+    )
+    optimizer = ActorCriticOptimizer(policy_model, critic_model, lr=0.05, seed=0)
+    policy = ActorCriticPolicy(policy_model, critic_model, action_keys, action_space=action_space, training=True)
+    learner = ActorCriticLearner(optimizer, policy, training=True)
+
+    runtime = CognitiveRuntime(
+        program=program,
+        policy=policy,
+        learner=learner,
+        config=RuntimeConfig(
+            episodes=1, seed=0, max_ticks_per_episode=program_config["episode_ticks"],
+            record_dir=str(tmp_path), session_id="value-estimate", program_config=program_config,
+        ),
+    )
+    runtime.run()
+
     session_dir = str(tmp_path / "value-estimate")
     saw_value_estimate = False
     for _decision, sensory, _motor in iter_cognitive_ticks(session_dir, "episode_00000"):
@@ -146,16 +196,16 @@ def test_actor_critic_publishes_value_estimate_stream(tmp_path):
 
 def test_bridge_crash_mid_episode_ends_the_episode_not_the_process(tmp_path, monkeypatch):
     _use_fake_remote(monkeypatch, crash_after_steps=8)
-    checkpoint = tmp_path / "actor-critic.pt"
+    checkpoint = tmp_path / "online-q.json"
 
     # Each episode's fake-bridge subprocess crashes after 8 steps -- both
     # episodes here end via the recoverable path, and the run still returns
     # normally instead of raising.
     main([
-        "run", "--backend", "remote", "--policy", "actor-critic", "--fresh",
+        "run", "--backend", "remote", "--policy", "online", "--fresh",
         "--episodes", "2", "--episode-ticks", "30", "--world-size", "16",
-        "--actor-critic-model", str(checkpoint),
-        "--actor-critic-save-every", "100000",
+        "--online-model", str(checkpoint),
+        "--online-save-every", "100000",
         "--record-dir", str(tmp_path), "--session-id", "live-bridge-crash",
     ])
 
@@ -171,8 +221,8 @@ def test_bridge_crash_mid_episode_ends_the_episode_not_the_process(tmp_path, mon
     # metadata write, but each episode's own bridge-crash checkpoint already
     # ran and is visible in that episode's summary (asserted above); the
     # checkpoint itself must still be valid and have trained.
-    metadata = read_checkpoint_metadata(str(checkpoint))
-    assert metadata["online_optimizer"]["step"] > 0
+    model = OnlineQModel.load(str(checkpoint))
+    assert model.training_ticks > 0
     assert checkpoint.exists()
 
 
@@ -184,7 +234,7 @@ def test_real_sigint_during_live_run_leaves_a_valid_checkpoint_that_resumes(
     tmp_path, monkeypatch
 ):
     _use_fake_remote(monkeypatch)
-    checkpoint = tmp_path / "actor-critic.pt"
+    checkpoint = tmp_path / "online-q.json"
 
     def _send_sigint_soon():
         os.kill(os.getpid(), signal.SIGINT)
@@ -194,29 +244,29 @@ def test_real_sigint_during_live_run_leaves_a_valid_checkpoint_that_resumes(
     try:
         with pytest.raises(KeyboardInterrupt):
             main([
-                "run", "--backend", "remote", "--policy", "actor-critic", "--fresh",
+                "run", "--backend", "remote", "--policy", "online", "--fresh",
                 "--episodes", "1", "--episode-ticks", "100000", "--world-size", "16",
-                "--actor-critic-model", str(checkpoint),
+                "--online-model", str(checkpoint),
                 "--record-dir", str(tmp_path), "--session-id", "live-sigint",
             ])
     finally:
         timer.cancel()
 
     assert checkpoint.exists()
-    metadata = read_checkpoint_metadata(str(checkpoint))
-    assert metadata["training_stats"]["last_checkpoint_reason"] == "keyboard_interrupt"
-    interrupted_step = metadata["online_optimizer"]["step"]
-    assert interrupted_step > 0
+    model = OnlineQModel.load(str(checkpoint))
+    assert model.meta["learner_stats"]["last_checkpoint_reason"] == "keyboard_interrupt"
+    interrupted_ticks = model.training_ticks
+    assert interrupted_ticks > 0
 
     # Rerun resumes both the tick counter and the trained weights.
     main([
-        "run", "--backend", "remote", "--policy", "actor-critic",
+        "run", "--backend", "remote", "--policy", "online",
         "--episodes", "1", "--episode-ticks", "10", "--world-size", "16",
-        "--actor-critic-model", str(checkpoint),
+        "--online-model", str(checkpoint),
         "--record-dir", str(tmp_path), "--session-id", "live-sigint-resume",
     ])
-    resumed_step = read_checkpoint_metadata(str(checkpoint))["online_optimizer"]["step"]
-    assert resumed_step > interrupted_step
+    resumed_ticks = OnlineQModel.load(str(checkpoint)).training_ticks
+    assert resumed_ticks > interrupted_ticks
 
 
 # ------------------------------------------------------------ review command
