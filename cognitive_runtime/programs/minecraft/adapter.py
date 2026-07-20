@@ -9,7 +9,7 @@ to change, and the runtime itself never changes.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from cognitive_runtime.core.action import NULL_ACTION, Action
 from cognitive_runtime.core.observation import Observation
@@ -29,9 +29,16 @@ from cognitive_runtime.programs.minecraft.backend import SimulatedBackend, Survi
 from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
 from cognitive_runtime.programs.minecraft.observations import OBSERVATION_KEYS
 from cognitive_runtime.programs.minecraft.remote import RemoteMinecraftBackend
-from cognitive_runtime.programs.minecraft.reward_engine import ProfileRewardEngine
-from cognitive_runtime.programs.minecraft.reward_profile import RewardProfile
 from cognitive_runtime.programs.minecraft.rewards import SurvivalReward, SurvivalRewardConfig
+
+if TYPE_CHECKING:
+    # Issue #176: the profile-driven reward economy (reward_engine.py +
+    # reward_profile.py, ~1,100 LOC) is only actually imported, at runtime
+    # below, when a caller passes a `reward_profile` -- constructing a
+    # MinecraftSurvivalBox with the default legacy SurvivalReward never
+    # touches it.
+    from cognitive_runtime.programs.minecraft.reward_engine import ProfileRewardEngine
+    from cognitive_runtime.programs.minecraft.reward_profile import RewardProfile
 from cognitive_runtime.programs.minecraft.streams import (
     BODY_HEARTBEAT_HZ,
     BODY_HEARTBEAT_KEY,
@@ -67,11 +74,17 @@ class MinecraftSurvivalBox(Program):
         #: A loaded profile (issue #41) drives rewards generically through
         #: ProfileRewardEngine; otherwise the historical hard-coded
         #: SurvivalReward (optionally tuned by `reward_config`) is unchanged.
-        self._reward_fn = (
-            ProfileRewardEngine(reward_profile)
-            if reward_profile is not None
-            else SurvivalReward(reward_config)
-        )
+        #: Issue #176: reward_engine.py/reward_profile.py (the profile-driven
+        #: reward economy) are only imported here, when a profile is
+        #: actually given -- the default legacy-reward path never pulls
+        #: them in.
+        self._is_profile_reward = reward_profile is not None
+        if reward_profile is not None:
+            from cognitive_runtime.programs.minecraft.reward_engine import ProfileRewardEngine
+
+            self._reward_fn = ProfileRewardEngine(reward_profile)
+        else:
+            self._reward_fn = SurvivalReward(reward_config)
         self._pending_events: List[str] = []
         self._last_action: Action = NULL_ACTION
         self._last_reward: RewardSignal = RewardSignal()
@@ -342,20 +355,20 @@ class MinecraftSurvivalBox(Program):
         one-tick lag `model.novelty`/`internal.*` already have relative to
         the window that first observes them. A no-op unless a `RewardProfile`
         is active (the legacy `SurvivalReward` path never reads `internal.*`)."""
-        if isinstance(self._reward_fn, ProfileRewardEngine):
+        if self._is_profile_reward:
             self._reward_fn.observe_external_streams(payloads)
 
     def reward_engine_state_dict(self) -> Optional[Dict[str, Any]]:
         """Brain-scoped milestone state + return normalizer (issue #41), for
         the checkpoint bundle.  `None` when no profile is active."""
-        if not isinstance(self._reward_fn, ProfileRewardEngine):
+        if not self._is_profile_reward:
             return None
         return self._reward_fn.state_dict()
 
     def load_reward_engine_state_dict(self, state: Dict[str, Any]) -> None:
         """Restore brain-scoped milestone state on resume, so a checkpoint
         interrupt/resume does not re-grant one-time rewards already earned."""
-        if not isinstance(self._reward_fn, ProfileRewardEngine):
+        if not self._is_profile_reward:
             raise ValueError("no reward profile is active; nothing to restore state into")
         self._reward_fn.load_state_dict(state)
 
@@ -389,6 +402,6 @@ class MinecraftSurvivalBox(Program):
                 "final_tick": self._backend.tick(),
             }
         )
-        if isinstance(self._reward_fn, ProfileRewardEngine):
+        if self._is_profile_reward:
             stats["reward_by_tier"] = self._reward_fn.tier_totals()
         return stats

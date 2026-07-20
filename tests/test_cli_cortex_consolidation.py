@@ -31,7 +31,7 @@ def _write_tiny_cortex_checkpoint(path, action_keys):
 def test_async_trainer_without_cortex_world_model_exits_with_actionable_message(tmp_path):
     with pytest.raises(SystemExit, match="--world-model cortex:"):
         main([
-            "run", "--policy", "scripted", "--async-trainer",
+            "run", "--world", "minecraft", "--policy", "scripted", "--async-trainer",
             "--episodes", "1", "--episode-ticks", "5", "--world-size", "16",
             "--no-record",
         ])
@@ -50,7 +50,7 @@ def test_async_trainer_with_neural_world_model_path_exits_with_actionable_messag
     # before that path is even attempted.
     with pytest.raises(SystemExit, match="--world-model cortex:"):
         main([
-            "run", "--policy", "scripted", "--async-trainer",
+            "run", "--world", "minecraft", "--policy", "scripted", "--async-trainer",
             "--world-model", str(checkpoint),
             "--episodes", "1", "--episode-ticks", "5", "--world-size", "16",
             "--no-record",
@@ -66,7 +66,7 @@ def test_async_trainer_with_cortex_world_model_runs_without_crashing(tmp_path):
     _write_tiny_cortex_checkpoint(checkpoint, action_keys)
 
     main([
-        "run", "--policy", "scripted",
+        "run", "--world", "minecraft", "--policy", "scripted",
         "--world-model", f"cortex:{checkpoint}",
         "--async-trainer", "--async-wake-ticks", "5", "--async-consolidation-steps", "2",
         "--episodes", "1", "--episode-ticks", str(program_config["episode_ticks"]),

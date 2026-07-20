@@ -1,6 +1,7 @@
 """Command-line interface for the Continuous Cognitive Runtime.
 
-    python -m cognitive_runtime run --policy scripted --episodes 3
+    python -m cognitive_runtime run --episodes 3
+    python -m cognitive_runtime run --world minecraft --policy scripted --episodes 3
     python -m cognitive_runtime demo
     python -m cognitive_runtime evaluate --episodes 3
     python -m cognitive_runtime statistical-evaluate --episodes 20 --baseline random
@@ -18,7 +19,17 @@ import argparse
 import dataclasses
 import os
 import sys
-from typing import Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+
+if TYPE_CHECKING:
+    # Issue #176: the CLI's default --world is now "crafter", and the
+    # survival-economy world (MinecraftSurvivalBox, its --backend registry,
+    # the profile-driven reward system) is only imported, at runtime, from
+    # the functions below that actually select --world minecraft or pass
+    # --reward-profile -- not at module import time.
+    from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+    from cognitive_runtime.programs.minecraft.reward_profile import RewardProfile
+    from cognitive_runtime.programs.minecraft.rewards import SurvivalRewardConfig
 
 from brain.hippocampus import Hippocampus
 from cognitive_runtime.core.attention import ATTENTION_MODES
@@ -36,15 +47,8 @@ from cognitive_runtime.policies import (
     ScriptedSurvivalPolicy,
 )
 from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
-from cognitive_runtime.programs.minecraft.adapter import BACKENDS, MinecraftSurvivalBox
 from cognitive_runtime.programs.minecraft.curriculum import CURRICULUM_ORDER, get_curriculum
 from cognitive_runtime.programs.minecraft.evaluation import comparison_table, summarize_episodes
-from cognitive_runtime.programs.minecraft.reward_profile import (
-    RewardProfile,
-    RewardProfileError,
-    load_reward_profile,
-)
-from cognitive_runtime.programs.minecraft.rewards import SurvivalRewardConfig
 from cognitive_runtime.programs.minecraft.action_registry import MINECRAFT_ACTION_REGISTRY
 from cognitive_runtime.programs.minecraft.stream_registry import MINECRAFT_STREAM_REGISTRY
 from cognitive_runtime.runtime.config import RuntimeConfig
@@ -68,11 +72,19 @@ DEFAULT_ONLINE_MODEL_OUT = "models/online-q.json"
 #: semantic streams keep publishing/recording but stop reaching the policy.
 INPUT_PROFILES = {"full", "raw"}
 
+#: ``--backend`` choices for ``--world minecraft`` (the ``BACKENDS`` registry
+#: itself lives in ``programs.minecraft.adapter``; its keys are mirrored here,
+#: statically, so building the parser -- which needs these for every
+#: subcommand's ``--backend``/``choices=`` metadata, regardless of the world
+#: actually selected -- never imports the survival-economy adapter module
+#: (issue #176).
+MINECRAFT_BACKEND_NAMES = ("remote", "simulated")
+
 
 def _default_nursery_backend() -> str:
     """Use the live backend by default when live connection env is present."""
     env_default = os.environ.get("CCR_NURSERY_BACKEND")
-    if env_default in BACKENDS:
+    if env_default in MINECRAFT_BACKEND_NAMES:
         return env_default
     if os.environ.get("CCR_MINECRAFT_HOST"):
         return "remote"
@@ -113,23 +125,35 @@ def _resolve_world_args(args: argparse.Namespace) -> None:
         args.seed = preset.seed if preset else 0
 
 
-def _reward_config_for(args: argparse.Namespace) -> Optional[SurvivalRewardConfig]:
+def _reward_config_for(args: argparse.Namespace) -> Optional["SurvivalRewardConfig"]:
     """The curriculum's reward-weight bundle applied over the defaults, or
     `None` (default reward config) when no curriculum was chosen."""
     if not args.curriculum:
         return None
+    from cognitive_runtime.programs.minecraft.rewards import SurvivalRewardConfig
+
     preset = get_curriculum(args.curriculum)
     return dataclasses.replace(SurvivalRewardConfig(), **preset.reward_config)
 
 
-def _reward_profile_for(args: argparse.Namespace) -> Optional[RewardProfile]:
+def _reward_profile_for(args: argparse.Namespace) -> Optional["RewardProfile"]:
     """The loaded `--reward-profile`, or `None` for the legacy hard-coded
     reward path.  Fails the whole invocation immediately (issue #41: "a
     malformed profile fails at startup with a clear message, not mid-run")
-    rather than letting a bad profile surface as a mid-episode crash."""
+    rather than letting a bad profile surface as a mid-episode crash.
+
+    Issue #176: the profile-driven reward economy (reward_profile.py) is
+    only imported here, when `--reward-profile` is actually given -- not at
+    CLI module import time.
+    """
     path = getattr(args, "reward_profile", None)
     if not path:
         return None
+    from cognitive_runtime.programs.minecraft.reward_profile import (
+        RewardProfileError,
+        load_reward_profile,
+    )
+
     try:
         return load_reward_profile(path)
     except RewardProfileError as exc:
@@ -353,7 +377,7 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
                              "prismarine-viewer first-person snapshots (default); "
                              "'grid' uses the compact colorized semantic-grid fallback")
     parser.add_argument("--model", default=None, help="path to a trained BC model (learned policy)")
-    parser.add_argument("--backend", default="simulated", choices=sorted(BACKENDS),
+    parser.add_argument("--backend", default="simulated", choices=sorted(MINECRAFT_BACKEND_NAMES),
                         help="survival backend: the deterministic simulated world, or "
                              "a real-Minecraft client (remote; not yet implemented)")
     parser.add_argument("--reward-profile", default=None,
@@ -369,19 +393,23 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
                              "sigmoid around --intrinsic-risk-threshold (default: 0.15)")
 
 
-#: Programs that aren't Minecraft (issue #89). Default stays "minecraft" for
-#: back-compat; ``--world crafter`` routes construction through
-#: ``_build_program`` instead of the historical hardcoded ``MinecraftSurvivalBox``.
+#: Programs the ``--world`` selector can build (issue #89). Crafter is the
+#: default (issue #176): it's the live V2 nursery world and needs none of
+#: Minecraft's survival-economy weight (crafting/inventory/reward-profile
+#: system) the predictive objective doesn't use. Minecraft stays fully
+#: supported, opt-in via ``--world minecraft`` -- see
+#: ``cognitive_runtime/programs/minecraft/__init__.py`` for its quarantine
+#: note and the future graduation-world milestone it's kept for.
 WORLDS = {"minecraft", "crafter"}
 
 
-def _add_world_selector_arg(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--world", default="minecraft", choices=sorted(WORLDS),
-                        help="which Program to run: the deterministic Minecraft-like "
-                             "survival sim (default, for back-compat), or the Crafter "
-                             "nursery world (issue #89; needs the 'crafter' extra "
-                             "installed). Both implement the same streams-v2 seam, so "
-                             "the runtime/policy code is unchanged either way.")
+def _add_world_selector_arg(parser: argparse.ArgumentParser, default: str = "crafter") -> None:
+    parser.add_argument("--world", default=default, choices=sorted(WORLDS),
+                        help="which Program to run: the Crafter nursery world "
+                             f"or the legacy Minecraft-like survival sim "
+                             f"(default here: {default}). Both implement the "
+                             "same streams-v2 seam, so the runtime/policy code "
+                             "is unchanged either way.")
 
 
 def _build_program(args: argparse.Namespace, program_config: Dict[str, Any],
@@ -394,6 +422,11 @@ def _build_program(args: argparse.Namespace, program_config: Dict[str, Any],
     """
     world = getattr(args, "world", "minecraft")
     if world == "minecraft":
+        # Issue #176: MinecraftSurvivalBox (and the survival-economy reward
+        # system it pulls in) is only imported here, when --world minecraft
+        # is actually selected -- never for the default (crafter) path.
+        from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+
         program = MinecraftSurvivalBox(
             config=program_config,
             reward_config=None if reward_profile else reward_config,
@@ -406,9 +439,10 @@ def _build_program(args: argparse.Namespace, program_config: Dict[str, Any],
         from cognitive_runtime.programs.crafter.adapter import CrafterWorld
         from cognitive_runtime.programs.crafter.stream_registry import CRAFTER_STREAM_REGISTRY
 
-        # CrafterWorld imports the optional 'crafter' package lazily, inside
-        # __init__ -- the ImportError (if it's not installed) only surfaces
-        # at construction, not at the module import above.
+        # CrafterWorld imports the 'crafter' package (a core dependency,
+        # issue #176) lazily, inside __init__ -- a partial/dev install
+        # missing it only surfaces an ImportError here, at construction, not
+        # at the module import above.
         try:
             program = CrafterWorld(config=program_config)
         except ImportError as exc:
@@ -451,6 +485,11 @@ def _enforce_live_run_protocol(args: argparse.Namespace) -> None:
 def cmd_run(args: argparse.Namespace) -> None:
     _resolve_world_args(args)
     world = getattr(args, "world", "minecraft")
+    if args.policy is None:
+        # Issue #176: --policy scripted is a Minecraft-specific heuristic,
+        # so it's only the implicit default for --world minecraft; every
+        # other world falls back to random.
+        args.policy = "scripted" if world == "minecraft" else "random"
     if world != "minecraft" and args.backend != "simulated":
         sys.exit(f"--backend only applies to --world minecraft (got --world {world!r})")
     if world != "minecraft" and args.curriculum is not None:
@@ -544,6 +583,11 @@ def cmd_demo(args: argparse.Namespace) -> None:
 
 
 def cmd_evaluate(args: argparse.Namespace) -> None:
+    # `evaluate` has no --world selector; it's a Minecraft-only tool (issue
+    # #176: imported here, not at CLI module load, since most commands
+    # never touch the survival economy).
+    from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+
     _resolve_world_args(args)
     program_config = _program_config(args)
     reward_profile = _reward_profile_for(args)
@@ -585,6 +629,11 @@ def cmd_statistical_evaluate(args: argparse.Namespace) -> None:
             for (curriculum, policy), s in sorted(by_group.items())
         }
     else:
+        # `statistical-evaluate` has no --world selector; it's a
+        # Minecraft-only tool (issue #176: imported here, not at CLI module
+        # load).
+        from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+
         _resolve_world_args(args)
         program_config = _program_config(args)
         reward_profile = _reward_profile_for(args)
@@ -1607,9 +1656,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="issue #88: organism name, threaded into the session id, "
                             "recorded metadata, checkpoints and exports; default: a "
                             "generated Docker-style name (e.g. vigorous-shannon)")
-    p_run.add_argument("--policy", default="scripted",
+    p_run.add_argument("--policy", default=None,
                        choices=["null", "random", "scripted", "learned", "neural", "online",
-                                "human"])
+                                "human"],
+                       help="default: 'scripted' for --world minecraft (issue #89's original "
+                            "default), 'random' otherwise -- --policy scripted is a "
+                            "Minecraft-specific heuristic (issue #176)")
     p_run.add_argument("--input-profile", default="full", choices=sorted(INPUT_PROFILES),
                        help="issue #32: 'full' (default) fuses every stream the legacy "
                             "encoder registry binds, including hand-computed semantic "
@@ -1699,7 +1751,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_demo.add_argument("--name", default=None,
                         help="issue #88: organism name (see 'run --name'); default: generated")
     _add_world_args(p_demo)
-    _add_world_selector_arg(p_demo)
+    # `demo` forces HumanDemoPolicy (cmd_demo below), a Minecraft-specific
+    # terminal keymap/status display (world.front_block, body.hunger, ...);
+    # it doesn't understand Crafter's action space or streams, so unlike
+    # `run`/`nursery`, this default stays "minecraft" (issue #193 review).
+    _add_world_selector_arg(p_demo, default="minecraft")
     _add_world_model_arg(p_demo)
     _add_entity_persistence_arg(p_demo)
     p_demo.set_defaults(func=cmd_demo)
@@ -1899,9 +1955,9 @@ def build_parser() -> argparse.ArgumentParser:
     nursery_sub = p_nursery.add_subparsers(dest="nursery_command", required=True)
 
     p_nursery_list = nursery_sub.add_parser("list", help="list available nursery scenarios")
-    p_nursery_list.add_argument("--world", default="minecraft", choices=sorted(WORLDS),
-                                help="issue #90: list Minecraft's scenarios (default) or "
-                                     "Crafter's ports (--world crafter)")
+    p_nursery_list.add_argument("--world", default="crafter", choices=sorted(WORLDS),
+                                help="issue #90/#176: list Crafter's scenarios (default) or "
+                                     "Minecraft's legacy ports (--world minecraft)")
     p_nursery_list.set_defaults(func=cmd_nursery_list)
 
     p_nursery_run = nursery_sub.add_parser(
@@ -1910,11 +1966,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_run.add_argument(
         "scenario", help="scenario name (see 'nursery list'), or 'all' to run the full suite"
     )
-    p_nursery_run.add_argument("--world", default="minecraft", choices=sorted(WORLDS),
-                               help="issue #90: record against Minecraft's simulated/remote "
-                                    "backend (default) or the Crafter nursery world "
-                                    "(--world crafter; needs the 'crafter' extra installed). "
-                                    "--backend/--world-size only apply to --world minecraft.")
+    p_nursery_run.add_argument("--world", default="crafter", choices=sorted(WORLDS),
+                               help="issue #90/#176: record against the Crafter nursery world "
+                                    "(default) or Minecraft's legacy simulated/remote backend "
+                                    "(--world minecraft). --backend/--world-size only apply to "
+                                    "--world minecraft.")
     p_nursery_run.add_argument("--name", default=None,
                                help="issue #88: organism name threaded into every recorded "
                                     "episode's session metadata, prediction exports, and the "
@@ -1928,7 +1984,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_run.add_argument("--episode-ticks", type=int, default=400)
     p_nursery_run.add_argument("--world-size", type=int, default=48)
     p_nursery_run.add_argument("--backend", default=_default_nursery_backend(),
-                               choices=sorted(BACKENDS),
+                               choices=sorted(MINECRAFT_BACKEND_NAMES),
                                help="backend used to record nursery episodes. Defaults to "
                                     "remote when CCR_MINECRAFT_HOST is set, otherwise "
                                     "simulated; CCR_NURSERY_BACKEND can override this.")
@@ -1983,7 +2039,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_joint.add_argument("--episode-ticks", type=int, default=400)
     p_nursery_joint.add_argument("--world-size", type=int, default=48)
     p_nursery_joint.add_argument("--backend", default=_default_nursery_backend(),
-                                 choices=sorted(BACKENDS))
+                                 choices=sorted(MINECRAFT_BACKEND_NAMES))
     p_nursery_joint.add_argument("--realtime", action="store_true")
     p_nursery_joint.add_argument("--horizons", type=int, nargs="+", default=[1, 10, 100],
                                  help="tick offsets to evaluate at (converted to recorded-frame "
@@ -2047,7 +2103,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_bench.add_argument("--episode-ticks", type=int, default=400)
     p_nursery_bench.add_argument("--world-size", type=int, default=48)
     p_nursery_bench.add_argument("--backend", default=_default_nursery_backend(),
-                                 choices=sorted(BACKENDS))
+                                 choices=sorted(MINECRAFT_BACKEND_NAMES))
     p_nursery_bench.add_argument("--realtime", action="store_true")
     p_nursery_bench.add_argument("--horizons", type=int, nargs="+", default=[1, 10, 100],
                                  help="tick offsets to evaluate at (converted to recorded-frame "

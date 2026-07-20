@@ -52,7 +52,7 @@ def test_cli_end_to_end_flow(tmp_path):
     record_dir = str(tmp_path / "sessions")
     model_path = str(tmp_path / "bc.json")
 
-    main(["run", "--policy", "scripted", "--episodes", "2", "--seed", "5",
+    main(["run", "--world", "minecraft", "--policy", "scripted", "--episodes", "2", "--seed", "5",
           "--episode-ticks", "200", "--world-size", "32",
           "--record-dir", record_dir, "--session-id", "cli"])
     session_dir = os.path.join(record_dir, "cli")
@@ -65,8 +65,8 @@ def test_cli_end_to_end_flow(tmp_path):
     assert os.path.exists(model_path)
 
     # The trained latent model drives the runtime end-to-end (inference path).
-    main(["run", "--policy", "learned", "--model", model_path, "--episodes", "1",
-          "--seed", "9", "--episode-ticks", "200", "--world-size", "32",
+    main(["run", "--world", "minecraft", "--policy", "learned", "--model", model_path,
+          "--episodes", "1", "--seed", "9", "--episode-ticks", "200", "--world-size", "32",
           "--record-dir", record_dir, "--session-id", "learned-run"])
     assert os.path.exists(os.path.join(record_dir, "learned-run", "session.json"))
 
@@ -112,8 +112,9 @@ def test_cli_backend_flag_runs_over_the_remote_backend(tmp_path, monkeypatch):
 
     fake_bridge = Path(__file__).resolve().parents[1] / "bridge" / "fake" / "sim_bridge.py"
     monkeypatch.setenv("CCR_MINECRAFT_BRIDGE_CMD", f"{sys.executable} {fake_bridge}")
-    main(["run", "--policy", "scripted", "--episodes", "1", "--episode-ticks", "20",
-          "--backend", "remote", "--record-dir", str(tmp_path), "--session-id", "cli-remote"])
+    main(["run", "--world", "minecraft", "--policy", "scripted", "--episodes", "1",
+          "--episode-ticks", "20", "--backend", "remote", "--record-dir", str(tmp_path),
+          "--session-id", "cli-remote"])
     metadata = json.loads((tmp_path / "cli-remote" / "session.json").read_text())
     assert metadata["deterministic"] is False
     assert "remote" in metadata["program_tags"]

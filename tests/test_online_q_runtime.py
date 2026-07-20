@@ -18,6 +18,8 @@ def _run_cli_online(path, ticks=30, *extra):
     main(
         [
             "run",
+            "--world",
+            "minecraft",
             "--policy",
             "online",
             "--episodes",
@@ -65,6 +67,8 @@ def test_online_session_metadata_records_model_details(tmp_path):
     main(
         [
             "run",
+            "--world",
+            "minecraft",
             "--policy",
             "online",
             "--episodes",

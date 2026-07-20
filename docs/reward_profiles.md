@@ -1,5 +1,13 @@
 # Reward profiles: YAML tiers, milestones, normalized returns
 
+> **Quarantine note (issue #176):** the reward-profile system is part of
+> Minecraft's legacy survival economy -- the V2 predictive objective doesn't
+> use crafted rewards, so it's Minecraft-only (`--world minecraft`; the CLI's
+> default `--world` is now Crafter) and lazily imported: nothing here loads
+> unless `--reward-profile` is actually passed. See
+> `cognitive_runtime/programs/minecraft/__init__.py` for the full quarantine
+> note and the graduation-world milestone this is kept for.
+
 Tracked by issue #41. A **reward profile** is a YAML/JSON document that
 drives the Minecraft reward function entirely declaratively, instead of the
 hard-coded Python in `programs/minecraft/rewards.py` (`SurvivalReward`,
@@ -7,8 +15,8 @@ still the default when no profile is given -- profiles are additive, not a
 breaking change). Load one with:
 
 ```
-ccr run --reward-profile goals/survival.yaml ...
-ccr run --reward-profile goals/ender_dragon.yaml ...
+ccr run --world minecraft --reward-profile goals/survival.yaml ...
+ccr run --world minecraft --reward-profile goals/ender_dragon.yaml ...
 ```
 
 A malformed profile fails immediately with a diagnosis naming the exact

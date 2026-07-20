@@ -15,7 +15,13 @@ license = { text = "MIT" }
 # (issue #41, --reward-profile) are the one place YAML is the primary format.
 # namesgenerator is core: the organism's default name (issue #88,
 # RuntimeConfig.resolve_name) is generated from it; zero transitive deps.
-dependencies = ["numpy>=1.23", "PyYAML>=6", "namesgenerator>=0.3"]
+# crafter is core (issue #176): it's the CLI's default `--world` and the live
+# V2 nursery, so a base install must be able to run the documented default
+# `ccr run`/`ccr nursery run` path without an extra; its own deps (imageio,
+# numpy, opensimplex, pillow, ruamel.yaml) are all lightweight, pure-Python.
+# The legacy Minecraft survival economy needs none of this -- `--world
+# minecraft` never imports `programs.crafter`.
+dependencies = ["numpy>=1.23", "PyYAML>=6", "namesgenerator>=0.3", "crafter>=1.8,<2"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
@@ -24,11 +30,6 @@ dev = ["pytest>=7"]
 # trainer and every heuristic encoder) runs without it. Only the pixel CNN,
 # its trainer and the neural policy import torch, always lazily.
 neural = ["torch>=2"]
-# Crafter nursery world (issue #89): a fast, deterministic, pixel-native 2-D
-# world behind the same Program seam Minecraft uses. Optional and imported
-# lazily (`programs.crafter.adapter`) so `--world minecraft` (the default)
-# never needs it installed.
-crafter = ["crafter>=1.8,<2"]
 
 [project.scripts]
 ccr = "cognitive_runtime.cli:main"
