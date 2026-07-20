@@ -72,6 +72,9 @@ def test_first_tick_has_no_prediction_error_then_forecast_drives_it():
     assert 0.0 <= first.risk <= 1.0
     assert first.p_death is not None and 0.0 <= first.p_death <= 1.0
     assert first.next_latent is not None and len(first.next_latent) == 8
+    # issue #169: the cortex's own uncertainty head, not just risk/p_death,
+    # rides along in Prediction -- the arbiter's dedicated sigma source.
+    assert first.predicted_uncertainty is not None and first.predicted_uncertainty >= 0.0
 
     for seq in range(1, 4):
         memory.record_action(Action.from_key("move_forward"))
@@ -79,6 +82,7 @@ def test_first_tick_has_no_prediction_error_then_forecast_drives_it():
         pred = wm.predict(state, memory)
         assert pred.prediction_error is not None
         assert pred.prediction_error >= 0.0
+        assert pred.predicted_uncertainty is not None and pred.predicted_uncertainty >= 0.0
 
 
 def test_hidden_state_persists_across_ticks_and_resets_between_episodes():

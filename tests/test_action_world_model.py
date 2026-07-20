@@ -15,6 +15,7 @@ from cognitive_runtime.training.action_world_model import (  # noqa: E402
     build_action_sequence_dataset,
     build_action_world_model,
     evaluate_action_world_model,
+    evaluate_cortex_heads,
     horizons_ticks_to_frames,
     linear_probe_yaw,
     load_action_world_model,
@@ -94,6 +95,23 @@ def test_build_action_sequence_dataset_aligns_frames_actions_and_yaw(turn_sessio
     assert 0.5 < dataset.ticks_per_frame < 1.5
 
 
+def test_build_action_sequence_dataset_aligns_reward_terminal_risk(turn_session):
+    """issue #169: reward/terminal/risk ride along per-frame like yaw does,
+    read off the decision record's ``reward_window_total`` and the tick's
+    ``internal.risk``/``event.died`` streams."""
+    dataset = build_action_sequence_dataset([turn_session])
+    episode = dataset.episodes[0]
+    assert len(episode.reward) == len(episode.frames)
+    assert len(episode.terminal) == len(episode.frames)
+    assert len(episode.risk) == len(episode.frames)
+    assert all(isinstance(r, float) for r in episode.reward)
+    assert all(isinstance(t, bool) for t in episode.terminal)
+    # turn_in_place never dies; risk should be a recorded, mostly-small float,
+    # not a placeholder constant across the whole episode.
+    assert all(0.0 <= r <= 1.0 for r in episode.risk)
+    assert not any(episode.terminal)
+
+
 def test_build_action_sequence_dataset_pins_and_extends_vocabulary(turn_session):
     dataset = build_action_sequence_dataset(
         [turn_session], action_keys=["MOVE_FORWARD", "LOOK_LEFT"]
@@ -133,6 +151,42 @@ def test_train_evaluate_probe_and_round_trip(turn_session, tmp_path):
             [torch.rand(3, *model.pixel_shape[:2]) for _ in range(2)]
         )
         assert torch.allclose(model.encoder(frames), reloaded.encoder(frames))
+
+
+def test_train_action_world_model_trains_reward_terminal_risk_uncertainty_heads(turn_session):
+    """issue #169: the previously-untrained heads now get a loss curve each,
+    and ``evaluate_cortex_heads`` reports a well-formed diagnostic against
+    held-out data."""
+    dataset = build_action_sequence_dataset([turn_session])
+    model, stats = train_action_world_model(dataset, _small_model_config())
+
+    for key in ("reward_loss", "terminal_loss", "risk_loss", "uncertainty_loss"):
+        assert key in stats["loss_curves"]
+        assert len(stats["loss_curves"][key]) == stats["epochs"]
+        assert all(v >= 0.0 for v in stats["loss_curves"][key])
+        assert stats[f"final_{key}"] == stats["loss_curves"][key][-1]
+
+    report = evaluate_cortex_heads(model, dataset, [1, 3], warmup_frames=2)
+    assert set(report) == {1, 3}
+    for row in report.values():
+        assert row["n_samples"] > 0
+        for head in ("reward", "terminal", "risk"):
+            assert row[f"{head}_mse"] >= 0.0
+            assert row[f"{head}_constant_mse"] >= 0.0
+            assert isinstance(row[f"{head}_beats_constant"], bool)
+        correlation = row["uncertainty_error_correlation"]
+        ci_low, ci_high = row["uncertainty_error_correlation_ci"]
+        assert -1.0 <= correlation <= 1.0
+        assert -1.0 <= ci_low <= ci_high <= 1.0
+
+
+def test_evaluate_cortex_heads_rejects_actions_outside_the_model_vocabulary(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    foreign = build_action_sequence_dataset([turn_session])
+    foreign.action_keys = ["SOMETHING_ELSE"]
+    with pytest.raises(ValueError, match="vocabulary"):
+        evaluate_cortex_heads(model, foreign, [1])
 
 
 def test_evaluate_rejects_actions_outside_the_model_vocabulary(turn_session):

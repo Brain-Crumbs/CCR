@@ -39,6 +39,7 @@ torch.
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -49,6 +50,12 @@ from cognitive_runtime.runtime.recorder import stream_event_from_log
 PIXEL_STREAM = "vision.frame.pixels"
 MOTOR_STREAM = "motor.command"
 ROTATION_STREAM = "spatial.rotation"
+#: Recorded ground-truth streams for the cortex's reward/terminal/risk heads
+#: (issue #169). ``RISK_STREAM`` mirrors ``brain.neuromod.modulation.RISK_STREAM``
+#: (duplicated as a plain constant, not imported, matching this module's
+#: existing torch-free-dataset-half discipline -- see the module docstring).
+DEATH_STREAM = "event.died"
+RISK_STREAM = "internal.risk"
 
 
 # --------------------------------------------------------------------------- dataset
@@ -71,6 +78,16 @@ class EpisodeActionFrames:
     actions: List[int] = field(default_factory=list)
     yaw: List[Optional[float]] = field(default_factory=list)
     ticks: List[int] = field(default_factory=list)
+    #: Per-frame supervision for the cortex's reward/terminal/risk heads
+    #: (issue #169) -- ``reward_window_total`` off the decision record,
+    #: ``event.died`` presence in the tick's sensory window, and the
+    #: recorded ``internal.risk`` stream value, aligned 1:1 with ``frames``
+    #: like ``yaw``. Empty on hand-built episodes that predate these fields
+    #: (e.g. synthetic test fixtures); ``_episode_head_targets`` falls back
+    #: to all-zero targets in that case rather than raising.
+    reward: List[float] = field(default_factory=list)
+    terminal: List[bool] = field(default_factory=list)
+    risk: List[float] = field(default_factory=list)
 
     @property
     def ticks_per_frame(self) -> float:
@@ -145,6 +162,24 @@ def _tick_yaw(sensory_records: List[Dict[str, Any]]) -> Optional[float]:
     return None
 
 
+def _tick_risk(sensory_records: List[Dict[str, Any]]) -> float:
+    """The tick's recorded ``internal.risk`` value, or ``0.0`` when absent --
+    matching ``ModulationSignals.risk``'s "always available, defaults to
+    0.0" contract (``brain/neuromod/modulation.py``)."""
+    for record in reversed(sensory_records):
+        if record.get("stream_id") != RISK_STREAM:
+            continue
+        payload = record.get("payload") or {}
+        value = payload.get("value")
+        if isinstance(value, (int, float)):
+            return float(value)
+    return 0.0
+
+
+def _tick_terminal(sensory_records: List[Dict[str, Any]]) -> bool:
+    return any(record.get("stream_id") == DEATH_STREAM for record in sensory_records)
+
+
 def build_action_sequence_dataset(
     session_dirs: Sequence[str],
     action_keys: Optional[Sequence[str]] = None,
@@ -179,6 +214,9 @@ def build_action_sequence_dataset(
                     action_name = _tick_action_name(motor) or last_action
                     last_action = action_name
                     yaw = _tick_yaw(sensory)
+                    reward = float(decision.get("reward_window_total", 0.0))
+                    terminal = _tick_terminal(sensory)
+                    risk = _tick_risk(sensory)
                     for record in sensory:
                         if record.get("stream_id") != PIXEL_STREAM:
                             continue
@@ -193,6 +231,9 @@ def build_action_sequence_dataset(
                         episode.frames.append(frame)
                         episode.yaw.append(yaw)
                         episode.ticks.append(tick)
+                        episode.reward.append(reward)
+                        episode.terminal.append(terminal)
+                        episode.risk.append(risk)
                 if len(episode.frames) >= 2:
                     if dataset.pixel_shape is None:
                         first = episode.frames[0]
@@ -240,6 +281,20 @@ class ActionWorldModelConfig:
     scheduled_sampling_p: float = 0.5
     pixel_loss_weight: float = 1.0
     latent_loss_weight: float = 1.0
+    #: Weights for the previously-untrained heads (issue #169): reward MSE
+    #: vs. recorded ``reward_window_total``, terminal BCE vs. recorded
+    #: ``event.died``, risk MSE vs. recorded ``internal.risk``. Default 1.0
+    #: matches ``training.world_model.WorldModelTrainingConfig``'s
+    #: reward/death/risk weights for the legacy memoryless model.
+    reward_loss_weight: float = 1.0
+    terminal_loss_weight: float = 1.0
+    risk_loss_weight: float = 1.0
+    #: Uncertainty-head weight: MSE against the (detached) realized latent
+    #: squared error at each rollout step -- an auxiliary, self-supervised
+    #: signal like the legacy model's ``prediction_error_loss_weight``, whose
+    #: 0.1 default this matches so it calibrates without dominating the
+    #: pixel/latent objective.
+    uncertainty_loss_weight: float = 0.1
     seed: int = 0
     #: Horizons in ticks (not frames), persisted with the checkpoint so
     #: "T+8" means the same thing across worlds/sample rates. Convert to
@@ -317,6 +372,29 @@ def _episode_tensors(dataset: ActionSequenceDataset, reconstruction_shape):
     return tensors
 
 
+def _episode_head_targets(episode: EpisodeActionFrames, n_frames: int) -> Tuple[Any, Any, Any, bool]:
+    """``(reward, terminal, risk, has_targets)`` for one episode, the first
+    three aligned with :func:`_episode_tensors`' pixel/latent indexing
+    (issue #169). ``has_targets`` is ``False`` when the episode predates
+    these fields (hand-built synthetic episodes in tests): the columns are
+    then all-zero placeholders callers must mask out of the reward/
+    terminal/risk losses rather than train the heads to imitate a fictitious
+    "always zero" ground truth."""
+    torch, _F = _torch()
+    has_targets = (
+        len(episode.reward) == n_frames
+        and len(episode.terminal) == n_frames
+        and len(episode.risk) == n_frames
+    )
+
+    def _column(values: Sequence[Any]) -> Any:
+        if len(values) == n_frames:
+            return torch.tensor([float(v) for v in values], dtype=torch.float32)
+        return torch.zeros(n_frames, dtype=torch.float32)
+
+    return _column(episode.reward), _column(episode.terminal), _column(episode.risk), has_targets
+
+
 def train_action_world_model(
     dataset: ActionSequenceDataset,
     config: Optional[ActionWorldModelConfig] = None,
@@ -370,6 +448,11 @@ def train_action_world_model(
     else:
         model = build_action_world_model(dataset.pixel_shape, dataset.action_keys, cfg)
     episodes = _episode_tensors(dataset, model.reconstruction_shape)
+    #: Per-episode reward/terminal/risk targets (issue #169), aligned 1:1
+    #: with ``episodes`` by index.
+    head_targets = [
+        _episode_head_targets(episode, pixels.shape[0]) for episode, pixels, _t, _a in episodes
+    ]
 
     window = cfg.warmup_frames + cfg.rollout_frames
     starts: List[Tuple[int, int]] = []  # (episode index, start frame)
@@ -383,7 +466,15 @@ def train_action_world_model(
         )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    curves: Dict[str, List[float]] = {"total_loss": [], "pixel_loss": [], "latent_loss": []}
+    curves: Dict[str, List[float]] = {
+        "total_loss": [],
+        "pixel_loss": [],
+        "latent_loss": [],
+        "reward_loss": [],
+        "terminal_loss": [],
+        "risk_loss": [],
+        "uncertainty_loss": [],
+    }
 
     #: Context-length curriculum (issue #93, task 5): windowed backbones
     #: (dilated-conv/transformer) get their attended-over window ramped from
@@ -406,15 +497,36 @@ def train_action_world_model(
             frames_batch = []
             actions_batch = []
             targets_batch = []
+            rewards_batch = []
+            terminals_batch = []
+            risks_batch = []
+            has_targets_batch = []
             for flat in batch_ids.tolist():
                 e_idx, t = starts[flat]
                 _episode, pixels, targets, actions = episodes[e_idx]
+                rewards, terminals, risks, has_targets = head_targets[e_idx]
                 frames_batch.append(pixels[t : t + window])
                 targets_batch.append(targets[t : t + window])
                 actions_batch.append(actions[t : t + window - 1])
+                rewards_batch.append(rewards[t : t + window])
+                terminals_batch.append(terminals[t : t + window])
+                risks_batch.append(risks[t : t + window])
+                has_targets_batch.append(1.0 if has_targets else 0.0)
             frames_b = torch.stack(frames_batch)  # [B, W+R, C, H, W]
             targets_b = torch.stack(targets_batch)
             actions_b = torch.stack(actions_batch)  # [B, W+R-1]
+            rewards_b = torch.stack(rewards_batch)
+            terminals_b = torch.stack(terminals_batch)
+            risks_b = torch.stack(risks_batch)
+            #: Per-sample mask (issue #169): episodes without recorded
+            #: reward/terminal/risk streams (e.g. hand-built synthetic test
+            #: episodes) carry all-zero placeholder targets that must not
+            #: train the heads to imitate a fictitious "always zero" ground
+            #: truth -- only genuinely-supervised samples contribute to
+            #: these three losses. Uncertainty is exempt: its target is the
+            #: model's own realized latent error, always available.
+            has_targets_b = torch.tensor(has_targets_batch, dtype=torch.float32)
+            n_supervised = float(has_targets_b.sum())
             if cfg.withhold_actions:
                 # Ablation: every action index becomes the same constant, so
                 # backprop through the action embedding carries no signal
@@ -434,6 +546,10 @@ def train_action_world_model(
 
             pixel_loss = frames_b.new_zeros(())
             latent_loss = frames_b.new_zeros(())
+            reward_loss = frames_b.new_zeros(())
+            terminal_loss = frames_b.new_zeros(())
+            risk_loss = frames_b.new_zeros(())
+            uncertainty_loss = frames_b.new_zeros(())
             latent_in = latents[:, cfg.warmup_frames - 1]
             for step in range(cfg.rollout_frames):
                 idx = cfg.warmup_frames - 1 + step
@@ -442,11 +558,35 @@ def train_action_world_model(
                 # raw encoder latents are unbounded (ReLU), and a raw-space MSE
                 # swamps the pixel term.
                 target_latent = latents[:, idx + 1].detach()
-                latent_loss = latent_loss + F.mse_loss(
-                    F.normalize(predicted, dim=1), F.normalize(target_latent, dim=1)
-                )
+                per_sample_latent_error = (
+                    F.normalize(predicted, dim=1) - F.normalize(target_latent, dim=1)
+                ).pow(2).mean(dim=1)
+                latent_loss = latent_loss + per_sample_latent_error.mean()
                 decoded = model.decoder(predicted)
                 pixel_loss = pixel_loss + F.mse_loss(decoded, targets_b[:, idx + 1])
+
+                # Heads (issue #169): reward/terminal/risk read off the same
+                # post-step hidden state ``forward_horizons`` uses, supervised
+                # against the recorded targets at this frame; uncertainty
+                # against this step's own (detached) *normalized* latent
+                # error above -- same bounded [0, 4] scale as latent_loss
+                # (an ICM-style self-supervised signal, not backprop into the
+                # latent prediction itself), rather than the raw unbounded
+                # squared error, which can dwarf pixel/latent and destabilize
+                # shared-backbone training even at a small loss weight.
+                reward_pred, terminal_logit, risk_pred, uncertainty_pred = model.heads(hidden)
+                if n_supervised > 0:
+                    reward_sq = (reward_pred - rewards_b[:, idx + 1]).pow(2)
+                    reward_loss = reward_loss + (reward_sq * has_targets_b).sum() / n_supervised
+                    terminal_bce = F.binary_cross_entropy_with_logits(
+                        terminal_logit, terminals_b[:, idx + 1], reduction="none"
+                    )
+                    terminal_loss = terminal_loss + (terminal_bce * has_targets_b).sum() / n_supervised
+                    risk_sq = (risk_pred - risks_b[:, idx + 1]).pow(2)
+                    risk_loss = risk_loss + (risk_sq * has_targets_b).sum() / n_supervised
+                realized_latent_error = per_sample_latent_error.detach()
+                uncertainty_loss = uncertainty_loss + F.mse_loss(uncertainty_pred, realized_latent_error)
+
                 # Scheduled sampling: feed the prediction back in with
                 # probability p, else the observed latent.
                 if float(torch.rand((), generator=generator)) < cfg.scheduled_sampling_p:
@@ -455,7 +595,18 @@ def train_action_world_model(
                     latent_in = latents[:, idx + 1]
             pixel_loss = pixel_loss / cfg.rollout_frames
             latent_loss = latent_loss / cfg.rollout_frames
-            total = cfg.pixel_loss_weight * pixel_loss + cfg.latent_loss_weight * latent_loss
+            reward_loss = reward_loss / cfg.rollout_frames
+            terminal_loss = terminal_loss / cfg.rollout_frames
+            risk_loss = risk_loss / cfg.rollout_frames
+            uncertainty_loss = uncertainty_loss / cfg.rollout_frames
+            total = (
+                cfg.pixel_loss_weight * pixel_loss
+                + cfg.latent_loss_weight * latent_loss
+                + cfg.reward_loss_weight * reward_loss
+                + cfg.terminal_loss_weight * terminal_loss
+                + cfg.risk_loss_weight * risk_loss
+                + cfg.uncertainty_loss_weight * uncertainty_loss
+            )
             total.backward()
             optimizer.step()
 
@@ -463,6 +614,10 @@ def train_action_world_model(
             epoch["total_loss"] += float(total.detach()) * batch_n
             epoch["pixel_loss"] += float(pixel_loss.detach()) * batch_n
             epoch["latent_loss"] += float(latent_loss.detach()) * batch_n
+            epoch["reward_loss"] += float(reward_loss.detach()) * batch_n
+            epoch["terminal_loss"] += float(terminal_loss.detach()) * batch_n
+            epoch["risk_loss"] += float(risk_loss.detach()) * batch_n
+            epoch["uncertainty_loss"] += float(uncertainty_loss.detach()) * batch_n
         for key in curves:
             curves[key].append(round(epoch[key] / max(seen, 1), 6))
 
@@ -485,6 +640,10 @@ def train_action_world_model(
         "final_total_loss": curves["total_loss"][-1],
         "final_pixel_loss": curves["pixel_loss"][-1],
         "final_latent_loss": curves["latent_loss"][-1],
+        "final_reward_loss": curves["reward_loss"][-1],
+        "final_terminal_loss": curves["terminal_loss"][-1],
+        "final_risk_loss": curves["risk_loss"][-1],
+        "final_uncertainty_loss": curves["uncertainty_loss"][-1],
     }
     return model, stats
 
@@ -689,6 +848,204 @@ def _ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional
     if numerator is None or denominator is None or denominator <= 0:
         return None
     return numerator / denominator
+
+
+# --------------------------------------------------------------------------- heads diagnostic
+
+
+def evaluate_cortex_heads(
+    model: Any,
+    dataset: ActionSequenceDataset,
+    horizons_frames: Sequence[int],
+    *,
+    warmup_frames: int = 3,
+    max_starts_per_episode: Optional[int] = None,
+    n_bootstrap: int = 500,
+    bootstrap_seed: int = 0,
+) -> Dict[int, Dict[str, Any]]:
+    """Held-out diagnostic for the reward/terminal/risk/uncertainty heads
+    (issue #169) -- the closed-loop counterpart to
+    ``evaluate_action_world_model``'s pixel/latent report, kept as a
+    separate additive function rather than folded into that (heavily
+    reused, currently pixel-only) report.
+
+    Per horizon:
+
+    - ``reward``/``terminal``/``risk``: model MSE against the recorded
+      target vs. a constant-predictor baseline (the held-out target mean --
+      the same baseline discipline ``evaluate_action_world_model``'s own
+      ``mean_frame_mse`` already uses for pixels), plus whether the model
+      beats it.
+    - ``uncertainty``: the Pearson correlation between predicted
+      ``uncertainty`` and the realized squared latent error at that
+      horizon, with a percentile bootstrap confidence interval -- the
+      calibration check ``training.world_model.uncertainty_calibration``
+      runs for the legacy memoryless model, here for the recurrent cortex.
+    """
+    torch, F = _torch()
+
+    horizons_sorted = sorted(set(int(h) for h in horizons_frames))
+    if not horizons_sorted or horizons_sorted[0] < 1:
+        raise ValueError(f"horizons must be positive frame steps, got {horizons_frames!r}")
+    max_horizon = horizons_sorted[-1]
+
+    episodes = _episode_tensors(dataset, model.reconstruction_shape)
+    action_index = {name: i for i, name in enumerate(model.action_keys)}
+    for name in dataset.action_keys:
+        if name not in action_index:
+            raise ValueError(
+                f"action {name!r} is outside the model's vocabulary {model.action_keys!r}; "
+                "build the training dataset with a pinned action_keys covering it"
+            )
+
+    samples: Dict[int, Dict[str, List[float]]] = {
+        h: {
+            "reward_pred": [], "reward_target": [],
+            "terminal_pred": [], "terminal_target": [],
+            "risk_pred": [], "risk_target": [],
+            "uncertainty": [], "latent_error": [],
+        }
+        for h in horizons_sorted
+    }
+
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for episode, pixels, _targets, actions in episodes:
+            n = pixels.shape[0]
+            if n <= max_horizon + warmup_frames:
+                continue
+            remap = torch.tensor(
+                [action_index[dataset.action_keys[a]] for a in episode.actions],
+                dtype=torch.long,
+            )
+            latents = model.encoder(pixels)
+            rewards, terminals, risks, _has_targets = _episode_head_targets(episode, n)
+
+            hiddens = [model.initial_state(1)]
+            hidden = hiddens[0]
+            for i in range(n - 1):
+                _pred, hidden = model.step(latents[i : i + 1], remap[i : i + 1], hidden)
+                hiddens.append(hidden)
+
+            starts = range(warmup_frames, n - max_horizon)
+            if max_starts_per_episode is not None:
+                starts = list(starts)[:max_starts_per_episode]
+            for t in starts:
+                out = model.forward_horizons(
+                    latents[t : t + 1],
+                    remap[t : t + max_horizon].unsqueeze(0),
+                    hiddens[t],
+                    horizon_frames=horizons_sorted,
+                )
+                for h in horizons_sorted:
+                    pred = out[h]
+                    entry = samples[h]
+                    entry["reward_pred"].append(float(pred.reward))
+                    entry["reward_target"].append(float(rewards[t + h]))
+                    entry["terminal_pred"].append(float(torch.sigmoid(pred.terminal_logit)))
+                    entry["terminal_target"].append(float(terminals[t + h]))
+                    entry["risk_pred"].append(float(pred.risk))
+                    entry["risk_target"].append(float(risks[t + h]))
+                    entry["uncertainty"].append(float(pred.uncertainty))
+                    # Same normalized scale ``uncertainty_head`` is trained
+                    # against in train_action_world_model, not raw latent MSE.
+                    entry["latent_error"].append(
+                        float(
+                            F.mse_loss(
+                                F.normalize(pred.latent, dim=1).squeeze(0),
+                                F.normalize(latents[t + h : t + h + 1], dim=1).squeeze(0),
+                            )
+                        )
+                    )
+    if was_training:
+        model.train()
+
+    report: Dict[int, Dict[str, Any]] = {}
+    for h in horizons_sorted:
+        entry = samples[h]
+        if not entry["reward_pred"]:
+            raise ValueError(f"no evaluation samples at horizon {h}; episodes too short for it")
+        reward_mse, reward_const_mse = _head_mse_vs_constant(entry["reward_pred"], entry["reward_target"])
+        terminal_mse, terminal_const_mse = _head_mse_vs_constant(
+            entry["terminal_pred"], entry["terminal_target"]
+        )
+        risk_mse, risk_const_mse = _head_mse_vs_constant(entry["risk_pred"], entry["risk_target"])
+        correlation, ci = _bootstrap_correlation_ci(
+            entry["uncertainty"], entry["latent_error"],
+            n_bootstrap=n_bootstrap, seed=bootstrap_seed,
+        )
+        report[h] = {
+            "n_samples": len(entry["reward_pred"]),
+            "reward_mse": reward_mse,
+            "reward_constant_mse": reward_const_mse,
+            "reward_beats_constant": bool(reward_mse < reward_const_mse),
+            "terminal_mse": terminal_mse,
+            "terminal_constant_mse": terminal_const_mse,
+            "terminal_beats_constant": bool(terminal_mse < terminal_const_mse),
+            "risk_mse": risk_mse,
+            "risk_constant_mse": risk_const_mse,
+            "risk_beats_constant": bool(risk_mse < risk_const_mse),
+            "uncertainty_error_correlation": correlation,
+            "uncertainty_error_correlation_ci": ci,
+        }
+    return report
+
+
+def _head_mse_vs_constant(preds: Sequence[float], targets: Sequence[float]) -> Tuple[float, float]:
+    """``(model_mse, constant_predictor_mse)`` where the constant predictor
+    always answers the held-out targets' own mean -- the same baseline
+    discipline as ``evaluate_action_world_model``'s ``mean_frame_mse``."""
+    n = len(targets)
+    mean_target = sum(targets) / n
+    model_mse = sum((p - t) ** 2 for p, t in zip(preds, targets)) / n
+    constant_mse = sum((mean_target - t) ** 2 for t in targets) / n
+    return model_mse, constant_mse
+
+
+def _pearson_correlation_floats(xs: Sequence[float], ys: Sequence[float]) -> float:
+    """Pearson correlation over plain float sequences; ``0.0`` for
+    degenerate inputs (fewer than 2 samples, or a constant series) rather
+    than a division-by-zero NaN."""
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    var_y = sum((y - mean_y) ** 2 for y in ys)
+    denom = math.sqrt(var_x * var_y)
+    return cov / denom if denom > 0 else 0.0
+
+
+def _bootstrap_correlation_ci(
+    xs: Sequence[float],
+    ys: Sequence[float],
+    *,
+    n_bootstrap: int = 500,
+    confidence: float = 0.95,
+    seed: int = 0,
+) -> Tuple[float, Tuple[float, float]]:
+    """``(point_correlation, (ci_low, ci_high))`` via percentile bootstrap --
+    issue #169's "uncertainty correlates positively with realized held-out
+    latent error, CI clear of 0" acceptance criterion needs an interval, not
+    just a point estimate."""
+    point = _pearson_correlation_floats(xs, ys)
+    n = len(xs)
+    if n < 2:
+        return point, (point, point)
+    rng = random.Random(seed)
+    resampled = []
+    for _ in range(n_bootstrap):
+        idx = [rng.randrange(n) for _ in range(n)]
+        resampled.append(_pearson_correlation_floats([xs[i] for i in idx], [ys[i] for i in idx]))
+    resampled.sort()
+    lo = (1.0 - confidence) / 2.0
+    hi = 1.0 - lo
+    lo_i = max(0, min(n_bootstrap - 1, int(lo * n_bootstrap)))
+    hi_i = max(0, min(n_bootstrap - 1, int(hi * n_bootstrap)))
+    return point, (resampled[lo_i], resampled[hi_i])
 
 
 # --------------------------------------------------------------------------- probes
