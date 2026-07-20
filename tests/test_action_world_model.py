@@ -112,6 +112,28 @@ def test_build_action_sequence_dataset_aligns_reward_terminal_risk(turn_session)
     assert not any(episode.terminal)
 
 
+def test_build_action_sequence_dataset_risk_matches_decision_record_not_lagged_stream(turn_session):
+    """issue #169 review: ``internal.risk`` in a tick's *sensory* window is
+    published one tick late (``runtime/loop.py``'s documented "primes the
+    next tick's evaluation" comment) -- reading it out of ``sensory`` would
+    train the risk head on the previous tick's value. Risk must instead come
+    straight off that tick's own decision record."""
+    from cognitive_runtime.runtime.replay import iter_cognitive_ticks
+
+    dataset = build_action_sequence_dataset([turn_session])
+    episode = dataset.episodes[0]
+    decision_risk_by_tick = {
+        decision["tick_index"]: decision["risk"]
+        for decision, _sensory, _motor in iter_cognitive_ticks(
+            episode.session_dir, episode.episode_id
+        )
+    }
+
+    assert len(decision_risk_by_tick) > 0
+    for tick, risk in zip(episode.ticks, episode.risk):
+        assert risk == pytest.approx(decision_risk_by_tick[tick])
+
+
 def test_build_action_sequence_dataset_pins_and_extends_vocabulary(turn_session):
     dataset = build_action_sequence_dataset(
         [turn_session], action_keys=["MOVE_FORWARD", "LOOK_LEFT"]
@@ -173,7 +195,13 @@ def test_train_action_world_model_trains_reward_terminal_risk_uncertainty_heads(
         for head in ("reward", "terminal", "risk"):
             assert row[f"{head}_mse"] >= 0.0
             assert row[f"{head}_constant_mse"] >= 0.0
-            assert isinstance(row[f"{head}_beats_constant"], bool)
+            # None for a degenerate (zero-variance) target column, e.g. no
+            # deaths in this holdout split -- see _beats_constant.
+            assert row[f"{head}_beats_constant"] in (True, False, None)
+        # turn_in_place never dies: the terminal target column is a constant
+        # 0.0, so "beats the constant baseline" isn't a meaningful question.
+        assert row["terminal_constant_mse"] == pytest.approx(0.0, abs=1e-9)
+        assert row["terminal_beats_constant"] is None
         correlation = row["uncertainty_error_correlation"]
         ci_low, ci_high = row["uncertainty_error_correlation_ci"]
         assert -1.0 <= correlation <= 1.0

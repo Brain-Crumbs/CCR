@@ -50,12 +50,14 @@ from cognitive_runtime.runtime.recorder import stream_event_from_log
 PIXEL_STREAM = "vision.frame.pixels"
 MOTOR_STREAM = "motor.command"
 ROTATION_STREAM = "spatial.rotation"
-#: Recorded ground-truth streams for the cortex's reward/terminal/risk heads
-#: (issue #169). ``RISK_STREAM`` mirrors ``brain.neuromod.modulation.RISK_STREAM``
-#: (duplicated as a plain constant, not imported, matching this module's
-#: existing torch-free-dataset-half discipline -- see the module docstring).
+#: Recorded ground-truth stream for the cortex's terminal head (issue #169).
+#: Reward and risk targets instead come straight off the decision record
+#: (``reward_window_total``/``risk``) -- not the ``internal.*`` streams
+#: derived from them, which the loop deliberately publishes one tick late
+#: (``runtime/loop.py``'s "primes the *next* tick's evaluation" comment) so
+#: reading them out of a tick's *sensory* window would train the risk head
+#: on the previous tick's value.
 DEATH_STREAM = "event.died"
-RISK_STREAM = "internal.risk"
 
 
 # --------------------------------------------------------------------------- dataset
@@ -162,20 +164,6 @@ def _tick_yaw(sensory_records: List[Dict[str, Any]]) -> Optional[float]:
     return None
 
 
-def _tick_risk(sensory_records: List[Dict[str, Any]]) -> float:
-    """The tick's recorded ``internal.risk`` value, or ``0.0`` when absent --
-    matching ``ModulationSignals.risk``'s "always available, defaults to
-    0.0" contract (``brain/neuromod/modulation.py``)."""
-    for record in reversed(sensory_records):
-        if record.get("stream_id") != RISK_STREAM:
-            continue
-        payload = record.get("payload") or {}
-        value = payload.get("value")
-        if isinstance(value, (int, float)):
-            return float(value)
-    return 0.0
-
-
 def _tick_terminal(sensory_records: List[Dict[str, Any]]) -> bool:
     return any(record.get("stream_id") == DEATH_STREAM for record in sensory_records)
 
@@ -216,7 +204,10 @@ def build_action_sequence_dataset(
                     yaw = _tick_yaw(sensory)
                     reward = float(decision.get("reward_window_total", 0.0))
                     terminal = _tick_terminal(sensory)
-                    risk = _tick_risk(sensory)
+                    # Straight off the decision record (this tick's own
+                    # `Prediction.risk`), not the `internal.risk` stream --
+                    # see the module-level DEATH_STREAM comment for why.
+                    risk = float(decision.get("risk", 0.0))
                     for record in sensory:
                         if record.get("stream_id") != PIXEL_STREAM:
                             continue
@@ -979,13 +970,13 @@ def evaluate_cortex_heads(
             "n_samples": len(entry["reward_pred"]),
             "reward_mse": reward_mse,
             "reward_constant_mse": reward_const_mse,
-            "reward_beats_constant": bool(reward_mse < reward_const_mse),
+            "reward_beats_constant": _beats_constant(reward_mse, reward_const_mse),
             "terminal_mse": terminal_mse,
             "terminal_constant_mse": terminal_const_mse,
-            "terminal_beats_constant": bool(terminal_mse < terminal_const_mse),
+            "terminal_beats_constant": _beats_constant(terminal_mse, terminal_const_mse),
             "risk_mse": risk_mse,
             "risk_constant_mse": risk_const_mse,
-            "risk_beats_constant": bool(risk_mse < risk_const_mse),
+            "risk_beats_constant": _beats_constant(risk_mse, risk_const_mse),
             "uncertainty_error_correlation": correlation,
             "uncertainty_error_correlation_ci": ci,
         }
@@ -1001,6 +992,18 @@ def _head_mse_vs_constant(preds: Sequence[float], targets: Sequence[float]) -> T
     model_mse = sum((p - t) ** 2 for p, t in zip(preds, targets)) / n
     constant_mse = sum((mean_target - t) ** 2 for t in targets) / n
     return model_mse, constant_mse
+
+
+def _beats_constant(model_mse: float, constant_mse: float) -> Optional[bool]:
+    """``model_mse < constant_mse``, or ``None`` when the target column is
+    degenerate (e.g. a holdout split with no death events, so every
+    ``terminal`` target is 0.0): the constant predictor there scores an
+    unbeatable exact 0.0, which is a property of the (missing) held-out
+    coverage, not a signal about the head, so "does this beat the
+    baseline" isn't a meaningful question to answer either way."""
+    if constant_mse < 1e-9:
+        return None
+    return bool(model_mse < constant_mse)
 
 
 def _pearson_correlation_floats(xs: Sequence[float], ys: Sequence[float]) -> float:
