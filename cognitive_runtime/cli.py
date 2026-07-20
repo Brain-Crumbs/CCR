@@ -20,6 +20,7 @@ import os
 import sys
 from typing import Any, Callable, Dict, Optional
 
+from brain.hippocampus import Hippocampus
 from cognitive_runtime.core.attention import ATTENTION_MODES
 from cognitive_runtime.core.orienting_reflex import REFLEX_MODES
 from cognitive_runtime.core.policy import Policy
@@ -59,7 +60,6 @@ from cognitive_runtime.training.imitation import train_bc
 
 DEFAULT_MODEL_OUT = "models/bc.json"
 DEFAULT_ONLINE_MODEL_OUT = "models/online-q.json"
-DEFAULT_ACTOR_CRITIC_MODEL_OUT = "models/actor-critic.pt"
 
 #: Issue #32 "raw input" ablation: which stream classifications the online
 #: policy's fused state is built from. "full" preserves the pre-#32 behavior
@@ -67,13 +67,6 @@ DEFAULT_ACTOR_CRITIC_MODEL_OUT = "models/actor-critic.pt"
 #: MINECRAFT_STREAM_REGISTRY streams classified agent_input, so hand-computed
 #: semantic streams keep publishing/recording but stop reaching the policy.
 INPUT_PROFILES = {"full", "raw"}
-
-#: Issue #57 "learned fusion primary" bridge: which fusion path
-#: `--policy actor-critic` reads its fused agent state from. "fixed" is the
-#: `TemporalFusion` concatenation of hand-written encoders (the default,
-#: unchanged); "learned" runs trainable stream encoders + `LatentFusionModel`
-#: in the live tick (`cognitive_runtime.neural.live_fusion.LiveLearnedFusion`).
-FUSION_MODES = {"fixed", "learned"}
 
 
 def _default_nursery_backend() -> str:
@@ -167,7 +160,7 @@ def _make_policy(
             sys.exit(
                 f"--policy scripted is Minecraft-specific (a hand-authored heuristic over "
                 f"Minecraft's own actions); it does not support --world {args.world!r}. "
-                "Pick --policy null/random/human/online/actor-critic/learned/neural instead."
+                "Pick --policy null/random/human/online/learned/neural instead."
             )
         return ScriptedSurvivalPolicy(seed=args.seed)
     if name == "human":
@@ -187,7 +180,11 @@ def _make_policy(
     sys.exit(f"unknown policy: {name}")
 
 
-def _make_world_model(args: argparse.Namespace, program: MinecraftSurvivalBox):
+def _make_world_model(
+    args: argparse.Namespace,
+    program: MinecraftSurvivalBox,
+    hippocampus: Optional[Any] = None,
+):
     """The heuristic default (`None`, `TrendWorldModel`), or a trained neural
     world-model checkpoint bridged behind the same `world_model` seam.
 
@@ -196,11 +193,26 @@ def _make_world_model(args: argparse.Namespace, program: MinecraftSurvivalBox):
     - `--world-model cortex:PATH` drives the recurrent, action-conditioned
       `PredictiveCortex` as the live world model (issue #166) -- its backbone
       hidden state persists across ticks and resets on each episode boundary.
+      `--async-trainer` (issue #175) additionally wires a live
+      `sleep.cortex_consolidation.CortexConsolidator` into it, so the cortex
+      itself is the online learner instead of a separate actor/critic stack.
     - `--world-model PATH` bridges the memoryless `MLPWorldModel` (issue #26).
 
-    `--world-model` is unset unless the caller opts in."""
+    `--world-model` is unset unless the caller opts in. `hippocampus` is only
+    consulted for the cortex path with `--async-trainer` set -- it must be the
+    *same* instance the runtime loop is writing seeds into, so the
+    consolidator's dream mixer has real seeds to draw from (`cmd_run` builds
+    one `Hippocampus()` and passes it to both). Other callers (e.g. `cmd_demo`,
+    whose args namespace has no `async_trainer` attribute) can omit it."""
     path = getattr(args, "world_model", None)
+    async_trainer = getattr(args, "async_trainer", False)
     if not path:
+        if async_trainer:
+            sys.exit(
+                "--async-trainer (cortex consolidation, issue #175) requires "
+                "--world-model cortex:<ckpt>; it repoints the online learner at the "
+                "predictive cortex, so a live cortex world model must be selected"
+            )
         return None
     action_keys = [action.key() for action in program.metadata().action_space]
     cortex_prefix = "cortex:"
@@ -212,7 +224,24 @@ def _make_world_model(args: argparse.Namespace, program: MinecraftSurvivalBox):
             from cognitive_runtime.policies.cortex_world_model import CortexWorldModel
         except ImportError as exc:  # torch not installed
             sys.exit(f"the predictive cortex needs PyTorch ({exc}); install '.[neural]'.")
-        return CortexWorldModel(checkpoint, action_keys=action_keys)
+        world_model = CortexWorldModel(checkpoint, action_keys=action_keys)
+        if async_trainer:
+            try:
+                from sleep.cortex_consolidation import CortexConsolidator
+            except ImportError as exc:  # torch not installed
+                sys.exit(f"cortex consolidation needs PyTorch ({exc}); install '.[neural]'.")
+            world_model.consolidator = CortexConsolidator(
+                cortex=world_model.model, hippocampus=hippocampus,
+            )
+            world_model.consolidate_every_ticks = args.async_wake_ticks
+            world_model.consolidation_steps = args.async_consolidation_steps
+        return world_model
+    if async_trainer:
+        sys.exit(
+            "--async-trainer (cortex consolidation, issue #175) requires "
+            "--world-model cortex:<ckpt>; it repoints the online learner at the "
+            "predictive cortex, so a live cortex world model must be selected"
+        )
     try:
         from cognitive_runtime.policies.neural_world_model import NeuralWorldModel
     except ImportError as exc:  # torch not installed
@@ -293,412 +322,6 @@ def _make_online_policy_and_learner(
         save_every_updates=args.online_save_every,
     )
     return policy, learner
-
-
-def _make_actor_critic_policy_and_learner(
-    args: argparse.Namespace, program: MinecraftSurvivalBox, encoders=None,
-    stream_registry=MINECRAFT_STREAM_REGISTRY,
-):
-    """``--policy actor-critic``: the neural actor/critic online policy
-    (issue #29, docs/neural-stream-agent.md Phase E), wired the same way
-    ``_make_online_policy_and_learner`` wires the linear online-Q baseline.
-    Imported lazily -- torch stays optional for every other policy.
-    """
-    try:
-        import torch
-
-        from cognitive_runtime.neural import (
-            ActorCriticOptimizer,
-            MLPPolicyModel,
-            MLPValueModel,
-            MLPWorldModel,
-            NeuralAgentCheckpoint,
-            read_checkpoint_metadata,
-        )
-        from cognitive_runtime.neural.replay_buffer import MixedTrainingSchedule, ReplayBuffer
-        from cognitive_runtime.policies.actor_critic import (
-            ActorCriticLearner,
-            ActorCriticPolicy,
-            world_feature_width,
-        )
-    except ImportError as exc:  # torch not installed
-        sys.exit(f"the actor-critic policy needs PyTorch ({exc}); install '.[neural]'.")
-
-    action_space = list(program.metadata().action_space)
-    action_keys = [action.key() for action in action_space]
-    fusion = TemporalFusion(program.stream_catalog(), encoders or default_encoder_registry())
-    model_path = args.actor_critic_model
-    fusion_mode = getattr(args, "fusion", "fixed")
-    if fusion_mode not in FUSION_MODES:
-        sys.exit(f"unknown --fusion {fusion_mode!r}; expected one of {sorted(FUSION_MODES)}")
-
-    arch: Dict[str, Any] = {
-        "fused_width": fusion.width,
-        "world_feature_width": world_feature_width(action_keys),
-        "n_actions": len(action_keys),
-        "hidden_dim": args.actor_critic_hidden_dim,
-        "has_world_model": args.actor_critic_world_model_loss,
-        "fusion_mode": fusion_mode,
-    }
-    if os.path.exists(model_path):
-        saved_arch = read_checkpoint_metadata(model_path).get("extra", {}).get("actor_critic")
-        if saved_arch:
-            arch = saved_arch
-            saved_fusion_mode = arch.get("fusion_mode", "fixed")
-            if saved_fusion_mode != fusion_mode:
-                sys.exit(
-                    f"checkpoint {model_path!r} was trained with --fusion "
-                    f"{saved_fusion_mode!r}, but this run requested --fusion "
-                    f"{fusion_mode!r}; use the matching flag, or --fresh to start a new "
-                    "checkpoint (issue #57: fusion mode is not silently interchangeable)"
-                )
-
-    if fusion_mode == "learned" and getattr(args, "actor_critic_async", False):
-        sys.exit(
-            "--fusion learned does not support --async-trainer yet (issue #37's async "
-            "trainer only knows the fixed fused-latent transition shape); drop one of "
-            "the two flags"
-        )
-
-    live_fusion = None
-    if fusion_mode == "learned":
-        from cognitive_runtime.neural.live_fusion import LiveLearnedFusion
-
-        live_fusion = LiveLearnedFusion(
-            program.stream_catalog(),
-            stream_registry,
-            base_layout_hash=fusion.layout_hash,
-            fused_width=arch.get("fused_width"),
-            hidden_dim=arch["hidden_dim"],
-            lr=args.actor_critic_lr,
-        )
-        arch["fused_width"] = live_fusion.fused_width()
-        layout_hash = live_fusion.layout_hash
-    else:
-        layout_hash = fusion.layout_hash
-
-    if getattr(args, "actor_critic_async", False):
-        if getattr(args, "async_schedule", "phasic") == "concurrent":
-            return _make_concurrent_actor_critic_policy_and_learner(
-                args, arch=arch, model_path=model_path,
-                layout_hash=layout_hash, action_keys=action_keys, action_space=action_space,
-            ) + (None,)
-        return _make_async_actor_critic_policy_and_learner(
-            args, arch=arch, model_path=model_path,
-            layout_hash=layout_hash, action_keys=action_keys, action_space=action_space,
-        ) + (None,)
-
-    # Deterministic weight init: ActorCriticOptimizer's own `seed` only covers
-    # its later stochastic ops, not construction, which happens before it exists.
-    torch.manual_seed(args.seed)
-    policy_model = MLPPolicyModel(
-        arch["fused_width"], arch["world_feature_width"], arch["n_actions"],
-        hidden_dim=arch["hidden_dim"], layout_hash=layout_hash, action_keys=action_keys,
-    )
-    critic_model = MLPValueModel(
-        arch["fused_width"], arch["world_feature_width"],
-        hidden_dim=arch["hidden_dim"], layout_hash=layout_hash, action_keys=action_keys,
-    )
-    world_model = None
-    if arch["has_world_model"]:
-        world_model = MLPWorldModel(
-            arch["fused_width"], arch["n_actions"],
-            hidden_dim=arch["hidden_dim"], layout_hash=layout_hash, action_keys=action_keys,
-        )
-
-    optimizer = ActorCriticOptimizer(
-        policy_model,
-        critic_model,
-        world_model=world_model,
-        lr=args.actor_critic_lr,
-        gamma=args.actor_critic_gamma,
-        entropy_coef=args.actor_critic_entropy_coef,
-        grad_clip_norm=args.actor_critic_grad_clip_norm,
-        seed=args.seed,
-    )
-
-    checkpoint_kwargs: Dict[str, Any] = dict(
-        layout_hash=layout_hash,
-        action_keys=action_keys,
-        online_optimizer=optimizer,
-        extra_metadata={"actor_critic": arch},
-        name=getattr(args, "name", None),
-    )
-    if live_fusion is not None:
-        checkpoint_kwargs["encoders"] = live_fusion.encoders
-        checkpoint_kwargs["fusion"] = live_fusion.module
-        checkpoint_kwargs["optimizers"] = {"live_fusion": live_fusion.optimizer}
-    checkpoint = NeuralAgentCheckpoint(model_path, **checkpoint_kwargs)
-    if os.path.exists(model_path):
-        try:
-            checkpoint.load()
-        except ValueError as exc:
-            sys.exit(str(exc))
-
-    policy = ActorCriticPolicy(
-        policy_model, critic_model, action_keys, action_space=action_space,
-        history=args.actor_critic_history, training=args.actor_critic_train, seed=args.seed,
-    )
-    if live_fusion is not None:
-        (live_fusion.train_mode if args.actor_critic_train else live_fusion.eval_mode)()
-    replay_buffer = ReplayBuffer()
-    learner = ActorCriticLearner(
-        optimizer,
-        policy,
-        training=args.actor_critic_train,
-        checkpoint=checkpoint,
-        save_every_ticks=args.actor_critic_save_every,
-        replay_buffer=replay_buffer,
-        mixed_schedule=MixedTrainingSchedule(replay_every_n_ticks=args.actor_critic_replay_every),
-        replay_batch_size=args.actor_critic_replay_batch_size,
-        live_fusion=live_fusion,
-    )
-    return policy, learner, live_fusion
-
-
-def _make_async_actor_critic_policy_and_learner(
-    args: argparse.Namespace,
-    *,
-    arch: Dict[str, Any],
-    model_path: str,
-    layout_hash: str,
-    action_keys: list,
-    action_space: list,
-):
-    """Build the phasic actor/trainer split used by ``--async-trainer``.
-
-    Acting remains inference-only during each wake phase.  Between wake
-    phases, the runtime blocks before the next acting tick while the trainer
-    drains experience and performs a bounded consolidation pass.  Only the
-    completed pass is published and reloaded, so an acting tick can never see
-    intermediate or stale consolidation weights.
-    """
-    from cognitive_runtime.neural.checkpoint import NeuralAgentCheckpoint
-    from cognitive_runtime.neural.experience_queue import SharedExperienceRing
-    from sleep.weight_publisher import WeightSubscriber
-    from cognitive_runtime.policies.actor_critic import (
-        ActorCriticPolicy,
-        AsyncActorCriticLearner,
-    )
-    from sleep import PhasicSleepSchedule
-    from sleep.async_trainer import ActorCriticArch, AsyncTrainer, build_actor_critic_modules
-
-    trainer_arch = ActorCriticArch(
-        fused_width=arch["fused_width"],
-        world_feature_width=arch["world_feature_width"],
-        n_actions=arch["n_actions"],
-        action_keys=tuple(action_keys),
-        layout_hash=layout_hash,
-        hidden_dim=arch["hidden_dim"],
-        has_world_model=arch["has_world_model"],
-    )
-
-    ring = SharedExperienceRing(args.async_ring_capacity, arch["fused_width"])
-    trainer = AsyncTrainer(
-        trainer_arch,
-        model_path,
-        live_ring_handle=ring.handle(),
-        lr=args.actor_critic_lr,
-        gamma=args.actor_critic_gamma,
-        entropy_coef=args.actor_critic_entropy_coef,
-        grad_clip_norm=args.actor_critic_grad_clip_norm,
-        seed=args.seed,
-        batch_size=args.async_batch_size,
-        min_buffer_size=args.async_min_buffer_size,
-        publish_every_steps=args.async_publish_every,
-    )
-    trainer.resume_if_checkpoint_exists()
-
-    policy_model, critic_model, _world_model, _optimizer = build_actor_critic_modules(
-        trainer_arch, seed=args.seed,
-    )
-    actor_bundle = NeuralAgentCheckpoint(
-        model_path, layout_hash=layout_hash, action_keys=action_keys,
-        policy=policy_model, critic=critic_model,
-    )
-    subscriber = WeightSubscriber(path=model_path, bundle=actor_bundle)
-    # A resumed checkpoint is already a completed snapshot; load it before
-    # the first wake tick rather than waiting for the first sleep boundary.
-    subscriber.maybe_reload()
-
-    policy = ActorCriticPolicy(
-        policy_model, critic_model, action_keys, action_space=action_space,
-        history=args.actor_critic_history, training=args.actor_critic_train, seed=args.seed,
-    )
-    actor_learner = AsyncActorCriticLearner(policy, ring, weight_subscriber=None)
-    schedule = PhasicSleepSchedule(wake_ticks=args.async_wake_ticks)
-
-    class _PhasicLearner:
-        """Learner adapter: the loop's update boundary is between acting ticks."""
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(actor_learner, name)
-
-        def update(self, window: Any) -> None:
-            schedule.act(lambda: actor_learner.update(window))
-            if schedule.sleep_due:
-                schedule.consolidate(
-                    lambda: trainer.consolidate(args.async_consolidation_steps),
-                    reload_weights=subscriber.maybe_reload,
-                )
-
-        def reset(self) -> None:
-            actor_learner.reset()
-
-        def model_metadata(self) -> Dict[str, Any]:
-            return actor_learner.model_metadata()
-
-        def finish(self) -> None:
-            """Consolidate a final, partial wake phase before teardown."""
-            if schedule.request_sleep():
-                schedule.consolidate(
-                    lambda: trainer.consolidate(args.async_consolidation_steps),
-                    reload_weights=subscriber.maybe_reload,
-                )
-
-    learner = _PhasicLearner()
-    # Stashed for `cmd_run` cleanup; not part of the `Learner` contract.
-    learner.async_resources = (ring,)
-    learner.phasic_schedule = schedule
-    learner.sleep_trainer = trainer
-    return policy, learner
-
-
-def _make_concurrent_actor_critic_policy_and_learner(
-    args: argparse.Namespace,
-    *,
-    arch: Dict[str, Any],
-    model_path: str,
-    layout_hash: str,
-    action_keys: list,
-    action_space: list,
-):
-    """Build the concurrent actor/trainer split used by ``--async-trainer
-    --async-schedule concurrent`` (issue #100).
-
-    Unlike the phasic split, acting never pauses: the trainer runs
-    continuously in its own OS process (:class:`~sleep.async_trainer.
-    TrainerSupervisor`, restarting it if it crashes), and the actor polls
-    for a newer weight snapshot every ``--async-reload-every-ticks`` ticks
-    instead of blocking. Because a reload can land mid-play, the trainer
-    publishes an EMA/Polyak-averaged snapshot (see
-    ``sleep.weight_publisher.EMAWeightPublisher``) -- a slow-moving target
-    that absorbs tick-to-tick gradient noise -- stamped with the optimizer's
-    own monotonic step count, so the actor can measure and bound how many
-    versions behind its live weights are (``WeightSubscriber.staleness()``).
-    """
-    from cognitive_runtime.neural.checkpoint import NeuralAgentCheckpoint
-    from cognitive_runtime.neural.experience_queue import SharedExperienceRing
-    from sleep.weight_publisher import WeightSubscriber, ema_publish_path
-    from cognitive_runtime.policies.actor_critic import (
-        ActorCriticPolicy,
-        AsyncActorCriticLearner,
-    )
-    from sleep.async_trainer import ActorCriticArch, TrainerSupervisor, build_actor_critic_modules
-
-    # `EMAWeightPublisher` only validates this inside the spawned trainer
-    # process, which the parent would then supervise/restart forever
-    # without it ever reporting the real error back to the CLI user.
-    if not 0.0 < args.async_ema_decay < 1.0:
-        sys.exit(f"--async-ema-decay must be in (0, 1), got {args.async_ema_decay!r}")
-
-    trainer_arch = ActorCriticArch(
-        fused_width=arch["fused_width"],
-        world_feature_width=arch["world_feature_width"],
-        n_actions=arch["n_actions"],
-        action_keys=tuple(action_keys),
-        layout_hash=layout_hash,
-        hidden_dim=arch["hidden_dim"],
-        has_world_model=arch["has_world_model"],
-    )
-
-    ring = SharedExperienceRing(args.async_ring_capacity, arch["fused_width"])
-    supervisor = TrainerSupervisor(
-        trainer_arch, model_path,
-        live_ring_handle=ring.handle(),
-        trainer_kwargs={
-            "lr": args.actor_critic_lr,
-            "gamma": args.actor_critic_gamma,
-            "entropy_coef": args.actor_critic_entropy_coef,
-            "grad_clip_norm": args.actor_critic_grad_clip_norm,
-            "seed": args.seed,
-            "batch_size": args.async_batch_size,
-            "min_buffer_size": args.async_min_buffer_size,
-            "publish_every_steps": args.async_publish_every,
-            "ema_decay": args.async_ema_decay,
-        },
-    )
-    supervisor.start()
-
-    policy_model, critic_model, _world_model, _optimizer = build_actor_critic_modules(
-        trainer_arch, seed=args.seed,
-    )
-    actor_bundle = NeuralAgentCheckpoint(
-        model_path, layout_hash=layout_hash, action_keys=action_keys,
-        policy=policy_model, critic=critic_model,
-    )
-    # The trainer's `EMAWeightPublisher` never writes EMA weights to
-    # `model_path` itself -- that path doubles as the trainer's own resume
-    # checkpoint, which must always stay raw (see EMAWeightPublisher's
-    # docstring). The actor polls the separate EMA snapshot file instead.
-    subscriber = WeightSubscriber(path=ema_publish_path(model_path), bundle=actor_bundle)
-    # A resumed checkpoint is already a completed snapshot; load it before
-    # the first tick rather than waiting for the first background publish.
-    subscriber.maybe_reload()
-
-    policy = ActorCriticPolicy(
-        policy_model, critic_model, action_keys, action_space=action_space,
-        history=args.actor_critic_history, training=args.actor_critic_train, seed=args.seed,
-    )
-    actor_learner = AsyncActorCriticLearner(
-        policy, ring, weight_subscriber=subscriber,
-        reload_every_ticks=args.async_reload_every_ticks,
-    )
-
-    class _ConcurrentLearner:
-        """Learner adapter: supervises the trainer process alongside acting."""
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(actor_learner, name)
-
-        def update(self, window: Any) -> None:
-            actor_learner.update(window)
-            # Cheap liveness check; restarts the trainer process if it died
-            # (issue #37: "trainer crash must not kill the actor").
-            supervisor.poll()
-
-    learner = _ConcurrentLearner()
-    # Stashed for `cmd_run` cleanup; not part of the `Learner` contract.
-    learner.async_resources = (ring, supervisor)
-    learner.sleep_trainer_supervisor = supervisor
-    learner.weight_subscriber = subscriber
-    return policy, learner
-
-
-def _shutdown_async_trainer(learner: Optional[Any]) -> None:
-    """Best-effort, always-runs cleanup for ``--async-trainer``: ask the
-    trainer process to stop when using the legacy process resources, then
-    release the shared-memory ring."""
-    resources = getattr(learner, "async_resources", None)
-    if resources is None:
-        return
-    ring = resources[0]
-    try:
-        finish = getattr(learner, "finish", None)
-        if finish is not None:
-            finish()
-        if len(resources) == 2 and hasattr(resources[1], "stop"):
-            resources[1].stop()
-        elif len(resources) == 3:
-            _, trainer_process, trainer_stop_event = resources
-            trainer_stop_event.set()
-            trainer_process.join(timeout=10)
-            if trainer_process.is_alive():
-                trainer_process.terminate()
-                trainer_process.join(timeout=5)
-    finally:
-        ring.close()
-        ring.unlink()
 
 
 def _add_world_args(parser: argparse.ArgumentParser) -> None:
@@ -793,7 +416,7 @@ def _build_program(args: argparse.Namespace, program_config: Dict[str, Any],
 
 #: Online-learning policies whose model path needs a checkpoint-or-`--fresh`
 #: decision for live runs (issue #33).
-_CHECKPOINTED_POLICIES = {"online": "online_model", "actor-critic": "actor_critic_model"}
+_CHECKPOINTED_POLICIES = {"online": "online_model"}
 
 
 def _enforce_live_run_protocol(args: argparse.Namespace) -> None:
@@ -840,16 +463,16 @@ def cmd_run(args: argparse.Namespace) -> None:
     encoders = _encoders_for_input_profile(args.input_profile, stream_registry)
     action_space = list(program.metadata().action_space)
     learner = None
-    learned_fusion = None
     if args.policy == "online":
         policy, learner = _make_online_policy_and_learner(args, program, encoders)
-    elif args.policy == "actor-critic":
-        policy, learner, learned_fusion = _make_actor_critic_policy_and_learner(
-            args, program, encoders, stream_registry,
-        )
     else:
         policy = _make_policy(args.policy, args, action_space)
-    world_model = _make_world_model(args, program)
+    # Shared with the runtime's own Hippocampus below when `--async-trainer`
+    # wires a live `CortexConsolidator` into the cortex world model (issue
+    # #175): its generative-replay dream mixer needs the *same* hippocampus
+    # instance the loop writes seeds into, not a separate empty one.
+    hippocampus = Hippocampus()
+    world_model = _make_world_model(args, program, hippocampus)
     entity_persistence = _make_entity_persistence(args)
     config = RuntimeConfig(
         tick_rate=args.tick_rate,
@@ -882,13 +505,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         entity_persistence=entity_persistence,
         stream_registry=stream_registry,
         encoders=encoders,
-        learned_fusion=learned_fusion,
         action_registry=action_registry,
+        hippocampus=hippocampus,
     )
-    try:
-        summaries = runtime.run()
-    finally:
-        _shutdown_async_trainer(learner)
+    summaries = runtime.run()
     for summary in summaries:
         stats = summary.program_stats
         print(
@@ -1837,67 +1457,6 @@ def cmd_nursery_backbone_benchmark(args: argparse.Namespace) -> None:
         print(f"report written to {args.report}")
 
 
-def cmd_trainer(args: argparse.Namespace) -> None:
-    """``ccr trainer`` (issue #37): run an ``AsyncTrainer`` to completion in
-    the foreground, pointed only at recorded sessions and no live actor --
-    "the same trainer, pointed only at recorded sessions with no live
-    actor, performs offline pretraining." The output checkpoint is exactly
-    what ``run --async-trainer`` (or the synchronous ``--policy
-    actor-critic``) reads back in.
-    """
-    try:
-        import multiprocessing as mp
-
-        from cognitive_runtime.policies.actor_critic import world_feature_width
-        from sleep.async_trainer import ActorCriticArch, AsyncTrainer
-    except ImportError as exc:  # torch not installed
-        sys.exit(f"the trainer needs PyTorch ({exc}); install '.[neural]'.")
-    from cognitive_runtime.core.streams import TemporalFusion
-    from cognitive_runtime.core.streams.events import StreamSpec
-    from cognitive_runtime.runtime.replay import load_session_metadata, require_streams_v2
-
-    metadata = load_session_metadata(args.sessions[0])
-    require_streams_v2(metadata)
-    catalog = [StreamSpec.from_dict(s) for s in metadata.get("stream_catalog", [])]
-    fusion = TemporalFusion(catalog)
-    action_keys = tuple(metadata.get("action_space", []))
-    if not action_keys:
-        sys.exit(f"session {args.sessions[0]!r} has no recorded action_space")
-
-    arch = ActorCriticArch(
-        fused_width=fusion.width,
-        world_feature_width=world_feature_width(action_keys),
-        n_actions=len(action_keys),
-        action_keys=action_keys,
-        layout_hash=fusion.layout_hash,
-        hidden_dim=args.hidden_dim,
-        has_world_model=args.world_model_loss,
-    )
-    trainer = AsyncTrainer(
-        arch, args.out,
-        lr=args.lr, gamma=args.gamma, entropy_coef=args.entropy_coef,
-        grad_clip_norm=args.grad_clip_norm, seed=args.seed,
-        session_dirs=args.sessions,
-        max_transitions_from_sessions=args.max_transitions,
-        min_episode_reward=args.min_episode_reward,
-        batch_size=args.batch_size,
-        min_buffer_size=1,
-        publish_every_steps=args.publish_every,
-    )
-    resumed = trainer.resume_if_checkpoint_exists()
-    loaded = trainer.load_recorded_sessions()
-    print(
-        f"{'resumed from checkpoint; ' if resumed else ''}"
-        f"loaded {loaded} transitions from {len(args.sessions)} session(s)"
-    )
-    if loaded == 0:
-        sys.exit("no training transitions found in the given sessions")
-
-    stats = trainer.run_forever(mp.Event(), max_steps=args.steps)
-    print(f"trained {stats['step_count']} steps; checkpoint written to {args.out}")
-    print(f"last metrics: {stats['last_metrics']}")
-
-
 def cmd_replay(args: argparse.Namespace) -> None:
     reward_profile = _reward_profile_for(args)
     try:
@@ -2047,7 +1606,7 @@ def build_parser() -> argparse.ArgumentParser:
                             "generated Docker-style name (e.g. vigorous-shannon)")
     p_run.add_argument("--policy", default="scripted",
                        choices=["null", "random", "scripted", "learned", "neural", "online",
-                                "actor-critic", "human"])
+                                "human"])
     p_run.add_argument("--input-profile", default="full", choices=sorted(INPUT_PROFILES),
                        help="issue #32: 'full' (default) fuses every stream the legacy "
                             "encoder registry binds, including hand-computed semantic "
@@ -2089,17 +1648,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--no-online-train", dest="online_train", action="store_false",
                        help="run online Q in eval mode without mutating the model")
     p_run.add_argument("--fresh", action="store_true",
-                       help="initialize online/actor-critic weights fresh even though no "
-                            "checkpoint exists yet at the model path; required for "
-                            "--backend remote with no existing checkpoint (issue #33)")
-    p_run.add_argument("--actor-critic-model", default=DEFAULT_ACTOR_CRITIC_MODEL_OUT,
-                       help="actor-critic checkpoint bundle path (.pt)")
-    p_run.add_argument("--fusion", choices=sorted(FUSION_MODES), default="fixed",
-                       help="actor-critic's fused-state source (issue #57): 'fixed' (default) "
-                            "is TemporalFusion's hand-written concatenation; 'learned' runs "
-                            "trainable stream encoders + LatentFusionModel in the tick's "
-                            "inference path instead. A checkpoint trained under one mode "
-                            "fails loudly if resumed under the other.")
+                       help="initialize online weights fresh even though no checkpoint "
+                            "exists yet at the model path; required for --backend remote "
+                            "with no existing checkpoint (issue #33)")
     p_run.add_argument("--attention", choices=sorted(ATTENTION_MODES), default="off",
                        help="deterministic attention controller (issue #59): 'off' (default) "
                             "gives every agent-input stream uniform weight 1.0, reproducing "
@@ -2114,64 +1665,23 @@ def build_parser() -> argparse.ArgumentParser:
                             "survival-critical policy action; 'off' disables it (the "
                             "ablation); 'learned-only' leaves orienting to the policy "
                             "instead. Only fires when --attention=budgeted.")
-    p_run.add_argument("--actor-critic-save-every", type=int, default=1000,
-                       help="save the actor-critic checkpoint every N gradient steps")
-    p_run.add_argument("--actor-critic-lr", type=float, default=1e-3)
-    p_run.add_argument("--actor-critic-gamma", type=float, default=0.99)
-    p_run.add_argument("--actor-critic-entropy-coef", type=float, default=0.01,
-                       help="entropy-bonus weight encouraging exploration")
-    p_run.add_argument("--actor-critic-grad-clip-norm", type=float, default=5.0)
-    p_run.add_argument("--actor-critic-hidden-dim", type=int, default=128)
-    p_run.add_argument("--actor-critic-history", type=int, default=8,
-                       help="recent-action window fed into world_features")
-    p_run.add_argument("--actor-critic-replay-every", type=int, default=32,
-                       help="pull a replay minibatch every N ticks")
-    p_run.add_argument("--actor-critic-replay-batch-size", type=int, default=32)
-    p_run.add_argument("--actor-critic-world-model-loss", dest="actor_critic_world_model_loss",
-                       action="store_true", default=True,
-                       help="jointly train an action-conditioned world model from the same "
-                            "transitions (default: on)")
-    p_run.add_argument("--no-actor-critic-world-model-loss", dest="actor_critic_world_model_loss",
-                       action="store_false")
-    p_run.add_argument("--actor-critic-train", dest="actor_critic_train", action="store_true",
-                       default=True, help="train the actor-critic model while running")
-    p_run.add_argument("--no-actor-critic-train", dest="actor_critic_train", action="store_false",
-                       help="run actor-critic in eval mode without mutating weights")
-    p_run.add_argument("--async-trainer", dest="actor_critic_async", action="store_true",
+    p_run.add_argument("--async-trainer", dest="async_trainer", action="store_true",
                        default=False,
-                       help="actor/learner split: train in the background instead of "
-                            "synchronously in the tick loop; see --async-schedule for "
-                            "phasic (default) vs concurrent")
-    p_run.add_argument("--async-schedule", choices=("phasic", "concurrent"), default="phasic",
-                       help="'phasic' (default): pause acting for bounded sleep "
-                            "consolidation, no staleness. 'concurrent' (issue #100): the "
-                            "trainer runs continuously in its own process while the actor "
-                            "keeps acting, polling for EMA-averaged weight snapshots every "
-                            "--async-reload-every-ticks ticks instead of pausing")
-    p_run.add_argument("--async-ring-capacity", type=int, default=20_000,
-                       help="live-experience ring buffer capacity (transitions); "
-                            "drop-oldest once full")
-    p_run.add_argument("--async-batch-size", type=int, default=32,
-                       help="trainer process minibatch size")
-    p_run.add_argument("--async-min-buffer-size", type=int, default=256,
-                       help="trainer process waits for this many transitions before its "
-                            "first gradient step")
-    p_run.add_argument("--async-publish-every", type=int, default=50,
-                       help="trainer process publishes a new weight snapshot every N "
-                            "gradient steps")
-    p_run.add_argument("--async-reload-every-ticks", type=int, default=5,
-                       help="ignored by --async-schedule phasic, which reloads exactly "
-                            "once after each completed consolidation; for "
-                            "--async-schedule concurrent, the actor polls for a newer "
-                            "snapshot every N ticks")
-    p_run.add_argument("--async-ema-decay", type=float, default=0.999,
-                       help="--async-schedule concurrent only: Polyak/EMA decay for "
-                            "published weight snapshots (closer to 1 = slower-moving "
-                            "target, less tick-to-tick oscillation)")
+                       help="issue #175: consolidate the live predictive cortex online -- "
+                            "requires --world-model cortex:<ckpt>. Every --async-wake-ticks "
+                            "ticks, the tick blocks for a bounded sleep pass (a "
+                            "sleep.cortex_consolidation.CortexConsolidator draws quality-"
+                            "gated replay batches -- real transitions recorded from every "
+                            "tick, mixed with guardrailed generative dreams -- and takes "
+                            "--async-consolidation-steps gradient steps), then publishes "
+                            "the result back into the cortex. The world model is the "
+                            "online learner; nothing in the motor path trains online.")
     p_run.add_argument("--async-wake-ticks", type=int, default=50,
-                       help="number of acting ticks between sleep consolidation passes")
+                       help="number of acting ticks between cortex consolidation passes "
+                            "(only with --async-trainer)")
     p_run.add_argument("--async-consolidation-steps", type=int, default=50,
-                       help="maximum gradient steps in each sleep consolidation pass")
+                       help="gradient steps taken in each consolidation pass "
+                            "(only with --async-trainer)")
     _add_world_args(p_run)
     _add_world_selector_arg(p_run)
     _add_world_model_arg(p_run)
@@ -2343,41 +1853,6 @@ def build_parser() -> argparse.ArgumentParser:
                          help="skip episodes below this total reward")
     p_train.add_argument("--seed", type=int, default=0)
     p_train.set_defaults(func=cmd_train)
-
-    p_trainer = sub.add_parser(
-        "trainer",
-        help="standalone actor/critic AsyncTrainer (issue #37): pointed only at recorded "
-             "sessions with no live actor, this is offline pretraining -- the same trainer "
-             "`run --async-trainer` spawns as a background process, run here to completion "
-             "in the foreground",
-    )
-    p_trainer.add_argument("--sessions", nargs="+", required=True,
-                           help="session directories to pretrain from (streams-v2)")
-    p_trainer.add_argument("--out", default=DEFAULT_ACTOR_CRITIC_MODEL_OUT,
-                           help="checkpoint bundle path (.pt); resumed from if it already "
-                                "exists")
-    p_trainer.add_argument("--steps", type=int, default=2000,
-                           help="gradient steps to run (an offline trainer has no live "
-                                "stream to keep waiting on, so it stops here)")
-    p_trainer.add_argument("--max-transitions", type=int, default=None,
-                           help="cap on transitions loaded from the sessions")
-    p_trainer.add_argument("--min-episode-reward", type=float, default=None,
-                           help="skip episodes below this total reward")
-    p_trainer.add_argument("--batch-size", type=int, default=32)
-    p_trainer.add_argument("--publish-every", type=int, default=100,
-                           help="write a checkpoint every N gradient steps, plus once more "
-                                "at the end")
-    p_trainer.add_argument("--hidden-dim", type=int, default=128)
-    p_trainer.add_argument("--lr", type=float, default=1e-3)
-    p_trainer.add_argument("--gamma", type=float, default=0.99)
-    p_trainer.add_argument("--entropy-coef", type=float, default=0.01)
-    p_trainer.add_argument("--grad-clip-norm", type=float, default=5.0)
-    p_trainer.add_argument("--world-model-loss", dest="world_model_loss",
-                           action="store_true", default=True)
-    p_trainer.add_argument("--no-world-model-loss", dest="world_model_loss",
-                           action="store_false")
-    p_trainer.add_argument("--seed", type=int, default=0)
-    p_trainer.set_defaults(func=cmd_trainer)
 
     p_canary = sub.add_parser(
         "ego-motion-canary",

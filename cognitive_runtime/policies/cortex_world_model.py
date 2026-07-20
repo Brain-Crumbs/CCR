@@ -38,7 +38,7 @@ runtime stays torch-free.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence, Union
+from typing import Any, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -60,6 +60,9 @@ class CortexWorldModel(CoreWorldModel):
         model: Union["PredictiveCortex", str],  # noqa: F821 -- lazy torch type
         action_keys: Optional[Sequence[str]] = None,
         horizons: Optional[Sequence[int]] = None,
+        consolidator: Optional[Any] = None,
+        consolidate_every_ticks: int = 0,
+        consolidation_steps: int = 1,
     ):
         if isinstance(model, str):
             from cognitive_runtime.training.action_world_model import (
@@ -100,6 +103,17 @@ class CortexWorldModel(CoreWorldModel):
         # the same pre-advance starting point.
         self._latent: Optional[torch.Tensor] = None
         self._pre_advance_hidden = None
+
+        # Optional online-consolidation wiring (issue #175): a live
+        # `sleep.cortex_consolidation.CortexConsolidator` feeding real
+        # `(z0, actions, next_latents)` transitions from every tick and
+        # running a bounded sleep pass (then publishing the result back into
+        # this adapter) every `consolidate_every_ticks` ticks. `0` disables
+        # it -- the default, byte-for-byte unchanged behavior.
+        self.consolidator = consolidator
+        self.consolidate_every_ticks = consolidate_every_ticks
+        self.consolidation_steps = consolidation_steps
+        self._tick = 0
 
     def _workspace_modalities(self, memory: Memory) -> dict[str, torch.Tensor]:
         """Bind the runtime's actual fused workspace plus efference copy."""
@@ -174,6 +188,23 @@ class CortexWorldModel(CoreWorldModel):
             if self._predicted_latent is not None:
                 prediction_error = float(F.mse_loss(latent, self._predicted_latent))
 
+            # The action emitted since last tick's encoded latent -- computed
+            # once and reused both for recording the real transition below
+            # (issue #175) and for the rollout's steady-state repeat.
+            action_col = self._last_action_column(memory)
+
+            # Feed the live consolidator the real transition that just
+            # completed: last tick's latent + the action taken since ->
+            # this tick's actually-observed latent (dream_length=1). Must
+            # happen before ``self._latent`` below overwrites the previous
+            # tick's value.
+            if self.consolidator is not None and self._latent is not None:
+                self.consolidator.record_transition(
+                    z0=self._latent.squeeze(0).tolist(),
+                    actions=[self.action_keys[int(action_col.item())]],
+                    next_latents=latent.detach(),
+                )
+
             # Snapshot for cortex MPC (issue #168): the encoded observation
             # and the hidden state *before* the one-step advance below.
             self._latent = latent
@@ -184,7 +215,6 @@ class CortexWorldModel(CoreWorldModel):
             # first step is the *real* advance whose hidden state and latent
             # forecast we persist; further steps are what-if look-ahead that
             # must not corrupt the rolling state.
-            action_col = self._last_action_column(memory)
             hidden = self._hidden
             latent_i = latent
             first_hidden = None
@@ -199,6 +229,20 @@ class CortexWorldModel(CoreWorldModel):
             self._predicted_latent = first_latent
 
             reward, terminal_logit, risk, uncertainty = self.model.heads(first_hidden)
+
+        # Sleep-phase consolidation (issue #175): outside `no_grad` above --
+        # `consolidate()` takes real gradient steps. Phasic/synchronous by
+        # design: this blocks the tick until the pass (and the weight
+        # publish back into `self`) completes, exactly the integration
+        # `CortexConsolidator`'s own docstring describes.
+        self._tick += 1
+        if (
+            self.consolidator is not None
+            and self.consolidate_every_ticks > 0
+            and self._tick % self.consolidate_every_ticks == 0
+        ):
+            self.consolidator.consolidate(self.consolidation_steps)
+            self.consolidator.publish_to(self)
 
         return Prediction(
             # ``risk_head`` is softplus'd (non-negative, unbounded); clamp into
