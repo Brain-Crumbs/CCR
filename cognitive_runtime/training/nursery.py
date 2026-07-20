@@ -802,6 +802,23 @@ def _scenarios_for_world(world: str) -> Dict[str, NurseryScenario]:
     raise ValueError(f"unknown nursery world {world!r}; choices: ['crafter', 'minecraft']")
 
 
+def _action_keys_for_world(world: str) -> List[str]:
+    """Return the selected World's complete, stable action vocabulary.
+
+    Stage recordings often exercise only a subset. Pinning checkpoints to
+    that incidental subset makes warm-starting across nursery/development
+    stages unsafe, so every dataset for a World uses the registry's full
+    ordered action space from the outset.
+    """
+    if world == "crafter":
+        from cognitive_runtime.programs.crafter.actions import ACTION_SPACE
+    elif world == "minecraft":
+        from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
+    else:
+        raise ValueError(f"unknown nursery world {world!r}; choices: ['crafter', 'minecraft']")
+    return [action.key() for action in ACTION_SPACE]
+
+
 def run_nursery_scenario(
     record_dir: str,
     scenario_name: str,
@@ -1127,11 +1144,7 @@ def run_nursery_joint(
     # scenario may issue actions no training scenario used, and zero-shot
     # evaluation must be able to encode them (their embeddings are simply
     # untrained).
-    from cognitive_runtime.training.features import ACTION_KEYS
-
-    vocabulary = list(ACTION_KEYS)
-    if NULL_ACTION.name not in vocabulary:
-        vocabulary.append(NULL_ACTION.name)
+    vocabulary = _action_keys_for_world(cfg.world)
 
     all_train_dirs = [d for name in train_names for d in train_sessions[name]]
     dataset = build_action_sequence_dataset(all_train_dirs, action_keys=vocabulary)
@@ -1308,11 +1321,7 @@ def run_action_ablation_eval(
     # Pin the vocabulary to the full action space (issue #91's joint-training
     # convention) so both runs' models share one embedding table even though
     # only one is trained to actually read it.
-    from cognitive_runtime.training.features import ACTION_KEYS
-
-    vocabulary = list(ACTION_KEYS)
-    if NULL_ACTION.name not in vocabulary:
-        vocabulary.append(NULL_ACTION.name)
+    vocabulary = _action_keys_for_world(cfg.world)
 
     all_train_dirs = [d for name in train_scenarios for d in train_sessions[name]]
     dataset = build_action_sequence_dataset(all_train_dirs, action_keys=vocabulary)
@@ -1483,11 +1492,7 @@ def run_backbone_benchmark(
                 + "\n  - ".join(issues)
             )
 
-    from cognitive_runtime.training.features import ACTION_KEYS
-
-    vocabulary = list(ACTION_KEYS)
-    if NULL_ACTION.name not in vocabulary:
-        vocabulary.append(NULL_ACTION.name)
+    vocabulary = _action_keys_for_world(cfg.world)
 
     all_train_dirs = [d for name in train_scenarios for d in train_sessions[name]]
     dataset = build_action_sequence_dataset(all_train_dirs, action_keys=vocabulary)

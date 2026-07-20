@@ -33,6 +33,10 @@ def __getattr__(name: str):
         from sleep import forgetting
 
         return getattr(forgetting, name)
+    if name in {"CortexConsolidator", "ConsolidationMetrics"}:
+        from sleep import cortex_consolidation
+
+        return getattr(cortex_consolidation, name)
     raise AttributeError(name)
 
 __all__ = [
@@ -53,4 +57,6 @@ __all__ = [
     "GenerativeReplayMixer",
     "ForgettingReport",
     "compute_forgetting_metric",
+    "CortexConsolidator",
+    "ConsolidationMetrics",
 ]

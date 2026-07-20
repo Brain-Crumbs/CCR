@@ -11,6 +11,17 @@ def test_mpc_deterministically_selects_highest_scoring_prediction():
     assert controller.choose(None, [Action("LEFT"), Action("RIGHT")]) == Action("RIGHT")
 
 
+def test_mpc_treats_nan_as_worst_score_and_keeps_deterministic_order():
+    controller = MPCController(
+        lambda state, action: {"BAD": float("nan"), "GOOD": 1.0}[action.name],
+        lambda prediction, goal: prediction,
+    )
+    assert controller.choose(None, [Action("BAD"), Action("GOOD")]) == Action("GOOD")
+
+    all_nan = MPCController(lambda state, action: float("nan"), lambda prediction, goal: prediction)
+    assert all_nan.choose(None, [Action("FIRST"), Action("SECOND")]) == Action("FIRST")
+
+
 def test_all_controller_variants_share_the_seam_and_mpc_is_default():
     actions = [NULL_ACTION, Action("GO")]
     assert build_voluntary_controller(
@@ -92,6 +103,49 @@ def test_active_inference_controller_encodes_a_raw_pixel_goal_in_nchw_layout():
     # the encoder requires.
     chosen = controller.choose(state, [Action("LEFT"), Action("RIGHT")], goal=goal)
     assert chosen in (Action("LEFT"), Action("RIGHT"))
+
+
+def test_active_inference_goal_rejects_invalid_dimensions_and_batched_latents():
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    from motor.policy import _encode_goal
+
+    class FakeCortex:
+        latent_width = 4
+
+    for goal, message in [
+        (torch.tensor(1.0), "at least 1D"),
+        (torch.zeros(8, 8), "H x W x C"),
+        (torch.zeros(2, 4), "one latent goal"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            _encode_goal(FakeCortex(), goal)
+
+
+def test_imagination_actor_handles_unbatched_latent():
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    from motor.policy import ImaginationActor
+
+    actor = ImaginationActor(latent_width=2, n_actions=2, hidden_dim=2)
+    with torch.no_grad():
+        for parameter in actor.actor.parameters():
+            parameter.zero_()
+        actor.actor[-1].bias.copy_(torch.tensor([0.0, 1.0]))
+    assert actor.act(torch.zeros(2)) == 1
+
+
+def test_callable_policy_controller_allows_unoffered_universal_null_action():
+    from motor.policy import build_policy_controller
+
+    class EmptyPolicy:
+        def emit(self, state, memory, prediction):
+            return []
+
+    controller = build_policy_controller(EmptyPolicy())
+    assert controller.choose((None, None, None), [Action("MOVE")]) == NULL_ACTION
 
 
 def test_active_inference_controller_requires_a_goal():

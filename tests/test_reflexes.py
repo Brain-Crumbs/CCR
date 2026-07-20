@@ -65,6 +65,17 @@ def test_reflex_activation_rate_is_exposed_as_session_metric():
     assert reflexes.metrics()["motor.reflex_activation_rate"] == .5
 
 
+def test_reflex_stack_reset_clears_per_episode_metrics():
+    reflexes = stack()
+    reflexes.decide(Action("GO"), [Stimulus("threat", 1)])
+    reflexes.reset()
+    assert reflexes.metrics() == {
+        "motor.reflex_activation_rate": 0.0,
+        "motor.reflex_activations": 0,
+        "motor.ticks": 0,
+    }
+
+
 # --------------------------------------------------------- issue #103: developmental trend
 
 
@@ -129,6 +140,7 @@ def test_stimulus_from_attention_migrates_orienting_reflex_capture():
 def test_stimulus_from_attention_is_none_without_a_localized_capture():
     assert stimulus_from_attention(_attention_state(bottom_up_capture=False)) is None
     assert stimulus_from_attention(_attention_state(bearing_deg=None)) is None
+    assert stimulus_from_attention(_attention_state(bearing_deg=0.0)) is None
 
 
 def test_stimulus_from_threat_wraps_the_amygdala_adrenaline_level():

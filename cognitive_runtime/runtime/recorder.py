@@ -94,6 +94,12 @@ class DecisionRecord:
     #: calibrator's current calibration error), every tick; `None` for
     #: every session recorded before this field existed.
     arbiter_mode: Optional[Dict[str, Any]] = None
+    #: Full motor-stack efference record (issue #168):
+    #: ``MotorDecision.to_dict()`` carrying voluntary, reflex,
+    #: caregiver_override, and actuated for every tick the organism-motor
+    #: policy drives; ``None`` when the policy is not a
+    #: ``MotorFreedomPolicy`` or for sessions recorded before this field.
+    motor_decision: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

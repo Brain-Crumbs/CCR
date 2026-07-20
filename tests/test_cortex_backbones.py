@@ -118,6 +118,8 @@ def test_windowed_backbone_set_context_length_clamps_to_max(name):
     assert backbone._current_context == 4
     backbone.set_context_length(1)
     assert backbone._current_context == 1
+    backbone.set_context_length(0)
+    assert backbone._current_context == 1
 
 
 # --------------------------------------------------------------- cortex-level contract

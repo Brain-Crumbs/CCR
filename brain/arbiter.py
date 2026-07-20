@@ -212,10 +212,11 @@ class SurpriseCalibratorConfig:
 
 
 class SurpriseCalibrator:
-    """Calibrates a raw per-tick surprise reading (cortex sigma / the
-    prediction-error stand-in `brain.neuromod.compute_acetylcholine` also
-    uses -- no dedicated sigma head is wired into the `WorldModel`
-    interface yet) into a `[0, 1)` "this tick is surprising" probability,
+    """Calibrates a raw per-tick surprise reading -- the cortex's own
+    forward-uncertainty head where the live `WorldModel` bridge exposes one
+    (issue #169: `PredictiveCortex.uncertainty_head` via `CortexWorldModel`),
+    else the prediction-error stand-in `brain.neuromod.compute_acetylcholine`
+    also uses -- into a `[0, 1)` "this tick is surprising" probability,
     temperature-scaled against a rolling holdout of its own recent
     readings, and reports Expected Calibration Error (ECE,
     `brain.calibration.expected_calibration_error`) as the first-class

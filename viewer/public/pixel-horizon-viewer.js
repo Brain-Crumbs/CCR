@@ -1,8 +1,11 @@
 /**
  * <pixel-horizon-viewer> — reusable, framework-agnostic web component that
- * shows, for each prediction horizon h, the ACTUAL frame at t+h next to a
- * PREDICTED frame at t+h, plus an |error| heatmap and MSE/PSNR readouts,
- * with a scrubber/playback over the episode and an MSE-over-time chart.
+ * shows, for each prediction horizon h, a four-up strip: the SEEN frame the
+ * model was given at t, the PREDICTED frame at t+h, the ACTUAL frame at t+h,
+ * and an |error| heatmap, plus MSE/PSNR readouts, a scrubber/playback over
+ * the episode and an MSE-over-time chart. The seen→predicted→actual triple
+ * answers, for every frame, "what the model saw, what it predicted it would
+ * see next, and what actually was shown."
  *
  * Prediction sources:
  *   - "copy-last"  : predicted(t+h) = actual(t)      (the harness baseline)
@@ -360,8 +363,9 @@ class PixelHorizonViewer extends HTMLElement {
         panel.innerHTML = `
           <h3>horizon t+${h}</h3>
           <div class="strip">
-            <figure class="cell"><canvas class="px actual"></canvas><figcaption>actual t+${h}</figcaption></figure>
+            <figure class="cell"><canvas class="px seen"></canvas><figcaption>seen t</figcaption></figure>
             <figure class="cell"><canvas class="px pred"></canvas><figcaption>predicted t+${h}</figcaption></figure>
+            <figure class="cell"><canvas class="px actual"></canvas><figcaption>actual t+${h}</figcaption></figure>
             <figure class="cell"><canvas class="px diff"></canvas><figcaption>|error|</figcaption></figure>
           </div>
           <div class="metrics"></div>`;
@@ -374,7 +378,9 @@ class PixelHorizonViewer extends HTMLElement {
       const h = Number(panel.dataset.h);
       const pred = this._predicted(source, t, h);
       const target = this._target(source, t + h);
+      const seen = this._target(source, t); // the input frame the model saw at t
       const shape = pred ? pred.shape : this._shape;
+      this._drawFrame(panel.querySelector(".seen"), seen?.bytes ?? null, seen?.shape ?? this._shape);
       this._drawFrame(panel.querySelector(".actual"), target?.bytes ?? null, target?.shape ?? this._shape);
       this._drawFrame(panel.querySelector(".pred"), pred?.bytes ?? null, shape);
       const comparable = pred && target && pred.bytes.length === target.bytes.length;

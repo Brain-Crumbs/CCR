@@ -189,23 +189,43 @@ def _make_policy(
 
 def _make_world_model(args: argparse.Namespace, program: MinecraftSurvivalBox):
     """The heuristic default (`None`, `TrendWorldModel`), or a trained neural
-    world-model checkpoint bridged behind the same `world_model` seam
-    (issue #26); `--world-model` is unset unless the caller opts in."""
+    world-model checkpoint bridged behind the same `world_model` seam.
+
+    Two neural paths, both requiring the `neural` extra:
+
+    - `--world-model cortex:PATH` drives the recurrent, action-conditioned
+      `PredictiveCortex` as the live world model (issue #166) -- its backbone
+      hidden state persists across ticks and resets on each episode boundary.
+    - `--world-model PATH` bridges the memoryless `MLPWorldModel` (issue #26).
+
+    `--world-model` is unset unless the caller opts in."""
     path = getattr(args, "world_model", None)
     if not path:
         return None
+    action_keys = [action.key() for action in program.metadata().action_space]
+    cortex_prefix = "cortex:"
+    if path.startswith(cortex_prefix):
+        checkpoint = path[len(cortex_prefix):]
+        if not checkpoint:
+            sys.exit("--world-model cortex: needs a checkpoint path (cortex:PATH)")
+        try:
+            from cognitive_runtime.policies.cortex_world_model import CortexWorldModel
+        except ImportError as exc:  # torch not installed
+            sys.exit(f"the predictive cortex needs PyTorch ({exc}); install '.[neural]'.")
+        return CortexWorldModel(checkpoint, action_keys=action_keys)
     try:
         from cognitive_runtime.policies.neural_world_model import NeuralWorldModel
     except ImportError as exc:  # torch not installed
         sys.exit(f"the neural world model needs PyTorch ({exc}); install '.[neural]'.")
-    action_keys = [action.key() for action in program.metadata().action_space]
     return NeuralWorldModel(path, action_keys=action_keys)
 
 
 def _add_world_model_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--world-model", default=None,
                         help="path to a trained neural world-model checkpoint (.pt bundle, "
-                             "--model-type world-model); default: the heuristic TrendWorldModel")
+                             "--model-type world-model); prefix with 'cortex:' to drive a "
+                             "trained recurrent PredictiveCortex checkpoint as the live world "
+                             "model (issue #166); default: the heuristic TrendWorldModel")
 
 
 def _make_entity_persistence(args: argparse.Namespace):
