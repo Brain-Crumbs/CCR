@@ -173,7 +173,7 @@ class PixelHorizonViewer extends HTMLElement {
   static get observedAttributes() { return ["frames-src", "predictions-src", "horizons", "scale"]; }
 
   connectedCallback() {
-    this._$("#scrub").addEventListener("input", (e) => { this._t = Number(e.target.value); this._render(); });
+    this._$("#scrub").addEventListener("input", (e) => this.setTime(Number(e.target.value), true));
     this._$("#source").addEventListener("change", () => this._render(true));
     this._$("#play").addEventListener("click", () => this._togglePlay());
     this._load();
@@ -195,6 +195,29 @@ class PixelHorizonViewer extends HTMLElement {
     return (this.getAttribute("horizons") || "1,10,100").split(",").map((s) => parseInt(s.trim(), 10)).filter((h) => h > 0);
   }
   get scale() { return Number(this.getAttribute("scale") || 6); }
+  get time() { return this._t; }
+
+  setTick(tick) {
+    if (!this._frames?.length) return this.setTime(tick);
+    const wanted = Number(tick) || 0;
+    const closest = this._frames.reduce((best, frame, index) => (
+      !best || Math.abs(Number(frame.tick) - wanted) < best.distance
+        ? { index, distance: Math.abs(Number(frame.tick) - wanted) } : best
+    ), null);
+    this.setTime(closest.index);
+  }
+
+  setTime(t, emit = false) {
+    const requested = Math.max(0, Math.round(Number(t) || 0));
+    const max = Number(this._$("#scrub")?.max ?? 0);
+    const next = this._frames ? Math.min(max, requested) : requested;
+    this._t = next;
+    if (this._$("#scrub")) this._$("#scrub").value = next;
+    this._render();
+    if (emit) this.dispatchEvent(new CustomEvent("timechange", {
+      detail: { t: next, tick: this._frames?.[next]?.tick ?? next }, bubbles: true, composed: true,
+    }));
+  }
 
   _$(sel) { return this.shadowRoot.querySelector(sel); }
 
@@ -233,7 +256,7 @@ class PixelHorizonViewer extends HTMLElement {
     if (hasModel && !sourceSel.querySelector('option[value="model"]')) {
       const opt = document.createElement("option");
       opt.value = "model";
-      opt.textContent = "model (exported)";
+      opt.textContent = this._pred.source === "live-record" ? "model (live record)" : "model (exported)";
       sourceSel.prepend(opt);
       sourceSel.value = "model";
     } else if (!hasModel) {
@@ -247,7 +270,7 @@ class PixelHorizonViewer extends HTMLElement {
     this._t = Math.min(this._t, Number(scrub.max));
     scrub.value = this._t;
     this._$("#status").textContent =
-      `${this._frames.length} frames (${this._shape.join("×")} ${this._pred ? "· model predictions loaded" : "· no model predictions exported — showing baselines"})`;
+      `${this._frames.length} frames (${this._shape.join("×")} ${this._pred ? `· ${this._pred.source === "live-record" ? "live" : "exported"} model predictions loaded` : "· no model predictions recorded — showing baselines"})`;
     this._render(true);
   }
 
@@ -481,9 +504,7 @@ class PixelHorizonViewer extends HTMLElement {
       const rect = svg.getBoundingClientRect();
       const i = Math.round(((ev.clientX - rect.left - pad.l) / (W - pad.l - pad.r)) * (n - 1));
       if (i >= 0 && i <= Number(this._$("#scrub").max)) {
-        this._t = i;
-        this._$("#scrub").value = i;
-        this._render();
+        this.setTime(i, true);
       }
     };
   }
@@ -493,9 +514,7 @@ class PixelHorizonViewer extends HTMLElement {
     this._$("#play").textContent = "❚❚";
     this._timer = setInterval(() => {
       const max = Number(this._$("#scrub").max);
-      this._t = this._t >= max ? 0 : this._t + 1;
-      this._$("#scrub").value = this._t;
-      this._render();
+      this.setTime(this._t >= max ? 0 : this._t + 1, true);
     }, 100);
   }
 

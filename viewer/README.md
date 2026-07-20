@@ -38,6 +38,16 @@ events, JSON exports, and the `record.quality` verdict. Existing episode
   also saves `<scenario>-full.pt`, a full encoder+decoder+predictor bundle
   for re-exporting later:
 
+Live `CortexWorldModel` runs also place decoded horizon frames in each
+`DecisionRecord`. When no offline export exists, the clinic assembles those
+records into the same `pixel-predictions-v1` response and labels the source
+**model (live record)**.
+
+The episode frame scrubber is shared with the EEG and arbiter-mode timelines:
+moving either pixel viewer highlights the matching cognitive tick, while
+clicking a trace or mode tick moves both pixel viewers to its corresponding
+recorded frame.
+
 ```bash
 python -m cognitive_runtime.training.prediction_export \
     --model out/walk_forward-full.pt \

@@ -59,14 +59,16 @@ export function episodeDiagnostics(records = [], decisions = []) {
 function sparkline(points, color) {
   if (!points.length) return '<div class="no-data">not recorded</div>';
   const values = points.map((p) => p.value), min = Math.min(...values), max = Math.max(...values), span = max - min || 1;
-  const coords = points.map((p, i) => `${points.length === 1 ? 50 : i * 100 / (points.length - 1)},${34 - ((p.value - min) / span) * 30}`).join(" ");
-  return `<svg class="spark" viewBox="0 0 100 38" preserveAspectRatio="none" role="img" aria-label="${points.length} tick timeline"><polyline points="${coords}" fill="none" stroke="${color}" vector-effect="non-scaling-stroke"/></svg><span class="range">${esc(min.toFixed(3))}–${esc(max.toFixed(3))}</span>`;
+  const minTick = Math.min(...points.map((p) => p.tick)), maxTick = Math.max(...points.map((p) => p.tick));
+  const tickSpan = maxTick - minTick || 1;
+  const coords = points.map((p) => `${points.length === 1 ? 50 : (p.tick - minTick) * 100 / tickSpan},${34 - ((p.value - min) / span) * 30}`).join(" ");
+  return `<svg class="spark" data-min-tick="${minTick}" data-max-tick="${maxTick}" viewBox="0 0 100 38" preserveAspectRatio="none" role="img" aria-label="${points.length} tick timeline"><polyline points="${coords}" fill="none" stroke="${color}" vector-effect="non-scaling-stroke"/><line class="time-cursor" x1="0" x2="0" y1="1" y2="37" vector-effect="non-scaling-stroke"/></svg><span class="range">${esc(min.toFixed(3))}–${esc(max.toFixed(3))}</span>`;
 }
 
 export function renderEEGPanel(diagnostics) {
   const colors = { dopamine: "#7b55c7", acetylcholine: "#167c80", adrenaline: "#c34b36", prediction_error: "#b27a00" };
   const traces = Object.entries(diagnostics.series).map(([name, points]) => `<div class="trace"><strong>${esc(name.replace("_", " "))}</strong>${sparkline(points, colors[name])}</div>`).join("");
-  const modes = diagnostics.modes.length ? diagnostics.modes.map((x) => `<li class="mode mode--${esc(x.mode)}"><span>t${esc(x.tick)}</span>${esc(x.mode)}</li>`).join("") : '<li class="no-data">arbiter mode not recorded</li>';
+  const modes = diagnostics.modes.length ? diagnostics.modes.map((x) => `<li class="mode mode--${esc(x.mode)}" data-tick="${esc(x.tick)}" tabindex="0"><span>t${esc(x.tick)}</span>${esc(x.mode)}</li>`).join("") : '<li class="no-data">arbiter mode not recorded</li>';
   return `<section class="diagnostic eeg" aria-labelledby="eeg-title"><h3 id="eeg-title">EEG</h3><p>Neuromodulation, error, and arbiter state tick by tick.</p><div class="traces">${traces}</div><ol class="mode-timeline" aria-label="arbiter mode timeline">${modes}</ol></section>`;
 }
 
@@ -94,7 +96,40 @@ export function renderDevelopmentPanel(session) {
   return `<section class="diagnostic development" aria-labelledby="development-title"><h3 id="development-title">Developmental ladder</h3><p>Milestones passed by this organism.</p><ol class="stage-list">${items || '<li class="no-data">no developmental gates recorded</li>'}</ol></section>`;
 }
 
-export function mountDiagnostics(root, records, decisions, session) {
+export function bindDiagnosticCursor(root, onTimeChange = () => {}) {
+  const selectTime = (tick) => {
+    const t = Math.max(0, Math.round(Number(tick) || 0));
+    for (const svg of root.querySelectorAll(".spark")) {
+      const min = Number(svg.dataset.minTick), max = Number(svg.dataset.maxTick);
+      const x = max === min ? 50 : Math.max(0, Math.min(100, (t - min) * 100 / (max - min)));
+      const cursor = svg.querySelector(".time-cursor");
+      cursor.setAttribute("x1", x); cursor.setAttribute("x2", x);
+    }
+    const modes = [...root.querySelectorAll(".mode[data-tick]")];
+    const closest = modes.reduce((best, item) => !best || Math.abs(Number(item.dataset.tick) - t) < Math.abs(Number(best.dataset.tick) - t) ? item : best, null);
+    for (const item of modes) item.classList.toggle("is-current", item === closest);
+    return t;
+  };
+  root.addEventListener("click", (event) => {
+    const mode = event.target.closest?.(".mode[data-tick]");
+    if (mode) return onTimeChange(selectTime(mode.dataset.tick));
+    const svg = event.target.closest?.(".spark");
+    if (!svg) return;
+    const rect = svg.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+    onTimeChange(selectTime(Number(svg.dataset.minTick) + ratio * (Number(svg.dataset.maxTick) - Number(svg.dataset.minTick))));
+  });
+  root.addEventListener("keydown", (event) => {
+    const mode = event.target.closest?.(".mode[data-tick]");
+    if (mode && (event.key === "Enter" || event.key === " ")) {
+      event.preventDefault(); onTimeChange(selectTime(mode.dataset.tick));
+    }
+  });
+  return { setTime: selectTime };
+}
+
+export function mountDiagnostics(root, records, decisions, session, options = {}) {
   const diagnostics = episodeDiagnostics(records, decisions);
   root.innerHTML = renderEEGPanel(diagnostics) + renderAttentionPanel(diagnostics) + renderDevelopmentPanel(session);
+  return bindDiagnosticCursor(root, options.onTimeChange);
 }

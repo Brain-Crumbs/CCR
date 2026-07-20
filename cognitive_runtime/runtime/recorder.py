@@ -100,6 +100,10 @@ class DecisionRecord:
     #: policy drives; ``None`` when the policy is not a
     #: ``MotorFreedomPolicy`` or for sessions recorded before this field.
     motor_decision: Optional[Dict[str, Any]] = None
+    #: Decoded multi-horizon frames produced by the live cortex on this tick.
+    #: The clinic aggregates these records into ``pixel-predictions-v1`` so a
+    #: live run is inspectable without a separate offline export.
+    live_prediction: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

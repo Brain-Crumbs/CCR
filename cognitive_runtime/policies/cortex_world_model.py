@@ -38,6 +38,7 @@ runtime stays torch-free.
 
 from __future__ import annotations
 
+import base64
 from typing import Any, Optional, Sequence, Union
 
 import numpy as np
@@ -50,6 +51,13 @@ from cognitive_runtime.core.perception import State
 from cognitive_runtime.core.world_model import Prediction
 from cognitive_runtime.core.world_model import WorldModel as CoreWorldModel
 from cognitive_runtime.neural.pixel_stream_encoder import PIXEL_STREAM_ID
+
+
+def _record_frame(chw: torch.Tensor) -> str:
+    """Encode a decoded ``[C,H,W]`` frame for the JSONL decision record."""
+    hwc = (chw.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).permute(1, 2, 0)
+    return base64.b64encode(hwc.contiguous().cpu().numpy().tobytes()).decode("ascii")
+
 
 class CortexWorldModel(CoreWorldModel):
     """Bridges a trained ``PredictiveCortex`` into the loop's ``WorldModel``
@@ -121,6 +129,7 @@ class CortexWorldModel(CoreWorldModel):
         # the same pre-advance starting point.
         self._latent: Optional[torch.Tensor] = None
         self._pre_advance_hidden = None
+        self._latest_live_prediction: Optional[dict[str, Any]] = None
 
         # Optional online-consolidation wiring (issue #175): a live
         # `sleep.cortex_consolidation.CortexConsolidator` feeding real
@@ -181,6 +190,11 @@ class CortexWorldModel(CoreWorldModel):
         self._pre_advance_hidden = None
         self._retrieval_surprise = 0.0
         self._last_recalls = ()
+        self._latest_live_prediction = None
+
+    def live_prediction_record(self) -> Optional[dict[str, Any]]:
+        """Return this tick's decoded live forecasts for the clinic Record."""
+        return self._latest_live_prediction
 
     def _recall_into_context(self, memory: Memory) -> float:
         """Retrieve, gate, and prepend compatible workspace-latent seeds."""
@@ -263,6 +277,7 @@ class CortexWorldModel(CoreWorldModel):
         if latest_pixels is None:
             # No pixel frame yet (first tick of an episode before the program
             # publishes): no learned signal, like the memoryless bridge.
+            self._latest_live_prediction = None
             return Prediction()
 
         frame = latest_pixels.payload
@@ -324,10 +339,28 @@ class CortexWorldModel(CoreWorldModel):
             latent_i = latent
             first_hidden = None
             first_latent = None
+            decoded_by_horizon: dict[str, str] = {}
             for step_i in range(self.horizons[-1]):
                 latent_i, hidden = self.model.step(latent_i, action_col, hidden)
                 if step_i == 0:
                     first_hidden, first_latent = hidden, latent_i
+                horizon = step_i + 1
+                if horizon in self.horizons:
+                    decoded_by_horizon[str(horizon)] = _record_frame(
+                        self.model.decoder(latent_i).squeeze(0)
+                    )
+
+            reconstruction_shape = tuple(self.model.reconstruction_shape)
+            target = F.interpolate(
+                pixel_batch,
+                size=reconstruction_shape[:2],
+                mode="area",
+            ).squeeze(0)
+            self._latest_live_prediction = {
+                "prediction_shape": list(reconstruction_shape),
+                "frames": decoded_by_horizon,
+                "target": _record_frame(target),
+            }
 
             # Persist exactly one real step of world state.
             self._hidden = first_hidden

@@ -8,6 +8,7 @@ publishes cortex-sourced novelty/prediction-error telemetry.
 
 from __future__ import annotations
 
+import base64
 import os
 import copy
 
@@ -79,6 +80,12 @@ def test_first_tick_has_no_prediction_error_then_forecast_drives_it():
     # issue #169: the cortex's own uncertainty head, not just risk/p_death,
     # rides along in Prediction -- the arbiter's dedicated sigma source.
     assert first.predicted_uncertainty is not None and first.predicted_uncertainty >= 0.0
+    live = wm.live_prediction_record()
+    assert live is not None
+    assert live["prediction_shape"] == [8, 8, 3]
+    assert set(live["frames"]) == {"1", "4"}
+    assert len(base64.b64decode(live["target"])) == 8 * 8 * 3
+    assert all(len(base64.b64decode(frame)) == 8 * 8 * 3 for frame in live["frames"].values())
 
     for seq in range(1, 4):
         memory.record_action(Action.from_key("move_forward"))
