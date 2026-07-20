@@ -199,7 +199,7 @@ def test_save_nursery_scenario_checkpoint_round_trips(tmp_path):
 
 
 def test_nursery_cli_list_and_run(tmp_path, capsys):
-    main(["nursery", "list"])
+    main(["nursery", "list", "--world", "minecraft"])
     listed = capsys.readouterr().out
     assert "walk_forward" in listed
     assert "object_permanence" in listed
@@ -208,6 +208,7 @@ def test_nursery_cli_list_and_run(tmp_path, capsys):
     report_path = str(tmp_path / "report.json")
     main([
         "nursery", "run", "walk_forward",
+        "--world", "minecraft",
         "--record-dir", record_dir,
         "--train-seeds", "2", "--holdout-seeds", "1",
         "--episode-ticks", "24", "--world-size", "16",

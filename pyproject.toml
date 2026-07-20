@@ -25,9 +25,12 @@ dev = ["pytest>=7"]
 # its trainer and the neural policy import torch, always lazily.
 neural = ["torch>=2"]
 # Crafter nursery world (issue #89): a fast, deterministic, pixel-native 2-D
-# world behind the same Program seam Minecraft uses. Optional and imported
-# lazily (`programs.crafter.adapter`) so `--world minecraft` (the default)
-# never needs it installed.
+# world behind the same Program seam Minecraft uses, and the default
+# `--world` (issue #176: the predictive objective's actual nursery -- the
+# legacy Minecraft survival economy is opt-in via `--world minecraft`,
+# which never needs this extra). Imported lazily (`programs.crafter.adapter`)
+# so non-nursery commands (e.g. `--world minecraft`, `replay`, `dashboard`)
+# don't need it installed either.
 crafter = ["crafter>=1.8,<2"]
 
 [project.scripts]

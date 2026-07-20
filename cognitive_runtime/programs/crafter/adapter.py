@@ -7,8 +7,8 @@ deterministic, pixel-native nursery world.  See
 ``docs/v2/phases/phase-1-nursery-world.md``.
 
 ``crafter`` is an optional dependency, imported lazily here (like
-``cognitive_runtime.neural``'s torch imports) so ``--world minecraft`` (the
-default) never requires it installed.
+``cognitive_runtime.neural``'s torch imports) so other worlds/commands (e.g.
+``--world minecraft``, ``replay``, ``dashboard``) never require it installed.
 """
 
 from __future__ import annotations

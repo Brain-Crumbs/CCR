@@ -67,7 +67,7 @@ def test_live_run_without_checkpoint_or_fresh_exits_with_actionable_message(
     checkpoint = tmp_path / "online-q.json"
     with pytest.raises(SystemExit, match="--fresh"):
         main([
-            "run", "--backend", "remote", "--policy", "online",
+            "run", "--world", "minecraft", "--backend", "remote", "--policy", "online",
             "--episodes", "1", "--episode-ticks", "5", "--world-size", "16",
             "--online-model", str(checkpoint),
             "--record-dir", str(tmp_path), "--session-id", "live-no-checkpoint",
@@ -79,7 +79,7 @@ def test_live_run_with_fresh_flag_starts_a_new_checkpoint(tmp_path, monkeypatch)
     _use_fake_remote(monkeypatch)
     checkpoint = tmp_path / "online-q.json"
     main([
-        "run", "--backend", "remote", "--policy", "online", "--fresh",
+        "run", "--world", "minecraft", "--backend", "remote", "--policy", "online", "--fresh",
         "--episodes", "1", "--episode-ticks", "10", "--world-size", "16",
         "--online-model", str(checkpoint),
         "--record-dir", str(tmp_path), "--session-id", "live-fresh",
@@ -91,7 +91,7 @@ def test_live_run_with_existing_checkpoint_does_not_need_fresh(tmp_path, monkeyp
     _use_fake_remote(monkeypatch)
     checkpoint = tmp_path / "online-q.json"
     main([
-        "run", "--backend", "remote", "--policy", "online", "--fresh",
+        "run", "--world", "minecraft", "--backend", "remote", "--policy", "online", "--fresh",
         "--episodes", "1", "--episode-ticks", "10", "--world-size", "16",
         "--online-model", str(checkpoint),
         "--record-dir", str(tmp_path), "--session-id", "live-seed",
@@ -100,7 +100,7 @@ def test_live_run_with_existing_checkpoint_does_not_need_fresh(tmp_path, monkeyp
 
     # No --fresh this time: an existing checkpoint satisfies the gate.
     main([
-        "run", "--backend", "remote", "--policy", "online",
+        "run", "--world", "minecraft", "--backend", "remote", "--policy", "online",
         "--episodes", "1", "--episode-ticks", "10", "--world-size", "16",
         "--online-model", str(checkpoint),
         "--record-dir", str(tmp_path), "--session-id", "live-resume",
@@ -117,7 +117,7 @@ def test_live_run_without_no_record_flag_rejects_no_record(tmp_path, monkeypatch
     checkpoint = tmp_path / "online-q.json"
     with pytest.raises(SystemExit, match="recorded"):
         main([
-            "run", "--backend", "remote", "--policy", "online", "--fresh",
+            "run", "--world", "minecraft", "--backend", "remote", "--policy", "online", "--fresh",
             "--episodes", "1", "--episode-ticks", "5", "--world-size", "16",
             "--online-model", str(checkpoint), "--no-record",
         ])
@@ -127,7 +127,7 @@ def test_live_run_auto_records_frames_without_the_flag(tmp_path, monkeypatch):
     _use_fake_remote(monkeypatch)
     checkpoint = tmp_path / "online-q.json"
     main([
-        "run", "--backend", "remote", "--policy", "online", "--fresh",
+        "run", "--world", "minecraft", "--backend", "remote", "--policy", "online", "--fresh",
         "--episodes", "1", "--episode-ticks", "10", "--world-size", "16",
         "--online-model", str(checkpoint),
         "--record-dir", str(tmp_path), "--session-id", "live-frames",
@@ -202,7 +202,7 @@ def test_bridge_crash_mid_episode_ends_the_episode_not_the_process(tmp_path, mon
     # episodes here end via the recoverable path, and the run still returns
     # normally instead of raising.
     main([
-        "run", "--backend", "remote", "--policy", "online", "--fresh",
+        "run", "--world", "minecraft", "--backend", "remote", "--policy", "online", "--fresh",
         "--episodes", "2", "--episode-ticks", "30", "--world-size", "16",
         "--online-model", str(checkpoint),
         "--online-save-every", "100000",
@@ -244,7 +244,7 @@ def test_real_sigint_during_live_run_leaves_a_valid_checkpoint_that_resumes(
     try:
         with pytest.raises(KeyboardInterrupt):
             main([
-                "run", "--backend", "remote", "--policy", "online", "--fresh",
+                "run", "--world", "minecraft", "--backend", "remote", "--policy", "online", "--fresh",
                 "--episodes", "1", "--episode-ticks", "100000", "--world-size", "16",
                 "--online-model", str(checkpoint),
                 "--record-dir", str(tmp_path), "--session-id", "live-sigint",
@@ -260,7 +260,7 @@ def test_real_sigint_during_live_run_leaves_a_valid_checkpoint_that_resumes(
 
     # Rerun resumes both the tick counter and the trained weights.
     main([
-        "run", "--backend", "remote", "--policy", "online",
+        "run", "--world", "minecraft", "--backend", "remote", "--policy", "online",
         "--episodes", "1", "--episode-ticks", "10", "--world-size", "16",
         "--online-model", str(checkpoint),
         "--record-dir", str(tmp_path), "--session-id", "live-sigint-resume",
@@ -278,8 +278,8 @@ def test_review_reports_run_summary_and_baseline_comparison(tmp_path):
         "--curriculum", "flat-safe", "--episodes", "1", "--episode-ticks", "20",
         "--world-size", "16", "--record-dir", str(record_dir),
     ]
-    main(["run", "--policy", "random", "--session-id", "baseline-random", *common])
-    main(["run", "--policy", "scripted", "--session-id", "candidate-run", *common])
+    main(["run", "--world", "minecraft", "--policy", "random", "--session-id", "baseline-random", *common])
+    main(["run", "--world", "minecraft", "--policy", "scripted", "--session-id", "candidate-run", *common])
 
     report = review_run(str(record_dir / "candidate-run"), record_dir=str(record_dir))
     assert "candidate-run" in report

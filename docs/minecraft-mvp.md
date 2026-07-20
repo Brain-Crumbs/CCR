@@ -1,5 +1,12 @@
 # Minecraft MVP: SurvivalBox
 
+> **Quarantine note (issue #176):** this MVP's survival economy (hunger,
+> crafting, the `--reward-profile` system) is nursery-era legacy the V2
+> predictive objective doesn't need. The Crafter nursery world is the CLI's
+> default `--world`; Minecraft is opt-in (`--world minecraft`) and stays in
+> the design as the eventual first-person *graduation* world, post
+> Milestone 5. See `cognitive_runtime/programs/minecraft/__init__.py`.
+
 **Program name:** `MinecraftSurvivalBox`
 **Initial objective:** stay alive for 5 minutes (6000 ticks at 20 tps).
 

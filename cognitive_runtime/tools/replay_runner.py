@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from cognitive_runtime.core.program import Program
-from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
-from cognitive_runtime.programs.minecraft.reward_profile import RewardProfile
 from cognitive_runtime.runtime.replay import (
     ReplayResult,
     list_episodes,
@@ -16,18 +14,28 @@ from cognitive_runtime.runtime.replay import (
     require_streams_v2,
 )
 
+if TYPE_CHECKING:
+    from cognitive_runtime.programs.minecraft.reward_profile import RewardProfile
+
 
 def _build_replay_program(
-    metadata: Dict[str, Any], reward_profile: Optional[RewardProfile]
+    metadata: Dict[str, Any], reward_profile: Optional["RewardProfile"]
 ) -> Program:
     """Rebuild the Program a session was recorded against, keyed off
     ``session.json``'s ``program`` field (``ProgramMetadata.name`` --
     ``cli.py``'s ``--world`` selector determines which one recorded a given
     session). Reward profiles (``--reward-profile``) are Minecraft-only;
-    Crafter has no reward-profile system (issue #90)."""
+    Crafter has no reward-profile system (issue #90).
+
+    Issue #176: MinecraftSurvivalBox is only imported here, when replaying a
+    session actually recorded against it -- not at module import time, so
+    replaying a Crafter session never touches the survival economy.
+    """
     program_config = metadata.get("program_config") or None
     program_name = metadata.get("program")
     if program_name == "MinecraftSurvivalBox":
+        from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+
         return MinecraftSurvivalBox(config=program_config, reward_profile=reward_profile)
     if program_name == "CrafterWorld":
         if reward_profile is not None:
@@ -45,7 +53,7 @@ def replay_session(
     session_dir: str,
     episode_id: str | None = None,
     verify: bool = True,
-    reward_profile: Optional[RewardProfile] = None,
+    reward_profile: Optional["RewardProfile"] = None,
 ) -> List[ReplayResult]:
     metadata = load_session_metadata(session_dir)
     require_streams_v2(metadata)

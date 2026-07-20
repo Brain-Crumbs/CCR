@@ -30,6 +30,8 @@ def test_dashboard_and_view_work_with_online_sessions(tmp_path):
     main(
         [
             "run",
+            "--world",
+            "minecraft",
             "--policy",
             "online",
             "--episodes",

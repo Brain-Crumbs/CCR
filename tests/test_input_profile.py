@@ -18,6 +18,7 @@ def _run_cli_online(path, profile, ticks=20):
     main(
         [
             "run",
+            "--world", "minecraft",
             "--policy", "online",
             "--input-profile", profile,
             "--episodes", "1",
@@ -63,8 +64,8 @@ def test_full_input_profile_is_the_default_and_unchanged(tmp_path):
     default_path = tmp_path / "online-q-default.json"
     explicit_path = tmp_path / "online-q-explicit-full.json"
     main([
-        "run", "--policy", "online", "--episodes", "1", "--episode-ticks", "20",
-        "--world-size", "32", "--online-model", str(default_path),
+        "run", "--world", "minecraft", "--policy", "online", "--episodes", "1",
+        "--episode-ticks", "20", "--world-size", "32", "--online-model", str(default_path),
         "--online-save-every", "5", "--no-record",
     ])
     _run_cli_online(explicit_path, "full")
@@ -81,7 +82,7 @@ def test_session_metadata_still_records_every_stream_under_raw_profile(tmp_path)
     'recording/replay handles the classification')."""
     record_dir = tmp_path / "sessions"
     main([
-        "run", "--policy", "scripted", "--input-profile", "raw",
+        "run", "--world", "minecraft", "--policy", "scripted", "--input-profile", "raw",
         "--episodes", "1", "--episode-ticks", "20", "--world-size", "32",
         "--record-dir", str(record_dir), "--session-id", "raw-profile-session",
     ])
