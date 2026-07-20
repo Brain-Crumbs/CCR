@@ -175,6 +175,26 @@ def test_action_ablation_promotion_rejects_a_collapsed_representation(monkeypatc
     ) == -1.0
 
 
+def test_action_ablation_promotion_rejects_missing_orientation_probe(monkeypatch):
+    from types import SimpleNamespace
+
+    import cognitive_runtime.training.nursery as nursery_module
+    from development.ladder import _action_ablation_margin
+
+    report = SimpleNamespace(
+        representation_diagnostics={"gate_evaluable": False, "passed": False},
+        with_actions_stats={},
+        without_actions_stats={},
+    )
+    monkeypatch.setattr(
+        nursery_module, "run_action_ablation_eval", lambda *args, **kwargs: report
+    )
+
+    assert _action_ablation_margin(
+        GESTATION_TO_FORAGING.stages[1], "unused"
+    ) == -1.0
+
+
 def test_ladder_stages_declare_losses_their_own_gates_require():
     """The real ladder table must itself satisfy the same precondition --
     otherwise Milestone 7's real run would hit this exact error."""

@@ -19,6 +19,7 @@ from cognitive_runtime.training.action_world_model import (  # noqa: E402
     horizons_ticks_to_frames,
     linear_probe_yaw,
     representation_collapse_diagnostics,
+    _tick_facing,
     load_action_world_model,
     save_action_world_model,
     train_action_world_model,
@@ -80,6 +81,13 @@ def test_horizons_ticks_to_frames_converts_and_dedupes():
     assert horizons_ticks_to_frames([1, 2, 10, 100], 2.0) == [1, 5, 50]
     with pytest.raises(ValueError):
         horizons_ticks_to_frames([1], 0.0)
+
+
+def test_tick_facing_reads_crafter_discrete_direction():
+    assert _tick_facing([
+        {"stream_id": "spatial.facing", "payload": {"x": 0, "y": -1}}
+    ]) == (0.0, -1.0)
+    assert _tick_facing([]) is None
 
 
 def test_build_action_sequence_dataset_aligns_frames_actions_and_yaw(turn_session):

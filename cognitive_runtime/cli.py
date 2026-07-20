@@ -1713,6 +1713,7 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
             "scenario_metrics": report.scenario_metrics,
             "zero_shot_metrics": report.zero_shot_metrics,
             "yaw_probe": report.yaw_probe,
+            "orientation_probe": report.orientation_probe,
             "representation_diagnostics": report.representation_diagnostics,
             "train_sessions": report.train_sessions,
             "eval_sessions": report.eval_sessions,

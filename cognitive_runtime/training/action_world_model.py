@@ -51,6 +51,7 @@ from cognitive_runtime.runtime.recorder import stream_event_from_log
 PIXEL_STREAM = "vision.frame.pixels"
 MOTOR_STREAM = "motor.command"
 ROTATION_STREAM = "spatial.rotation"
+FACING_STREAM = "spatial.facing"
 #: Recorded ground-truth stream for the cortex's terminal head (issue #169).
 #: Reward and risk targets instead come straight off the decision record
 #: (``reward_window_total``/``risk``) -- not the ``internal.*`` streams
@@ -80,6 +81,9 @@ class EpisodeActionFrames:
     frames: List[Any] = field(default_factory=list)
     actions: List[int] = field(default_factory=list)
     yaw: List[Optional[float]] = field(default_factory=list)
+    #: Discrete grid facing ``(x, y)`` labels (Crafter).  The current value is
+    #: forward-filled between delta-published facing events.
+    facing: List[Optional[Tuple[float, float]]] = field(default_factory=list)
     ticks: List[int] = field(default_factory=list)
     #: Per-frame supervision for the cortex's reward/terminal/risk heads
     #: (issue #169) -- ``reward_window_total`` off the decision record,
@@ -165,6 +169,20 @@ def _tick_yaw(sensory_records: List[Dict[str, Any]]) -> Optional[float]:
     return None
 
 
+def _tick_facing(
+    sensory_records: List[Dict[str, Any]],
+) -> Optional[Tuple[float, float]]:
+    """Read Crafter's discrete ``spatial.facing`` direction, when present."""
+    for record in reversed(sensory_records):
+        if record.get("stream_id") != FACING_STREAM:
+            continue
+        payload = record.get("payload") or {}
+        x, y = payload.get("x"), payload.get("y")
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            return float(x), float(y)
+    return None
+
+
 def _tick_terminal(sensory_records: List[Dict[str, Any]]) -> bool:
     return any(record.get("stream_id") == DEATH_STREAM for record in sensory_records)
 
@@ -198,11 +216,15 @@ def build_action_sequence_dataset(
             for episode_id in list_episodes(session_dir):
                 episode = EpisodeActionFrames(session_dir=session_dir, episode_id=episode_id)
                 last_action: Optional[str] = None
+                last_facing: Optional[Tuple[float, float]] = None
                 for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
                     tick = int(decision.get("tick_index", len(episode.ticks)))
                     action_name = _tick_action_name(motor) or last_action
                     last_action = action_name
                     yaw = _tick_yaw(sensory)
+                    facing = _tick_facing(sensory) or last_facing
+                    if facing is not None:
+                        last_facing = facing
                     reward = float(decision.get("reward_window_total", 0.0))
                     terminal = _tick_terminal(sensory)
                     # Straight off the decision record (this tick's own
@@ -222,6 +244,7 @@ def build_action_sequence_dataset(
                             episode.actions.append(action_index(action_name or "NULL"))
                         episode.frames.append(frame)
                         episode.yaw.append(yaw)
+                        episode.facing.append(facing)
                         episode.ticks.append(tick)
                         episode.reward.append(reward)
                         episode.terminal.append(terminal)
@@ -1099,12 +1122,17 @@ def _bootstrap_correlation_ci(
 # --------------------------------------------------------------------------- probes
 
 
-def linear_probe_yaw(model: Any, dataset: ActionSequenceDataset) -> Dict[str, Any]:
-    """Can the representation linearly decode the agent's heading?
+def _linear_probe_orientation(
+    model: Any,
+    dataset: ActionSequenceDataset,
+    *,
+    include_facing: bool,
+) -> Dict[str, Any]:
+    """Probe continuous yaw and, optionally, Crafter's discrete facing.
 
     Fits ridge regressions latent -> (sin yaw, cos yaw) and hidden ->
     (sin yaw, cos yaw) on every frame with a recorded ``spatial.rotation``,
-    reporting R^2 and mean angular error.  A hidden state that decodes yaw
+    reporting R^2 and mean angular error.  A hidden state that decodes heading
     where the raw latent cannot is direct evidence the recurrence is
     carrying orientation/motion state (phase 3's cheap interpretability
     check)."""
@@ -1115,6 +1143,7 @@ def linear_probe_yaw(model: Any, dataset: ActionSequenceDataset) -> Dict[str, An
     latent_rows: List[Any] = []
     hidden_rows: List[Any] = []
     targets_rows: List[Any] = []
+    source_rows: List[str] = []
 
     was_training = model.training
     model.eval()
@@ -1127,13 +1156,21 @@ def linear_probe_yaw(model: Any, dataset: ActionSequenceDataset) -> Dict[str, An
             )
             hidden = model.initial_state(1)
             for i, yaw in enumerate(episode.yaw):
+                source: Optional[str] = None
+                angle: Optional[float] = None
                 if yaw is not None:
-                    rad = math.radians(yaw)
+                    source, angle = "yaw", math.radians(yaw)
+                elif include_facing and i < len(episode.facing):
+                    facing = episode.facing[i]
+                    if facing is not None and (facing[0] or facing[1]):
+                        source, angle = "facing", math.atan2(facing[1], facing[0])
+                if angle is not None:
                     latent_rows.append(latents[i])
                     hidden_rows.append(hidden.squeeze(0))
                     targets_rows.append(
-                        torch.tensor([math.sin(rad), math.cos(rad)])
+                        torch.tensor([math.sin(angle), math.cos(angle)])
                     )
+                    source_rows.append(source or "unknown")
                 if i < len(episode.actions):
                     _pred, hidden = model.step(
                         latents[i : i + 1], remap[i : i + 1], hidden
@@ -1142,14 +1179,31 @@ def linear_probe_yaw(model: Any, dataset: ActionSequenceDataset) -> Dict[str, An
         model.train()
 
     if len(targets_rows) < 8:
-        return {"n_samples": len(targets_rows), "note": "too few yaw-labelled frames to probe"}
+        return {
+            "n_samples": len(targets_rows),
+            "sources": sorted(set(source_rows)),
+            "note": "too few orientation-labelled frames to probe",
+        }
 
     y = torch.stack(targets_rows)
-    report: Dict[str, Any] = {"n_samples": int(y.shape[0])}
+    report: Dict[str, Any] = {
+        "n_samples": int(y.shape[0]),
+        "sources": sorted(set(source_rows)),
+    }
     for name, rows in (("latent", latent_rows), ("hidden", hidden_rows)):
         x = torch.stack(rows)
         report[name] = _ridge_probe(x, y)
     return report
+
+
+def linear_probe_yaw(model: Any, dataset: ActionSequenceDataset) -> Dict[str, Any]:
+    """Backward-compatible probe using only continuous yaw labels."""
+    return _linear_probe_orientation(model, dataset, include_facing=False)
+
+
+def linear_probe_orientation(model: Any, dataset: ActionSequenceDataset) -> Dict[str, Any]:
+    """Probe yaw or Crafter's discrete ``spatial.facing`` labels."""
+    return _linear_probe_orientation(model, dataset, include_facing=True)
 
 
 class RepresentationCollapseError(RuntimeError):
@@ -1223,29 +1277,37 @@ def representation_collapse_diagnostics(
 ) -> Dict[str, Any]:
     """Return the yaw/variance gate report used by training and promotion.
 
-    A failure requires both a poor hidden-state yaw probe and a collapsed
-    latent distribution.  Datasets without enough yaw labels are reported
-    as non-evaluable rather than being silently called healthy or failed.
+    A failure requires both a poor hidden-state orientation probe and a
+    collapsed latent distribution.  Datasets without enough yaw/facing
+    labels are reported as non-evaluable; promotion callers may reject that
+    status when an orientation gate is mandatory.
     """
     cfg = config or ActionWorldModelConfig()
     latent = latent_variance_rank(model, dataset)
-    yaw_probe = linear_probe_yaw(model, dataset)
-    hidden_yaw_r2 = (
-        float(yaw_probe["hidden"]["r2"]) if "hidden" in yaw_probe else None
+    orientation_probe = linear_probe_orientation(model, dataset)
+    hidden_orientation_r2 = (
+        float(orientation_probe["hidden"]["r2"])
+        if "hidden" in orientation_probe else None
     )
     variance_collapsed = latent["mean_variance"] < cfg.collapse_gate_min_latent_variance
     rank_collapsed = latent["effective_rank"] < cfg.collapse_gate_min_effective_rank
     latent_collapsed = variance_collapsed or rank_collapsed
-    gate_evaluable = hidden_yaw_r2 is not None
+    gate_evaluable = hidden_orientation_r2 is not None
     yaw_collapsed = (
-        gate_evaluable and hidden_yaw_r2 < cfg.collapse_gate_min_hidden_yaw_r2
+        gate_evaluable
+        and hidden_orientation_r2 < cfg.collapse_gate_min_hidden_yaw_r2
     )
     passed = not (yaw_collapsed and latent_collapsed) if gate_evaluable else False
     return {
         "passed": bool(passed),
         "gate_evaluable": gate_evaluable,
-        "hidden_yaw_r2": hidden_yaw_r2,
-        "yaw_probe": yaw_probe,
+        # Keep the old key for report consumers; it now means the selected
+        # orientation source (yaw or Crafter facing).
+        "hidden_yaw_r2": hidden_orientation_r2,
+        "hidden_orientation_r2": hidden_orientation_r2,
+        "yaw_probe": orientation_probe,
+        "orientation_probe": orientation_probe,
+        "orientation_sources": orientation_probe.get("sources", []),
         "latent": latent,
         "yaw_collapsed": bool(yaw_collapsed),
         "variance_collapsed": variance_collapsed,

@@ -61,6 +61,7 @@ from cognitive_runtime.training.action_world_model import (
     evaluate_action_world_model,
     horizons_ticks_to_frames,
     linear_probe_yaw,
+    linear_probe_orientation,
     representation_collapse_diagnostics,
     load_action_world_model,
     save_action_world_model,
@@ -1035,6 +1036,8 @@ class JointNurseryReport:
     zero_shot_metrics: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     #: Does the representation linearly decode the agent's heading?
     yaw_probe: Dict[str, Any] = field(default_factory=dict)
+    #: Heading probe using yaw or Crafter's discrete facing stream.
+    orientation_probe: Dict[str, Any] = field(default_factory=dict)
     #: Promotion-grade yaw + latent variance/effective-rank collapse gate.
     representation_diagnostics: Dict[str, Any] = field(default_factory=dict)
     horizon_frames: List[int] = field(default_factory=list)
@@ -1179,6 +1182,7 @@ def run_nursery_joint(
         [d for dirs in eval_sessions.values() for d in dirs], action_keys=model.action_keys
     )
     yaw_probe = linear_probe_yaw(model, probe_dataset)
+    orientation_probe = linear_probe_orientation(model, probe_dataset)
     representation_diagnostics = representation_collapse_diagnostics(
         model, probe_dataset, config=model_cfg
     )
@@ -1194,6 +1198,7 @@ def run_nursery_joint(
         scenario_metrics=scenario_metrics,
         zero_shot_metrics=zero_shot_metrics,
         yaw_probe=yaw_probe,
+        orientation_probe=orientation_probe,
         representation_diagnostics=representation_diagnostics,
         horizon_frames=horizon_frames,
         ticks_per_frame=ticks_per_frame,
