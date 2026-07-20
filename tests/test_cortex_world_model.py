@@ -19,6 +19,7 @@ from brain.cortex.predictive import PredictiveCortex, PredictiveCortexConfig  # 
 from cognitive_runtime.core.action import Action  # noqa: E402
 from cognitive_runtime.core.memory import Memory  # noqa: E402
 from cognitive_runtime.core.perception import State  # noqa: E402
+from cognitive_runtime.core.streams.fusion import LatentState  # noqa: E402
 from cognitive_runtime.core.streams.events import StreamEvent  # noqa: E402
 from cognitive_runtime.neural.pixel_stream_encoder import PIXEL_STREAM_ID  # noqa: E402
 from cognitive_runtime.policies import ScriptedSurvivalPolicy  # noqa: E402
@@ -134,6 +135,27 @@ def test_mismatched_pixel_shape_is_rejected():
     _push_frame(memory, np.zeros((10, 10, 3), dtype=np.uint8), 0)
     with pytest.raises(ValueError, match="pixel-frame shape"):
         wm.predict(State(observation=None), memory)
+
+
+def test_c2_live_bridge_uses_fused_workspace_and_efference_copy():
+    cortex = PredictiveCortex(
+        (8, 8, 3), _ACTION_KEYS,
+        PredictiveCortexConfig(
+            latent_width=8, hidden_dim=16, reconstruction_size=8,
+            workspace_modalities={"workspace": 5, "efference": len(_ACTION_KEYS)},
+            workspace_layout_hash="workspace-v2-test",
+        ),
+    )
+    wm = CortexWorldModel(cortex, action_keys=_ACTION_KEYS)
+    memory = Memory()
+    memory.set_fused_latent(LatentState(
+        vector=[0.1] * 5, slices={}, layout_hash="workspace-v2-test"
+    ))
+    memory.record_action(Action.from_key("turn_left"))
+    modalities = wm._workspace_modalities(memory)
+    assert modalities["workspace"].shape == (1, 5)
+    assert modalities["efference"].shape == (1, len(_ACTION_KEYS))
+    assert modalities["efference"][0, _ACTION_KEYS.index("turn_left")] == 1.0
 
 
 def test_cortex_bridges_prediction_into_recorded_session(tmp_path):
