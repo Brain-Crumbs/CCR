@@ -101,6 +101,28 @@ class CortexWorldModel(CoreWorldModel):
         self._latent: Optional[torch.Tensor] = None
         self._pre_advance_hidden = None
 
+    def _workspace_modalities(self, memory: Memory) -> dict[str, torch.Tensor]:
+        """Bind the runtime's actual fused workspace plus efference copy."""
+        if not self.model.workspace_modalities:
+            return {}
+        latent = memory.fused_latent()
+        if latent is None:
+            raise ValueError("fused workspace is required by this cortex checkpoint")
+        if self.model.workspace_layout_hash != latent.layout_hash:
+            raise ValueError(
+                "fused workspace layout mismatch: cortex expects "
+                f"{self.model.workspace_layout_hash!r}, runtime has {latent.layout_hash!r}"
+            )
+        values: dict[str, torch.Tensor] = {}
+        if "workspace" in self.model.workspace_modalities:
+            values["workspace"] = torch.tensor([latent.vector], dtype=torch.float32)
+        if "efference" in self.model.workspace_modalities:
+            action = self._last_action_column(memory)
+            one_hot = torch.zeros(1, len(self.model.action_keys), dtype=torch.float32)
+            one_hot.scatter_(1, action.unsqueeze(1), 1.0)
+            values["efference"] = one_hot
+        return values
+
     def reset(self) -> None:
         self._hidden = None
         self._predicted_latent = None
@@ -135,7 +157,11 @@ class CortexWorldModel(CoreWorldModel):
             )
 
         with torch.no_grad():
-            latent = self.model.encoder.encode_frame(frame).unsqueeze(0)  # [1, L]
+            # ``encode_frame`` is intentionally not used as the token: C2's
+            # token is the bound vision + TemporalFusion workspace state.
+            from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
+            pixel_batch = pixels_to_chw(frame).unsqueeze(0).to(next(self.model.parameters()).device)
+            latent = self.model.encode_workspace(pixel_batch, self._workspace_modalities(memory))
 
             if self._hidden is None:
                 self._hidden = self.model.initial_state(1)
