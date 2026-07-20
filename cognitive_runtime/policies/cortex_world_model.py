@@ -172,7 +172,7 @@ class CortexWorldModel(CoreWorldModel):
             self._hidden = first_hidden
             self._predicted_latent = first_latent
 
-            reward, terminal_logit, risk, _uncertainty = self.model.heads(first_hidden)
+            reward, terminal_logit, risk, uncertainty = self.model.heads(first_hidden)
 
         return Prediction(
             # ``risk_head`` is softplus'd (non-negative, unbounded); clamp into
@@ -182,4 +182,9 @@ class CortexWorldModel(CoreWorldModel):
             predicted_reward=float(reward),
             next_latent=first_latent.squeeze(0).tolist(),
             prediction_error=prediction_error,
+            # The cortex's own forward-uncertainty head (issue #169), read
+            # off the same real one-step advance as the other heads above --
+            # the dedicated sigma the arbiter's surprise calibration reads
+            # in preference to the prediction_error stand-in.
+            predicted_uncertainty=float(uncertainty),
         )

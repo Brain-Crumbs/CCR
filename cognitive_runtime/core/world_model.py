@@ -34,6 +34,14 @@ class Prediction:
     predicted_reward: Optional[float] = None
     next_latent: Optional[List[float]] = None
     prediction_error: Optional[float] = None
+    #: A dedicated forward-uncertainty estimate (issue #169), e.g. the
+    #: Predictive Cortex's ``uncertainty_head`` -- distinct from
+    #: ``prediction_error`` (this tick's *realized* error) in that it is
+    #: predicted *before* the outcome is known. ``None`` for any bridge
+    #: without a trained uncertainty head (the heuristic ``TrendWorldModel``,
+    #: the legacy ``MLPWorldModel`` bridge), in which case consumers fall
+    #: back to ``prediction_error`` as the closest available stand-in.
+    predicted_uncertainty: Optional[float] = None
 
 
 class WorldModel(abc.ABC):

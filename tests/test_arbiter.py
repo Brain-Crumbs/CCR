@@ -274,6 +274,56 @@ class _ScriptedThreeRegionWorldModel(WorldModel):
         self.tick = 0
 
 
+class _UncertaintyOnlyWorldModel(WorldModel):
+    """``prediction_error`` stays at 0.0 (would calibrate as "boring") the
+    whole run; ``predicted_uncertainty`` stays at 5.0 (must calibrate as
+    "surprising") -- proves the arbiter's raw-surprise input is sourced from
+    a dedicated ``predicted_uncertainty`` head (issue #169) whenever a
+    ``WorldModel`` bridge exposes one, not from ``prediction_error``."""
+
+    def predict(self, state, memory) -> Prediction:
+        return Prediction(
+            risk=0.02, prediction_error=0.0, predicted_reward=0.0, predicted_uncertainty=5.0
+        )
+
+    def reset(self) -> None:
+        pass
+
+
+def test_arbiter_surprise_input_prefers_predicted_uncertainty_over_prediction_error(tmp_path):
+    config = {"episode_ticks": 30, "world_size": 16, "max_mobs": 1}
+    runtime_config = RuntimeConfig(
+        episodes=1,
+        seed=0,
+        max_ticks_per_episode=30,
+        record_dir=str(tmp_path),
+        session_id="arbiter-uncertainty-source",
+        program_config=config,
+    )
+    CognitiveRuntime(
+        program=MinecraftSurvivalBox(config=config),
+        policy=ScriptedSurvivalPolicy(seed=0),
+        config=runtime_config,
+        world_model=_UncertaintyOnlyWorldModel(),
+    ).run()
+
+    session_dir = os.path.join(str(tmp_path), "arbiter-uncertainty-source")
+    surprises = []
+    for decision, sensory, _motor in iter_cognitive_ticks(session_dir, "episode_00000"):
+        for record in sensory:
+            if record.get("stream_id") == ARBITER_MODE_STREAM and not record.get("elided"):
+                surprises.append(record["payload"]["surprise"])
+
+    assert surprises, "expected the arbiter mode stream to be recorded"
+    # Pass-through temperature (1.0) until the calibrator's window is full
+    # enough to refit, and a constant reading never triggers a refit (see
+    # SurpriseCalibrator._refit's degenerate-window guard) -- so a raw 5.0
+    # calibrates to 5/6 ~= 0.83 every tick. Sourced from prediction_error
+    # (always 0.0) it would instead sit at ~0.0, well under the arbiter's
+    # 0.5 surprise_threshold.
+    assert all(s > 0.5 for s in surprises)
+
+
 def test_milestone_3_three_region_scripted_scenario(tmp_path):
     """Milestone 3 exit gate: a harmless surprise drives info-gathering, a
     harmful one drives fight-or-flight, and boredom drives reward-seeking

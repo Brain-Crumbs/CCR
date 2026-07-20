@@ -644,13 +644,26 @@ class CognitiveRuntime:
                     stream_id, payload, window.ended_at, source="model"
                 )
             # The arbiter (issue #95): calibrates this tick's raw surprise
-            # reading (the same prediction-error stand-in acetylcholine
-            # uses above) and feeds it, plus the amygdala's pain reading
+            # reading and feeds it, plus the amygdala's pain reading
             # (adrenaline) just computed, through the hand-authored 2x2
             # switch. `self._arbiter_attention_mode` (consumed at the top
             # of *next* tick) is set here, one tick lagged like every other
             # internal.* signal.
-            raw_surprise = prediction.prediction_error if prediction.prediction_error is not None else 0.0
+            #
+            # Prefers the world model's own dedicated forward-uncertainty
+            # head (issue #169: `PredictiveCortex.uncertainty_head`, wired
+            # through `CortexWorldModel`) over the realized-error stand-in
+            # acetylcholine uses above -- a genuine forward sigma calibrated
+            # against held-out latent error, not this tick's already-known
+            # outcome. Falls back to `prediction_error` (then 0.0) for any
+            # bridge without one (the heuristic `TrendWorldModel`, the
+            # legacy `MLPWorldModel` bridge).
+            if prediction.predicted_uncertainty is not None:
+                raw_surprise = prediction.predicted_uncertainty
+            elif prediction.prediction_error is not None:
+                raw_surprise = prediction.prediction_error
+            else:
+                raw_surprise = 0.0
             calibrated_surprise = self.surprise_calibrator.update(raw_surprise)
             arbiter_mode = self.arbiter.decide(surprise=calibrated_surprise, pain=adrenaline)
             self._arbiter_attention_mode = arbiter_mode
