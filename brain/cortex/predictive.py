@@ -86,22 +86,20 @@ class PredictiveCortexConfig:
     #: Extra backbone-specific constructor kwargs (e.g. ``kernel_size``,
     #: ``n_layers``, ``n_heads``); not persisted with the checkpoint.
     backbone_kwargs: Dict[str, Any] = field(default_factory=dict)
+    #: Non-visual slices of the bound workspace token.  Vision is encoded by
+    #: the CNN below; these are the fixed-layout vectors produced by
+    #: ``TemporalFusion`` plus the efference-copy one-hot.  Empty preserves
+    #: loading and using pre-C2 pixel-only cortexes.
+    workspace_modalities: Dict[str, int] = field(default_factory=dict)
+    #: Stream-layout identity for the ``workspace`` slice, persisted with the
+    #: checkpoint so a live cortex cannot silently consume another program's
+    #: fused state.
+    workspace_layout_hash: Optional[str] = None
 
 
 @dataclass(frozen=True)
 class CortexHorizonPrediction:
-    """One rollout horizon's worth of predictions, all ``Tensor[batch, ...]``.
-
-    - ``latent``: predicted latent at this horizon.
-    - ``decoded``: ``self.decoder(latent)``, same shape as the model's own
-      reconstruction target (``reconstruction_shape``) -- viewable at every
-      horizon, not just the last.
-    - ``reward`` / ``terminal_logit`` / ``risk``: the world-model heads
-      ``cognitive_runtime.neural.world_model.WorldModelOutput`` defines,
-      read off the GRU hidden state at this horizon.
-    - ``uncertainty``: non-negative predicted-error estimate for ``latent``
-      at this horizon -- the calibratable sigma Phase 3's arbiter reads.
-    """
+    """One rollout horizon's visual and workspace predictions."""
 
     latent: torch.Tensor
     decoded: torch.Tensor
@@ -109,6 +107,7 @@ class CortexHorizonPrediction:
     terminal_logit: torch.Tensor
     risk: torch.Tensor
     uncertainty: torch.Tensor
+    modalities: Dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -131,6 +130,7 @@ class CortexSequencePrediction:
     terminal_logit: torch.Tensor
     risk: torch.Tensor
     uncertainty: torch.Tensor
+    modalities: Dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 class PredictiveCortex(nn.Module):
@@ -169,11 +169,25 @@ class PredictiveCortex(nn.Module):
         self.latent_width = cfg.latent_width
         self.hidden_dim = cfg.hidden_dim
         self.horizons_ticks: Tuple[int, ...] = horizons_ticks
+        if any(int(width) <= 0 for width in cfg.workspace_modalities.values()):
+            raise ValueError(f"workspace modality widths must be positive, got {cfg.workspace_modalities!r}")
+        self.workspace_modalities = {
+            str(name): int(width) for name, width in cfg.workspace_modalities.items()
+        }
+        self.workspace_layout_hash = cfg.workspace_layout_hash
         self.reconstruction_shape = _reconstruction_shape(
             self.pixel_shape, cfg.reconstruction_size
         )
 
         self.encoder = PixelStreamEncoder(self.pixel_shape, latent_width=cfg.latent_width)
+        self.workspace_width = sum(self.workspace_modalities.values())
+        # The token is a learned binding of vision with the stream-native
+        # workspace slices, rather than the pixels-only encoder output.
+        self.workspace_fuser = (
+            nn.Linear(cfg.latent_width + self.workspace_width, cfg.latent_width)
+            if self.workspace_width
+            else None
+        )
         self.action_embedding = nn.Embedding(len(self.action_keys), cfg.action_embed_dim)
         self.transition_backbone = build_backbone(
             cfg.backbone,
@@ -186,6 +200,10 @@ class PredictiveCortex(nn.Module):
         self.decoder = PixelReconstructionDecoder(
             cfg.latent_width, self.reconstruction_shape, hidden_dim=cfg.hidden_dim
         )
+        self.workspace_decoders = nn.ModuleDict({
+            name: nn.Linear(cfg.latent_width, width)
+            for name, width in self.workspace_modalities.items()
+        })
 
         # Multi-horizon heads (task 2): applied to the GRU hidden state at
         # every rollout step, so one closed-loop rollout yields
@@ -214,6 +232,49 @@ class PredictiveCortex(nn.Module):
 
     def initial_state(self, batch: int) -> Any:
         return self.transition_backbone.initial_state(batch)
+
+    def encode_workspace(
+        self,
+        pixels: torch.Tensor,
+        modalities: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Bind visual and fused-workspace slices into one prediction token.
+
+        ``modalities`` is keyed by the persisted workspace layout (normally
+        ``workspace`` and ``efference``).  A C2 checkpoint rejects a missing
+        or differently-shaped slice instead of falling back to pixels-only.
+        """
+        visual = self.encoder(pixels)
+        if not self.workspace_modalities:
+            return visual
+        if modalities is None:
+            raise ValueError("this cortex requires fused workspace modalities")
+        pieces = [visual]
+        for name, width in self.workspace_modalities.items():
+            value = modalities.get(name)
+            if value is None or value.ndim != 2 or value.shape != (visual.shape[0], width):
+                got = None if value is None else tuple(value.shape)
+                raise ValueError(
+                    f"workspace modality {name!r} must be [{visual.shape[0]}, {width}], got {got}"
+                )
+            pieces.append(value.to(device=visual.device, dtype=visual.dtype))
+        assert self.workspace_fuser is not None
+        return self.workspace_fuser(torch.cat(pieces, dim=-1))
+
+    def decode_workspace(self, latent: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Decode the visual frame and every non-visual workspace modality."""
+        if latent.ndim not in {2, 3}:
+            raise ValueError(f"latent must be [B, L] or [B, T, L], got {tuple(latent.shape)}")
+        leading = latent.shape[:-1]
+        flat = latent.reshape(-1, latent.shape[-1])
+        vision = self.decoder(flat).reshape(
+            *leading, self.reconstruction_shape[2], self.reconstruction_shape[0],
+            self.reconstruction_shape[1],
+        )
+        decoded: Dict[str, torch.Tensor] = {"vision": vision}
+        for name, head in self.workspace_decoders.items():
+            decoded[name] = head(flat).reshape(*leading, self.workspace_modalities[name])
+        return decoded
 
     def set_context_length(self, n: Optional[int]) -> None:
         """Context-length curriculum hook (issue #93, task 5): a no-op for
@@ -306,17 +367,15 @@ class PredictiveCortex(nn.Module):
             uncertainty = F.softplus(heads["uncertainty"](hidden)).squeeze(-1)
         if latent.ndim != 3:
             raise ValueError(f"sequence hidden must be [B, T, H], got {tuple(hidden.shape)}")
-        decoded = self.decoder(latent.reshape(-1, self.latent_width)).reshape(
-            latent.shape[0], latent.shape[1], self.reconstruction_shape[2],
-            self.reconstruction_shape[0], self.reconstruction_shape[1],
-        )
+        decoded_workspace = self.decode_workspace(latent)
         return CortexSequencePrediction(
             latent=latent,
-            decoded=decoded,
+            decoded=decoded_workspace["vision"],
             reward=reward,
             terminal_logit=terminal_logit,
             risk=risk,
             uncertainty=uncertainty,
+            modalities={name: value for name, value in decoded_workspace.items() if name != "vision"},
         )
 
     def heads(self, hidden: Any) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -381,13 +440,18 @@ class PredictiveCortex(nn.Module):
             h = step + 1
             if h in wanted:
                 reward, terminal_logit, risk, uncertainty = self.heads(hidden)
+                decoded_workspace = self.decode_workspace(latent)
                 predictions[h] = CortexHorizonPrediction(
                     latent=latent,
-                    decoded=self.decoder(latent),
+                    decoded=decoded_workspace["vision"],
                     reward=reward,
                     terminal_logit=terminal_logit,
                     risk=risk,
                     uncertainty=uncertainty,
+                    modalities={
+                        name: value for name, value in decoded_workspace.items()
+                        if name != "vision"
+                    },
                 )
         return CortexRolloutOutput(horizons=predictions)
 
@@ -401,6 +465,8 @@ class PredictiveCortex(nn.Module):
             "horizons_ticks": list(self.horizons_ticks),
             "backbone": self.config.backbone,
             "context_length": self.config.context_length,
+            "workspace_modalities": dict(self.workspace_modalities),
+            "workspace_layout_hash": self.workspace_layout_hash,
         }
 
 

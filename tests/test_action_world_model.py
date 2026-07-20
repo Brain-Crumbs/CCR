@@ -11,6 +11,7 @@ torch = pytest.importorskip("torch")
 
 from cognitive_runtime.training.action_world_model import (  # noqa: E402
     ActionWorldModelConfig,
+    _episode_workspace_tensors,
     _episode_tensors,
     build_action_sequence_dataset,
     build_action_world_model,
@@ -102,6 +103,15 @@ def test_build_action_sequence_dataset_aligns_frames_actions_and_yaw(turn_sessio
     assert any(y is not None for y in episode.yaw)
     # Simulated backend records ~one frame per tick.
     assert 0.5 < dataset.ticks_per_frame < 1.5
+
+
+def test_action_sequence_dataset_replays_fused_workspace_at_each_frame(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    episode = dataset.episodes[0]
+    assert dataset.workspace_layout_hash
+    assert dataset.workspace_width == len(dataset.workspace_feature_names)
+    assert len(episode.workspace) == len(episode.frames)
+    assert all(len(token) == dataset.workspace_width for token in episode.workspace)
 
 
 def test_build_action_sequence_dataset_aligns_reward_terminal_risk(turn_session):
@@ -340,6 +350,27 @@ def test_build_action_world_model_returns_predictive_cortex(turn_session):
         dataset.pixel_shape, dataset.action_keys, _small_model_config()
     )
     assert isinstance(model, PredictiveCortex)
+
+
+def test_cortex_binds_and_decodes_workspace_modalities(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    episode, pixels, _targets, actions = _episode_tensors(dataset, model.reconstruction_shape)[0]
+    workspace = _episode_workspace_tensors(episode, dataset, model, actions=actions)
+    latents = model.encode_workspace(pixels[:2], {name: value[:2] for name, value in workspace.items()})
+    decoded = model.decode_workspace(latents)
+
+    assert decoded["vision"].shape[0] == 2
+    assert decoded["workspace"].shape == (2, dataset.workspace_width)
+    assert decoded["efference"].shape == (2, len(dataset.action_keys))
+    horizons = model.forward_horizons(
+        latents[:1], actions[:1].unsqueeze(0), model.initial_state(1), horizon_frames=[1]
+    )
+    assert horizons[1].modalities["workspace"].shape == (1, dataset.workspace_width)
+    assert horizons[1].modalities["efference"].shape == (1, len(dataset.action_keys))
+    report = evaluate_action_world_model(model, dataset, [1], warmup_frames=2)
+    assert set(report["workspace_modalities"]) == {"workspace", "efference"}
+    assert report["workspace_modalities"]["workspace"][1]["n_samples"] > 0
 
 
 def test_forward_horizons_yields_decoded_frame_and_heads_at_every_horizon(turn_session):
