@@ -51,6 +51,70 @@ backprop-through-composition of a single transition "selects for the identity"
 (the frozen-rollout failure). **Direct per-horizon heads don't compose**, so they
 avoid that attractor by construction, while still yielding every horizon.
 
+## The window: configurable, rolling, bounded
+
+The context window is **configurable and rolling**, and both are already true in
+the code — with one caveat worth stating so we don't trip over it later:
+
+- **Configurable.** `context_length` is a persisted `PredictiveCortexConfig`
+  field (per-organism, saved with the checkpoint).
+- **Rolling.** The windowed backbones keep a ring buffer (`_slide_window`,
+  `brain/cortex/backbones.py:126`); at the live tick the window slides over the
+  stream — the last `k` frames, oldest dropped. Correct by construction.
+- **Two distinct knobs.** The **buffer capacity** (`context_length_max`) is fixed
+  at build time; the **curriculum** ramps the *effective* width 1→k during
+  training (`set_context_length`). "Configurable" is build-time; "rolling" is
+  runtime, up to that max.
+- **Caveat — length extrapolation.** Positions use a learned
+  `nn.Embedding(context_length)` (`backbones.py:201`), so the window cannot roll
+  *beyond* the trained max at inference without swapping to a relative /
+  extrapolating position encoding (RoPE/ALiBi). A rolling window is therefore a
+  **bounded** memory horizon — which is exactly what motivates content-addressed
+  recall below.
+
+## Memory recall: loading stored tokens (retrieval-augmented cortex)
+
+A rolling window forgets everything older than `k`. The organism already has a
+longer store — the **hippocampus** — but today it is read only *offline*, as
+dreams during sleep. This section proposes reading it *online*: when the present
+resembles a stored episode, **load the matched stored tokens into the cortex's
+context** so it predicts using remembered dynamics. This is the "hippocampal
+retrieval" the [implementation plan](02-implementation-plan.md) explicitly
+defers, and mechanically it is a **memory-augmented transformer** (cf.
+Memorizing Transformers' kNN-over-past-keys, RETRO's chunked cross-attention,
+kNN-LM). It completes the Complementary-Learning-Systems triangle *at inference*,
+not just at sleep:
+
+| Timescale | Organ | Reaches the cortex how |
+|---|---|---|
+| seconds | rolling window (working memory) | local self-attention (this proposal) |
+| a session / a day | **hippocampus** (stored tokens) | **retrieval → context injection (new)** |
+| the life | cortex weights | consolidated by sleep |
+
+Design shape:
+
+- **Key/value = the workspace latent `z`.** The hippocampus already prioritizes
+  seeds by surprise / reward / novelty (`brain/hippocampus.py`) — good retrieval
+  keys. Query by cosine similarity to the current `z_t`.
+- **Injection, two options.** *Prepend* the retrieved tokens to the context
+  window (simplest — reuses the causal attention, retrieved segment un-masked
+  among itself), or a separate **cross-attention block** (RETRO-style) that keeps
+  the local window fixed-cost and scales better to many recalled tokens.
+- **Who consumes it.** The **cortex** (sharper prediction), and — powerfully —
+  the **amygdala / arbiter** downstream: recalling a token from "the place I got
+  hurt" raises predicted pain *before* the threat re-arrives (hippocampus →
+  amygdala pattern completion — on-biology).
+- **Guardrails.** Retrieval must be **gated** (recalling irrelevant tokens is a
+  new hallucination surface — gate on similarity + the same calibrated-surprise
+  signal the arbiter uses). And stored tokens carry the **provenance/version**
+  problem from the dream-bootstrap paradox: a token encoded by a stale cortex
+  must not silently poison a newer one — stamp seeds with the cortex version and
+  prefer recent/consolidated keys.
+
+This also reframes **dreams and recall as one mechanism at two duty cycles**:
+sleep replays retrieved tokens generatively (consolidation); wake injects them
+into context (recall). Same store, same tokens.
+
 ## What changes in the code
 
 The architecture is already ~80% here — the gap is that the parallelism is
