@@ -43,13 +43,28 @@ export function mountSessionBrowser(root, { loadSessions = () => fetch("/api/ses
     const dream = document.createElement("pixel-horizon-viewer");
     dream.setAttribute("frames-src", urls.frames); dream.setAttribute("predictions-src", `${urls.predictions}?kind=dream`);
     const diagnostics = document.createElement("div"); diagnostics.className = "diagnostics"; diagnostics.textContent = "Loading diagnostic streams…";
+    let diagnosticCursor = null;
+    const syncTime = (source, t, tick) => {
+      if (source !== viewer) viewer.setTime(t);
+      if (source !== dream) dream.setTime(t);
+      diagnosticCursor?.setTime(tick);
+    };
+    const syncTick = (tick) => {
+      viewer.setTick(tick); dream.setTick(tick); diagnosticCursor?.setTime(tick);
+    };
+    viewer.addEventListener("timechange", (event) => syncTime(viewer, event.detail.t, event.detail.tick));
+    dream.addEventListener("timechange", (event) => syncTime(dream, event.detail.t, event.detail.tick));
     root.append(back, title, stripTitle, viewer, dreamTitle, dream, diagnostics);
     location.hash = `${encodeURIComponent(session.id)}/${encodeURIComponent(episode)}`;
     try {
       const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}`);
       if (!response.ok) throw new Error(`Unable to load diagnostics (${response.status})`);
       const detail = await response.json();
-      mountDiagnostics(diagnostics, detail.streams?.[episode] || [], detail.decisions?.[episode] || [], detail.session || session);
+      diagnosticCursor = mountDiagnostics(
+        diagnostics, detail.streams?.[episode] || [], detail.decisions?.[episode] || [], detail.session || session,
+        { onTimeChange: syncTick },
+      );
+      diagnosticCursor.setTime(viewer.time);
     } catch (error) { diagnostics.textContent = String(error); diagnostics.setAttribute("role", "alert"); }
   }
 

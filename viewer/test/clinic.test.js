@@ -5,7 +5,7 @@ const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { createServer } = require("../server");
+const { createServer, makeStore } = require("../server");
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-"));
@@ -52,6 +52,18 @@ test("service lists by organism and returns streams, exports, and verdict", asyn
   assert.equal(detail.exports[0].data.format, "pixel-predictions-v1"); assert.equal(detail.quality.verdict, "red");
 });
 
+test("session quality verdicts are memoized until a session file changes", () => {
+  const root = fixture(); let calls = 0;
+  const store = makeStore(root, { qualityCheck: () => ({ verdict: `call-${++calls}`, issues: [], warnings: [] }) });
+  assert.equal(store.list()[0].quality.verdict, "call-1");
+  assert.equal(store.list()[0].quality.verdict, "call-1");
+  assert.equal(calls, 1);
+  const metadata = path.join(root, "pixel-session", "session.json");
+  const future = new Date(Date.now() + 2000); fs.utimesSync(metadata, future, future);
+  assert.equal(store.list()[0].quality.verdict, "call-2");
+  assert.equal(calls, 2);
+});
+
 test("browser links an episode to the locally served frame and prediction APIs", async () => {
   const source = fs.readFileSync(path.join(__dirname, "../public/session-browser.js"), "utf8");
   const isolated = source.replace(/^import .*diagnostic-panels\.js.*$/m, "");
@@ -61,6 +73,38 @@ test("browser links an episode to the locally served frame and prediction APIs",
     predictions: "/api/sessions/pixel%20session/episodes/episode_00000/predictions",
   });
   assert.match(source, /createElement\("pixel-horizon-viewer"\)/);
+  assert.match(source, /timechange/);
+});
+
+test("prediction endpoint assembles forecasts recorded by a live cortex", async (t) => {
+  const root = fixture(), dir = path.join(root, "pixel-session");
+  fs.unlinkSync(path.join(dir, "Pixel-predictions_episode_00000.json"));
+  const decisions = [0, 1, 2].map((tick) => ({ tick_index: tick, live_prediction: {
+    prediction_shape: [2, 2, 3], target: `target-${tick}`,
+    frames: { "1": `prediction-${tick}` },
+  } }));
+  fs.writeFileSync(path.join(dir, "episode_00000.decisions.jsonl"), decisions.map(JSON.stringify).join("\n") + "\n");
+  const server = createServer({ dataDir: root }); await new Promise((resolve) => server.listen(0, resolve)); t.after(() => server.close());
+  const result = await get(server.address().port, "/api/sessions/pixel-session/episodes/episode_00000/predictions");
+  assert.equal(result.status, 200); assert.equal(result.body.source, "live-record");
+  assert.deepEqual(result.body.predictions["1"].frames, ["prediction-0", "prediction-1"]);
+  assert.deepEqual(result.body.targets, ["target-0", "target-1", "target-2"]);
+});
+
+test("frame endpoint maps ordered decision windows in one forward pass", async (t) => {
+  const root = fixture(), dir = path.join(root, "pixel-session");
+  const frames = [0.2, 1.2, 2.2].map((timestamp, seq) => ({
+    stream_id: "vision.frame.pixels", timestamp, seq, shape: [2, 2, 3], dtype: "uint8",
+  }));
+  const decisions = [0, 1, 2].map((tick) => ({ tick_index: tick + 10, window_span: [tick, tick + 0.9] }));
+  fs.writeFileSync(path.join(dir, "episode_00000.streams.jsonl"), frames.map(JSON.stringify).join("\n") + "\n");
+  fs.writeFileSync(path.join(dir, "episode_00000.decisions.jsonl"), decisions.map(JSON.stringify).join("\n") + "\n");
+  const server = createServer({ dataDir: root }); await new Promise((resolve) => server.listen(0, resolve)); t.after(() => server.close());
+
+  const result = await get(server.address().port, "/api/sessions/pixel-session/episodes/episode_00000/frames");
+
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.frames.map((frame) => frame.tick), [10, 11, 12]);
 });
 
 async function panels() {
@@ -85,6 +129,7 @@ test("EEG component renders neuromodulators, prediction error, and mode timeline
   ]);
   const html = ui.renderEEGPanel(model);
   for (const label of ["dopamine", "acetylcholine", "adrenaline", "prediction error", "afraid"]) assert.match(html, new RegExp(label));
+  assert.match(html, /class="time-cursor"/); assert.match(html, /data-tick="1"/);
 });
 
 test("attention component renders reasons from DecisionRecord rather than the stream payload", async () => {

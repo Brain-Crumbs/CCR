@@ -732,6 +732,10 @@ class CognitiveRuntime:
             motor_decision_record = (
                 motor_decision_attr.to_dict() if motor_decision_attr is not None else None
             )
+            live_prediction_attr = getattr(self.world_model, "live_prediction_record", None)
+            live_prediction_record = (
+                live_prediction_attr() if callable(live_prediction_attr) else None
+            )
             self.recorder.write_cognitive_tick(
                 sensory_events=window.events,
                 motor_events=motor_events,
@@ -758,6 +762,7 @@ class CognitiveRuntime:
                     reflex=reflex_decision.to_dict() if reflex_decision is not None else None,
                     arbiter_mode=arbiter_payload,
                     motor_decision=motor_decision_record,
+                    live_prediction=live_prediction_record,
                 ),
             )
 

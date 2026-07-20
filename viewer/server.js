@@ -38,8 +38,15 @@ function qualityVerdict(dir) {
   return { verdict: "red", issues: ["quality check could not be evaluated"], warnings: [] };
 }
 
-function makeStore(dataDir) {
+function qualityStamp(dir) {
+  return fs.readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .reduce((latest, entry) => Math.max(latest, fs.statSync(path.join(dir, entry.name)).mtimeMs), 0);
+}
+
+function makeStore(dataDir, { qualityCheck = qualityVerdict } = {}) {
   dataDir = path.resolve(dataDir);
+  const qualityCache = new Map();
   function sessionDir(sid) {
     if (!/^[\w.-]+$/.test(sid)) return null;
     const dir = path.join(dataDir, sid);
@@ -51,10 +58,13 @@ function makeStore(dataDir) {
     const meta = readJSON(path.join(dir, "session.json"));
     const episodes = fs.readdirSync(dir).filter((f) => /^episode_\d+\.streams\.jsonl$/.test(f))
       .map((f) => f.replace(".streams.jsonl", "")).sort();
+    const stamp = qualityStamp(dir), cached = qualityCache.get(id);
+    const quality = cached?.stamp === stamp ? cached.value : qualityCheck(dir);
+    if (cached?.stamp !== stamp) qualityCache.set(id, { stamp, value: quality });
     return { id, name: meta.name ?? "legacy", curriculum: meta.curriculum ?? null,
       program: meta.program ?? null, tick_rate: meta.tick_rate ?? null, episodes,
       development: meta.development ?? meta.ladder ?? meta.developmental ?? null,
-      quality: qualityVerdict(dir) };
+      quality };
   }
   function list(name = null) {
     if (!fs.existsSync(dataDir)) return [];
@@ -82,12 +92,26 @@ function loadFrameIndex(dir) {
 
 function readEpisodeFrames(dir, sid, eid) {
   const records = readStreams(dir, eid); if (!records) return null;
+  const decisions = readDecisions(dir, eid) || [];
+  const decisionWindows = decisions.flatMap((decision) => {
+    const span = decision.window_span;
+    return Array.isArray(span) && span.length >= 2
+      ? [{ start: Number(span[0]), end: Number(span[1]), tick: decision.tick_index }]
+      : [];
+  });
+  let decisionIndex = 0;
   const index = loadFrameIndex(dir), bins = new Map(), frames = [];
   let shape = null, dtype = null;
   for (const rec of records) {
     if (rec.stream_id !== "vision.frame.pixels") continue;
     shape = rec.shape ?? shape; dtype = rec.dtype ?? dtype;
-    const entry = { i: frames.length, t: rec.timestamp, seq: rec.seq, hash: rec.frame_ref ?? null, data: null };
+    while (decisionIndex < decisionWindows.length && rec.timestamp > decisionWindows[decisionIndex].end) {
+      decisionIndex += 1;
+    }
+    const window = decisionWindows[decisionIndex];
+    const matchingTick = window && rec.timestamp >= window.start && rec.timestamp <= window.end ? window.tick : null;
+    const entry = { i: frames.length, t: rec.timestamp, tick: matchingTick ?? rec.seq ?? frames.length,
+      seq: rec.seq, hash: rec.frame_ref ?? null, data: null };
     const loc = entry.hash ? index.get(entry.hash) : null;
     if (loc && !rec.elided) {
       if (!bins.has(loc.bin)) bins.set(loc.bin, fs.readFileSync(loc.bin));
@@ -113,6 +137,24 @@ function readDecisions(dir, eid) { return readEpisodeJSONL(dir, eid, "decisions"
 function exportsFor(dir) {
   return fs.readdirSync(dir).filter((f) => f.endsWith(".json") && f !== "session.json" && !f.endsWith(".summary.json"))
     .sort().map((file) => ({ file, data: readJSON(path.join(dir, file), null) }));
+}
+
+function livePredictionsFromDecisions(decisions, sid, eid) {
+  const live = decisions.filter((decision) => decision.live_prediction?.prediction_shape);
+  if (!live.length) return null;
+  const shape = live[0].live_prediction.prediction_shape;
+  const horizons = [...new Set(live.flatMap((decision) => Object.keys(decision.live_prediction.frames || {}).map(Number)))]
+    .filter((h) => Number.isInteger(h) && h > 0).sort((a, b) => a - b);
+  if (!horizons.length) return null;
+  const predictions = Object.fromEntries(horizons.map((h) => [String(h), {
+    frames: live.slice(0, Math.max(0, live.length - h))
+      .map((decision) => decision.live_prediction.frames?.[String(h)]).filter(Boolean),
+  }]));
+  return {
+    format: "pixel-predictions-v1", source: "live-record", session_id: sid, episode_id: eid,
+    horizons, prediction_shape: shape, n_frames: live.length,
+    predictions, targets: live.map((decision) => decision.live_prediction.target).filter(Boolean),
+  };
 }
 
 const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
@@ -145,8 +187,12 @@ function createServer({ dataDir }) {
           const kind = url.searchParams.get("kind") === "dream" ? "dream" : "predictions";
           const candidates = [`${readJSON(path.join(dir, "session.json")).name}-${kind}_${p[4]}.json`, `${kind}_${p[4]}.json`];
           const file = candidates.map((n) => path.join(dir, n)).find(fs.existsSync);
-          if (!file) return sendJSON(res, 404, { error: "no predictions exported for this episode" });
-          return sendJSON(res, 200, readJSON(file));
+          if (file) return sendJSON(res, 200, readJSON(file));
+          if (kind === "predictions") {
+            const live = livePredictionsFromDecisions(readDecisions(dir, p[4]), p[2], p[4]);
+            if (live) return sendJSON(res, 200, live);
+          }
+          return sendJSON(res, 404, { error: "no recorded predictions for this episode" });
         }
       }
       return sendJSON(res, 404, { error: "unknown API route" });
@@ -158,4 +204,4 @@ if (require.main === module) {
   const args = parseArgs(process.argv);
   createServer(args).listen(args.port, () => console.log(`CCR clinic: http://localhost:${args.port}  (Record: ${args.dataDir})`));
 }
-module.exports = { createServer, makeStore };
+module.exports = { createServer, livePredictionsFromDecisions, makeStore };
