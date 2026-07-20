@@ -44,12 +44,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from brain.hippocampus import HippocampalRetrievalConfig, Hippocampus, Recall
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.perception import State
 from cognitive_runtime.core.world_model import Prediction
 from cognitive_runtime.core.world_model import WorldModel as CoreWorldModel
 from cognitive_runtime.neural.pixel_stream_encoder import PIXEL_STREAM_ID
-
 
 class CortexWorldModel(CoreWorldModel):
     """Bridges a trained ``PredictiveCortex`` into the loop's ``WorldModel``
@@ -60,6 +60,8 @@ class CortexWorldModel(CoreWorldModel):
         model: Union["PredictiveCortex", str],  # noqa: F821 -- lazy torch type
         action_keys: Optional[Sequence[str]] = None,
         horizons: Optional[Sequence[int]] = None,
+        retrieval_config: Optional[HippocampalRetrievalConfig] = None,
+        cortex_version: int = 0,
         consolidator: Optional[Any] = None,
         consolidate_every_ticks: int = 0,
         consolidation_steps: int = 1,
@@ -101,6 +103,12 @@ class CortexWorldModel(CoreWorldModel):
         if not self.horizons or self.horizons[0] < 1:
             raise ValueError(f"horizons must be positive frame steps, got {picked!r}")
 
+        self.retrieval_config = retrieval_config or HippocampalRetrievalConfig()
+        self.cortex_version = int(cortex_version)
+        self._hippocampus: Optional[Hippocampus] = None
+        self._retrieval_surprise = 0.0
+        self._last_recalls: tuple[Recall, ...] = ()
+
         # Rolling world state (reset on episode boundary):
         self._hidden = None  # backbone hidden state, opaque to this adapter
         # The cortex's one-step latent forecast for the *current* tick, made
@@ -124,6 +132,25 @@ class CortexWorldModel(CoreWorldModel):
         self.consolidate_every_ticks = consolidate_every_ticks
         self.consolidation_steps = consolidation_steps
         self._tick = 0
+
+    def configure_retrieval(self, hippocampus: Hippocampus) -> None:
+        """Attach the live organism's episodic store to this cortex."""
+        self._hippocampus = hippocampus
+
+    def set_retrieval_surprise(self, calibrated_surprise: float) -> None:
+        """Supply the loop's calibrated surprise gate for the next tick."""
+        self._retrieval_surprise = float(calibrated_surprise)
+
+    def set_cortex_version(self, version: int) -> None:
+        """Advance provenance after consolidated weights are published."""
+        self.cortex_version = int(version)
+        self.reset()
+
+    def hippocampal_context_latent(self) -> Optional[list[float]]:
+        """Cortex-native value stored beside the fused retrieval key."""
+        if self._latent is None:
+            return None
+        return self._latent.squeeze(0).detach().cpu().tolist()
 
     def _workspace_modalities(self, memory: Memory) -> dict[str, torch.Tensor]:
         """Bind the runtime's actual fused workspace plus efference copy."""
@@ -152,6 +179,72 @@ class CortexWorldModel(CoreWorldModel):
         self._predicted_latent = None
         self._latent = None
         self._pre_advance_hidden = None
+        self._retrieval_surprise = 0.0
+        self._last_recalls = ()
+
+    def _recall_into_context(self, memory: Memory) -> float:
+        """Retrieve, gate, and prepend compatible workspace-latent seeds."""
+        self._last_recalls = ()
+        if self._hippocampus is None:
+            return 0.0
+        fused = memory.fused_latent()
+        if fused is None:
+            return 0.0
+        recalls = self._hippocampus.retrieve(
+            fused.vector,
+            surprise=self._retrieval_surprise,
+            current_cortex_version=self.cortex_version,
+            config=self.retrieval_config,
+        )
+        best_first = tuple(
+            recall
+            for recall in recalls
+            if len(self._recall_token(recall)) == self.model.latent_width
+        )
+        if not best_first:
+            return 0.0
+
+        # ``retrieve`` ranks best-to-worst, while context is chronological:
+        # the last injected token sits nearest the next live input. Keep only
+        # recalls the configured window can hold, then inject weakest-to-best
+        # so truncation/the following live step discard weaker matches first.
+        context_capacity = self.model.context_length_max
+        if context_capacity is not None:
+            best_first = best_first[:context_capacity]
+        injection_order = tuple(reversed(best_first))
+
+        parameter = next(self.model.parameters())
+        recalled_latents = torch.tensor(
+            [[self._recall_token(recall) for recall in injection_order]],
+            dtype=parameter.dtype,
+            device=parameter.device,
+        )
+        recalled_actions = torch.tensor(
+            [[self._seed_action_index(recall) for recall in injection_order]],
+            dtype=torch.long,
+            device=parameter.device,
+        )
+        self._hidden = self.model.inject_context(
+            recalled_latents, recalled_actions, self._hidden
+        )
+        self._last_recalls = best_first
+        return max(self._recall_threat(recall) for recall in best_first)
+
+    @staticmethod
+    def _recall_token(recall: Recall) -> list[float]:
+        return recall.seed.context_z if recall.seed.context_z is not None else recall.seed.z
+
+    def _seed_action_index(self, recall: Recall) -> int:
+        for action in reversed(recall.seed.actions):
+            if action in self._action_index:
+                return self._action_index[action]
+        return 0
+
+    @staticmethod
+    def _recall_threat(recall: Recall) -> float:
+        tags = recall.seed.tags
+        tagged = float(tags.threat) if tags.threat is not None else 0.0
+        return max(0.0, min(1.0, max(tagged, 1.0 if tags.damage or tags.done else 0.0)))
 
     def _last_action_column(self, memory: Memory) -> torch.Tensor:
         """The last emitted action as a ``Tensor[1]`` index column (0 -- the
@@ -214,6 +307,8 @@ class CortexWorldModel(CoreWorldModel):
                     actions=[self.action_keys[int(action_col.item())]],
                     next_latents=latent.detach(),
                 )
+
+            recalled_threat = self._recall_into_context(memory)
 
             # Snapshot for cortex MPC (issue #168): the encoded observation
             # and the hidden state *before* the one-step advance below.
@@ -280,7 +375,7 @@ class CortexWorldModel(CoreWorldModel):
         return Prediction(
             # ``risk_head`` is softplus'd (non-negative, unbounded); clamp into
             # the heuristic model's 0..1 range the reflex/veto thresholds expect.
-            risk=float(torch.clamp(risk, 0.0, 1.0)),
+            risk=max(float(torch.clamp(risk, 0.0, 1.0)), recalled_threat),
             p_death=float(torch.sigmoid(terminal_logit)),
             predicted_reward=float(reward),
             next_latent=first_latent.squeeze(0).tolist(),
@@ -290,4 +385,9 @@ class CortexWorldModel(CoreWorldModel):
             # the dedicated sigma the arbiter's surprise calibration reads
             # in preference to the prediction_error stand-in.
             predicted_uncertainty=float(uncertainty),
+            recalled_seed_count=len(self._last_recalls),
+            retrieval_similarity=(
+                self._last_recalls[0].similarity if self._last_recalls else None
+            ),
+            recalled_threat=recalled_threat if self._last_recalls else None,
         )

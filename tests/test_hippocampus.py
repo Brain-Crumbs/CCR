@@ -9,7 +9,12 @@ import time
 
 import pytest
 
-from brain.hippocampus import Hippocampus, HippocampusConfig, SeedTags
+from brain.hippocampus import (
+    HippocampalRetrievalConfig,
+    Hippocampus,
+    HippocampusConfig,
+    SeedTags,
+)
 from cognitive_runtime.core.priority import PriorityWeights, Transition, transition_priority
 from cognitive_runtime.policies import ScriptedSurvivalPolicy
 from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
@@ -29,18 +34,34 @@ def test_config_rejects_out_of_range_threat_threshold():
         HippocampusConfig(threat_threshold=1.5)
 
 
+def test_retrieval_config_rejects_invalid_gates():
+    with pytest.raises(ValueError, match="top_k"):
+        HippocampalRetrievalConfig(top_k=0)
+    with pytest.raises(ValueError, match="min_similarity"):
+        HippocampalRetrievalConfig(min_similarity=1.1)
+    with pytest.raises(ValueError, match="min_surprise"):
+        HippocampalRetrievalConfig(min_surprise=-0.1)
+
+
 # --------------------------------------------------------------- encoding + priority
 
 
 def test_encode_returns_the_stored_seed_and_counts_it():
     hippocampus = Hippocampus()
     seed = hippocampus.encode(
-        z=[0.1, 0.2], actions=["move_forward"], tags=SeedTags(reward=1.0), tick_index=3,
+        z=[0.1, 0.2],
+        actions=["move_forward"],
+        tags=SeedTags(reward=1.0),
+        tick_index=3,
+        cortex_version=2,
+        context_z=[0.3],
     )
     assert seed is not None
     assert seed.z == [0.1, 0.2]
     assert seed.actions == ["move_forward"]
     assert seed.tick_index == 3
+    assert seed.cortex_version == 2
+    assert seed.context_z == [0.3]
     assert len(hippocampus) == 1
     assert hippocampus.total_encoded == 1
 
@@ -143,6 +164,74 @@ def test_seeds_snapshot_is_sorted_highest_priority_first():
         hippocampus.encode(z=[0.0], actions=[], tags=SeedTags(reward=reward))
     priorities = [seed.priority for seed in hippocampus.seeds()]
     assert priorities == sorted(priorities, reverse=True)
+
+
+# --------------------------------------------------------------- online retrieval
+
+
+def test_cosine_retrieval_returns_nearest_seed_only_after_surprise_gate():
+    hippocampus = Hippocampus()
+    nearest = hippocampus.encode(
+        z=[1.0, 0.0],
+        actions=["turn_left"],
+        tags=SeedTags(reward=1.0),
+        tick_index=1,
+        cortex_version=4,
+    )
+    hippocampus.encode(
+        z=[0.0, 1.0], actions=["turn_right"], tags=SeedTags(), cortex_version=4
+    )
+    config = HippocampalRetrievalConfig(
+        top_k=1, min_similarity=0.8, min_surprise=0.5
+    )
+
+    assert hippocampus.retrieve(
+        [0.99, 0.01], surprise=0.49, current_cortex_version=4, config=config
+    ) == ()
+    recalls = hippocampus.retrieve(
+        [0.99, 0.01], surprise=0.5, current_cortex_version=4, config=config
+    )
+    assert len(recalls) == 1
+    assert recalls[0].seed is nearest
+    assert recalls[0].similarity > 0.99
+
+
+def test_stale_and_unknown_cortex_provenance_are_excluded():
+    hippocampus = Hippocampus()
+    hippocampus.encode(
+        z=[1.0, 0.0], actions=[], tags=SeedTags(), cortex_version=2
+    )
+    hippocampus.encode(z=[1.0, 0.0], actions=[], tags=SeedTags())
+    current = hippocampus.encode(
+        z=[1.0, 0.0], actions=[], tags=SeedTags(), cortex_version=3
+    )
+
+    recalls = hippocampus.retrieve(
+        [1.0, 0.0], surprise=1.0, current_cortex_version=3
+    )
+    assert [recall.seed for recall in recalls] == [current]
+
+
+def test_retrieval_prefers_consolidated_then_recent_seed_on_equal_similarity():
+    hippocampus = Hippocampus()
+    hippocampus.encode(
+        z=[1.0], actions=[], tags=SeedTags(), tick_index=20, cortex_version=1
+    )
+    consolidated = hippocampus.encode(
+        z=[1.0],
+        actions=[],
+        tags=SeedTags(),
+        tick_index=10,
+        cortex_version=1,
+        consolidated=True,
+    )
+    recalls = hippocampus.retrieve(
+        [1.0],
+        surprise=1.0,
+        current_cortex_version=1,
+        config=HippocampalRetrievalConfig(top_k=1),
+    )
+    assert recalls[0].seed is consolidated
 
 
 def test_reset_clears_the_store_and_counters():

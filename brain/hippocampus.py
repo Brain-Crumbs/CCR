@@ -36,14 +36,16 @@ Deliberately torch-free (unlike the rest of ``cognitive_runtime.neural``):
 seed every waking tick -- including runs with no ``neural`` extra installed
 -- without pulling in torch.
 
-Context-cued *retrieval* is explicitly deferred (a follow-up per the phase
-doc); this module only writes and bounds the store.
+Context-cued retrieval uses a torch-free cosine kNN scan over the bounded
+store. Recall is gated by similarity, calibrated surprise, and cortex-version
+provenance before any token can reach the live cortex.
 """
 
 from __future__ import annotations
 
 import heapq
 import itertools
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -53,6 +55,8 @@ __all__ = [
     "SeedTags",
     "Seed",
     "HippocampusConfig",
+    "HippocampalRetrievalConfig",
+    "Recall",
     "Hippocampus",
 ]
 
@@ -90,6 +94,18 @@ class Seed:
     priority: float
     tick_index: int
     source: str = ""
+    #: Cortex weight version that produced ``z``. ``None`` marks legacy or
+    #: otherwise unknown provenance and is excluded when retrieval names a
+    #: current version.
+    cortex_version: Optional[int] = None
+    #: True once this memory has passed a consolidation/quality gate. Used as
+    #: a deterministic tie-breaker after semantic and provenance scores.
+    consolidated: bool = False
+    #: Optional cortex-native token to prepend after retrieval. ``z`` remains
+    #: the full workspace key used for cosine matching; this bridge field is
+    #: needed while the live visual cortex and fused workspace have different
+    #: widths, and can disappear once the cortex consumes the fused token.
+    context_z: Optional[List[float]] = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +124,46 @@ class HippocampusConfig:
             raise ValueError(
                 f"threat_threshold must be in [0, 1], got {self.threat_threshold!r}"
             )
+
+
+@dataclass(frozen=True)
+class HippocampalRetrievalConfig:
+    """Guardrails for online context-cued recall."""
+
+    top_k: int = 4
+    min_similarity: float = 0.8
+    min_surprise: float = 0.2
+    max_version_lag: int = 0
+    stale_decay: float = 0.25
+
+    def __post_init__(self) -> None:
+        if self.top_k <= 0:
+            raise ValueError(f"top_k must be positive, got {self.top_k!r}")
+        if not -1.0 <= self.min_similarity <= 1.0:
+            raise ValueError(
+                f"min_similarity must be in [-1, 1], got {self.min_similarity!r}"
+            )
+        if not 0.0 <= self.min_surprise <= 1.0:
+            raise ValueError(f"min_surprise must be in [0, 1], got {self.min_surprise!r}")
+        if self.max_version_lag < 0:
+            raise ValueError(
+                f"max_version_lag must be non-negative, got {self.max_version_lag!r}"
+            )
+        if not 0.0 <= self.stale_decay <= 1.0:
+            raise ValueError(f"stale_decay must be in [0, 1], got {self.stale_decay!r}")
+
+
+@dataclass(frozen=True)
+class Recall:
+    """One provenance-gated nearest neighbour returned by ``retrieve``."""
+
+    seed: Seed
+    similarity: float
+    provenance_weight: float
+
+    @property
+    def score(self) -> float:
+        return self.similarity * self.provenance_weight
 
 
 def _seed_priority(tags: SeedTags, config: HippocampusConfig) -> float:
@@ -170,6 +226,9 @@ class Hippocampus:
         *,
         tick_index: int = 0,
         source: str = "",
+        cortex_version: Optional[int] = None,
+        consolidated: bool = False,
+        context_z: Optional[Sequence[float]] = None,
     ) -> Optional[Seed]:
         """One tick's `(z, actions, tags)`; scores and stores it, evicting
         the current lowest-priority seed if the store is full and this one
@@ -184,6 +243,9 @@ class Hippocampus:
             priority=priority,
             tick_index=tick_index,
             source=source,
+            cortex_version=cortex_version,
+            consolidated=consolidated,
+            context_z=list(context_z) if context_z is not None else None,
         )
         self.total_encoded += 1
         entry = (priority, next(self._counter), seed)
@@ -196,6 +258,62 @@ class Hippocampus:
             return seed
         self.total_skipped += 1
         return None
+
+    def retrieve(
+        self,
+        query: Sequence[float],
+        *,
+        surprise: float,
+        current_cortex_version: Optional[int],
+        config: Optional[HippocampalRetrievalConfig] = None,
+    ) -> Tuple[Recall, ...]:
+        """Return cosine-nearest seeds that pass every online-recall gate.
+
+        A low-surprise tick returns immediately: familiar context alone is
+        not enough to inject memory. When a current cortex version is given,
+        unknown provenance is rejected and older versions are geometrically
+        down-weighted before the similarity threshold is applied.
+        """
+        cfg = config or HippocampalRetrievalConfig()
+        if not math.isfinite(surprise) or surprise < cfg.min_surprise:
+            return ()
+        query_values = [float(value) for value in query]
+        query_norm = math.sqrt(sum(value * value for value in query_values))
+        if query_norm == 0.0 or not math.isfinite(query_norm):
+            return ()
+
+        matches: List[Recall] = []
+        for seed in self.seeds():
+            if len(seed.z) != len(query_values):
+                continue
+            seed_norm = math.sqrt(sum(value * value for value in seed.z))
+            if seed_norm == 0.0 or not math.isfinite(seed_norm):
+                continue
+            similarity = sum(a * b for a, b in zip(query_values, seed.z)) / (
+                query_norm * seed_norm
+            )
+            provenance_weight = 1.0
+            if current_cortex_version is not None:
+                if seed.cortex_version is None:
+                    continue
+                version_lag = abs(current_cortex_version - seed.cortex_version)
+                if version_lag > cfg.max_version_lag:
+                    continue
+                provenance_weight = cfg.stale_decay ** version_lag
+            recall = Recall(seed, max(-1.0, min(1.0, similarity)), provenance_weight)
+            if recall.score >= cfg.min_similarity:
+                matches.append(recall)
+
+        matches.sort(
+            key=lambda recall: (
+                recall.score,
+                recall.seed.consolidated,
+                recall.seed.tick_index,
+                recall.seed.priority,
+            ),
+            reverse=True,
+        )
+        return tuple(matches[: cfg.top_k])
 
     def reset(self) -> None:
         self._heap.clear()

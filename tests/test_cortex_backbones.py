@@ -148,8 +148,102 @@ def test_windowed_backbone_set_context_length_clamps_to_max(name):
     assert backbone._current_context == 4
     backbone.set_context_length(1)
     assert backbone._current_context == 1
+
+
+@pytest.mark.parametrize("name", ["dilated_conv", "transformer"])
+def test_windowed_backbone_set_context_length_zero_clamps_to_one(name):
+    """Regression for #147: zero must not select the entire buffer via -0."""
+    backbone = build_backbone(name, input_dim=6, hidden_dim=8, context_length=4)
     backbone.set_context_length(0)
     assert backbone._current_context == 1
+
+
+def test_transformer_position_encoding_extrapolates_past_training_width():
+    """ALiBi remains defined when inference uses more context than training."""
+    backbone = build_backbone(
+        "transformer", input_dim=6, hidden_dim=8, context_length=8, n_heads=2
+    )
+    assert not any("position_embedding" in name for name, _ in backbone.named_parameters())
+
+    backbone.train()
+    backbone.set_context_length(3)
+    short = backbone.forward_sequence(torch.randn(2, 5, 6))
+    short.square().mean().backward()
+
+    backbone.eval()
+    backbone.set_context_length(None)
+    with torch.no_grad():
+        wide = backbone.forward_sequence(torch.randn(2, 10, 6))
+    assert backbone._current_context == 8
+    assert wide.shape == (2, 10, 8)
+    assert torch.isfinite(wide).all()
+
+
+def test_recalled_tokens_are_prepended_to_windowed_cortex_context():
+    config = PredictiveCortexConfig(
+        latent_width=6,
+        hidden_dim=8,
+        reconstruction_size=4,
+        backbone="transformer",
+        context_length=4,
+    )
+    model = PredictiveCortex(PIXEL_SHAPE, ACTION_KEYS, config)
+    state = model.initial_state(1)
+    recalled = torch.randn(1, 2, 6)
+    actions = torch.tensor([[1, 2]])
+
+    injected = model.inject_context(recalled, actions, state)
+    expected = torch.cat([recalled, model.action_embedding(actions)], dim=-1)
+    assert torch.allclose(injected[0][:, -2:], expected)
+    assert torch.equal(injected[1], state[1])
+
+
+def test_recalled_context_improves_held_out_recurring_dynamics():
+    """A learned cue-dependent transition benefits from the matching memory."""
+    torch.manual_seed(4)
+    config = PredictiveCortexConfig(
+        latent_width=4,
+        hidden_dim=8,
+        action_embed_dim=2,
+        reconstruction_size=4,
+        backbone="dilated_conv",
+        context_length=3,
+    )
+    model = PredictiveCortex(PIXEL_SHAPE, ACTION_KEYS, config)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+    positive_cue = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    cues = torch.stack([positive_cue, -positive_cue]).unsqueeze(1)
+    current = torch.zeros(2, 4)
+    actions = torch.zeros(2, 1, dtype=torch.long)
+    targets = torch.stack([torch.full((4,), 0.7), torch.full((4,), -0.7)])
+
+    # Disable dropout so the tiny synthetic fit is deterministic while still
+    # leaving gradients enabled.
+    model.eval()
+    for _ in range(100):
+        state = model.inject_context(cues, actions, model.initial_state(2))
+        prediction, _state = model.step(current, actions[:, 0], state)
+        loss = torch.nn.functional.mse_loss(prediction, targets)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    held_out_cue = cues * 0.9
+    held_out_target = targets
+    held_out_action = torch.zeros(2, 1, dtype=torch.long)
+    with torch.no_grad():
+        without_recall, _ = model.step(
+            torch.zeros(2, 4), held_out_action[:, 0], model.initial_state(2)
+        )
+        recalled_state = model.inject_context(
+            held_out_cue, held_out_action, model.initial_state(2)
+        )
+        with_recall, _ = model.step(
+            torch.zeros(2, 4), held_out_action[:, 0], recalled_state
+        )
+    baseline_error = torch.nn.functional.mse_loss(without_recall, held_out_target)
+    recall_error = torch.nn.functional.mse_loss(with_recall, held_out_target)
+    assert recall_error < baseline_error * 0.5
 
 
 # --------------------------------------------------------------- cortex-level contract
@@ -370,6 +464,26 @@ def test_checkpoint_round_trips_backbone_choice(turn_session, name, tmp_path):
     assert report_before["horizons"][1]["model_mse"] == pytest.approx(
         report_after["horizons"][1]["model_mse"], rel=1e-5
     )
+
+
+def test_pre_alibi_transformer_checkpoint_discards_obsolete_position_table(tmp_path):
+    cfg = PredictiveCortexConfig(
+        latent_width=6,
+        hidden_dim=8,
+        reconstruction_size=4,
+        backbone="transformer",
+        context_length=3,
+    )
+    model = PredictiveCortex(PIXEL_SHAPE, ACTION_KEYS, cfg)
+    path = str(tmp_path / "pre-alibi.pt")
+    save_action_world_model(path, model, {})
+    payload = torch.load(path, weights_only=False)
+    payload["state_dict"]["transition_backbone.position_embedding.weight"] = torch.randn(3, 8)
+    torch.save(payload, path)
+
+    loaded, _stats = load_action_world_model(path)
+    assert isinstance(loaded.transition_backbone, TransformerBackbone)
+    assert not hasattr(loaded.transition_backbone, "position_embedding")
 
 
 def test_checkpoint_before_c1_direct_heads_still_loads(turn_session, tmp_path):

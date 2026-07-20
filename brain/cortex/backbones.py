@@ -31,7 +31,10 @@ phase doc asks for. Their window is curriculum-controlled via
 ``set_context_length`` (task 5's "1 frame -> 2 -> k"): training starts each
 windowed backbone seeing only its most recent input and ramps the window up
 to ``context_length_max``, so the model isn't asked to exploit a long window
-before it has learned what one step of dynamics looks like.
+before it has learned what one step of dynamics looks like. The transformer
+uses ALiBi relative attention biases rather than a learned absolute position
+table, so every positional rule learned at a short curriculum width remains
+defined when inference restores a wider configured buffer.
 """
 
 from __future__ import annotations
@@ -79,6 +82,12 @@ class TemporalBackbone(nn.Module):
 
     def set_context_length(self, n: Optional[int]) -> None:
         """No-op unless overridden by a windowed backbone."""
+
+    def inject_context(self, inputs: torch.Tensor, state: Any) -> Any:
+        """Prepend recalled inputs to ``state`` before the next live step."""
+        for index in range(inputs.shape[1]):
+            _hidden, state = self.step(inputs[:, index], state)
+        return state
 
 
 class GRUBackbone(TemporalBackbone):
@@ -141,6 +150,22 @@ class _WindowedBackbone(TemporalBackbone):
 
     def readout(self, state: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         return state[1]
+
+    def inject_context(
+        self,
+        inputs: torch.Tensor,
+        state: Tuple[torch.Tensor, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Place recalled tokens immediately before the next live input."""
+        if inputs.ndim != 3 or inputs.shape[0] != state[0].shape[0]:
+            raise ValueError("inputs must be [batch, recalled_time, input_dim]")
+        if inputs.shape[2] != self.input_dim:
+            raise ValueError(
+                f"recalled input width {inputs.shape[2]} != backbone input width {self.input_dim}"
+            )
+        buffer, last_hidden = state
+        buffer = torch.cat([buffer, inputs], dim=1)[:, -self.context_length_max :]
+        return buffer, last_hidden
 
     def _slide_window(self, x: torch.Tensor, state: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         buffer, _last_hidden = state
@@ -215,7 +240,14 @@ class DilatedConvBackbone(_WindowedBackbone):
 class TransformerBackbone(_WindowedBackbone):
     """A small causal transformer encoder over the window: full pairwise
     attention across the last ``context_length`` inputs each step, in one
-    parallel pass, rather than the GRU's one-token-at-a-time recurrence."""
+    parallel pass, rather than the GRU's one-token-at-a-time recurrence.
+
+    Attention Linear Biases (ALiBi) encode position as a per-head penalty
+    proportional to causal key distance. Unlike ``nn.Embedding`` slots, that
+    rule has no trained maximum index: a model exposed to an effective width
+    ``k`` during the curriculum can use the same learned attention at any
+    wider width up to its configured ring-buffer capacity.
+    """
 
     def __init__(
         self,
@@ -232,8 +264,14 @@ class TransformerBackbone(_WindowedBackbone):
             # the largest divisor <= n_heads rather than erroring on odd
             # configs a caller didn't hand-tune for this backbone.
             n_heads = next(h for h in range(min(n_heads, hidden_dim), 0, -1) if hidden_dim % h == 0)
+        self.n_heads = n_heads
         self.input_proj = nn.Linear(input_dim, hidden_dim)
-        self.position_embedding = nn.Embedding(context_length, hidden_dim)
+        head_numbers = torch.arange(1, n_heads + 1, dtype=torch.float32)
+        self.register_buffer(
+            "alibi_slopes",
+            torch.pow(2.0, -8.0 * head_numbers / n_heads),
+            persistent=False,
+        )
         layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=n_heads,
@@ -242,15 +280,41 @@ class TransformerBackbone(_WindowedBackbone):
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
 
+    def _attention_mask(
+        self,
+        length: int,
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return ``[batch * heads, query, key]`` causal ALiBi biases."""
+        positions = torch.arange(length, device=device)
+        distance = positions[:, None] - positions[None, :]
+        future = distance < 0
+        bias = -self.alibi_slopes.to(device=device, dtype=dtype)[:, None, None] * (
+            distance.clamp_min(0).to(dtype)
+        )
+        bias = bias.masked_fill(future.unsqueeze(0), float("-inf"))
+        return (
+            bias.unsqueeze(0)
+            .expand(batch_size, -1, -1, -1)
+            .reshape(batch_size * self.n_heads, length, length)
+        )
+
     def step(
         self, x: torch.Tensor, state: Tuple[torch.Tensor, torch.Tensor]
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         buffer = self._slide_window(x, state)
         window = self._windowed(buffer)  # [B, C, input_dim]
         length = window.shape[1]
-        positions = torch.arange(length, device=window.device)
-        projected = self.input_proj(window) + self.position_embedding(positions).unsqueeze(0)
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(length).to(window.device)
+        projected = self.input_proj(window)
+        causal_mask = self._attention_mask(
+            length,
+            projected.shape[0],
+            device=projected.device,
+            dtype=projected.dtype,
+        )
         encoded = self.encoder(projected, mask=causal_mask)
         hidden = encoded[:, -1]
         return hidden, (buffer, hidden)
@@ -262,16 +326,20 @@ class TransformerBackbone(_WindowedBackbone):
         context = self._current_context
         # Build every sliding window as a batch item.  This is still an
         # all-positions parallel pass, and it exactly matches ``step``: the
-        # newest token always occupies the final (and therefore identical)
-        # position-embedding slot in its causal window.
+        # newest token always has the same relative distances to its causal
+        # predecessors as it does in ``step``.
         padded = torch.cat(
             [inputs.new_zeros(batch, context - 1, input_dim), inputs], dim=1
         )
         windows = padded.unfold(1, context, 1).permute(0, 1, 3, 2)
         windows = windows.contiguous().reshape(batch * length, context, input_dim)
-        positions = torch.arange(context, device=inputs.device)
-        projected = self.input_proj(windows) + self.position_embedding(positions).unsqueeze(0)
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(context).to(inputs.device)
+        projected = self.input_proj(windows)
+        causal_mask = self._attention_mask(
+            context,
+            projected.shape[0],
+            device=projected.device,
+            dtype=projected.dtype,
+        )
         encoded = self.encoder(projected, mask=causal_mask)
         return encoded[:, -1].reshape(batch, length, self.hidden_dim)
 

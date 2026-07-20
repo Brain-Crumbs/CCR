@@ -391,9 +391,13 @@ class CortexConsolidator:
         state = self._publish_state(publish_ema)
         target = getattr(world_model, "model", world_model)
         target.load_state_dict(state)
-        reset = getattr(world_model, "reset", None)
-        if callable(reset):
-            reset()
+        set_cortex_version = getattr(world_model, "set_cortex_version", None)
+        if callable(set_cortex_version):
+            set_cortex_version(self.version)
+        else:
+            reset = getattr(world_model, "reset", None)
+            if callable(reset):
+                reset()
         return self.version
 
     # ----------------------------------------------------------------- misc
