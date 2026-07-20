@@ -6,9 +6,11 @@ runtime, recorder and replay machinery run unmodified against a fast,
 deterministic, pixel-native nursery world.  See
 ``docs/v2/phases/phase-1-nursery-world.md``.
 
-``crafter`` is an optional dependency, imported lazily here (like
-``cognitive_runtime.neural``'s torch imports) so other worlds/commands (e.g.
-``--world minecraft``, ``replay``, ``dashboard``) never require it installed.
+``crafter`` is a core dependency (issue #176: it's the CLI's default
+``--world``), but the import here stays lazy, inside ``__init__``, so other
+worlds/commands (e.g. ``--world minecraft``, ``replay``, ``dashboard``)
+never pay for it and a partial/dev install missing it still fails with an
+actionable message instead of an import-time crash.
 """
 
 from __future__ import annotations
@@ -52,7 +54,8 @@ def _import_crafter():
         import crafter
     except ImportError as exc:  # pragma: no cover - exercised via ImportError message
         raise ImportError(
-            "the crafter world needs the 'crafter' package; install '.[crafter]'"
+            "the crafter world needs the 'crafter' package (a core dependency; "
+            "install '.', or 'pip install crafter>=1.8,<2' into this environment)"
         ) from exc
     return crafter
 

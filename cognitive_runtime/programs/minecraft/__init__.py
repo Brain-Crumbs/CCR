@@ -16,15 +16,35 @@ Minecraft stays fully functional and supported, opt-in via
 ``--world minecraft`` (or direct construction), and stays in the design as
 the eventual *graduation* world -- a first-person environment the organism
 graduates into once the nursery loop is a real organism (post Milestone 5;
-see ``docs/v2/``). Until then it is not on the default path: nothing here
-is imported by the CLI, ``training.nursery``, or any other module unless a
-caller actually selects ``--world minecraft`` (or otherwise constructs
-``MinecraftSurvivalBox``/loads a reward profile) -- see
-``cognitive_runtime/cli.py``'s ``--world`` selector and
-``MinecraftSurvivalBox.__init__``'s lazy ``reward_profile`` import.
+see ``docs/v2/``). Until then it is not on the default path: the heavy
+survival-economy modules (``adapter.py``/``world.py``/``rewards.py``, and
+-- lazily even from ``adapter.py`` itself -- the profile-driven
+``reward_engine.py``/``reward_profile.py``) are only imported once a caller
+actually selects ``--world minecraft``, constructs ``MinecraftSurvivalBox``,
+or loads a reward profile. ``MinecraftSurvivalBox``/``SurvivalBoxConfig``
+are re-exported below via a lazy ``__getattr__`` (PEP 562), not a plain
+import, specifically so that importing any lightweight submodule of this
+package (e.g. ``programs.minecraft.actions``, which the CLI does import
+eagerly -- Python always runs a package's ``__init__`` before any
+submodule) does not itself drag in ``adapter.py``.
 """
 
-from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
-from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+    from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
 
 __all__ = ["MinecraftSurvivalBox", "SurvivalBoxConfig"]
+
+
+def __getattr__(name: str):
+    if name == "MinecraftSurvivalBox":
+        from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+
+        return MinecraftSurvivalBox
+    if name == "SurvivalBoxConfig":
+        from cognitive_runtime.programs.minecraft.config import SurvivalBoxConfig
+
+        return SurvivalBoxConfig
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

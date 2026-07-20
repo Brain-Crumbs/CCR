@@ -403,14 +403,13 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
 WORLDS = {"minecraft", "crafter"}
 
 
-def _add_world_selector_arg(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--world", default="crafter", choices=sorted(WORLDS),
+def _add_world_selector_arg(parser: argparse.ArgumentParser, default: str = "crafter") -> None:
+    parser.add_argument("--world", default=default, choices=sorted(WORLDS),
                         help="which Program to run: the Crafter nursery world "
-                             "(default, issue #176) or the legacy Minecraft-like "
-                             "survival sim (issue #89's original default; opt in "
-                             "with --world minecraft). Both implement the same "
-                             "streams-v2 seam, so the runtime/policy code is "
-                             "unchanged either way.")
+                             f"or the legacy Minecraft-like survival sim "
+                             f"(default here: {default}). Both implement the "
+                             "same streams-v2 seam, so the runtime/policy code "
+                             "is unchanged either way.")
 
 
 def _build_program(args: argparse.Namespace, program_config: Dict[str, Any],
@@ -440,9 +439,10 @@ def _build_program(args: argparse.Namespace, program_config: Dict[str, Any],
         from cognitive_runtime.programs.crafter.adapter import CrafterWorld
         from cognitive_runtime.programs.crafter.stream_registry import CRAFTER_STREAM_REGISTRY
 
-        # CrafterWorld imports the optional 'crafter' package lazily, inside
-        # __init__ -- the ImportError (if it's not installed) only surfaces
-        # at construction, not at the module import above.
+        # CrafterWorld imports the 'crafter' package (a core dependency,
+        # issue #176) lazily, inside __init__ -- a partial/dev install
+        # missing it only surfaces an ImportError here, at construction, not
+        # at the module import above.
         try:
             program = CrafterWorld(config=program_config)
         except ImportError as exc:
@@ -1751,7 +1751,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_demo.add_argument("--name", default=None,
                         help="issue #88: organism name (see 'run --name'); default: generated")
     _add_world_args(p_demo)
-    _add_world_selector_arg(p_demo)
+    # `demo` forces HumanDemoPolicy (cmd_demo below), a Minecraft-specific
+    # terminal keymap/status display (world.front_block, body.hunger, ...);
+    # it doesn't understand Crafter's action space or streams, so unlike
+    # `run`/`nursery`, this default stays "minecraft" (issue #193 review).
+    _add_world_selector_arg(p_demo, default="minecraft")
     _add_world_model_arg(p_demo)
     _add_entity_persistence_arg(p_demo)
     p_demo.set_defaults(func=cmd_demo)
