@@ -18,6 +18,7 @@ from cognitive_runtime.training.action_world_model import (  # noqa: E402
     evaluate_cortex_heads,
     horizons_ticks_to_frames,
     linear_probe_yaw,
+    representation_collapse_diagnostics,
     load_action_world_model,
     save_action_world_model,
     train_action_world_model,
@@ -175,6 +176,47 @@ def test_train_evaluate_probe_and_round_trip(turn_session, tmp_path):
         assert torch.allclose(model.encoder(frames), reloaded.encoder(frames))
 
 
+def test_ema_target_encoder_is_opt_in_and_reported(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    _model, default_stats = train_action_world_model(dataset, _small_model_config())
+    assert default_stats["ema_target_enabled"] is False
+    assert default_stats["ema_target_decay"] is None
+
+    _model, ema_stats = train_action_world_model(
+        dataset, _small_model_config(ema_target_decay=0.9)
+    )
+    assert ema_stats["ema_target_enabled"] is True
+    assert ema_stats["ema_target_decay"] == pytest.approx(0.9)
+    assert "representation_diagnostics" in ema_stats
+
+    with pytest.raises(ValueError, match="ema_target_decay"):
+        train_action_world_model(dataset, _small_model_config(ema_target_decay=1.0))
+
+
+def test_representation_gate_catches_synthetic_constant_latent(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model = build_action_world_model(
+        dataset.pixel_shape, dataset.action_keys, _small_model_config()
+    )
+    with torch.no_grad():
+        for parameter in model.encoder.parameters():
+            parameter.zero_()
+
+    def collapsed_step(latent, action, hidden):
+        return (
+            torch.zeros(latent.shape[0], model.latent_width),
+            torch.zeros(latent.shape[0], model.hidden_dim),
+        )
+
+    model.step = collapsed_step
+    report = representation_collapse_diagnostics(model, dataset)
+    assert report["gate_evaluable"] is True
+    assert report["passed"] is False
+    assert report["latent"]["mean_variance"] == pytest.approx(0.0)
+    assert report["latent"]["effective_rank"] == pytest.approx(0.0)
+    assert report["hidden_yaw_r2"] < report["thresholds"]["min_hidden_yaw_r2"]
+
+
 def test_train_action_world_model_trains_reward_terminal_risk_uncertainty_heads(turn_session):
     """issue #169: the previously-untrained heads now get a loss curve each,
     and ``evaluate_cortex_heads`` reports a well-formed diagnostic against
@@ -263,6 +305,10 @@ def test_run_nursery_joint_trains_one_model_across_scenarios(tmp_path):
         assert set(metrics["horizons"]) == set(report.horizon_frames)
         assert "frozen_rollout" in metrics["rollout_health"]
     assert report.yaw_probe.get("n_samples", 0) > 0
+    assert report.representation_diagnostics["gate_evaluable"] is True
+    assert set(report.representation_diagnostics["latent"]) >= {
+        "mean_variance", "effective_rank", "matrix_rank"
+    }
 
 
 def test_run_nursery_joint_rejects_overlapping_scenarios(tmp_path):

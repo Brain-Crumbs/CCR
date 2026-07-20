@@ -1630,6 +1630,7 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
         rollout_frames=args.rollout_frames,
         backbone=args.backbone,
         context_length=args.context_length,
+        ema_target_decay=args.ema_target_decay,
     )
     print(
         f"nursery joint: training one action-conditioned world model "
@@ -1685,6 +1686,16 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
             f"hidden r2={probe['hidden']['r2']:.3f} "
             f"({probe['hidden']['mean_angular_error_deg']:.1f} deg err)"
         )
+    representation = report.representation_diagnostics
+    latent = representation["latent"]
+    status = (
+        "PASS" if representation["passed"] else
+        "N/A" if not representation["gate_evaluable"] else "FAIL"
+    )
+    print(
+        f"representation gate: {status}; latent variance={latent['mean_variance']:.3e}, "
+        f"effective rank={latent['effective_rank']:.2f}/{latent['dimensions']}"
+    )
 
     if args.out_dir:
         os.makedirs(args.out_dir, exist_ok=True)
@@ -1702,6 +1713,7 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
             "scenario_metrics": report.scenario_metrics,
             "zero_shot_metrics": report.zero_shot_metrics,
             "yaw_probe": report.yaw_probe,
+            "representation_diagnostics": report.representation_diagnostics,
             "train_sessions": report.train_sessions,
             "eval_sessions": report.eval_sessions,
         }
@@ -2513,6 +2525,10 @@ def build_parser() -> argparse.ArgumentParser:
                                  help="window size the dilated_conv/transformer backbones attend "
                                       "over (ignored by gru); ramped 1 -> this value over training "
                                       "via the context-length curriculum")
+    p_nursery_joint.add_argument(
+        "--ema-target-decay", type=float, default=None,
+        help="enable a Polyak target encoder for latent targets (e.g. 0.99); off by default",
+    )
     p_nursery_joint.add_argument("--neural-lr", type=float, default=1e-3)
     p_nursery_joint.add_argument("--batch-size", type=int, default=32)
     p_nursery_joint.add_argument("--seed", type=int, default=0)

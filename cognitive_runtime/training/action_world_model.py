@@ -38,6 +38,7 @@ torch.
 
 from __future__ import annotations
 
+import copy
 import math
 import random
 from dataclasses import dataclass, field
@@ -286,6 +287,17 @@ class ActionWorldModelConfig:
     #: 0.1 default this matches so it calibrates without dominating the
     #: pixel/latent objective.
     uncertainty_loss_weight: float = 0.1
+    #: Optional slow target encoder for the latent regression target. ``None``
+    #: preserves the historical shared-encoder objective; a value in [0, 1)
+    #: enables a Polyak/EMA copy updated after every optimizer step.
+    ema_target_decay: Optional[float] = None
+    #: Representation-collapse gate.  The gate fails only when the recurrent
+    #: state has lost yaw *and* the encoder output is degenerate, avoiding a
+    #: false alarm when one diagnostic alone is weak.
+    collapse_gate_enabled: bool = True
+    collapse_gate_min_hidden_yaw_r2: float = 0.1
+    collapse_gate_min_latent_variance: float = 1e-6
+    collapse_gate_min_effective_rank: float = 1.5
     seed: int = 0
     #: Horizons in ticks (not frames), persisted with the checkpoint so
     #: "T+8" means the same thing across worlds/sample rates. Convert to
@@ -396,10 +408,12 @@ def train_action_world_model(
     sampling over every episode in ``dataset``.
 
     Loss per rollout step: pixel MSE of the decoded prediction against the
-    downsampled true frame, plus latent MSE against the (detached) encoder
-    latent of the true frame -- the pixel term keeps predictions decodable,
-    the latent term keeps rollouts on the encoder's manifold without the
-    100-step compositions that drove the old predictor to the identity.
+    downsampled true frame, plus latent MSE against the detached target
+    latent of the true frame.  The target is the online encoder by default,
+    or a slow Polyak copy when ``ema_target_decay`` is configured.  The pixel
+    term keeps predictions decodable; the latent term keeps rollouts on the
+    encoder's manifold without the 100-step compositions that drove the old
+    predictor to the identity.
 
     ``initial_model`` (issue #134), when given, continues training that
     ``PredictiveCortex`` in place instead of building a fresh one -- a
@@ -421,6 +435,11 @@ def train_action_world_model(
         raise ValueError(f"warmup_frames must be >= 1, got {cfg.warmup_frames}")
     if cfg.rollout_frames < 1:
         raise ValueError(f"rollout_frames must be >= 1, got {cfg.rollout_frames}")
+    if cfg.ema_target_decay is not None and not 0.0 <= cfg.ema_target_decay < 1.0:
+        raise ValueError(
+            "ema_target_decay must be None or in [0, 1), got "
+            f"{cfg.ema_target_decay!r}"
+        )
     torch.manual_seed(cfg.seed)
     generator = torch.Generator().manual_seed(cfg.seed)
 
@@ -438,6 +457,11 @@ def train_action_world_model(
         model = initial_model
     else:
         model = build_action_world_model(dataset.pixel_shape, dataset.action_keys, cfg)
+    target_encoder = None
+    if cfg.ema_target_decay is not None:
+        target_encoder = copy.deepcopy(model.encoder)
+        target_encoder.requires_grad_(False)
+        target_encoder.eval()
     episodes = _episode_tensors(dataset, model.reconstruction_shape)
     #: Per-episode reward/terminal/risk targets (issue #169), aligned 1:1
     #: with ``episodes`` by index.
@@ -528,6 +552,10 @@ def train_action_world_model(
             optimizer.zero_grad()
             flat_frames = frames_b.reshape(-1, *frames_b.shape[2:])
             latents = model.encoder(flat_frames).reshape(batch_n, window, -1)
+            target_latents = latents
+            if target_encoder is not None:
+                with torch.no_grad():
+                    target_latents = target_encoder(flat_frames).reshape(batch_n, window, -1)
 
             hidden = model.initial_state(batch_n)
             # Teacher-forced warmup: observed latents drive the state.
@@ -548,7 +576,7 @@ def train_action_world_model(
                 # Normalized like visual_representation.next_latent_prediction_loss:
                 # raw encoder latents are unbounded (ReLU), and a raw-space MSE
                 # swamps the pixel term.
-                target_latent = latents[:, idx + 1].detach()
+                target_latent = target_latents[:, idx + 1].detach()
                 per_sample_latent_error = (
                     F.normalize(predicted, dim=1) - F.normalize(target_latent, dim=1)
                 ).pow(2).mean(dim=1)
@@ -600,6 +628,17 @@ def train_action_world_model(
             )
             total.backward()
             optimizer.step()
+            if target_encoder is not None:
+                decay = float(cfg.ema_target_decay)
+                with torch.no_grad():
+                    for target_param, online_param in zip(
+                        target_encoder.parameters(), model.encoder.parameters()
+                    ):
+                        target_param.mul_(decay).add_(online_param, alpha=1.0 - decay)
+                    for target_buffer, online_buffer in zip(
+                        target_encoder.buffers(), model.encoder.buffers()
+                    ):
+                        target_buffer.copy_(online_buffer)
 
             seen += batch_n
             epoch["total_loss"] += float(total.detach()) * batch_n
@@ -635,7 +674,13 @@ def train_action_world_model(
         "final_terminal_loss": curves["terminal_loss"][-1],
         "final_risk_loss": curves["risk_loss"][-1],
         "final_uncertainty_loss": curves["uncertainty_loss"][-1],
+        "ema_target_enabled": target_encoder is not None,
+        "ema_target_decay": cfg.ema_target_decay,
     }
+    diagnostics = representation_collapse_diagnostics(model, dataset, config=cfg)
+    stats["representation_diagnostics"] = diagnostics
+    if cfg.collapse_gate_enabled and diagnostics["gate_evaluable"] and not diagnostics["passed"]:
+        raise RepresentationCollapseError(diagnostics)
     return model, stats
 
 
@@ -1105,6 +1150,113 @@ def linear_probe_yaw(model: Any, dataset: ActionSequenceDataset) -> Dict[str, An
         x = torch.stack(rows)
         report[name] = _ridge_probe(x, y)
     return report
+
+
+class RepresentationCollapseError(RuntimeError):
+    """Raised when the yaw/variance representation gate detects collapse."""
+
+    def __init__(self, diagnostics: Dict[str, Any]):
+        self.diagnostics = diagnostics
+        super().__init__(
+            "representation collapse gate failed: hidden yaw R^2 "
+            f"{diagnostics.get('hidden_yaw_r2')} < "
+            f"{diagnostics['thresholds']['min_hidden_yaw_r2']} while latent "
+            f"variance/rank collapsed (variance={diagnostics['latent']['mean_variance']:.3e}, "
+            f"effective_rank={diagnostics['latent']['effective_rank']:.3f})"
+        )
+
+
+def latent_variance_rank(model: Any, dataset: ActionSequenceDataset) -> Dict[str, Any]:
+    """Measure encoder spread and effective rank over all recorded frames.
+
+    Effective rank is ``exp(entropy(normalized singular-value energy))``;
+    it is 0 for a constant representation and approaches ``latent_width``
+    when variance is distributed evenly across dimensions.
+    """
+    torch, _F = _torch()
+    episodes = _episode_tensors(dataset, model.reconstruction_shape)
+    was_training = model.training
+    model.eval()
+    rows = []
+    with torch.no_grad():
+        for _episode, pixels, _targets, _actions in episodes:
+            rows.append(model.encoder(pixels))
+    if was_training:
+        model.train()
+    if not rows:
+        return {
+            "n_samples": 0,
+            "dimensions": int(model.latent_width),
+            "mean_variance": 0.0,
+            "effective_rank": 0.0,
+            "matrix_rank": 0,
+        }
+
+    latents = torch.cat(rows, dim=0)
+    centered = latents - latents.mean(dim=0, keepdim=True)
+    variances = centered.pow(2).mean(dim=0)
+    singular_values = torch.linalg.svdvals(centered)
+    energy = singular_values.pow(2)
+    total_energy = energy.sum()
+    if float(total_energy) > 0.0:
+        probabilities = energy / total_energy
+        probabilities = probabilities[probabilities > 0]
+        effective_rank = float(torch.exp(-(probabilities * probabilities.log()).sum()))
+    else:
+        effective_rank = 0.0
+    return {
+        "n_samples": int(latents.shape[0]),
+        "dimensions": int(latents.shape[1]),
+        "mean_variance": float(variances.mean()),
+        "min_variance": float(variances.min()),
+        "max_variance": float(variances.max()),
+        "effective_rank": effective_rank,
+        "matrix_rank": int(torch.linalg.matrix_rank(centered)),
+    }
+
+
+def representation_collapse_diagnostics(
+    model: Any,
+    dataset: ActionSequenceDataset,
+    *,
+    config: Optional[ActionWorldModelConfig] = None,
+) -> Dict[str, Any]:
+    """Return the yaw/variance gate report used by training and promotion.
+
+    A failure requires both a poor hidden-state yaw probe and a collapsed
+    latent distribution.  Datasets without enough yaw labels are reported
+    as non-evaluable rather than being silently called healthy or failed.
+    """
+    cfg = config or ActionWorldModelConfig()
+    latent = latent_variance_rank(model, dataset)
+    yaw_probe = linear_probe_yaw(model, dataset)
+    hidden_yaw_r2 = (
+        float(yaw_probe["hidden"]["r2"]) if "hidden" in yaw_probe else None
+    )
+    variance_collapsed = latent["mean_variance"] < cfg.collapse_gate_min_latent_variance
+    rank_collapsed = latent["effective_rank"] < cfg.collapse_gate_min_effective_rank
+    latent_collapsed = variance_collapsed or rank_collapsed
+    gate_evaluable = hidden_yaw_r2 is not None
+    yaw_collapsed = (
+        gate_evaluable and hidden_yaw_r2 < cfg.collapse_gate_min_hidden_yaw_r2
+    )
+    passed = not (yaw_collapsed and latent_collapsed) if gate_evaluable else False
+    return {
+        "passed": bool(passed),
+        "gate_evaluable": gate_evaluable,
+        "hidden_yaw_r2": hidden_yaw_r2,
+        "yaw_probe": yaw_probe,
+        "latent": latent,
+        "yaw_collapsed": bool(yaw_collapsed),
+        "variance_collapsed": variance_collapsed,
+        "rank_collapsed": rank_collapsed,
+        "latent_collapsed": latent_collapsed,
+        "thresholds": {
+            "min_hidden_yaw_r2": cfg.collapse_gate_min_hidden_yaw_r2,
+            "min_latent_variance": cfg.collapse_gate_min_latent_variance,
+            "min_effective_rank": cfg.collapse_gate_min_effective_rank,
+        },
+    }
 
 
 def _ridge_probe(x, y, l2: float = 1e-3) -> Dict[str, float]:
