@@ -91,6 +91,22 @@ test("prediction endpoint assembles forecasts recorded by a live cortex", async 
   assert.deepEqual(result.body.targets, ["target-0", "target-1", "target-2"]);
 });
 
+test("frame endpoint maps ordered decision windows in one forward pass", async (t) => {
+  const root = fixture(), dir = path.join(root, "pixel-session");
+  const frames = [0.2, 1.2, 2.2].map((timestamp, seq) => ({
+    stream_id: "vision.frame.pixels", timestamp, seq, shape: [2, 2, 3], dtype: "uint8",
+  }));
+  const decisions = [0, 1, 2].map((tick) => ({ tick_index: tick + 10, window_span: [tick, tick + 0.9] }));
+  fs.writeFileSync(path.join(dir, "episode_00000.streams.jsonl"), frames.map(JSON.stringify).join("\n") + "\n");
+  fs.writeFileSync(path.join(dir, "episode_00000.decisions.jsonl"), decisions.map(JSON.stringify).join("\n") + "\n");
+  const server = createServer({ dataDir: root }); await new Promise((resolve) => server.listen(0, resolve)); t.after(() => server.close());
+
+  const result = await get(server.address().port, "/api/sessions/pixel-session/episodes/episode_00000/frames");
+
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.frames.map((frame) => frame.tick), [10, 11, 12]);
+});
+
 async function panels() {
   const source = fs.readFileSync(path.join(__dirname, "../public/diagnostic-panels.js"), "utf8");
   return import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);

@@ -389,8 +389,10 @@ class CortexWorldModel(CoreWorldModel):
             # reset; it's still a valid (if slightly stale, pre-update)
             # encoding of this tick's real observation.
             pending_latent = self._latent
+            pending_live_prediction = self._latest_live_prediction
             self.consolidator.publish_to(self)
             self._latent = pending_latent
+            self._latest_live_prediction = pending_live_prediction
             if self.checkpoint_path is not None:
                 # In-memory-only weights are lost on episode end, a crash, or
                 # KeyboardInterrupt -- persist every publish so a completed

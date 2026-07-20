@@ -222,6 +222,24 @@ def test_record_transition_keeps_firing_after_every_consolidation_cadence():
     assert len(fake.recorded) == 4
 
 
+def test_consolidation_publish_preserves_this_ticks_live_prediction():
+    """A publish resets rolling episode state inside ``predict()``, but the
+    decoded forecast already produced for this tick must remain available to
+    the recorder after ``predict()`` returns."""
+    fake = FakeConsolidator()
+    wm = CortexWorldModel(
+        _small_cortex(), action_keys=_ACTION_KEYS, consolidator=fake,
+        consolidate_every_ticks=1, consolidation_steps=1,
+    )
+
+    _run_ticks(wm, 1)
+
+    assert fake.publish_calls == 1
+    live = wm.live_prediction_record()
+    assert live is not None
+    assert set(live["frames"]) == {"1", "4"}
+
+
 def test_consolidation_publish_persists_checkpoint_to_disk(tmp_path):
     """Issue #175 review (P1): with `--async-trainer`, `publish_to`'s
     in-memory weight update was the only hand-off -- nothing wrote the

@@ -93,16 +93,24 @@ function loadFrameIndex(dir) {
 function readEpisodeFrames(dir, sid, eid) {
   const records = readStreams(dir, eid); if (!records) return null;
   const decisions = readDecisions(dir, eid) || [];
+  const decisionWindows = decisions.flatMap((decision) => {
+    const span = decision.window_span;
+    return Array.isArray(span) && span.length >= 2
+      ? [{ start: Number(span[0]), end: Number(span[1]), tick: decision.tick_index }]
+      : [];
+  });
+  let decisionIndex = 0;
   const index = loadFrameIndex(dir), bins = new Map(), frames = [];
   let shape = null, dtype = null;
   for (const rec of records) {
     if (rec.stream_id !== "vision.frame.pixels") continue;
     shape = rec.shape ?? shape; dtype = rec.dtype ?? dtype;
-    const matchingDecision = decisions.find((decision) => {
-      const span = decision.window_span;
-      return Array.isArray(span) && rec.timestamp >= span[0] && rec.timestamp <= span[1];
-    });
-    const entry = { i: frames.length, t: rec.timestamp, tick: matchingDecision?.tick_index ?? rec.seq ?? frames.length,
+    while (decisionIndex < decisionWindows.length && rec.timestamp > decisionWindows[decisionIndex].end) {
+      decisionIndex += 1;
+    }
+    const window = decisionWindows[decisionIndex];
+    const matchingTick = window && rec.timestamp >= window.start && rec.timestamp <= window.end ? window.tick : null;
+    const entry = { i: frames.length, t: rec.timestamp, tick: matchingTick ?? rec.seq ?? frames.length,
       seq: rec.seq, hash: rec.frame_ref ?? null, data: null };
     const loc = entry.hash ? index.get(entry.hash) : null;
     if (loc && !rec.elided) {
