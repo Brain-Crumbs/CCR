@@ -39,6 +39,7 @@ from cognitive_runtime.core.world_model import Prediction
 from development.definitions import MOTOR_FREEDOMS, CurriculumStageSpec
 from motor.reflexes import (
     CaregiverChannel,
+    MotorDecision,
     ReflexStack,
     Stimulus,
     stimulus_from_attention,
@@ -99,6 +100,7 @@ class MotorFreedomPolicy(SingleActionPolicy):
         self.caregiver = caregiver
         self.stimuli = tuple(stimuli)
         self.goal = goal
+        self.latest_motor_decision: Optional[MotorDecision] = None
 
     def reset(self) -> None:
         if self.scripted is not None:
@@ -135,6 +137,9 @@ class MotorFreedomPolicy(SingleActionPolicy):
 
     def decide(self, state: State, memory: Memory, prediction: Optional[Prediction]) -> Action:
         if self.motor_freedom == "frozen":
+            self.latest_motor_decision = MotorDecision(
+                NULL_ACTION, reflex=None, caregiver_override=None, actuated=NULL_ACTION,
+            )
             return NULL_ACTION
 
         if self.motor_freedom == "overridden":
@@ -142,18 +147,29 @@ class MotorFreedomPolicy(SingleActionPolicy):
             voluntary_action = _single_action(self.scripted, state, memory, prediction)
             if self.reflexes is None:
                 caregiver_override = self.caregiver.drain() if self.caregiver is not None else None
-                return caregiver_override.action if caregiver_override is not None else voluntary_action
+                actuated = caregiver_override.action if caregiver_override is not None else voluntary_action
+                self.latest_motor_decision = MotorDecision(
+                    voluntary_action, reflex=None, caregiver_override=caregiver_override, actuated=actuated,
+                )
+                return actuated
             caregiver_override = self.caregiver.drain() if self.caregiver is not None else None
-            return self.reflexes.decide(voluntary_action, self.stimuli, caregiver_override).actuated
+            decision = self.reflexes.decide(voluntary_action, self.stimuli, caregiver_override)
+            self.latest_motor_decision = decision
+            return decision.actuated
 
         # "learned": Objects/Foraging hand control to the voluntary path.
         assert self.voluntary is not None
         voluntary_action = self.voluntary.choose(state, self.action_space, self.goal)
         if self.reflexes is None:
+            self.latest_motor_decision = MotorDecision(
+                voluntary_action, reflex=None, caregiver_override=None, actuated=voluntary_action,
+            )
             return voluntary_action
         # No caregiver channel drives a learned-motor stage, by design --
         # `self.caregiver` (if any) is deliberately never drained here.
-        return self.reflexes.decide(voluntary_action, self.stimuli, None).actuated
+        decision = self.reflexes.decide(voluntary_action, self.stimuli, None)
+        self.latest_motor_decision = decision
+        return decision.actuated
 
 
 def build_stage_policy(

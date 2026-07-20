@@ -1,5 +1,6 @@
 """World-agnostic motor control primitives."""
 
+from motor.cortex_mpc import build_cortex_mpc, cortex_mpc_factory
 from motor.reflexes import (
     AttentionStimulusSource,
     CaregiverChannel,
@@ -28,7 +29,9 @@ __all__ = [
     "ReflexStack",
     "Stimulus",
     "VoluntaryController",
+    "build_cortex_mpc",
     "build_voluntary_controller",
+    "cortex_mpc_factory",
     "default_reflex_genome",
     "eligible_orienting_stimuli",
     "stimulus_from_attention",

@@ -94,10 +94,18 @@ class CortexWorldModel(CoreWorldModel):
         # last tick -- compared against the actually-observed latent to score
         # this tick's prediction error. ``None`` at episode start.
         self._predicted_latent: Optional[torch.Tensor] = None
+        # The most recently encoded observation latent and the hidden state
+        # *before* predict()'s one-step advance — exposed for the cortex MPC
+        # predictor (issue #168), which evaluates each candidate action from
+        # the same pre-advance starting point.
+        self._latent: Optional[torch.Tensor] = None
+        self._pre_advance_hidden = None
 
     def reset(self) -> None:
         self._hidden = None
         self._predicted_latent = None
+        self._latent = None
+        self._pre_advance_hidden = None
 
     def _last_action_column(self, memory: Memory) -> torch.Tensor:
         """The last emitted action as a ``Tensor[1]`` index column (0 -- the
@@ -139,6 +147,11 @@ class CortexWorldModel(CoreWorldModel):
             prediction_error: Optional[float] = None
             if self._predicted_latent is not None:
                 prediction_error = float(F.mse_loss(latent, self._predicted_latent))
+
+            # Snapshot for cortex MPC (issue #168): the encoded observation
+            # and the hidden state *before* the one-step advance below.
+            self._latent = latent
+            self._pre_advance_hidden = self._hidden
 
             # Closed-loop rollout from the current world state, repeating the
             # last action across every horizon (steady-state assumption). The

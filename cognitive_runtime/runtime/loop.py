@@ -696,6 +696,10 @@ class CognitiveRuntime:
             if self._observe_external_streams is not None:
                 self._observe_external_streams({**modulation_payloads, **neuromod_payloads})
 
+            motor_decision_attr = getattr(self.policy, "latest_motor_decision", None)
+            motor_decision_record = (
+                motor_decision_attr.to_dict() if motor_decision_attr is not None else None
+            )
             self.recorder.write_cognitive_tick(
                 sensory_events=window.events,
                 motor_events=motor_events,
@@ -721,6 +725,7 @@ class CognitiveRuntime:
                     attention=attention_state.to_dict(),
                     reflex=reflex_decision.to_dict() if reflex_decision is not None else None,
                     arbiter_mode=arbiter_payload,
+                    motor_decision=motor_decision_record,
                 ),
             )
 
