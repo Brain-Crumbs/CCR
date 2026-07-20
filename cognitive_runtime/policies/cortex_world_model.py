@@ -155,6 +155,7 @@ class CortexWorldModel(CoreWorldModel):
         self._predicted_latent = None
         self._latent = None
         self._pre_advance_hidden = None
+        self._retrieval_surprise = 0.0
         self._last_recalls = ()
 
     def _recall_into_context(self, memory: Memory) -> float:
@@ -171,30 +172,39 @@ class CortexWorldModel(CoreWorldModel):
             current_cortex_version=self.cortex_version,
             config=self.retrieval_config,
         )
-        compatible = tuple(
+        best_first = tuple(
             recall
             for recall in recalls
             if len(self._recall_token(recall)) == self.model.latent_width
         )
-        if not compatible:
+        if not best_first:
             return 0.0
+
+        # ``retrieve`` ranks best-to-worst, while context is chronological:
+        # the last injected token sits nearest the next live input. Keep only
+        # recalls the configured window can hold, then inject weakest-to-best
+        # so truncation/the following live step discard weaker matches first.
+        context_capacity = self.model.context_length_max
+        if context_capacity is not None:
+            best_first = best_first[:context_capacity]
+        injection_order = tuple(reversed(best_first))
 
         parameter = next(self.model.parameters())
         recalled_latents = torch.tensor(
-            [[self._recall_token(recall) for recall in compatible]],
+            [[self._recall_token(recall) for recall in injection_order]],
             dtype=parameter.dtype,
             device=parameter.device,
         )
         recalled_actions = torch.tensor(
-            [[self._seed_action_index(recall) for recall in compatible]],
+            [[self._seed_action_index(recall) for recall in injection_order]],
             dtype=torch.long,
             device=parameter.device,
         )
         self._hidden = self.model.inject_context(
             recalled_latents, recalled_actions, self._hidden
         )
-        self._last_recalls = compatible
-        return max(self._recall_threat(recall) for recall in compatible)
+        self._last_recalls = best_first
+        return max(self._recall_threat(recall) for recall in best_first)
 
     @staticmethod
     def _recall_token(recall: Recall) -> list[float]:

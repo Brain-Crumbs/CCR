@@ -132,6 +132,13 @@ def test_hidden_state_persists_across_ticks_and_resets_between_episodes():
     assert first_of_next_episode.prediction_error is None
 
 
+def test_reset_clears_retrieval_surprise_before_next_episode():
+    wm = CortexWorldModel(_small_cortex(), action_keys=_ACTION_KEYS)
+    wm.set_retrieval_surprise(0.9)
+    wm.reset()
+    assert wm._retrieval_surprise == 0.0
+
+
 def test_mismatched_pixel_shape_is_rejected():
     wm = CortexWorldModel(_small_cortex(pixel_shape=(8, 8, 3)), action_keys=_ACTION_KEYS)
     memory = Memory()
@@ -205,6 +212,52 @@ def test_recalled_threat_raises_amygdala_before_live_threat_arrives():
     assert prediction.recalled_threat == pytest.approx(0.95)
     assert prediction.risk >= 0.95
     assert warned > calm
+
+
+def test_strongest_recall_is_retained_nearest_live_token():
+    model = PredictiveCortex(
+        (8, 8, 3),
+        _ACTION_KEYS,
+        PredictiveCortexConfig(
+            latent_width=8,
+            hidden_dim=16,
+            reconstruction_size=8,
+            horizons_ticks=(1,),
+            backbone="transformer",
+            context_length=2,
+        ),
+    )
+    world_model = CortexWorldModel(model, action_keys=_ACTION_KEYS)
+    hippocampus = Hippocampus()
+    query = [1.0, 0.0]
+    for key, marker in (
+        ([1.0, 0.0], 1.0),
+        ([0.99, 0.1], 2.0),
+        ([0.8, 0.6], 3.0),
+    ):
+        hippocampus.encode(
+            z=key,
+            actions=["noop"],
+            tags=SeedTags(),
+            cortex_version=0,
+            context_z=[marker] + [0.0] * 7,
+        )
+    world_model.configure_retrieval(hippocampus)
+    world_model.set_retrieval_surprise(1.0)
+    memory = _memory_with_frame_and_fused(
+        np.zeros((8, 8, 3), dtype=np.uint8), query
+    )
+
+    prediction = world_model.predict(State(observation=None), memory)
+
+    assert prediction.recalled_seed_count == 2
+    assert [
+        recall.seed.context_z[0] for recall in world_model._last_recalls
+    ] == [1.0, 2.0]
+    # After the current live token is appended, a two-slot window contains
+    # [strongest recall, live token]; weaker matches were discarded first.
+    buffer, _hidden = world_model._hidden
+    assert buffer[0, 0, 0] == pytest.approx(1.0)
 
 
 def test_c2_live_bridge_uses_fused_workspace_and_efference_copy():
