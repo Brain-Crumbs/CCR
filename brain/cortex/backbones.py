@@ -258,18 +258,22 @@ class TransformerBackbone(_WindowedBackbone):
     def forward_sequence(self, inputs: torch.Tensor) -> torch.Tensor:
         if inputs.ndim != 3:
             raise ValueError(f"inputs must be [B, T, D], got {tuple(inputs.shape)}")
-        length = inputs.shape[1]
-        # C1 trains every prefix in one attention call.  Positions repeat at
-        # the configured window length; C3 replaces this bounded embedding
-        # with a length-extrapolating position encoding.
-        positions = torch.arange(length, device=inputs.device) % self.context_length_max
-        projected = self.input_proj(inputs) + self.position_embedding(positions).unsqueeze(0)
-        indices = torch.arange(length, device=inputs.device)
-        distance = indices[:, None] - indices[None, :]
-        visible = (distance >= 0) & (distance < self._current_context)
-        mask = torch.zeros(length, length, device=inputs.device)
-        mask.masked_fill_(~visible, float("-inf"))
-        return self.encoder(projected, mask=mask)
+        batch, length, input_dim = inputs.shape
+        context = self._current_context
+        # Build every sliding window as a batch item.  This is still an
+        # all-positions parallel pass, and it exactly matches ``step``: the
+        # newest token always occupies the final (and therefore identical)
+        # position-embedding slot in its causal window.
+        padded = torch.cat(
+            [inputs.new_zeros(batch, context - 1, input_dim), inputs], dim=1
+        )
+        windows = padded.unfold(1, context, 1).permute(0, 1, 3, 2)
+        windows = windows.contiguous().reshape(batch * length, context, input_dim)
+        positions = torch.arange(context, device=inputs.device)
+        projected = self.input_proj(windows) + self.position_embedding(positions).unsqueeze(0)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(context).to(inputs.device)
+        encoded = self.encoder(projected, mask=causal_mask)
+        return encoded[:, -1].reshape(batch, length, self.hidden_dim)
 
 
 _BACKBONES.update(

@@ -110,6 +110,21 @@ def test_backbone_forward_sequence_returns_all_causal_positions(name):
     assert torch.allclose(output[:, :5], output_changed[:, :5])
 
 
+def test_transformer_forward_sequence_matches_repeated_step_windows():
+    """C1 training must use the same positional layout as live rollout."""
+    backbone = build_backbone("transformer", input_dim=10, hidden_dim=12, context_length=4)
+    backbone.eval()
+    inputs = torch.randn(2, 7, 10)
+    with torch.no_grad():
+        sequence = backbone.forward_sequence(inputs)
+        state = backbone.initial_state(inputs.shape[0])
+        stepped = []
+        for index in range(inputs.shape[1]):
+            hidden, state = backbone.step(inputs[:, index], state)
+            stepped.append(hidden)
+    assert torch.allclose(sequence, torch.stack(stepped, dim=1), atol=1e-6)
+
+
 @pytest.mark.parametrize("name", BACKBONES)
 def test_backbone_context_length_max_matches_windowed_or_unbounded(name):
     backbone = build_backbone(name, input_dim=6, hidden_dim=8, context_length=5)
@@ -262,6 +277,18 @@ def test_autoregressive_objective_trains_every_backbone(turn_session, name):
     assert len(stats["loss_curves"]["closed_loop_loss"]) == cfg.epochs
 
 
+def test_autoregressive_objective_converts_tick_horizons_to_frame_offsets(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    for episode in dataset.episodes:
+        episode.ticks = [tick * 2 for tick in episode.ticks]
+    _model, stats = train_action_world_model(
+        dataset,
+        _small_model_config(training_objective="autoregressive", horizons_ticks=(1, 4)),
+    )
+    assert stats["autoregressive_horizons_ticks"] == [1, 4]
+    assert stats["autoregressive_horizons"] == [1, 2]
+
+
 # --------------------------------------------------------------- context-length curriculum
 
 
@@ -343,6 +370,25 @@ def test_checkpoint_round_trips_backbone_choice(turn_session, name, tmp_path):
     assert report_before["horizons"][1]["model_mse"] == pytest.approx(
         report_after["horizons"][1]["model_mse"], rel=1e-5
     )
+
+
+def test_checkpoint_before_c1_direct_heads_still_loads(turn_session, tmp_path):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, stats = train_action_world_model(
+        dataset, _small_model_config(horizons_ticks=(1, 3))
+    )
+    path = str(tmp_path / "pre-c1.pt")
+    save_action_world_model(path, model, stats)
+    payload = torch.load(path, weights_only=False)
+    payload["state_dict"] = {
+        key: value
+        for key, value in payload["state_dict"].items()
+        if not key.startswith("multi_token_heads.")
+    }
+    torch.save(payload, path)
+
+    loaded, _stats = load_action_world_model(path)
+    assert "3" in loaded.multi_token_heads
 
 
 # --------------------------------------------------------------- benchmark harness
