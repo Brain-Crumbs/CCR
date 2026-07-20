@@ -31,12 +31,19 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 from cognitive_runtime.core.action import NULL_ACTION, Action
+from cognitive_runtime.core.attention import AttentionState
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.perception import State
 from cognitive_runtime.core.policy import Policy, SingleActionPolicy
 from cognitive_runtime.core.world_model import Prediction
 from development.definitions import MOTOR_FREEDOMS, CurriculumStageSpec
-from motor.reflexes import CaregiverChannel, ReflexStack, Stimulus
+from motor.reflexes import (
+    CaregiverChannel,
+    ReflexStack,
+    Stimulus,
+    stimulus_from_attention,
+    stimulus_from_threat,
+)
 from motor.voluntary import VoluntaryController
 
 
@@ -96,6 +103,35 @@ class MotorFreedomPolicy(SingleActionPolicy):
     def reset(self) -> None:
         if self.scripted is not None:
             self.scripted.reset()
+        if self.reflexes is not None:
+            self.reflexes.reset()
+
+    def set_stimuli(self, stimuli: Sequence[Stimulus]) -> None:
+        """Replace the World stimuli consumed on the next motor tick.
+
+        Worlds call this as their observations change; storing an immutable
+        snapshot keeps one-shot iterables safe without freezing stimuli at
+        construction time.
+        """
+        self.stimuli = tuple(stimuli)
+
+    def update_runtime_stimuli(
+        self, attention_state: Optional[AttentionState], threat: float
+    ) -> None:
+        """Refresh reflex inputs from the runtime's current cognitive tick.
+
+        ``threat`` is the Amygdala's most recently appraised adrenaline
+        level (internal signals are intentionally one tick lagged), while
+        attention is computed from the current sensory window.
+        """
+        stimuli = []
+        if attention_state is not None:
+            attention_stimulus = stimulus_from_attention(attention_state)
+            if attention_stimulus is not None:
+                stimuli.append(attention_stimulus)
+        if threat > 0.0:
+            stimuli.append(stimulus_from_threat(threat))
+        self.set_stimuli(stimuli)
 
     def decide(self, state: State, memory: Memory, prediction: Optional[Prediction]) -> Action:
         if self.motor_freedom == "frozen":

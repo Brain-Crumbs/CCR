@@ -112,7 +112,7 @@ class _WindowedBackbone(TemporalBackbone):
 
     def set_context_length(self, n: Optional[int]) -> None:
         limit = self.context_length_max or 1
-        self._current_context = max(1, min(int(n), limit)) if n else limit
+        self._current_context = max(1, min(int(n), limit)) if n is not None else limit
 
     def initial_state(self, batch: int) -> Tuple[torch.Tensor, torch.Tensor]:
         device_param = next(self.parameters())

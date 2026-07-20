@@ -46,6 +46,36 @@ def test_milestone0_null_policy_runs_at_fixed_tick_rate(tmp_path):
     assert runtime.scheduler.stats.ticks == 200  # per-episode, reset each episode
 
 
+def test_runtime_refreshes_motor_policy_stimuli_before_every_decision(tmp_path):
+    """A construction-time threat must not stay frozen through a live run."""
+    from cognitive_runtime.core.action import Action
+    from motor.organism_policy import MotorFreedomPolicy
+    from motor.reflexes import ReflexConfig, ReflexStack, Stimulus
+    from motor.voluntary import CallableController
+
+    forward = Action("MOVE_FORWARD")
+    backward = Action("MOVE_BACKWARD")
+    reflexes = ReflexStack([
+        ReflexConfig("withdraw", "threat", backward, threshold=0.5, priority=10),
+    ])
+    voluntary = CallableController("stub", lambda state, actions, goal: forward)
+    policy = MotorFreedomPolicy(
+        "learned", [forward, backward], voluntary=voluntary, reflexes=reflexes,
+        stimuli=[Stimulus("threat", 1.0)],
+    )
+    config = RuntimeConfig(
+        episodes=1, seed=0, max_ticks_per_episode=3,
+        record=False, program_config=FAST_CONFIG,
+    )
+
+    CognitiveRuntime(
+        program=MinecraftSurvivalBox(config=FAST_CONFIG), policy=policy, config=config,
+    ).run()
+
+    assert reflexes.ticks == 3
+    assert reflexes.reflex_ticks == 0
+
+
 def test_realtime_scheduler_holds_tick_rate():
     scheduler = FixedTickScheduler(tick_rate=200.0, realtime=True)
     for _ in range(20):

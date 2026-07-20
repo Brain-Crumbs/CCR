@@ -541,6 +541,13 @@ class CognitiveRuntime:
                     window.ended_at,
                     source="model",
                 )
+            # Policies with an organism-owned reflex stack consume fresh
+            # stimuli every cognitive tick. Keep this duck-typed so the core
+            # runtime does not depend on the optional motor implementation;
+            # ordinary policies expose no hook and remain unchanged.
+            update_runtime_stimuli = getattr(self.policy, "update_runtime_stimuli", None)
+            if callable(update_runtime_stimuli):
+                update_runtime_stimuli(attention_state, self.amygdala.level)
             emissions = self.policy.emit(state, self.memory, prediction)
             # Scripted orienting reflex (issue #60): may substitute a
             # look/turn action for the policy's this tick -- never when the

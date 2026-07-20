@@ -8,10 +8,11 @@ controllers interchangeable.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
-from cognitive_runtime.core.action import Action
+from cognitive_runtime.core.action import NULL_ACTION, Action
 
 
 class VoluntaryController(Protocol):
@@ -54,7 +55,11 @@ class MPCController:
         else:
             with torch.no_grad():
                 scores = [evaluate(action) for action in actions]
-        return actions[max(range(len(actions)), key=scores.__getitem__)]
+        # Treat an invalid model score as the worst possible prediction.
+        # This preserves deterministic action-space tie-breaking even when
+        # every scorer result is NaN.
+        safe_scores = [float("-inf") if math.isnan(score) else score for score in scores]
+        return actions[max(range(len(actions)), key=safe_scores.__getitem__)]
 
 
 @dataclass
@@ -66,7 +71,10 @@ class CallableController:
 
     def choose(self, state: Any, actions: Sequence[Action], goal: Any = None) -> Action:
         action = self.chooser(state, actions, goal)
-        if action not in actions:
+        # NULL is the universal explicit "do nothing" motor result. Policy
+        # heads represent it as an empty emission, so it remains valid even
+        # when a World offers only its actuated actions to this chooser.
+        if action != NULL_ACTION and action not in actions:
             raise ValueError(f"{self.name} chose action outside the World action space: {action}")
         return action
 

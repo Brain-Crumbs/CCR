@@ -115,6 +115,11 @@ class ReflexStack:
         self.reflex_ticks += reflex is not None
         return MotorDecision(voluntary, reflex, caregiver, actuated)
 
+    def reset(self) -> None:
+        """Clear per-episode activation counters."""
+        self.ticks = 0
+        self.reflex_ticks = 0
+
     @property
     def activation_rate(self) -> float:
         return self.reflex_ticks / self.ticks if self.ticks else 0.0
@@ -179,7 +184,7 @@ def stimulus_from_attention(attention_state: AttentionState) -> Optional[Stimulu
     if reason is None or reason.signal.direction is None:
         return None
     bearing = reason.signal.direction.bearing_deg
-    if bearing is None:
+    if bearing is None or bearing == 0:
         return None
     kind = "salience-right" if bearing > 0 else "salience-left"
     return Stimulus(kind, abs(bearing), source=attention_state.focus_stream,
