@@ -1,117 +1,199 @@
-# Continuous Cognitive Runtime
+# CCR — Train a CNN World Model That Builds Like an LLM
 
-A research-oriented AI runtime designed to **continuously inhabit interactive
-worlds**. Unlike a chatbot or task-specific agent, the system does not wait
-for prompts: it observes, updates memory, predicts, decides whether to act,
-and either acts or deliberately remains idle — every tick, forever.
+A research project for growing a **Predictive Cortex**: a recurrent,
+action-conditioned CNN world model that learns to predict its own future
+senses, trained incrementally from recorded experience — record scenarios,
+train, measure, repeat.
+
+The measurable claim: **the cortex beats a copy-last-frame baseline on
+held-out seeds at every prediction horizon, and withholding action
+information measurably hurts its predictions** (Milestone 2).
 
 ```
-Runtime + Program = Experience
+Record scenarios  →  Quality-gate the data  →  Train the Predictive Cortex
+     →  Evaluate on held-out seeds  →  Analyze results
 ```
 
-- **Runtime** — the always-running cognitive system (perception, memory,
-  world model, policy, learning, recording). Environment-agnostic.
-- **Program** — an environment the runtime can inhabit (Minecraft, ToyOS,
-  a Linux VM, a browser, a future AI-native OS). Programs create experiences.
-- **Experience** — the interaction between the two; what the runtime learns from.
+## Getting started
 
-This repository contains the runtime core and the first Program:
-**MinecraftSurvivalBox** — survive as long as possible in a constrained
-survival world. See [docs/history/minecraft-mvp.md](docs/history/minecraft-mvp.md).
+### Notebook (recommended)
 
-> The MVP ships with a deterministic *simulated* survival backend so the
-> entire stack — continuous loop, rewards, recording, replay, baselines,
-> behavioral cloning — runs end to end with zero dependencies and no
-> Minecraft server. A **real-Minecraft backend** (`--backend remote`) plugs in
-> behind the same adapter seam (`SurvivalBackend`) via a mineflayer bridge,
-> without touching the runtime — see
-> [bridge/mineflayer/README.md](bridge/mineflayer/README.md).
-
-## Quick start
-
-Requires Python ≥ 3.10. No dependencies for the core stack (pytest for tests).
-Pixel-vision neural training/inference is opt-in: `pip install -e .[neural]`
-pulls PyTorch; everything else runs without it.
+The primary entrypoint is the Jupyter notebook — it runs the full pipeline
+end-to-end in one place: record, gate, train, evaluate, diagnose.
 
 ```bash
-# Milestone 0: the continuous loop with the null policy
-python -m cognitive_runtime run --policy null --episodes 1
+pip install -e ".[neural]"      # installs PyTorch + Crafter + all deps
+jupyter notebook notebooks/build_and_diagnose_organism.ipynb
+```
 
-# Baselines with recording (sessions/ by default).  Add --record-frames when
-# the session is destined for training: frames are logged hash-only otherwise,
-# so the latent policy's vision features would train blind.
-python -m cognitive_runtime run --world minecraft --policy scripted --episodes 3 --record-frames
+The notebook walks through every step with inline results and plots. Start
+here if you want to understand the project or reproduce the results.
 
-# Real-time multi-rate streaming: hold 20 Hz in wall-clock time, vision paced
-# to 10 Hz and a 2 Hz body heartbeat (see docs/streams.md). Still replayable.
-python -m cognitive_runtime run --world minecraft --policy scripted --realtime --episode-ticks 200
+### CLI
 
-# Compare baseline policies on identical episode seeds
-python -m cognitive_runtime evaluate --policies null,random,scripted --episodes 3
+Every notebook step has a CLI equivalent for scripting, CI, or headless runs.
 
-# Play yourself; the session becomes imitation-learning data
-python -m cognitive_runtime demo
+```bash
+pip install -e ".[neural]"
+```
 
-# Train the first learned policy (behavioral cloning) from any session(s)
-python -m cognitive_runtime train --sessions sessions/<session-id> --out models/bc.json
+#### 1. Record nursery scenarios (train + holdout data)
 
-# Evaluate the learned policy against the baselines
-python -m cognitive_runtime evaluate --policies random,scripted,learned --model models/bc.json
+The nursery records scripted micro-scenarios in Crafter (a deterministic,
+pip-installable 2-D world) with pixel frames at multiple seeds, splitting
+into train and holdout sets.
 
-# Train a pixel-vision CNN end to end: it learns its own vision from the RGB
-# vision.frame.pixels stream (needs frames in the log + the optional neural extra)
-#   pip install -e .[neural]
-python -m cognitive_runtime train --model-type neural \
-    --sessions sessions/<session-id> --out models/vision_bc.pt
-python -m cognitive_runtime evaluate --policies scripted,neural --model models/vision_bc.pt
+```bash
+# List available scenarios
+ccr nursery list
 
-# Multi-horizon, uncertainty-aware world model (issue #39): predicts
-# next_latent/reward/terminal/risk at t+1/t+10/t+100 (configurable), each with
-# a learned uncertainty, and reports per-horizon copy-last/mean baselines.
-python -m cognitive_runtime train --model-type multi-horizon-world-model \
-    --sessions sessions/<session-id> --horizons 1 10 100 --out models/multi_horizon_world_model.pt
+# Record one scenario (train seeds 0-5, holdout seeds 6-7, 400 ticks each)
+ccr nursery run walk_forward --record-dir runs/Pixel --name Pixel
 
-# Ego-motion canary (issue #39): records walk_forward (constant MOVE_FORWARD)
-# episodes at multiple seeds, pretrains a next-frame predictor on a
-# train-seed subset only, and evaluates held-out-seed next-frame prediction
-# (PSNR/SSIM) against copy-last-frame/mean-frame baselines.
-python -m cognitive_runtime ego-motion-canary --record-dir sessions \
-    --train-seeds 6 --holdout-seeds 2
+# Record all scenarios at once
+ccr nursery run all --record-dir runs/Pixel --name Pixel
+```
 
-# Nursery scenario suite (issue #62): scripted micro-scenarios --
-# walk_forward, turn_in_place, strafe_and_stop, object_permanence,
-# day_night, approach_entity -- generalizing the ego-motion canary above
-# into stage zero of docs/curriculum.md. Each scenario benchmarks
-# multi-horizon next-frame prediction the same way; object_permanence also
-# reports whether entity-persistence training beats a forget-immediately
-# baseline, and every held-out episode gets a rendered dream strip.
-python -m cognitive_runtime nursery list
-python -m cognitive_runtime nursery run all --record-dir sessions
-# With CCR_MINECRAFT_HOST set, nursery defaults to the remote backend; otherwise
-# pass it explicitly for live-server nursery recordings.
-CCR_MINECRAFT_HOST=localhost python -m cognitive_runtime nursery run walk_forward \
-    --backend remote --record-dir sessions --out-dir models/nursery
+#### 2. Train the Predictive Cortex (joint world model)
 
-# Evaluation gates (issue #31): train actor/critic + linear online-Q,
-# eval both plus scripted/random on identical seeds, and report the three
-# deprecation gates. Records eval sessions for the dashboard + writes the gate
-# report into the checkpoint. --reproducible adds gate 3; --curriculum picks a
-# larger preset for manual runs (needs the neural extra).
-python -m cognitive_runtime evaluation-gates --reproducible \
-    --checkpoint models/actor-critic.pt --record-dir sessions
-python -m cognitive_runtime dashboard --record-dir sessions
+Train one recurrent, action-conditioned world model across all recorded
+scenarios. The cortex predicts future pixel frames and latent states at
+configurable horizons (default t+1, t+10, t+100).
 
-# Replay a recorded session and verify tick-for-tick determinism
-python -m cognitive_runtime replay --session sessions/<session-id>
+```bash
+ccr nursery joint \
+    --record-dir runs/Pixel \
+    --epochs 30 \
+    --backbone gru \
+    --training-objective autoregressive \
+    --out-dir models/Pixel \
+    --report results/joint-report.json
+```
 
-# Inspect an episode / aggregate metrics across sessions
-python -m cognitive_runtime view --session sessions/<session-id> --episode episode_00000
-python -m cognitive_runtime dashboard
+#### 3. Evaluate: does the cortex beat baselines?
 
-# Inhabit a real Minecraft server via the mineflayer bridge (see
-# bridge/mineflayer/README.md): npm install once, point at your server, then:
-CCR_MINECRAFT_HOST=localhost python -m cognitive_runtime run \
-    --backend remote --realtime --policy scripted --episode-ticks 400 --record-frames
+The nursery evaluation compares the trained model against copy-last-frame
+and mean-frame baselines on held-out seeds, reports per-horizon metrics
+(MSE, PSNR, SSIM), checks for frozen rollouts (a collapsed model), and
+runs a yaw linear probe on the hidden state.
+
+```bash
+# Per-scenario evaluation (run during nursery run)
+ccr nursery run walk_forward --record-dir runs/Pixel --out-dir models/Pixel --name Pixel
+
+# Joint evaluation with zero-shot held-out scenarios
+ccr nursery joint --record-dir runs/Pixel --out-dir models/Pixel --report results/report.json
+```
+
+#### 4. Inspect results in the clinic
+
+The clinic is a browser-based viewer that shows dream strips (predicted vs
+actual frames at each horizon), neuromodulator timelines, and data-quality
+diagnostics.
+
+```bash
+node viewer/server.js --data-dir runs/Pixel
+# open http://localhost:8787
+```
+
+### What each command does
+
+| Command | Purpose |
+|---|---|
+| `ccr nursery list` | List available nursery scenarios |
+| `ccr nursery run <scenario\|all>` | Record train/holdout episodes, train a pixel encoder, evaluate per-scenario |
+| `ccr nursery joint` | Train ONE joint world model across all scenarios, evaluate in-distribution + zero-shot |
+| `ccr nursery backbone-benchmark` | Compare GRU vs dilated-conv vs transformer backbones on identical data |
+| `ccr run` | Run the live cognitive loop (Crafter by default) |
+| `ccr train --model-type ...` | Offline training for specific model types (neural, world-model, etc.) |
+| `ccr evaluate` | Compare baseline policies on identical episodes |
+| `ccr statistical-evaluate` | Mean +/- CI evaluation over N episodes with regression flagging |
+| `ccr dashboard` | Aggregate metrics across recorded sessions |
+| `ccr replay --session <path>` | Replay a recorded session and verify determinism |
+| `ccr view --session <path> --episode <id>` | Inspect a single recorded episode |
+| `ccr review --session <path>` | Post-run session review with baseline comparison |
+
+Run `ccr <command> --help` for full option details.
+
+## What gets measured
+
+The project has explicit milestones with falsifiable acceptance criteria:
+
+**Milestone 2 — Prediction quality (the core result):**
+- (a) The cortex beats copy-last-frame at every horizon on held-out seeds
+- (b) Withholding actions from the model measurably hurts predictions
+  (action-ablation test)
+- No frozen rollouts (the model hasn't collapsed to a fixed point)
+
+**Milestone 4 — Dreams:**
+- Hippocampal seeds replay generatively through the cortex
+- Dream strips (predicted vs actual) are viewable and exported
+
+**Milestone 5 — Forgetting (the sharp research bet):**
+- Developmental staging + generative replay produces measurably less
+  catastrophic forgetting than flat training on the same data
+
+**Representation quality:**
+- The hidden state linearly decodes heading (yaw probe)
+- No latent collapse (effective rank, variance checks)
+- Reward/terminal/risk/uncertainty heads beat constant-predictor baselines
+
+## Project structure
+
+```
+notebooks/
+  build_and_diagnose_organism.ipynb    ** START HERE ** — full pipeline
+
+cognitive_runtime/
+  cli.py               CLI entrypoint (ccr command)
+  core/                Program interface, streams, memory, fusion, policy
+  runtime/             Tick loop, scheduler, recorder, replay
+  programs/
+    crafter/           Crafter nursery world (default)
+    minecraft/         Legacy survival-economy world (opt-in via --world minecraft)
+  training/            Dataset builders, nursery runner, evaluation harnesses
+  neural/              Trainable stream encoders, pixel encoder, world model
+  policies/            null, random, scripted, learned, neural, cortex world model
+  tools/               Episode viewer, dashboard, replay runner, review
+
+brain/
+  cortex/              PredictiveCortex — the recurrent action-conditioned world model
+  hippocampus.py       Episodic seed store for dreaming and recall
+  amygdala.py          Threat estimation from prediction error
+  arbiter.py           Mode selection (reward-seeking / info-gathering / fight-or-flight)
+  neuromod/            Neuromodulator signals (dopamine, acetylcholine, adrenaline)
+  calibration.py       Rolling-holdout surprise calibrator
+
+sleep/
+  dream.py             Generative world-model rollouts from hippocampal seeds
+  cortex_consolidation.py  Online cortex learning from replay
+  replay_mix.py        Generative replay mixer (real + dream transitions)
+  forgetting.py        CI-refereed forgetting metric
+
+motor/
+  voluntary.py         MPC over the world model
+  reflexes.py          Hardcoded reflex stack (orienting, threat withdrawal)
+  policy.py            Reflex-override precedence
+
+development/           Developmental ladder with gated stage promotion
+viewer/                Browser-based clinic (Node/JS, read-only diagnostics)
+docs/v2/               V2 design docs (architecture, phases, onboarding)
+tests/                 ~190 tests
+```
+
+## Installation
+
+Requires Python >= 3.10.
+
+```bash
+# Core only (runtime loop, recording, Crafter world — no neural training)
+pip install -e .
+
+# With neural training (PyTorch + everything needed for the notebook)
+pip install -e ".[neural]"
+
+# Development (adds pytest)
+pip install -e ".[dev,neural]"
 ```
 
 Run the tests:
@@ -120,76 +202,41 @@ Run the tests:
 pytest
 ```
 
-## The loop
+## The architecture in brief
 
-The runtime asks **"what streams have arrived since the last cognitive
-tick?"**, not "what is the current observation?" (see
-[docs/streams.md](docs/streams.md)):
+The system is a **continuously-running cognitive loop** that observes an
+interactive world, predicts what happens next, and records everything:
 
 ```python
 while running:
-    for _ in range(program_ticks_per_cognitive_tick):
-        program.step()                          # drains motor bus, publishes streams
-    window  = synchronizer.collect(sensory_bus) # events since the last cognitive tick
-    memory.update(window)                       # TemporalBuffer of recent events
-    latent  = fusion.fuse(window, memory.buffer)   # fixed-width LatentState
-    state   = memory.latest_values().to_observation()   # stream-derived, no observe()
-    prediction = world_model.predict(state, memory)
-    motor      = policy.emit(state, memory, prediction)  # [] == NULL
-    for action in motor: motor_bus.publish(...)          # applied next tick
-    learner.update(window)
-    recorder.write_cognitive_tick(window.events, motor, decision)  # streams-v2 log
+    streams  = world.step()                    # sensory input
+    memory.update(streams)                     # temporal buffer
+    latent   = fusion.fuse(streams, memory)    # fixed-width state
+    forecast = cortex.predict(latent, action)  # multi-horizon prediction
+    action   = motor.select(forecast)          # act by planning over the model
+    recorder.write(streams, action, forecast)  # full tick record
 ```
 
-**NULL is a real action.** An empty motor emission is an explicit, recorded
-decision — the agent must learn when *not* to act. Motor emissions are
-applied one tick later (a deliberate, replay-stable actuation latency); see
-[docs/architecture.md](docs/architecture.md).
+The **Predictive Cortex** (`brain/cortex/predictive.py`) is the core model:
+- Recurrent (GRU backbone by default; dilated-conv and transformer alternatives)
+- Action-conditioned (actions are part of the input, not just the output)
+- Multi-horizon (predicts at t+1, t+4, t+8 — configurable)
+- Decoded (every prediction has a pixel decoder so you can see what it imagined)
+- Trains from recorded experience with an autoregressive objective
 
-## Project structure
-
-```
-cognitive_runtime/
-  core/        Program interface, Action/Observation/Reward, Policy,
-               Perception, Memory, WorldModel, Learner  (environment-agnostic)
-  runtime/     continuous loop, fixed-tick scheduler, config,
-               recorder (streams-v2: stream log + decisions + summaries), replay/verify
-  programs/
-    minecraft/ SurvivalBox adapter, simulated backend, remote (mineflayer)
-               backend, observations, actions, survival reward, metrics
-  policies/    null, random, scripted survival, human-demo, learned (linear BC),
-               neural (end-to-end pixel-vision CNN)
-  training/    features, dataset builders (linear + neural), imitation trainer,
-               neural trainer (end-to-end BC), policy comparison
-  models/      neural models (pixel-vision CNN); optional, torch-only
-  neural/      trainable stream/fusion/world-model/policy/value module
-               contracts for the neural stream agent target; optional, torch-only
-  tools/       episode viewer, metrics dashboard, replay runner
-bridge/
-  mineflayer/  Node bridge to a live Minecraft server (real backend)
-  fake/        SimulatedWorld over the same protocol (tests / reference)
-docs/          architecture, program interface, Minecraft MVP, future AI-OS
-tests/         determinism, rewards, replay fidelity, training, remote backend
-```
-
-## Key architectural rule
-
-Minecraft-specific code must never leak into the runtime. The core runtime
-only ever talks to the generic `Program` interface — `program.step()` plus
-the sensory/motor stream buses; even the `State` handed to policies is
-derived from stream state, never pulled from the Program. Minecraft
-knowledge lives in the Minecraft Program, its reward module, and optional
-Minecraft-specific policy experiments. Adding a second Program requires no
-runtime changes; that is the point.
+The world is **Crafter** by default — a deterministic, 2-D, pip-installable
+environment that provides pixels, actions, rewards, and achievements without
+any server or GPU rendering dependencies.
 
 ## Documentation
 
-- [docs/neural-stream-agent.md](docs/neural-stream-agent.md) — **the target architecture and roadmap**: a neural, stream-native agent with learned encoders, fusion, world model, and actor/critic online learning
-- [docs/architecture.md](docs/architecture.md) — runtime design and components
-- [docs/streams.md](docs/streams.md) — sensory/motor stream primitives and the determinism contract
-- [docs/history/online-learning.md](docs/history/online-learning.md) — historical trainable stream modules and the online Q baseline
-- [docs/program-interface.md](docs/program-interface.md) — the universal Program contract
-- [docs/history/minecraft-mvp.md](docs/history/minecraft-mvp.md) — historical SurvivalBox scope, rewards, and milestones
-- [docs/curriculum.md](docs/curriculum.md) — staged `--curriculum` presets (world config + reward goals) for training
-- [docs/history/reward_profiles.md](docs/history/reward_profiles.md) — historical `--reward-profile` YAML/JSON reward tiers, milestones, intrinsic slots, normalized returns
-- [docs/history/future-ai-os.md](docs/history/future-ai-os.md) — the pre-V2 AI-native OS direction
+- [docs/v2/00-overview.md](docs/v2/00-overview.md) — the research vision and
+  the predict-surprise-act loop
+- [docs/v2/01-architecture.md](docs/v2/01-architecture.md) — the anatomy of
+  the organism, the old-to-new naming map
+- [docs/v2/03-onboarding-guide.md](docs/v2/03-onboarding-guide.md) — from-scratch
+  mental model of the system
+- [docs/v2/04-contracts-and-data-flow.md](docs/v2/04-contracts-and-data-flow.md) —
+  exact Python/tensor/stream contracts
+- [docs/v2/REVIEW-2026-07-organism-audit.md](docs/v2/REVIEW-2026-07-organism-audit.md) —
+  honest assessment of what's assembled vs what's separate pipelines
