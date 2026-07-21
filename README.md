@@ -138,6 +138,37 @@ The project has explicit milestones with falsifiable acceptance criteria:
 - No latent collapse (effective rank, variance checks)
 - Reward/terminal/risk/uncertainty heads beat constant-predictor baselines
 
+## Temporal backbones
+
+The Predictive Cortex's recurrent core is a swappable **temporal backbone**
+(`brain/cortex/backbones.py`) — the module that advances the world state
+from one `(latent, action)` pair to the next. All three share the same
+contract (`initial_state`, `step`, `readout`) and the same cortex
+prediction/scoring heads, so swapping the backbone is an A/B test, not a
+fork.
+
+| Backbone | `--backbone` | How it works | Context | Tradeoff |
+|---|---|---|---|---|
+| **GRU** | `gru` | A single `GRUCell` processes one input per step; the recurrent hidden state accumulates the full history implicitly. | Unbounded (recurrent) | Simple, fast per-step, proven on sequence prediction. Can't attend to distant tokens in parallel — long-range dependencies decay through the hidden state. |
+| **Dilated Causal Conv** | `dilated_conv` | WaveNet-style 1-D convolution stack with exponentially growing dilation (2, 4, 8...). Processes the last `--context-length` inputs in one parallel pass each step. | Fixed window (`--context-length`, default 8) | Reads multiple timescales simultaneously; efficient parallel training. Receptive field is bounded by depth and dilation — can't see beyond the window. |
+| **Causal Transformer** | `transformer` | A small `TransformerEncoder` with ALiBi (Attention with Linear Biases) positional encoding over the last `--context-length` inputs. Full pairwise attention within the window. | Fixed window (`--context-length`, default 8) | Attends to every position in the window equally (no decay); ALiBi means positions learned at short curriculum widths generalize to longer windows at inference. Quadratic cost in window length. |
+
+**Context-length curriculum:** The windowed backbones (dilated-conv,
+transformer) start training with a window of 1 frame and ramp up to
+`--context-length` over the course of training. This prevents the model
+from being asked to exploit a long context window before it has learned
+what one step of dynamics looks like.
+
+**Benchmarking backbones:**
+```bash
+ccr nursery backbone-benchmark \
+    --backbones gru dilated_conv transformer \
+    --baseline-backbone gru \
+    --train-scenarios walk_forward turn_in_place \
+    --eval-scenario turn_in_place \
+    --report results/backbone-comparison.json
+```
+
 ## Project structure
 
 ```
