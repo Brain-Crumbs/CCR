@@ -7,7 +7,7 @@ tests/test_actor_critic_acceptance.py's budget, plus the two data paths the
 issue's acceptance criteria call out -- recorded eval sessions for the
 dashboard and the gate report in the checkpoint bundle's training stats.
 Gates 2-3 are reported, not asserted: they are the documented manual command
-(the CLI ``evaluation-gates`` subcommand, docs/online-learning.md), so a shift in
+(the CLI ``evaluation-gates`` subcommand, docs/history/online-learning.md), so a shift in
 their outcome does not fail CI.
 """
 

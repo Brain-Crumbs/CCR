@@ -59,7 +59,7 @@ the old one.
   provenance are free: `walk_forward`, `object_permanence`, `approach_entity`, and
   a discrete-facing `turn` (Crafter's facing is a discrete flip, not the continuous
   rotation `turn_in_place` assumed — re-scope, don't port the optical-flow premise).
-- Bring the **data-quality gates** forward from `nursery-turn-in-place-analysis.md`
+- Bring the **data-quality gates** forward from `docs/history/nursery-turn-in-place-analysis.md`
   (pixel provenance, motion floor, completed-episode, yaw-sweep) as a reusable
   `record/quality.py`.
 

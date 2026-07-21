@@ -383,7 +383,7 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--reward-profile", default=None,
                         help="path to a YAML/JSON reward profile (e.g. goals/survival.yaml, "
                              "goals/ender_dragon.yaml); overrides --curriculum's reward weights "
-                             "with a profile-driven reward engine (docs/reward_profiles.md). "
+                             "with a profile-driven reward engine (docs/history/reward_profiles.md). "
                              "Malformed profiles fail immediately with a diagnosis.")
     parser.add_argument("--intrinsic-risk-threshold", type=float, default=0.5,
                         help="risk-gated intrinsic drive (issue #61): the internal.risk level "
@@ -1244,7 +1244,7 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
 def cmd_nursery_joint(args: argparse.Namespace) -> None:
     """``ccr nursery joint``: record every scenario and train ONE
     action-conditioned recurrent world model across them (phase 3 of
-    docs/nursery-turn-in-place-analysis.md), evaluating in-distribution
+    docs/history/nursery-turn-in-place-analysis.md), evaluating in-distribution
     generalization (held-out seeds), zero-shot generality (held-out
     scenarios), rollout health (frozen-rollout detector), and a yaw linear
     probe."""
@@ -2134,7 +2134,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_replay.add_argument("--reward-profile", default=None,
                           help="the reward profile the session was recorded with (required to "
                                "replay a session recorded with --reward-profile; must match by "
-                               "content -- see docs/reward_profiles.md)")
+                               "content -- see docs/history/reward_profiles.md)")
     p_replay.set_defaults(func=cmd_replay)
 
     p_view = sub.add_parser("view", help="inspect a recorded episode")

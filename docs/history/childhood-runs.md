@@ -1,6 +1,8 @@
+> **Historical:** This document predates the V2 redesign.
+
 # Live Childhood Runs
 
-Phase F of [`neural-stream-agent.md`](neural-stream-agent.md) (issue #33): the
+Phase F of [`neural-stream-agent.md`](../neural-stream-agent.md) (issue #33): the
 protocol for taking a trained policy off the deterministic simulator and onto
 a live Mineflayer connection, without losing training progress or the ability
 to explain what the agent did. Live Minecraft runs are non-deterministic and

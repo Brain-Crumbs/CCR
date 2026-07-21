@@ -1,3 +1,5 @@
+> **Historical:** This document predates the V2 redesign.
+
 # Online Learning And Modular Streams
 
 CCR's first online learner is intentionally small: a dependency-free linear
@@ -11,7 +13,7 @@ neural, stream-native agent with trainable encoders, budgeted attention,
 learned fusion, a multi-horizon world model, internal modulation streams,
 and an actor/critic policy driven by both extrinsic reward and a
 "safe surprise" intrinsic drive — is specified in
-[neural-stream-agent.md](neural-stream-agent.md).
+[neural-stream-agent.md](../neural-stream-agent.md).
 
 ## Trainable Stream Modules
 
@@ -84,7 +86,7 @@ python -m cognitive_runtime run --backend simulated --policy online \
 
 Before the actor/critic can replace the linear-Q baseline (or go live), it has
 to clear the deprecation gates from
-[`neural-stream-agent.md`](neural-stream-agent.md) Phase E. The
+[`neural-stream-agent.md`](../neural-stream-agent.md) Phase E. The
 `evaluation-gates` subcommand (issue #31) is the one-liner: it trains both the
 actor/critic and the linear online-Q in simulation, evaluates both plus
 `scripted` and `random` with no mutation on identical seeds, and reports:
@@ -167,7 +169,7 @@ harness, not a bit-comparison one.
 ## Live Mineflayer Rollout
 
 Install and configure the bridge as described in
-[`bridge/mineflayer/README.md`](../bridge/mineflayer/README.md), then start with
+[`bridge/mineflayer/README.md`](../../bridge/mineflayer/README.md), then start with
 eval-only live smoke:
 
 ```bash

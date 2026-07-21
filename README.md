@@ -17,7 +17,7 @@ Runtime + Program = Experience
 
 This repository contains the runtime core and the first Program:
 **MinecraftSurvivalBox** — survive as long as possible in a constrained
-survival world. See [docs/minecraft-mvp.md](docs/minecraft-mvp.md).
+survival world. See [docs/history/minecraft-mvp.md](docs/history/minecraft-mvp.md).
 
 > The MVP ships with a deterministic *simulated* survival backend so the
 > entire stack — continuous loop, rewards, recording, replay, baselines,
@@ -187,9 +187,9 @@ runtime changes; that is the point.
 - [docs/neural-stream-agent.md](docs/neural-stream-agent.md) — **the target architecture and roadmap**: a neural, stream-native agent with learned encoders, fusion, world model, and actor/critic online learning
 - [docs/architecture.md](docs/architecture.md) — runtime design and components
 - [docs/streams.md](docs/streams.md) — sensory/motor stream primitives and the determinism contract
-- [docs/online-learning.md](docs/online-learning.md) — trainable stream modules and the online Q baseline
+- [docs/history/online-learning.md](docs/history/online-learning.md) — historical trainable stream modules and the online Q baseline
 - [docs/program-interface.md](docs/program-interface.md) — the universal Program contract
-- [docs/minecraft-mvp.md](docs/minecraft-mvp.md) — SurvivalBox: scope, rewards, milestones
+- [docs/history/minecraft-mvp.md](docs/history/minecraft-mvp.md) — historical SurvivalBox scope, rewards, and milestones
 - [docs/curriculum.md](docs/curriculum.md) — staged `--curriculum` presets (world config + reward goals) for training
-- [docs/reward_profiles.md](docs/reward_profiles.md) — `--reward-profile` YAML/JSON reward tiers, milestones, intrinsic slots, normalized returns
-- [docs/future-ai-os.md](docs/future-ai-os.md) — the long-term AI-native OS direction
+- [docs/history/reward_profiles.md](docs/history/reward_profiles.md) — historical `--reward-profile` YAML/JSON reward tiers, milestones, intrinsic slots, normalized returns
+- [docs/history/future-ai-os.md](docs/history/future-ai-os.md) — the pre-V2 AI-native OS direction

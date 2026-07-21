@@ -325,7 +325,7 @@ streams" section for the full contract):
 Using these signals for attention (#59) or intrinsic reward (#61) stays out
 of scope here; the reward engine's `intrinsic_stream` component kind can
 already read any of them by stream id when a reward profile opts in
-(`docs/reward_profiles.md`).
+(`docs/history/reward_profiles.md`).
 
 ### 9. Add Attention As A Runtime Subsystem
 
@@ -580,8 +580,8 @@ to be byte-reproducible.)
 - `review` (`cognitive_runtime/tools/review.py`) is the post-run command:
   summarize a run, compare it against baseline sessions on the same
   curriculum, and show per-episode detail in one call
-  (`docs/childhood-runs.md`).
-- Workflow documented end-to-end in `docs/childhood-runs.md`: pretrain in
+  (`docs/history/childhood-runs.md`).
+- Workflow documented end-to-end in `docs/history/childhood-runs.md`: pretrain in
   sim → eval gates → live fine-tune → review → next curriculum step.
 - Curriculum promotion automation is #43.
 

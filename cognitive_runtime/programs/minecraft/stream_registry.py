@@ -117,9 +117,8 @@ MINECRAFT_STREAM_REGISTRY: StreamRegistry = DEFAULT_STREAM_REGISTRY.extend(
             attention=AttentionMetadata(modality="body", relative_compute_cost="low"),
             note=(
                 "Inventory-open flag (issue #42's OPEN_INVENTORY/CLOSE_INVENTORY); "
-                "no legacy fusion slot is bound (Minecraft-specific, unlike the "
-                "generic body.alive/body.in_water booleans in the default "
-                "registry), neural path uses BodyStateEncoder like those. "
+                "The neural path uses BodyStateEncoder, matching the generic "
+                "body.alive/body.in_water booleans in the default registry. "
                 "Self-state (the agent's own UI state), not a privileged world "
                 "fact -- agent input."
             ),
@@ -135,9 +134,8 @@ MINECRAFT_STREAM_REGISTRY: StreamRegistry = DEFAULT_STREAM_REGISTRY.extend(
             attention=AttentionMetadata(modality="body", relative_compute_cost="medium"),
             note=(
                 "Exact {minecraft_item_name: count} payload with an unbounded "
-                "item vocabulary. Neural path uses EntityEncoder; no legacy "
-                "fusion slot is bound because the bounded body.inventory "
-                "summary remains the compatibility baseline. Self-state (the "
+                "item vocabulary. The neural path uses EntityEncoder while the "
+                "bounded body.inventory summary remains available separately. Self-state (the "
                 "agent's own possessions), not a privileged world fact -- "
                 "agent input (issue #32)."
             ),

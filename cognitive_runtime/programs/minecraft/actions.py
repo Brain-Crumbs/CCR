@@ -39,9 +39,8 @@ BASE_ACTIONS: List[Action] = [
     Action("USE"),
     #: Generic block/entity interaction (doors, containers, furnace,
     #: villagers): a container in the simulated world, richer live-server
-    #: mechanics via the mineflayer bridge.  Distinct from USE, which stays
-    #: its historical overloaded self (eat/place/open+auto-craft) for
-    #: backward compatibility with recorded sessions.
+    #: mechanics via the mineflayer bridge. Distinct from USE, the compact
+    #: eat/place/open+auto-craft action used by the simulated world.
     Action("INTERACT"),
     Action("OPEN_INVENTORY"),
     Action("CLOSE_INVENTORY"),
@@ -81,8 +80,8 @@ MOVE_INVENTORY_ITEM_ACTIONS: List[Action] = [
 
 #: Craft a specific recipe by id (see ``world.RECIPES``): rejected (not just
 #: silently skipped) when the agent isn't at the matching container or lacks
-#: materials, unlike the implicit "USE a container tries every recipe in
-#: order" behaviour USE keeps for backward compatibility.
+#: materials, unlike the compact "USE a container tries every recipe in
+#: order" behaviour.
 CRAFT_ACTIONS: List[Action] = [
     Action.make("CRAFT", recipe=name) for name in RECIPE_NAMES
 ]

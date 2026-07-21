@@ -1,3 +1,5 @@
+> **Historical:** This document predates the V2 redesign.
+
 # Minecraft MVP: SurvivalBox
 
 > **Quarantine note (issue #176):** this MVP's survival economy (hunger,
@@ -51,7 +53,7 @@ hard yet — the goal is to make learning measurable.
 
 ### Real Minecraft via the mineflayer bridge
 
-Full setup is in [`bridge/mineflayer/README.md`](../bridge/mineflayer/README.md).
+Full setup is in [`bridge/mineflayer/README.md`](../../bridge/mineflayer/README.md).
 The short version:
 
 ```bash
@@ -186,7 +188,7 @@ merely acquiring one. Issue #30 filled these plus "crafting progress" and
 completed "first tool" / "light source", which used to be dormant in the
 simulated backend (no crafting) -- `world.py` now crafts a `wooden_pickaxe`
 (crafting table) and a `torch` (furnace), so every reward rule is reachable
-without a live server. See [`docs/curriculum.md`](curriculum.md) for the
+without a live server. See [`docs/curriculum.md`](../curriculum.md) for the
 named `--curriculum` presets that stage these goals (world config + reward
 weights) into flat-safe → resource-world → night-survival → caves → combat →
 crafting.

@@ -1,3 +1,5 @@
+> **Historical:** This document predates the V2 redesign.
+
 # Analysis: first real `nursery/turn_in_place` runs, and the road to a general world model
 
 Review of `shared/nursery-turn_in_place-train-{0..5}` on the
