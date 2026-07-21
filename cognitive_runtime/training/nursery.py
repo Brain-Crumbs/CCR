@@ -1669,7 +1669,7 @@ def _ascii_thumbnail(frame: torch.Tensor, size: Tuple[int, int]) -> List[str]:
     one row per thumbnail pixel row."""
     th, tw = size
     gray = frame.mean(dim=0, keepdim=True).unsqueeze(0)  # 1, 1, H, W
-    thumb = F.adaptive_avg_pool2d(gray, output_size=(th, tw))[0, 0].clamp(0.0, 1.0)
+    thumb = F.adaptive_avg_pool2d(gray, output_size=(th, tw))[0, 0].nan_to_num(0.0).clamp(0.0, 1.0)
     ramp = _ASCII_RAMP
     last = len(ramp) - 1
     rows = []
