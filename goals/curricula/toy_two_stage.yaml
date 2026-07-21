@@ -25,10 +25,10 @@ stages:
     reward_config:
       tick_alive: 0.02
     train_episodes: 2
-    promotion:
-      metric: average_ticks
-      threshold: 250
-      sample_size: 2
+    gates:
+      - metric: average_ticks
+        threshold: 250
+        sample_size: 2
     max_attempts: 2
 
   - name: night-survival-toy
@@ -42,8 +42,8 @@ stages:
     reward_config:
       survived_night: 2.0
     train_episodes: 2
-    promotion:
-      metric: survival_rate
-      threshold: 0.0
-      sample_size: 2
+    gates:
+      - metric: survival_rate
+        threshold: 0.0
+        sample_size: 2
     max_attempts: 2

@@ -149,7 +149,7 @@ byte-identical re-simulation for the deterministic simulated backend).
 ## Reward goals filled in for the curriculum (issue #30)
 
 The curriculum needed reward-goal gaps filled first; see the reward table in
-[`docs/minecraft-mvp.md`](minecraft-mvp.md#reward-design-programsminecraftrewardspy)
+[`docs/history/minecraft-mvp.md`](history/minecraft-mvp.md#reward-design-programsminecraftrewardspy)
 for the full list. In summary:
 
 - **Exploration — new-chunk/new-cell visitation** (`new_chunk`): rewards
@@ -202,13 +202,13 @@ stages:
     world_config: {world_size: 32, episode_ticks: 300, difficulty: 0.0, max_mobs: 0}
     reward_config: {tick_alive: 0.02}       # or reward_profile_path: goals/survival.yaml
     train_episodes: 2
-    promotion: {metric: average_ticks, threshold: 250, sample_size: 2}
+    gates: [{metric: average_ticks, threshold: 250, sample_size: 2}]
     max_attempts: 2
   - name: night-survival-toy
     world_config: {world_size: 32, episode_ticks: 300, day_length: 400, difficulty: 1.0, max_mobs: 2}
     reward_config: {survived_night: 2.0}
     train_episodes: 2
-    promotion: {metric: survival_rate, threshold: 0.0, sample_size: 2}
+    gates: [{metric: survival_rate, threshold: 0.0, sample_size: 2}]
     max_attempts: 2
 ```
 
@@ -216,10 +216,11 @@ stages:
   overrides, same as a `CurriculumPreset`. `reward_profile_path` (issue #41)
   is the alternative to `reward_config` -- the two are mutually exclusive per
   stage.
-- `promotion.metric` is one of `average_reward`, `average_ticks`,
+- Every stage requires one or more `gates`. A gate's `metric` is one of `average_reward`, `average_ticks`,
   `total_reward`, `total_ticks`, `survival_rate` (fraction of eval episodes
   that didn't end in death); `threshold` is compared against the *mean* over
-  `sample_size` eval episodes.
+  `sample_size` eval episodes. All gates in a stage must use the same
+  `sample_size`, and all must pass for promotion.
 - `max_attempts` is the demotion/plateau rule: a stage that hasn't met its
   promotion criteria after this many train+evaluate attempts holds instead of
   retrying forever.
@@ -234,10 +235,9 @@ stages:
 ### Phase 7: staged-ontogeny fields (issue #104)
 
 A stage can additionally declare the shape of a staged-ontogeny rung
-(`docs/v2/phases/phase-7-development-ladder.md`) instead of (or alongside)
-the legacy `world_config`/`promotion` shape above. All of these are optional
-and default to the pre-Phase-7 behavior, which is how old curriculum
-definitions keep loading unchanged:
+(`docs/v2/phases/phase-7-development-ladder.md`). The world, scenario,
+senses, motor freedom, and loss fields are optional; `gates` is the sole
+promotion shape:
 
 ```yaml
 stages:
@@ -265,15 +265,14 @@ stages:
 - `motor_freedom` is one of `frozen` (no motor output), `overridden`
   (caregiver/scripted controls the body), or `learned` (the voluntary path,
   Phase 6, is in charge).
-- `gates` generalises `promotion` to "not a single scalar": a stage with
-  `gates` promotes only when *every* gate passes, and a gate's `metric` can
+- A stage promotes only when *every* gate passes, and a gate's `metric` can
   name either the plain evaluation-episode metrics (`average_reward`,
   `average_ticks`, `total_reward`, `total_ticks`, `survival_rate`) or a
   Phase 2-6 milestone metric (`cortex_beats_copy_last`,
   `action_ablation_margin`, `calibrated_surprise_ece`, `forgetting_score`,
-  `reflex_activation_rate`, `reflex_override_precedence`). A stage's
-  `promotion.sample_size` still controls how many eval episodes each attempt
-  runs; milestone metrics beyond the built-in evaluation-episode ones need a
+  `reflex_activation_rate`, `reflex_override_precedence`). The gates' shared
+  `sample_size` controls how many eval episodes each attempt runs; milestone
+  metrics beyond the built-in evaluation-episode ones need a
   `milestone_metrics` callable passed to `run_curriculum(...)` that computes
   them -- omitting one a stage's gate references is a definition error
   (raised immediately), not a hold.

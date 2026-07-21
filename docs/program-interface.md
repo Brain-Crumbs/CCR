@@ -154,4 +154,4 @@ bug in the runtime's design.
   Crafting → ShelterBuilding; Sokoban; 2-D survival.
 - **Track B — interface worlds:** ToyOS, fake browser/file system/terminal,
   Linux VM, real browser, VS Code.
-- **Track C — AI-native OS:** see [future-ai-os.md](future-ai-os.md).
+- **Track C — AI-native OS:** see the historical [future-ai-os.md](history/future-ai-os.md).

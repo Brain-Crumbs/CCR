@@ -124,7 +124,7 @@ working live brain.
 predictive objective does not need — the objective is self-supervised on the
 world's own future, not on crafted rewards:
 
-- `reward_engine.py`, `rewards.py`, `reward_profile.py`, `docs/reward_profiles.md`,
+- `reward_engine.py`, `rewards.py`, `reward_profile.py`, `docs/history/reward_profiles.md`,
   and the whole `--reward-profile` system (elaborate, legacy, hunger/crafting).
 - crafting/inventory/auto-craft, `entity_persistence` (Minecraft-specific).
 

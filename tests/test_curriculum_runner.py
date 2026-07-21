@@ -29,7 +29,7 @@ def _stage(name: str, **overrides) -> dict:
         "name": name,
         "world_config": dict(_BASE_WORLD),
         "train_episodes": 1,
-        "promotion": {"metric": "average_ticks", "threshold": 0.0, "sample_size": 1},
+        "gates": [{"metric": "average_ticks", "threshold": 0.0, "sample_size": 1}],
         "max_attempts": 1,
     }
     stage.update(overrides)
@@ -90,8 +90,8 @@ def test_load_curriculum_definition_toy_file():
     definition = load_curriculum_definition(TOY_CURRICULUM_PATH)
     assert definition.name == "toy-two-stage"
     assert [s.name for s in definition.stages] == ["flat-safe-toy", "night-survival-toy"]
-    assert definition.stages[0].promotion.metric == "average_ticks"
-    assert definition.stages[1].promotion.metric == "survival_rate"
+    assert definition.stages[0].gates[0].metric == "average_ticks"
+    assert definition.stages[1].gates[0].metric == "survival_rate"
 
 
 def test_load_curriculum_definition_rejects_bad_extension(tmp_path):
@@ -106,17 +106,20 @@ def test_load_curriculum_definition_rejects_bad_extension(tmp_path):
 # motor-freedom/losses/gates), generalised from `training/curriculum_runner.py`
 # into `development/` behind this module's shim.
 
-def test_stage_spec_defaults_keep_pre_phase7_shape():
-    """A stage built with no Phase 7 fields is exactly the pre-#104 shape --
-    old curriculum defs still load through the shim unchanged."""
-    stage = CurriculumStageSpec(name="legacy")
-    assert stage.world is None
-    assert stage.scenario is None
-    assert stage.senses == ()
-    assert stage.motor_freedom is None
-    assert stage.losses == ()
-    assert stage.gates == ()
-    assert stage.is_staged_ontogeny is False
+def test_stage_spec_requires_promotion_gates():
+    with pytest.raises(ValueError, match="at least one promotion gate"):
+        CurriculumStageSpec(name="missing-gates")
+
+
+def test_stage_spec_rejects_mixed_gate_sample_sizes():
+    with pytest.raises(ValueError, match="same sample_size"):
+        CurriculumStageSpec(
+            name="mixed-samples",
+            gates=(
+                PromotionCriteria(metric="average_ticks", sample_size=1),
+                PromotionCriteria(metric="survival_rate", sample_size=2),
+            ),
+        )
 
 
 def test_stage_spec_accepts_phase7_fields_and_validates():
@@ -138,7 +141,7 @@ def test_stage_spec_accepts_phase7_fields_and_validates():
     assert stage.motor_freedom == "overridden"
     assert stage.losses == ("prediction", "action_conditioning")
     assert [g.metric for g in stage.gates] == ["cortex_beats_copy_last", "action_ablation_margin"]
-    assert stage.is_staged_ontogeny is True
+    assert stage.evaluation_sample_size == 3
 
 
 def test_stage_spec_rejects_unknown_world():
@@ -279,14 +282,11 @@ def test_curriculum_definition_from_dict_parses_phase7_fields():
     assert [g.metric for g in spec.gates] == ["average_ticks"]
 
 
-def test_old_curriculum_defs_still_load_through_the_shim():
-    """The exact back-compat contract of the shim (issue #104): a
-    pre-Phase-7 definition, with no world/senses/motor-freedom/losses/gates
-    fields anywhere, still loads and every stage keeps the legacy shape."""
-    definition = load_curriculum_definition(TOY_CURRICULUM_PATH)
-    for stage in definition.stages:
-        assert stage.is_staged_ontogeny is False
-        assert stage.gates == ()
+def test_single_promotion_shape_is_rejected():
+    stage = _stage("old-shape")
+    stage["promotion"] = stage.pop("gates")[0]
+    with pytest.raises(CurriculumDefinitionError, match="unknown stage field"):
+        curriculum_definition_from_dict({"name": "old", "stages": [stage]})
 
 
 # --------------------------------------------------------------------------
@@ -302,7 +302,7 @@ def _impossible_stage(name: str, **overrides) -> dict:
     """A stage whose promotion criterion can never be met, for hold tests."""
     stage = _stage(
         name,
-        promotion={"metric": "average_ticks", "threshold": 1_000_000.0, "sample_size": 1},
+        gates=[{"metric": "average_ticks", "threshold": 1_000_000.0, "sample_size": 1}],
     )
     stage.update(overrides)
     return stage
@@ -438,7 +438,7 @@ def test_force_promote_overrides_unmet_metric(tmp_path):
     entry = result.state.history[0]
     assert entry["promoted"] is True
     assert entry["forced"] is True
-    assert entry["value"] < entry["threshold"]
+    assert entry["value"]["average_ticks"] < entry["threshold"]["average_ticks"]
 
 
 def test_stage_override_restarts_at_given_index(tmp_path):
@@ -463,12 +463,11 @@ def test_stage_override_out_of_range_raises(tmp_path):
 
 # --------------------------------------------------------------------------
 # Phase 7 (issue #104): milestone-gated promotion, torch-gated (exercises
-# the real train/evaluate loop). ``promotion.sample_size`` still controls
-# how many eval episodes run each attempt; the *gate* decision comes from
-# ``gates`` instead of ``promotion`` whenever a stage declares any.
+# the real train/evaluate loop). Every gate declares the shared evaluation
+# sample size and all gates participate in the decision.
 
 def _gated_stage(name: str, gates, **overrides) -> dict:
-    stage = _stage(name, promotion={"metric": "average_ticks", "threshold": 0.0, "sample_size": 1})
+    stage = _stage(name)
     stage["gates"] = gates
     stage.update(overrides)
     return stage
@@ -476,8 +475,7 @@ def _gated_stage(name: str, gates, **overrides) -> dict:
 
 def test_promotion_fires_only_when_every_milestone_gate_passes(tmp_path):
     """"Not a single scalar": two gates on the same easy, mob-free world both
-    pass, so the stage promotes even though neither individually is the old
-    ``promotion`` field."""
+    pass, so the stage promotes only after the whole milestone set passes."""
     definition = curriculum_definition_from_dict({
         "name": "multi-gate",
         "stages": [_gated_stage("both-easy", gates=[

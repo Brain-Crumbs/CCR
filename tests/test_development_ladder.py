@@ -373,7 +373,7 @@ def test_learned_never_drains_a_supplied_caregiver_channel():
 
 
 def test_build_stage_policy_rejects_a_stage_with_no_declared_motor_freedom():
-    bare = CurriculumStageSpec(name="undeclared")
+    bare = CurriculumStageSpec(name="undeclared", gates=(PromotionCriteria(),))
     with pytest.raises(ValueError, match="motor_freedom"):
         build_stage_policy(bare, _ACTIONS)
 

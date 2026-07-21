@@ -138,7 +138,7 @@ def _capture_deterministic_algorithms() -> Dict[str, Any]:
     """Torch's global determinism switches (issue #44): recorded alongside RNG
     state so single-run debugging reproducibility is *possible* to reconstruct
     from a checkpoint, without these switches being a product guarantee for
-    live/learning runs (see docs/online-learning.md)."""
+    live/learning runs (see docs/history/online-learning.md)."""
     return {
         "deterministic_algorithms_enabled": torch.are_deterministic_algorithms_enabled(),
         "deterministic_algorithms_warn_only": torch.is_deterministic_algorithms_warn_only_enabled(),

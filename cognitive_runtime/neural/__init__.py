@@ -11,7 +11,7 @@ torch-free.
 
 This phase defines contracts only — abstract base classes with docstrings
 covering input/output tensor shapes and checkpoint keys for the pieces the
-neural stream agent target (see ``docs/online-learning.md``) will need:
+neural stream agent target (see ``docs/history/online-learning.md``) will need:
 
 - :class:`StreamEncoderModule` -- trainable per-stream encoder contract.
 - :class:`PixelStreamEncoder` -- CNN encoder for ``vision.frame.pixels``.

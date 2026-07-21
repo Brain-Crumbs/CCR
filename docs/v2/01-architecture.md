@@ -13,7 +13,7 @@
    prediction).
 2. **Predict in latent space, always carry a decoder.** Learning happens on
    compressed representations (robust, avoids the pixel identity-attractor
-   documented in `nursery-turn-in-place-analysis.md`), but every horizon can be
+   documented in `docs/history/nursery-turn-in-place-analysis.md`), but every horizon can be
    *decoded to the same input shape* so predictions stay viewable — your "output
    is the same shape as the input" requirement, satisfied without the fragility.
 3. **Prediction is action-conditioned.** `z_{t+1} = f(z_t, a_t)`. A predictor

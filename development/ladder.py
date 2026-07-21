@@ -64,7 +64,6 @@ def _stage(
         motor_freedom=motor_freedom,
         losses=losses,
         train_episodes=_TRAIN_EPISODES,
-        promotion=PromotionCriteria(metric="average_ticks", threshold=0.0, sample_size=_EVAL_SAMPLE_SIZE),
         max_attempts=_MAX_ATTEMPTS,
         gates=gates,
     )

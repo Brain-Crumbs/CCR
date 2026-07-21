@@ -7,7 +7,7 @@
 ## Why now
 
 Most of the recording-quality pain documented in
-[`nursery-turn-in-place-analysis.md`](../nursery-turn-in-place-analysis.md) traces
+[`nursery-turn-in-place-analysis.md`](../../history/nursery-turn-in-place-analysis.md) traces
 to using live survival Minecraft as a nursery (headless-GL artifacts,
 non-determinism, tick jitter). A clean deterministic pixel world removes that
 variable *before* Phase 2 tunes the hard part (the cortex). Determinism, pixel

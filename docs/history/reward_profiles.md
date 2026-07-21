@@ -1,3 +1,5 @@
+> **Historical:** This document predates the V2 redesign.
+
 # Reward profiles: YAML tiers, milestones, normalized returns
 
 > **Quarantine note (issue #176):** the reward-profile system is part of

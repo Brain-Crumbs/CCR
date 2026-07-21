@@ -1,5 +1,5 @@
 """Action-conditioned recurrent world model (phases 1-3 of
-docs/nursery-turn-in-place-analysis.md)."""
+docs/history/nursery-turn-in-place-analysis.md)."""
 
 from __future__ import annotations
 

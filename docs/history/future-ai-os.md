@@ -1,3 +1,5 @@
+> **Historical:** This document predates the V2 redesign.
+
 # Future Direction: the AI-Native OS
 
 The Minecraft MVP is the *first Program*, not the whole project. The

@@ -1,6 +1,6 @@
 """Policy-model contract (Phase A: interface only).
 
-:class:`PolicyModel` is the actor half of step 5 in ``docs/online-learning.md``'s
+:class:`PolicyModel` is the actor half of step 5 in ``docs/history/online-learning.md``'s
 neural upgrade path: fused latent state plus whatever features the
 :class:`~cognitive_runtime.neural.world_model.WorldModel` exposes (its
 predicted next state, risk, prediction error, ...) map to action logits,

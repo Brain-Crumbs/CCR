@@ -1,5 +1,5 @@
 """Action-conditioned recurrent world model (phases 1-3 of
-docs/nursery-turn-in-place-analysis.md).
+docs/history/nursery-turn-in-place-analysis.md).
 
 The nursery's original predictor (``visual_representation.NextLatentPredictor``)
 is a memoryless latent->latent MLP with no action input: from a single frame

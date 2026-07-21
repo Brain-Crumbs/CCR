@@ -7,15 +7,10 @@ curriculum or ladder definition can be loaded and checked without the
 ``neural`` extra installed. The actual train/evaluate/promote loop lives in
 :mod:`development.runner`, which does need torch.
 
-A stage originally declared just a world/reward config plus a single
-:class:`PromotionCriteria` (issue #43). Phase 7 (issue #104) extends
-:class:`CurriculumStageSpec` so a stage can instead declare the shape of a
-staged-ontogeny rung: which ``World`` + scenario it runs, which senses are
-active, its motor freedom (``frozen | overridden | learned``), which losses
-are on, and one or more **milestone gates** -- promotion then requires
-*every* gate to pass, not one scalar metric. The legacy single-``promotion``
-shape keeps working unchanged (``gates`` defaults to empty), which is how old
-curriculum definitions still load through the shim.
+A stage declares the shape of a staged-ontogeny rung: which ``World`` +
+scenario it runs, which senses are active, its motor freedom (``frozen |
+overridden | learned``), which losses are on, and one or more **milestone
+gates**. Promotion requires *every* gate to pass, not one scalar metric.
 
 Wiring a stage's gates to the concrete Phase 2-6 milestone computation (the
 cortex-beats-copy-last/action-ablation/forgetting/reflex-override metrics)
@@ -62,9 +57,8 @@ SENSE_MODALITIES: Dict[str, tuple] = {
     "proprioception": ("spatial",),
 }
 
-#: Metrics :class:`PromotionCriteria` can read off a plain
-#: ``EvaluationSummary`` (the pre-Phase-7 actor/critic eval): the raw
-#: episode aggregates plus the synthetic ``survival_rate``.
+#: Metrics :class:`PromotionCriteria` can read from the runner's evaluation
+#: summary: the raw episode aggregates plus the synthetic ``survival_rate``.
 _SUMMARY_METRICS = (
     "average_reward", "average_ticks", "total_reward", "total_ticks", "survival_rate",
 )
@@ -82,9 +76,7 @@ MILESTONE_METRICS = (
     "reflex_override_precedence",  # Phase 6 caregiver-override precedence (#102)
 )
 
-#: The full vocabulary a :class:`PromotionCriteria` (whether the legacy
-#: single ``promotion`` field or a Phase 7 milestone ``gates`` entry) may
-#: name.
+#: The full vocabulary a :class:`PromotionCriteria` gate may name.
 KNOWN_METRICS = _SUMMARY_METRICS + MILESTONE_METRICS
 
 
@@ -101,11 +93,9 @@ class PromotionCriteria:
     """One promotion gate: ``metric`` must reach ``threshold`` (mean over
     ``sample_size`` eval episodes, not a single episode) to pass.
 
-    ``evaluate``/``value_of`` accept either the legacy ``EvaluationSummary``
-    (issue #43's single-metric actor/critic eval) or a plain
-    ``Mapping[str, float]`` of milestone metrics (issue #104) -- a stage's
-    ``gates`` are a list of these, and promotion requires *all* of them to
-    pass, not one scalar.
+    ``evaluate``/``value_of`` accept either an ``EvaluationSummary`` or a
+    plain ``Mapping[str, float]`` of milestone metrics. A stage's ``gates``
+    are a list of these, and promotion requires *all* of them to pass.
     """
 
     metric: str = "average_ticks"
@@ -150,15 +140,9 @@ class PromotionCriteria:
 class CurriculumStageSpec:
     """One curriculum/ladder stage.
 
-    Legacy shape (issue #43): world/reward config for the Minecraft
-    actor/critic loop, gated by a single ``promotion`` criterion.
-
-    Phase 7 shape (issue #104), all optional and additive so old definitions
-    keep loading unchanged: which ``World`` + ``scenario`` the stage runs,
-    its active ``senses``, its ``motor_freedom``, its active ``losses``, and
-    one or more milestone ``gates`` -- when ``gates`` is non-empty it
-    replaces ``promotion`` as the thing a runner checks (all gates must pass;
-    see :mod:`development.runner`).
+    ``gates`` is the sole promotion shape. Every gate is evaluated against
+    the same episode sample and all gates must pass; see
+    :mod:`development.runner`.
     """
 
     name: str
@@ -166,7 +150,7 @@ class CurriculumStageSpec:
     reward_config: Dict[str, Any] = field(default_factory=dict)
     reward_profile_path: Optional[str] = None
     train_episodes: int = 10
-    promotion: PromotionCriteria = field(default_factory=PromotionCriteria)
+    gates: Sequence[PromotionCriteria] = ()
     #: Demotion/plateau rule: how many train+evaluate attempts this stage
     #: gets before the runner holds instead of retrying forever ("no silent
     #: spin").
@@ -191,11 +175,6 @@ class CurriculumStageSpec:
     #: require the loss(es) their computation presupposes to be declared here
     #: -- see ``development.ladder._require_losses``).
     losses: Sequence[str] = ()
-    #: Milestone gates (issue #104): when non-empty, promotion requires
-    #: *every* gate to pass against the stage's computed metrics, replacing
-    #: the single-scalar ``promotion`` field.
-    gates: Sequence[PromotionCriteria] = ()
-
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("stage name must be non-empty")
@@ -227,10 +206,18 @@ class CurriculumStageSpec:
                 f"subset of {sorted(SENSE_MODALITIES)}"
             )
         self._check_names("losses", self.losses)
+        if not self.gates:
+            raise ValueError(f"stage {self.name!r}: at least one promotion gate is required")
         gate_metrics = [gate.metric for gate in self.gates]
         if len(set(gate_metrics)) != len(gate_metrics):
             raise ValueError(
                 f"stage {self.name!r}: duplicate milestone gate metrics {gate_metrics}"
+            )
+        sample_sizes = {gate.sample_size for gate in self.gates}
+        if len(sample_sizes) != 1:
+            raise ValueError(
+                f"stage {self.name!r}: all promotion gates must use the same "
+                f"sample_size, got {sorted(sample_sizes)}"
             )
 
     def _check_names(self, field_name: str, values: Sequence[str]) -> None:
@@ -240,17 +227,14 @@ class CurriculumStageSpec:
             raise ValueError(f"stage {self.name!r}: duplicate {field_name} {list(values)}")
 
     @property
-    def is_staged_ontogeny(self) -> bool:
-        """True once a stage declares Phase 7's milestone gates instead of
-        the legacy single-``promotion`` shape."""
-        return bool(self.gates)
+    def evaluation_sample_size(self) -> int:
+        """Number of evaluation episodes shared by every promotion gate."""
+        return self.gates[0].sample_size
 
     def evaluate_gates(self, metrics: Mapping[str, float]) -> Dict[str, bool]:
         """Evaluate every milestone gate against ``metrics``; a stage
         promotes only when every gate passes (Phase 7: "not a single
         scalar")."""
-        if not self.gates:
-            raise ValueError(f"stage {self.name!r} has no milestone gates to evaluate")
         return {gate.metric: gate.evaluate(metrics) for gate in self.gates}
 
     def build_reward_profile(self) -> Optional[RewardProfile]:
@@ -327,7 +311,7 @@ class CurriculumDefinition:
 
 def _promotion_from_dict(source: str, stage_name: str, raw: Mapping[str, Any]) -> PromotionCriteria:
     if not isinstance(raw, Mapping):
-        raise _err(source, f"stage {stage_name!r}: 'promotion'/'gates' entry must be a mapping")
+        raise _err(source, f"stage {stage_name!r}: each 'gates' entry must be a mapping")
     unknown = set(raw) - {"metric", "threshold", "sample_size"}
     if unknown:
         raise _err(source, f"stage {stage_name!r}: unknown promotion field(s) {sorted(unknown)}")
@@ -346,7 +330,7 @@ def _stage_from_dict(source: str, raw: Mapping[str, Any]) -> CurriculumStageSpec
         raise _err(source, f"each stage must be a mapping, got {type(raw).__name__}")
     unknown = set(raw) - {
         "name", "world_config", "reward_config", "reward_profile_path",
-        "train_episodes", "promotion", "max_attempts",
+        "train_episodes", "max_attempts",
         "world", "scenario", "senses", "motor_freedom", "losses", "gates",
     }
     if unknown:
@@ -354,7 +338,6 @@ def _stage_from_dict(source: str, raw: Mapping[str, Any]) -> CurriculumStageSpec
     name = raw.get("name")
     if not isinstance(name, str) or not name:
         raise _err(source, "each stage requires a non-empty string 'name'")
-    promotion_raw = raw.get("promotion", {})
     senses_raw = raw.get("senses", [])
     if not isinstance(senses_raw, list):
         raise _err(source, f"stage {name!r}: 'senses' must be a list")
@@ -371,14 +354,13 @@ def _stage_from_dict(source: str, raw: Mapping[str, Any]) -> CurriculumStageSpec
             reward_config=dict(raw.get("reward_config", {})),
             reward_profile_path=raw.get("reward_profile_path"),
             train_episodes=int(raw.get("train_episodes", 10)),
-            promotion=_promotion_from_dict(source, name, promotion_raw),
+            gates=tuple(_promotion_from_dict(source, name, g) for g in gates_raw),
             max_attempts=int(raw.get("max_attempts", 3)),
             world=raw.get("world"),
             scenario=raw.get("scenario"),
             senses=tuple(senses_raw),
             motor_freedom=raw.get("motor_freedom"),
             losses=tuple(losses_raw),
-            gates=tuple(_promotion_from_dict(source, name, g) for g in gates_raw),
         )
     except ValueError as exc:
         raise _err(source, str(exc)) from exc

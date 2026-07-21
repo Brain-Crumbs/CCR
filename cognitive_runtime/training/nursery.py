@@ -1017,7 +1017,7 @@ def run_nursery_suite(
 @dataclass
 class JointNurseryReport:
     """One action-conditioned world model trained across scenarios
-    (phase 3 of docs/nursery-turn-in-place-analysis.md)."""
+    (phase 3 of docs/history/nursery-turn-in-place-analysis.md)."""
 
     train_scenarios: List[str]
     holdout_scenarios: List[str]

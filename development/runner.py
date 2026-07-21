@@ -28,15 +28,13 @@ gate intentionally keeps the simple mean criterion rather than growing a
 second, harder-to-predict gating rule.
 
 Phase 7 (issue #104) generalises promotion beyond that one scalar: a stage
-may instead declare one or more milestone ``gates`` (its ``World``/senses/
+declares one or more milestone ``gates`` (its ``World``/senses/
 motor-freedom/losses live on the same :class:`~development.definitions.CurriculumStageSpec`,
-declaratively). When a stage has ``gates``, *every* gate must pass -- wired
+declaratively). *Every* gate must pass -- wired
 through the ``milestone_metrics`` hook below, which lets a caller supply the
 Phase 2-6 milestone computation (action-ablation, forgetting, reflex-override,
 ...) alongside the plain evaluation-episode metrics this module already
-computes. A stage with no ``gates`` keeps the pre-Phase-7 single-``promotion``
-behaviour unchanged, which is how old curriculum definitions still run
-through the shim.
+computes.
 
 Curriculum state (current stage, attempt count, promotion history) lives in
 the checkpoint bundle's ``training_stats["curriculum"]`` (issue #20), so
@@ -330,16 +328,9 @@ def _evaluate_stage(
 ):
     """Evaluate one stage's promotion gate(s) against its eval episodes.
 
-    Returns ``(met_criteria, value, threshold, metric)`` where ``value``/
-    ``threshold``/``metric`` are scalars for the legacy single-``promotion``
-    path, or dicts keyed by metric name when the stage declares milestone
-    ``gates`` (Phase 7: "not a single scalar").
+    Returns ``(met_criteria, value, threshold, metric)`` with the latter
+    three values keyed by gate metric (Phase 7: "not a single scalar").
     """
-    if not stage.gates:
-        value = stage.promotion.value_of(summary)
-        met_criteria = stage.promotion.evaluate(summary)
-        return met_criteria, value, stage.promotion.threshold, stage.promotion.metric
-
     metrics = _summary_metrics(summary)
     if milestone_metrics is not None:
         extra = milestone_metrics(stage, summary)
@@ -407,11 +398,9 @@ def run_curriculum(
     metric (``--force-promote``, for manual experimentation). ``fresh``
     ignores any existing checkpoint and starts stage 0 with fresh weights.
 
-    ``milestone_metrics`` (issue #104) is called once per attempt for any
-    stage that declares milestone ``gates``: it receives the stage and its
+    ``milestone_metrics`` (issue #104) is called once per attempt: it receives the stage and its
     plain :class:`EvaluationSummary` and returns the additional metrics (e.g.
-    ``cortex_beats_copy_last``) those gates reference. Stages with no
-    ``gates`` ignore it and keep the legacy single-``promotion`` behaviour.
+    ``cortex_beats_copy_last``) those gates reference.
 
     ``voluntary_controller`` (issue #133) is called once per attempt for any
     stage declaring ``motor_freedom="learned"``: given the stage and its
@@ -495,7 +484,9 @@ def run_curriculum(
         while True:
             attempt = state.attempts_at_stage
             train_seed_i = _seed_for(train_seed, state.stage_index, attempt, stage.train_episodes)
-            eval_seed_i = _seed_for(eval_seed, state.stage_index, attempt, stage.promotion.sample_size)
+            eval_seed_i = _seed_for(
+                eval_seed, state.stage_index, attempt, stage.evaluation_sample_size,
+            )
 
             _run_stage_episodes(
                 stage, policy_model, critic_model, optimizer, action_keys,
@@ -505,7 +496,7 @@ def run_curriculum(
             )
             eval_episodes = _run_stage_episodes(
                 stage, policy_model, critic_model, optimizer, action_keys,
-                stage.promotion.sample_size, eval_seed_i, train=False,
+                stage.evaluation_sample_size, eval_seed_i, train=False,
                 record_dir=record_dir, session_id=None, stage_index=state.stage_index,
                 name=name, voluntary_controller=voluntary_controller,
             )
