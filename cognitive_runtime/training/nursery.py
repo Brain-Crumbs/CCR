@@ -459,6 +459,40 @@ def _crafter_neutralize_wildlife_every_reset(program: Any) -> None:
     _crafter_neutralize_wildlife(_crafter_env(program))  # the env built by __init__
 
 
+def _crafter_clear_walk_corridor(program: Any) -> None:
+    """Clear a corridor of terrain in the MOVE_UP direction (negative y) so
+    the walk_forward agent doesn't get stuck on trees/stone. Re-applied after
+    every ``reset(seed)`` so each seed still generates its own terrain outside
+    the corridor -- the agent sees varied surroundings while having a
+    guaranteed walkable path."""
+    original_reset = program.reset
+
+    def reset_clear_and_neutralize(seed: Optional[int] = None) -> None:
+        original_reset(seed)
+        env = _crafter_env(program)
+        _crafter_neutralize_wildlife(env)
+        px, py = int(env._player.pos[0]), int(env._player.pos[1])
+        # Clear a 3-wide corridor from the player to the top edge (y=0).
+        # Width of 3 (player column +/- 1) gives margin for the player's
+        # collision box without flattening the whole world.
+        world = env._world
+        area = world.area
+        for x in range(max(0, px - 1), min(area[0], px + 2)):
+            for y in range(0, py + 1):
+                world[(x, y)] = "grass"
+
+    program.reset = reset_clear_and_neutralize
+    # Apply to the env built by __init__ too
+    env = _crafter_env(program)
+    _crafter_neutralize_wildlife(env)
+    px, py = int(env._player.pos[0]), int(env._player.pos[1])
+    world = env._world
+    area = world.area
+    for x in range(max(0, px - 1), min(area[0], px + 2)):
+        for y in range(0, py + 1):
+            world[(x, y)] = "grass"
+
+
 def _crafter_box_in_player(program: Any) -> None:
     """Wall the player in on all four sides with stone -- every MOVE_*
     attempt is blocked, so only ``facing`` changes (issue #90's discrete
@@ -512,7 +546,7 @@ _CRAFTER_MOVE_UP = Action("MOVE_UP")
 def _crafter_walk_forward(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
     return ScenarioRecording(
         policy=ConstantActionPolicy(_CRAFTER_MOVE_UP, seed=seed),
-        scene_setup=_crafter_neutralize_wildlife_every_reset,
+        scene_setup=_crafter_clear_walk_corridor,
     )
 
 
