@@ -564,17 +564,27 @@ def _crafter_turn(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
 def _crafter_approach_entity(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
     distance = 6 + (seed % 6)
 
-    def scene_setup(program: Any) -> None:
+    def _setup_approach(program: Any) -> None:
         import crafter as crafter_pkg
 
         env = _crafter_env(program)
-        _crafter_freeze_wildlife(program)
+        _crafter_neutralize_wildlife(env)
         x, y = int(env._player.pos[0]), int(env._player.pos[1])
         target = (x, y - distance)
         _crafter_clear_terrain(env._world, x, y - distance // 2, radius=distance + 3)
         cow = crafter_pkg.objects.Cow(env._world, target)
         env._world.add(cow)
-        cow.update = lambda: None  # frozen: approach_entity's mob never moves
+        cow.update = lambda: None
+
+    def scene_setup(program: Any) -> None:
+        original_reset = program.reset
+
+        def reset_and_setup(seed: Optional[int] = None) -> None:
+            original_reset(seed)
+            _setup_approach(program)
+
+        program.reset = reset_and_setup
+        _setup_approach(program)
 
     return ScenarioRecording(policy=ConstantActionPolicy(_CRAFTER_MOVE_UP), scene_setup=scene_setup)
 
@@ -639,11 +649,10 @@ CRAFTER_SCENARIOS: Dict[str, NurseryScenario] = {
         "approach_entity",
         "scripted approach to a frozen entity -- scale change with distance.",
         _crafter_approach_entity,
-        # The approach distance is fixed (6-11 blocks, seed-dependent) and
-        # the agent naturally stops once blocked by the entity, so the floor
-        # must tolerate a long "arrived and stopped" tail the same way
-        # Minecraft's own approach_entity threshold does.
-        min_blocks_per_tick=0.02,
+        # The approach distance is 6-11 blocks (seed-dependent) and the
+        # agent stops once blocked by the entity, so with 400 ticks the
+        # per-tick rate is only 6/400=0.015 at the shortest distance.
+        min_blocks_per_tick=0.01,
     ),
 }
 
