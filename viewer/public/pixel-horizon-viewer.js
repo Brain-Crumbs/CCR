@@ -248,6 +248,9 @@ class PixelHorizonViewer extends HTMLElement {
           }
           p._targets = p.targets ? p.targets.map(b64ToBytes) : null;
           this._pred = p;
+          if (p.horizons?.length) {
+            this.setAttribute("horizons", p.horizons.join(","));
+          }
         }
       } catch { /* predictions are optional */ }
     }
