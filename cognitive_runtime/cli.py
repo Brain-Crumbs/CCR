@@ -35,6 +35,7 @@ from brain.hippocampus import Hippocampus
 from cognitive_runtime.core.attention import ATTENTION_MODES
 from cognitive_runtime.core.orienting_reflex import REFLEX_MODES
 from cognitive_runtime.core.policy import Policy
+from cognitive_runtime.core.program import Program
 from cognitive_runtime.core.streams import TemporalFusion, default_encoder_registry
 from cognitive_runtime.models.online_q import OnlineQModel
 from cognitive_runtime.policies import (
@@ -46,11 +47,6 @@ from cognitive_runtime.policies import (
     RandomPolicy,
     ScriptedSurvivalPolicy,
 )
-from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
-from cognitive_runtime.programs.minecraft.curriculum import CURRICULUM_ORDER, get_curriculum
-from cognitive_runtime.programs.minecraft.evaluation import comparison_table, summarize_episodes
-from cognitive_runtime.programs.minecraft.action_registry import MINECRAFT_ACTION_REGISTRY
-from cognitive_runtime.programs.minecraft.stream_registry import MINECRAFT_STREAM_REGISTRY
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
 from cognitive_runtime.runtime.replay import NonDeterministicSessionError
@@ -91,9 +87,12 @@ def _default_nursery_backend() -> str:
     return "simulated"
 
 
-def _encoders_for_input_profile(profile: str, stream_registry=MINECRAFT_STREAM_REGISTRY):
+def _encoders_for_input_profile(profile: str, stream_registry=None):
     if profile == "full":
         return None
+    if stream_registry is None:
+        from cognitive_runtime.programs.minecraft.stream_registry import MINECRAFT_STREAM_REGISTRY
+        stream_registry = MINECRAFT_STREAM_REGISTRY
     return stream_registry.to_encoder_registry(classifications={"agent_input"})
 
 
@@ -116,7 +115,11 @@ def _resolve_world_args(args: argparse.Namespace) -> None:
     """Fill unset world/seed args from `--curriculum`'s preset, falling back
     to the historical CLI defaults; mutates `args` in place so every caller
     downstream sees plain resolved values, curriculum or not."""
-    preset = get_curriculum(args.curriculum) if args.curriculum else None
+    if args.curriculum:
+        from cognitive_runtime.programs.minecraft.curriculum import get_curriculum
+        preset = get_curriculum(args.curriculum)
+    else:
+        preset = None
     for key, default in _WORLD_DEFAULTS.items():
         if getattr(args, key, None) is None:
             value = preset.world_config.get(key, default) if preset else default
@@ -130,6 +133,7 @@ def _reward_config_for(args: argparse.Namespace) -> Optional["SurvivalRewardConf
     `None` (default reward config) when no curriculum was chosen."""
     if not args.curriculum:
         return None
+    from cognitive_runtime.programs.minecraft.curriculum import get_curriculum
     from cognitive_runtime.programs.minecraft.rewards import SurvivalRewardConfig
 
     preset = get_curriculum(args.curriculum)
@@ -178,7 +182,10 @@ def _make_policy(
     if name == "null":
         return NullPolicy()
     if name == "random":
-        return RandomPolicy(action_space or ACTION_SPACE, seed=args.seed)
+        if not action_space:
+            from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
+            action_space = ACTION_SPACE
+        return RandomPolicy(action_space, seed=args.seed)
     if name == "scripted":
         if getattr(args, "world", "minecraft") != "minecraft":
             sys.exit(
@@ -206,7 +213,7 @@ def _make_policy(
 
 def _make_world_model(
     args: argparse.Namespace,
-    program: MinecraftSurvivalBox,
+    program: Program,
     hippocampus: Optional[Any] = None,
 ):
     """The heuristic default (`None`, `TrendWorldModel`), or a trained neural
@@ -305,7 +312,7 @@ def _add_entity_persistence_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def _make_online_policy_and_learner(
-    args: argparse.Namespace, program: MinecraftSurvivalBox, encoders=None
+    args: argparse.Namespace, program: Program, encoders=None
 ) -> tuple[OnlineQPolicy, OnlineQLearner]:
     action_space = list(program.metadata().action_space)
     action_keys = [action.key() for action in action_space]
@@ -352,6 +359,7 @@ def _make_online_policy_and_learner(
 
 
 def _add_world_args(parser: argparse.ArgumentParser) -> None:
+    from cognitive_runtime.programs.minecraft.curriculum import CURRICULUM_ORDER
     parser.add_argument("--curriculum", default=None, choices=CURRICULUM_ORDER,
                         help="named curriculum preset: world config + reward weights + a "
                              "default seed, staged flat-safe -> resource-world -> "
@@ -425,7 +433,9 @@ def _build_program(args: argparse.Namespace, program_config: Dict[str, Any],
         # Issue #176: MinecraftSurvivalBox (and the survival-economy reward
         # system it pulls in) is only imported here, when --world minecraft
         # is actually selected -- never for the default (crafter) path.
+        from cognitive_runtime.programs.minecraft.action_registry import MINECRAFT_ACTION_REGISTRY
         from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+        from cognitive_runtime.programs.minecraft.stream_registry import MINECRAFT_STREAM_REGISTRY
 
         program = MinecraftSurvivalBox(
             config=program_config,
@@ -485,11 +495,14 @@ def _enforce_live_run_protocol(args: argparse.Namespace) -> None:
 def cmd_run(args: argparse.Namespace) -> None:
     _resolve_world_args(args)
     world = getattr(args, "world", "minecraft")
+    has_cortex_wm = getattr(args, "world_model", None) and args.world_model.startswith("cortex:")
     if args.policy is None:
-        # Issue #176: --policy scripted is a Minecraft-specific heuristic,
-        # so it's only the implicit default for --world minecraft; every
-        # other world falls back to random.
-        args.policy = "scripted" if world == "minecraft" else "random"
+        if world == "minecraft":
+            args.policy = "scripted"
+        elif has_cortex_wm:
+            args.policy = "cortex-mpc"
+        else:
+            args.policy = "random"
     if world != "minecraft" and args.backend != "simulated":
         sys.exit(f"--backend only applies to --world minecraft (got --world {world!r})")
     if world != "minecraft" and args.curriculum is not None:
@@ -505,16 +518,22 @@ def cmd_run(args: argparse.Namespace) -> None:
     encoders = _encoders_for_input_profile(args.input_profile, stream_registry)
     action_space = list(program.metadata().action_space)
     learner = None
-    if args.policy == "online":
-        policy, learner = _make_online_policy_and_learner(args, program, encoders)
-    else:
-        policy = _make_policy(args.policy, args, action_space)
-    # Shared with the runtime's own Hippocampus below when `--async-trainer`
-    # wires a live `CortexConsolidator` into the cortex world model (issue
-    # #175): its generative-replay dream mixer needs the *same* hippocampus
-    # instance the loop writes seeds into, not a separate empty one.
+    # World model must be created before cortex-mpc policy, which reads
+    # the cortex's live hidden state every tick.
     hippocampus = Hippocampus()
     world_model = _make_world_model(args, program, hippocampus)
+    if args.policy == "online":
+        policy, learner = _make_online_policy_and_learner(args, program, encoders)
+    elif args.policy == "cortex-mpc":
+        if world_model is None or not hasattr(world_model, "model"):
+            sys.exit(
+                "--policy cortex-mpc requires --world-model cortex:<ckpt>; "
+                "the MPC plans over the live cortex's recurrent hidden state"
+            )
+        from motor.cortex_mpc import build_cortex_mpc
+        policy = build_cortex_mpc(world_model)
+    else:
+        policy = _make_policy(args.policy, args, action_space)
     entity_persistence = _make_entity_persistence(args)
     config = RuntimeConfig(
         tick_rate=args.tick_rate,
@@ -560,6 +579,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             f"placed={stats.get('blocks_placed')} damage={stats.get('damage_taken')}"
         )
     if summaries:
+        from cognitive_runtime.programs.minecraft.evaluation import comparison_table, summarize_episodes
         row = summarize_episodes(summaries)
         print("\naggregate:")
         print(comparison_table([row]))
@@ -606,6 +626,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         seed=args.seed,
         max_ticks=args.episode_ticks,
     )
+    from cognitive_runtime.programs.minecraft.evaluation import comparison_table
     print(comparison_table(rows))
 
 
@@ -1559,6 +1580,7 @@ def cmd_evaluation_gates(args: argparse.Namespace) -> None:
         }
         for name, s in result.summaries.items()
     ]
+    from cognitive_runtime.programs.minecraft.evaluation import comparison_table
     print(comparison_table(rows, columns=columns))
     print()
     print(f"metric: {result.metric} (identical eval seeds)")
@@ -1598,6 +1620,17 @@ def cmd_curriculum_run(args: argparse.Namespace) -> None:
     except CurriculumDefinitionError as exc:
         sys.exit(str(exc))
 
+    voluntary_ctrl = None
+    cortex_ckpt = getattr(args, "cortex_checkpoint", None)
+    if cortex_ckpt:
+        try:
+            from cognitive_runtime.policies.cortex_world_model import CortexWorldModel
+            from motor.cortex_mpc import cortex_mpc_factory
+        except ImportError as exc:
+            sys.exit(f"cortex-mpc needs PyTorch ({exc}); install '.[neural]'.")
+        cortex_wm = CortexWorldModel(cortex_ckpt)
+        voluntary_ctrl = cortex_mpc_factory(cortex_wm)
+
     try:
         result = run_curriculum(
             definition,
@@ -1610,6 +1643,7 @@ def cmd_curriculum_run(args: argparse.Namespace) -> None:
             fresh=args.fresh,
             record_dir=None if args.no_record else args.record_dir,
             name=args.name,
+            voluntary_controller=voluntary_ctrl,
         )
     except (CurriculumDefinitionError, ValueError) as exc:
         sys.exit(str(exc))
@@ -1658,10 +1692,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "generated Docker-style name (e.g. vigorous-shannon)")
     p_run.add_argument("--policy", default=None,
                        choices=["null", "random", "scripted", "learned", "neural", "online",
-                                "human"],
-                       help="default: 'scripted' for --world minecraft (issue #89's original "
-                            "default), 'random' otherwise -- --policy scripted is a "
-                            "Minecraft-specific heuristic (issue #176)")
+                                "human", "cortex-mpc"],
+                       help="default: 'cortex-mpc' when --world-model cortex:* is given "
+                            "(one-step MPC over the live cortex), 'scripted' for --world "
+                            "minecraft, 'random' otherwise")
     p_run.add_argument("--input-profile", default="full", choices=sorted(INPUT_PROFILES),
                        help="issue #32: 'full' (default) fuses every stream the legacy "
                             "encoder registry binds, including hand-computed semantic "
@@ -1796,7 +1830,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="evaluation gates: actor/critic vs random/scripted/linear-Q "
              "on identical seeds (issue #31)",
     )
-    p_gates.add_argument("--curriculum", default=None, choices=CURRICULUM_ORDER,
+    from cognitive_runtime.programs.minecraft.curriculum import CURRICULUM_ORDER as _CURRICULUM_ORDER
+    p_gates.add_argument("--curriculum", default=None, choices=_CURRICULUM_ORDER,
                          help="curriculum preset supplying world + reward config "
                               "(default: the fixed DEFAULT_GATE_CONFIG)")
     p_gates.add_argument("--train-episodes", type=int, default=20,
@@ -1854,6 +1889,10 @@ def build_parser() -> argparse.ArgumentParser:
                                    help="record train/eval sessions here")
     p_curriculum_run.add_argument("--no-record", action="store_true",
                                    help="skip recording sessions")
+    p_curriculum_run.add_argument("--cortex-checkpoint", default=None,
+                                   help="path to a PredictiveCortex checkpoint; enables "
+                                        "cortex-MPC as the voluntary controller for "
+                                        "'learned' motor-freedom stages")
     p_curriculum_run.set_defaults(func=cmd_curriculum_run)
 
     p_train = sub.add_parser("train", help="train a behavioral-cloning policy from sessions")

@@ -224,7 +224,7 @@ def test_motor_decision_recorded_for_frozen_stage():
 def test_cortex_mpc_factory_returns_controller_for_learned_stage():
     """The factory hook for run_curriculum returns a working cortex-MPC
     controller for a 'learned' stage."""
-    from development.definitions import CurriculumStageSpec
+    from development.definitions import CurriculumStageSpec, PromotionCriteria
 
     wm, _memory, _rng = _primed_cortex_wm()
     factory = cortex_mpc_factory(wm)
@@ -232,6 +232,7 @@ def test_cortex_mpc_factory_returns_controller_for_learned_stage():
         name="test-learned",
         world_config={"episode_ticks": 10},
         motor_freedom="learned",
+        gates=(PromotionCriteria(),),
     )
     actions = [Action(k) for k in _ACTION_KEYS]
     controller = factory(stage, actions)
