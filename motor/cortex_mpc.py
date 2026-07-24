@@ -11,10 +11,9 @@ advance).  The scorer reads the cortex's reward/risk/uncertainty heads
 off the resulting hidden and combines them into a single planning score:
 ``reward + novelty_weight * uncertainty``.
 
-The cortex heads are untrained until B1 adds head losses to the
-consolidation loop; until then the scorer plans over noise, but the
-NaN-score guard (#149) keeps selection deterministic and the first real
-action in action-space order wins ties.
+Head losses (reward, terminal, risk, uncertainty) are trained in both
+the offline and online (consolidation) paths.  The NaN-score guard
+(#149) keeps selection deterministic when the cortex is unprimed.
 """
 
 from __future__ import annotations
