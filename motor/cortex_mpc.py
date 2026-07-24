@@ -84,6 +84,13 @@ def cortex_mpc_factory(
 ) -> "VoluntaryControllerFactory":
     """Return a ``VoluntaryControllerFactory`` (the hook ``run_curriculum``
     accepts) that builds a cortex-backed MPC for every ``learned`` stage.
+
+    The returned factory carries the backing ``cortex_wm`` as a
+    ``.world_model`` attribute, so ``development.runner`` can attach the same
+    instance to each stage's ``CognitiveRuntime``. Without that, the
+    runtime's tick loop never calls ``cortex_wm.predict()``, so ``_latent``/
+    ``_pre_advance_hidden`` stay ``None`` and every MPC score is NaN -- the
+    controller silently tie-breaks to the first action every tick.
     """
 
     def factory(
@@ -91,4 +98,5 @@ def cortex_mpc_factory(
     ) -> VoluntaryController:
         return build_cortex_mpc(cortex_wm, novelty_weight=novelty_weight)
 
+    factory.world_model = cortex_wm
     return factory
