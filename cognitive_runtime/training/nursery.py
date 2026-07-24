@@ -25,11 +25,14 @@ group nursery runs the same way they already group curriculum-preset runs
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
+
+log = logging.getLogger("ccr.training.nursery")
 import torch.nn.functional as F
 
 from cognitive_runtime.core.action import NULL_ACTION, Action
@@ -459,6 +462,40 @@ def _crafter_neutralize_wildlife_every_reset(program: Any) -> None:
     _crafter_neutralize_wildlife(_crafter_env(program))  # the env built by __init__
 
 
+def _crafter_clear_walk_corridor(program: Any) -> None:
+    """Clear a corridor of terrain in the MOVE_UP direction (negative y) so
+    the walk_forward agent doesn't get stuck on trees/stone. Re-applied after
+    every ``reset(seed)`` so each seed still generates its own terrain outside
+    the corridor -- the agent sees varied surroundings while having a
+    guaranteed walkable path."""
+    original_reset = program.reset
+
+    def reset_clear_and_neutralize(seed: Optional[int] = None) -> None:
+        original_reset(seed)
+        env = _crafter_env(program)
+        _crafter_neutralize_wildlife(env)
+        px, py = int(env._player.pos[0]), int(env._player.pos[1])
+        # Clear a 3-wide corridor from the player to the top edge (y=0).
+        # Width of 3 (player column +/- 1) gives margin for the player's
+        # collision box without flattening the whole world.
+        world = env._world
+        area = world.area
+        for x in range(max(0, px - 1), min(area[0], px + 2)):
+            for y in range(0, py + 1):
+                world[(x, y)] = "grass"
+
+    program.reset = reset_clear_and_neutralize
+    # Apply to the env built by __init__ too
+    env = _crafter_env(program)
+    _crafter_neutralize_wildlife(env)
+    px, py = int(env._player.pos[0]), int(env._player.pos[1])
+    world = env._world
+    area = world.area
+    for x in range(max(0, px - 1), min(area[0], px + 2)):
+        for y in range(0, py + 1):
+            world[(x, y)] = "grass"
+
+
 def _crafter_box_in_player(program: Any) -> None:
     """Wall the player in on all four sides with stone -- every MOVE_*
     attempt is blocked, so only ``facing`` changes (issue #90's discrete
@@ -512,7 +549,7 @@ _CRAFTER_MOVE_UP = Action("MOVE_UP")
 def _crafter_walk_forward(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
     return ScenarioRecording(
         policy=ConstantActionPolicy(_CRAFTER_MOVE_UP, seed=seed),
-        scene_setup=_crafter_neutralize_wildlife_every_reset,
+        scene_setup=_crafter_clear_walk_corridor,
     )
 
 
@@ -530,17 +567,27 @@ def _crafter_turn(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
 def _crafter_approach_entity(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
     distance = 6 + (seed % 6)
 
-    def scene_setup(program: Any) -> None:
+    def _setup_approach(program: Any) -> None:
         import crafter as crafter_pkg
 
         env = _crafter_env(program)
-        _crafter_freeze_wildlife(program)
+        _crafter_neutralize_wildlife(env)
         x, y = int(env._player.pos[0]), int(env._player.pos[1])
         target = (x, y - distance)
         _crafter_clear_terrain(env._world, x, y - distance // 2, radius=distance + 3)
         cow = crafter_pkg.objects.Cow(env._world, target)
         env._world.add(cow)
-        cow.update = lambda: None  # frozen: approach_entity's mob never moves
+        cow.update = lambda: None
+
+    def scene_setup(program: Any) -> None:
+        original_reset = program.reset
+
+        def reset_and_setup(seed: Optional[int] = None) -> None:
+            original_reset(seed)
+            _setup_approach(program)
+
+        program.reset = reset_and_setup
+        _setup_approach(program)
 
     return ScenarioRecording(policy=ConstantActionPolicy(_CRAFTER_MOVE_UP), scene_setup=scene_setup)
 
@@ -605,11 +652,10 @@ CRAFTER_SCENARIOS: Dict[str, NurseryScenario] = {
         "approach_entity",
         "scripted approach to a frozen entity -- scale change with distance.",
         _crafter_approach_entity,
-        # The approach distance is fixed (6-11 blocks, seed-dependent) and
-        # the agent naturally stops once blocked by the entity, so the floor
-        # must tolerate a long "arrived and stopped" tail the same way
-        # Minecraft's own approach_entity threshold does.
-        min_blocks_per_tick=0.02,
+        # The approach distance is 6-11 blocks (seed-dependent) and the
+        # agent stops once blocked by the entity, so with 400 ticks the
+        # per-tick rate is only 6/400=0.015 at the shortest distance.
+        min_blocks_per_tick=0.01,
     ),
 }
 
@@ -759,6 +805,7 @@ def _build_scenario_program(cfg: NurseryConfig, program_config: Dict[str, Any]) 
 def _record_scenario_episode(
     record_dir: str, session_id: str, seed: int, scenario: NurseryScenario, cfg: NurseryConfig
 ) -> str:
+    log.info("recording %s  seed=%d  ticks=%d", session_id, seed, cfg.episode_ticks)
     recording = scenario.build(seed, cfg)
     episode_ticks = recording.episode_ticks or cfg.episode_ticks
     program_config: Dict[str, Any] = {"episode_ticks": episode_ticks, "world_size": cfg.world_size}
@@ -845,6 +892,7 @@ def run_nursery_scenario(
     disposable one every time.
     """
 
+    log.info("=== nursery scenario: %s ===", scenario_name)
     cfg = config or NurseryConfig()
     scenarios = _scenarios_for_world(cfg.world)
     if scenario_name not in scenarios:
@@ -870,6 +918,7 @@ def run_nursery_scenario(
         _record_scenario_episode(record_dir, f"nursery-{scenario_name}-holdout-{seed}", seed, scenario, cfg)
         for seed in cfg.holdout_seeds
     ]
+    log.info("recorded %d train + %d holdout sessions", len(train_sessions), len(holdout_sessions))
 
     if cfg.data_quality_gate:
         issues = validate_nursery_recordings(
@@ -892,12 +941,11 @@ def run_nursery_scenario(
                 "gate:\n  - " + "\n  - ".join(issues) + hint
             )
 
-    # config.horizons is declared in ticks; recorded vision may run below the
-    # tick rate (the first remote runs paced ~10 Hz against 20 Hz ticks, so
-    # "t+100" silently meant 200 ticks).  Convert via the measured rate so a
-    # horizon means the same amount of world time on every backend.
+    log.info("quality gate passed")
     ticks_per_frame = _measured_ticks_per_frame(train_sessions + holdout_sessions)
     horizon_frames = horizons_ticks_to_frames(cfg.horizons, ticks_per_frame)
+    log.info("horizons (ticks): %s -> frames: %s  (%.2f ticks/frame)",
+             cfg.horizons, horizon_frames, ticks_per_frame)
 
     train_dataset = build_pixel_sequence_dataset(train_sessions, max_samples=cfg.max_train_samples)
     if len(train_dataset) == 0:
@@ -917,10 +965,14 @@ def run_nursery_scenario(
     )
     initial_model = None
     if cortex_checkpoint_path is not None and os.path.exists(cortex_checkpoint_path):
+        log.info("warm-starting from checkpoint %s", cortex_checkpoint_path)
         initial_model = load_full_visual_model(cortex_checkpoint_path)
+    log.info("training pixel encoder  samples=%d  epochs=%d  lr=%s",
+             len(train_dataset), cfg.epochs, cfg.lr)
     model, pretraining_stats = train_pixel_encoder_pretraining(
         train_dataset, visual_config, initial_model=initial_model,
     )
+    log.info("pixel encoder training complete")
 
     consistency_stats: Dict[str, List[float]] = {}
     if cfg.consistency_epochs > 0:
@@ -945,10 +997,15 @@ def run_nursery_scenario(
                     f"({max_horizon} frames); increase episode_ticks"
                 )
 
+    log.info("evaluating on %d holdout sessions", len(holdout_sessions))
     horizon_metrics = evaluate_ego_motion_holdout(
         model, holdout_sessions, horizon_frames, ssim_window=cfg.ssim_window
     )
     rollout_health = evaluate_rollout_health(model, holdout_sessions, horizon_frames)
+    for h, metrics in horizon_metrics.items():
+        log.info("  t+%d: model_mse=%.4f  copy_last_mse=%.4f  beats=%s",
+                 h, metrics.get("model_mse", 0), metrics.get("copy_last_mse", 0),
+                 metrics.get("beats_copy_last", "?"))
 
     entity_persistence_stats: Optional[Dict[str, Any]] = None
     if scenario.entity_persistence_metric:
@@ -1278,6 +1335,7 @@ def run_action_ablation_eval(
     actions -- exactly the confound this ablation exists to rule out.
     """
     cfg = config or NurseryConfig()
+    log.info("=== action ablation eval  train=%s  eval=%s ===", list(train_scenarios), eval_scenario)
     if eval_scenario not in train_scenarios:
         raise ValueError(
             f"eval_scenario {eval_scenario!r} must be one of the trained scenarios "
@@ -1398,6 +1456,7 @@ def run_action_ablation_eval(
         model_with, holdout_dataset, config=with_actions_cfg
     )
 
+    log.info("ablation result  degrades_without_actions=%s", degrades)
     return ActionAblationReport(
         train_scenarios=list(train_scenarios),
         eval_scenario=eval_scenario,
@@ -1458,6 +1517,8 @@ def run_backbone_benchmark(
     across runs) so the two harnesses read the same way.
     """
     cfg = config or NurseryConfig()
+    log.info("=== backbone benchmark  backbones=%s  baseline=%s  eval=%s ===",
+             list(backbones), baseline_backbone, eval_scenario)
     if eval_scenario not in train_scenarios:
         raise ValueError(
             f"eval_scenario {eval_scenario!r} must be one of the trained scenarios "
@@ -1537,6 +1598,7 @@ def run_backbone_benchmark(
         metrics[name] = report
         stats[name] = cortex_horizon_statistics(report["per_episode_model_mse"])
         beats_copy_last[name] = {h: entry["beats_copy_last"] for h, entry in report["horizons"].items()}
+        log.info("backbone %s  beats_copy_last=%s", name, beats_copy_last[name])
 
     comparisons: Dict[str, Dict[int, MetricComparison]] = {
         name: compare_cortex_horizon_statistics(stats[baseline_backbone], stats[name])
@@ -1635,7 +1697,7 @@ def _ascii_thumbnail(frame: torch.Tensor, size: Tuple[int, int]) -> List[str]:
     one row per thumbnail pixel row."""
     th, tw = size
     gray = frame.mean(dim=0, keepdim=True).unsqueeze(0)  # 1, 1, H, W
-    thumb = F.adaptive_avg_pool2d(gray, output_size=(th, tw))[0, 0].clamp(0.0, 1.0)
+    thumb = F.adaptive_avg_pool2d(gray, output_size=(th, tw))[0, 0].nan_to_num(0.0).clamp(0.0, 1.0)
     ramp = _ASCII_RAMP
     last = len(ramp) - 1
     rows = []

@@ -432,3 +432,31 @@ def verdict_for_session(
             )
     verdict = "red" if issues else ("amber" if warnings else "green")
     return RecordingVerdict(verdict=verdict, issues=issues, warnings=warnings)
+
+
+def evaluate_record_quality(
+    session_dir: str,
+    *,
+    name: str = "recording",
+    min_blocks_per_tick: float = 0.0,
+    min_unique_frame_fraction: float = 0.0,
+    min_unique_frames: int = 0,
+    max_blocks_per_tick: Optional[float] = None,
+    min_yaw_sweep_degrees: float = 0.0,
+    min_unique_facings: int = 0,
+    require_completed: bool = True,
+    expected_pixel_source: Optional[str] = None,
+) -> RecordingVerdict:
+    """Convenience alias for :func:`verdict_for_session`."""
+    return verdict_for_session(
+        session_dir,
+        name=name,
+        min_blocks_per_tick=min_blocks_per_tick,
+        min_unique_frame_fraction=min_unique_frame_fraction,
+        min_unique_frames=min_unique_frames,
+        max_blocks_per_tick=max_blocks_per_tick,
+        min_yaw_sweep_degrees=min_yaw_sweep_degrees,
+        min_unique_facings=min_unique_facings,
+        require_completed=require_completed,
+        expected_pixel_source=expected_pixel_source,
+    )

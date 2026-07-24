@@ -39,10 +39,13 @@ torch.
 from __future__ import annotations
 
 import copy
+import logging
 import math
 import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+log = logging.getLogger("ccr.training.cortex")
 
 from cognitive_runtime.runtime.replay import iter_cognitive_ticks, list_episodes
 from cognitive_runtime.runtime.frame_store import open_frame_store
@@ -577,6 +580,8 @@ def _train_autoregressive_objective(
         "reward_loss": [], "terminal_loss": [], "risk_loss": [], "uncertainty_loss": [],
         "closed_loop_loss": [], "workspace_loss": [],
     }
+    log.info("training cortex (autoregressive)  episodes=%d  epochs=%d  horizons=%s  backbone=%s",
+             len(episodes), cfg.epochs, list(horizons_ticks), getattr(model, "backbone_name", "?"))
     model.train()
     for epoch_idx in range(cfg.epochs):
         if cfg.context_length_curriculum and max_context:
@@ -696,7 +701,13 @@ def _train_autoregressive_objective(
                 epoch[key] += float(value.detach())
         for key in curves:
             curves[key].append(round(epoch[key] / max(seen, 1), 6))
+        epoch_total = curves["total_loss"][-1]
+        epoch_pixel = curves["pixel_loss"][-1]
+        epoch_latent = curves["latent_loss"][-1]
+        log.info("  epoch %d/%d  total=%.4f  pixel=%.4f  latent=%.4f",
+                 epoch_idx + 1, cfg.epochs, epoch_total, epoch_pixel, epoch_latent)
 
+    log.info("training complete  final_total=%.4f", curves["total_loss"][-1])
     if cfg.context_length_curriculum and max_context:
         model.set_context_length(max_context)
     return {
@@ -845,11 +856,8 @@ def train_action_world_model(
         "workspace_loss": [],
     }
 
-    #: Context-length curriculum (issue #93, task 5): windowed backbones
-    #: (dilated-conv/transformer) get their attended-over window ramped from
-    #: 1 to the configured maximum over training, rather than the full
-    #: window from epoch zero -- ``None`` on "gru" (unbounded context, no
-    #: window to ramp) leaves this a no-op.
+    log.info("training cortex (windowed_rollout)  windows=%d  epochs=%d  backbone=%s",
+             len(starts), cfg.epochs, getattr(model, "backbone_name", "?"))
     model.train()
     for epoch_idx in range(cfg.epochs):
         if cfg.context_length_curriculum and max_context:
@@ -1011,7 +1019,13 @@ def train_action_world_model(
             epoch["workspace_loss"] += float(workspace_loss.detach()) * batch_n
         for key in curves:
             curves[key].append(round(epoch[key] / max(seen, 1), 6))
+        epoch_total = curves["total_loss"][-1]
+        epoch_pixel = curves["pixel_loss"][-1]
+        epoch_latent = curves["latent_loss"][-1]
+        log.info("  epoch %d/%d  total=%.4f  pixel=%.4f  latent=%.4f",
+                 epoch_idx + 1, cfg.epochs, epoch_total, epoch_pixel, epoch_latent)
 
+    log.info("training complete  final_total=%.4f", curves["total_loss"][-1])
     if cfg.context_length_curriculum and max_context:
         # Leave the model at its full window post-training regardless of how
         # the curriculum schedule landed (e.g. a curriculum longer than
@@ -1096,6 +1110,8 @@ def evaluate_action_world_model(
     if not horizons_sorted or horizons_sorted[0] < 1:
         raise ValueError(f"horizons must be positive frame steps, got {horizons_frames!r}")
     max_horizon = horizons_sorted[-1]
+    log.info("evaluating cortex  horizons=%s  warmup=%d  episodes=%d",
+             horizons_sorted, warmup_frames, len(dataset))
 
     episodes = _episode_tensors(dataset, model.reconstruction_shape)
     action_index = {name: i for i, name in enumerate(model.action_keys)}
@@ -1248,6 +1264,15 @@ def evaluate_action_world_model(
         }
         for name, horizons in workspace_samples.items()
     }
+    for h in horizons_sorted:
+        r = report[h]
+        log.info("  t+%d: model=%.4f  copy_last=%.4f  ratio=%.3f  beats=%s",
+                 h, r["model_mse"], r["copy_last_mse"],
+                 r["model_over_copy_last_mse"] or 0.0, r["beats_copy_last"])
+    log.info("rollout_health  frozen=%s  pred_disp=%.4f  tgt_disp=%.4f",
+             rollout_health["frozen_rollout"],
+             rollout_health["prediction_dispersion"],
+             rollout_health["target_dispersion"])
     return {
         "horizons": report,
         "workspace_modalities": workspace_report,
