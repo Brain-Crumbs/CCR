@@ -47,14 +47,45 @@ def _record_crafter_walk(tmp_path, session_id="crafter-walk"):
 
 
 def _record_crafter_stationary(tmp_path, session_id="crafter-still"):
-    """Object_permanence's player never moves -- a genuinely frozen
-    recording from the Crafter side, for the "flag a static session" gate
-    checks below."""
+    """Object_permanence's *player* never moves -- the motion-floor
+    ("barely moved") gate's Crafter case.
+
+    Note this is not a pixel-frozen recording: the scenario's scripted mob
+    walks in and out of view, so every frame differs. Use
+    ``_freeze_recorded_frames`` for the frozen-pixel gates.
+    """
     pytest.importorskip("crafter")
     cfg = NurseryConfig(world="crafter", episode_ticks=40)
     return _record_scenario_episode(
         str(tmp_path), session_id, 0, CRAFTER_SCENARIOS["object_permanence"], cfg
     )
+
+
+def _freeze_recorded_frames(session_dir):
+    """Rewrite a recorded session so every pixel frame is byte-identical.
+
+    The frozen-pixel gate counts *distinct* frame content hashes, so this
+    constructs exactly the condition it exists to catch. Recording a
+    scenario and hoping it comes out static does not: no nursery scenario
+    is pixel-frozen (Crafter's ``object_permanence`` has a moving mob,
+    Minecraft's ``turn_in_place`` re-renders on every yaw change), which is
+    what made the earlier fixture stop reproducing the failure it asserted.
+    """
+    for episode_id in list_episodes(session_dir):
+        path = os.path.join(session_dir, f"{episode_id}.streams.jsonl")
+        with open(path, encoding="utf-8") as handle:
+            lines = [json.loads(line) for line in handle if line.strip()]
+        first_ref = next(
+            (line["frame_ref"] for line in lines if "frame_ref" in line), None
+        )
+        assert first_ref is not None, f"{path} records no pixel frames"
+        for line in lines:
+            if "frame_ref" in line:
+                line["frame_ref"] = first_ref
+        with open(path, "w", encoding="utf-8") as handle:
+            for line in lines:
+                handle.write(json.dumps(line) + "\n")
+    return session_dir
 
 
 # --------------------------------------------------------------------------- measurement
@@ -148,10 +179,19 @@ def test_verdict_for_session_is_red_for_a_frozen_recording(tmp_path):
 
 
 def test_world_agnostic_unique_frame_count_gate_rejects_frozen_pixels(tmp_path):
-    session_dir = _record_crafter_stationary(tmp_path)
+    session_dir = _freeze_recorded_frames(_record_crafter_walk(tmp_path))
     verdict = verdict_for_session(session_dir, min_unique_frames=2)
     assert verdict.verdict == "red"
     assert any("recording appears frozen" in issue for issue in verdict.issues)
+
+
+def test_world_agnostic_unique_frame_count_gate_passes_a_moving_recording(tmp_path):
+    """The other half of the gate: a recording whose frames actually change
+    must not trip it -- otherwise the test above would pass against a gate
+    that simply always fires."""
+    session_dir = _record_crafter_walk(tmp_path)
+    verdict = verdict_for_session(session_dir, min_unique_frames=2)
+    assert not any("recording appears frozen" in issue for issue in verdict.issues)
 
 
 def test_verdict_for_session_is_amber_when_provenance_predates_tracking(tmp_path):

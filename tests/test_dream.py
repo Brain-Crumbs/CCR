@@ -51,6 +51,14 @@ def test_dream_is_the_cortex_own_closed_loop_rollout():
 
 
 def test_dream_never_reads_live_senses(monkeypatch):
+    """A dream's complete input is the stored latent and replayed actions --
+    it must never consume from the sensory bus.
+
+    Every consume path is booby-trapped by name, so `monkeypatch.setattr`
+    fails loudly if one is renamed: this test previously patched
+    `read_since`/`latest`, which the bus has never had, and so errored at
+    setup instead of guarding anything.
+    """
     model = _cortex()
     seed = _seed(model)
 
@@ -59,8 +67,9 @@ def test_dream_never_reads_live_senses(monkeypatch):
 
     from cognitive_runtime.core.streams import bus
 
-    monkeypatch.setattr(bus.StreamBus, "read_since", forbidden)
-    monkeypatch.setattr(bus.StreamBus, "latest", forbidden)
+    monkeypatch.setattr(bus.StreamBus, "drain", forbidden)
+    monkeypatch.setattr(bus.StreamBus, "_drain_matching", forbidden)
+    monkeypatch.setattr(bus.StreamSubscription, "drain", forbidden)
     assert len(list(dream(seed, 2, model))) == 2
 
 

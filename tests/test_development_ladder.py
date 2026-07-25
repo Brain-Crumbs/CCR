@@ -625,7 +625,16 @@ def test_real_milestone_metrics_provider_persists_and_warm_starts_its_cortex(tmp
     real ``ladder_milestone_metrics`` provider and
     ``world_model_checkpoint_paths`` through ``run_curriculum`` fixes both:
     a second attempt warm-starts from the first's cortex, and the ladder's
-    own checkpoint metadata records that a world model actually backs it."""
+    own checkpoint metadata records that a world model actually backs it.
+
+    Deliberately asserts nothing about whether the gate *promotes*. The
+    babbling gate is ``action_ablation_margin >= 1e-4`` measured from one
+    40-tick episode, and its value is noise-scale at that sizing: a fresh
+    cortex scores about +5e-4, while a warm-started second run measures
+    -0.008, -0.011, -0.003 over its three attempts and legitimately holds.
+    Pinning ``status == "completed"`` here made this test fail on the model's
+    behaviour rather than on the checkpoint wiring it exists to cover.
+    """
     import cognitive_runtime.training.nursery as nursery_module
     from development.ladder import ladder_cortex_checkpoint_paths
 
@@ -652,7 +661,9 @@ def test_real_milestone_metrics_provider_persists_and_warm_starts_its_cortex(tmp
         definition, checkpoint_path=checkpoint_path_1, record_dir=None,
         milestone_metrics=provider, world_model_checkpoint_paths=cortex_paths,
     )
-    assert result_1.status == "completed"
+    assert result_1.status in ("completed", "held")
+    assert result_1.state.history, "the real provider must have evaluated the gate"
+    assert result_1.state.history[0]["metric"] == ["action_ablation_margin"]
     assert any(os.path.exists(p) for p in cortex_paths), "a cortex checkpoint must be persisted"
     recorded = read_checkpoint_metadata(checkpoint_path_1)["extra"]["ladder_world_model_checkpoints"]
     assert recorded and all(os.path.exists(p) for p in recorded)
@@ -664,9 +675,11 @@ def test_real_milestone_metrics_provider_persists_and_warm_starts_its_cortex(tmp
         definition, checkpoint_path=checkpoint_path_2, record_dir=None,
         milestone_metrics=provider, world_model_checkpoint_paths=cortex_paths,
     )
-    assert result_2.status == "completed"
-    assert captured[calls_before_second_run] is not None, (
-        "a fresh curriculum run reusing the same cortex_checkpoint_base must warm-start"
+    assert result_2.status in ("completed", "held")
+    assert len(captured) > calls_before_second_run, "the second run must have trained a cortex"
+    assert all(model is not None for model in captured[calls_before_second_run:]), (
+        "a fresh curriculum run reusing the same cortex_checkpoint_base must warm-start "
+        "every arm from the persisted cortex, never train a disposable one"
     )
 
 

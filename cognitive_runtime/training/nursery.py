@@ -37,6 +37,7 @@ import torch.nn.functional as F
 
 from cognitive_runtime.core.action import NULL_ACTION, Action
 from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
+from cognitive_runtime.observability import span, trace_counter, trace_event, trace_metrics
 from cognitive_runtime.policies.constant_action import ConstantActionPolicy
 from cognitive_runtime.policies.null_policy import NullPolicy
 from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy
@@ -805,37 +806,48 @@ def _build_scenario_program(cfg: NurseryConfig, program_config: Dict[str, Any]) 
 def _record_scenario_episode(
     record_dir: str, session_id: str, seed: int, scenario: NurseryScenario, cfg: NurseryConfig
 ) -> str:
-    log.info("recording %s  seed=%d  ticks=%d", session_id, seed, cfg.episode_ticks)
-    recording = scenario.build(seed, cfg)
-    episode_ticks = recording.episode_ticks or cfg.episode_ticks
-    program_config: Dict[str, Any] = {"episode_ticks": episode_ticks, "world_size": cfg.world_size}
-    program_config.update(recording.program_config_extra)
-    runtime_config = RuntimeConfig(
-        episodes=1,
-        seed=seed,
-        max_ticks_per_episode=episode_ticks,
-        record_dir=record_dir,
-        session_id=session_id,
-        program_config=program_config,
-        realtime=cfg.realtime,
-        record_frames=True,
-        curriculum=f"nursery/{scenario.name}",
-        name=cfg.name,
-    )
-    program = _build_scenario_program(cfg, program_config)
-    # Crafter's scripted scenarios always run against the (only) live env;
-    # Minecraft's scene-setup only makes sense against the simulated
-    # backend's in-process world (a remote server has no scriptable world to
-    # reach into).
-    if recording.scene_setup is not None and (cfg.world == "crafter" or cfg.backend == "simulated"):
-        recording.scene_setup(program)
-    try:
-        CognitiveRuntime(program=program, policy=recording.policy, config=runtime_config).run()
-    finally:
-        close = getattr(program, "close", None)
-        if callable(close):
-            close()
-    return os.path.join(record_dir, session_id)
+    with span("nursery.record.episode", session=session_id, scenario=scenario.name,
+              seed=seed, ticks=cfg.episode_ticks):
+        log.info("recording %s  seed=%d  ticks=%d", session_id, seed, cfg.episode_ticks)
+        recording = scenario.build(seed, cfg)
+        episode_ticks = recording.episode_ticks or cfg.episode_ticks
+        program_config: Dict[str, Any] = {
+            "episode_ticks": episode_ticks, "world_size": cfg.world_size,
+        }
+        program_config.update(recording.program_config_extra)
+        runtime_config = RuntimeConfig(
+            episodes=1,
+            seed=seed,
+            max_ticks_per_episode=episode_ticks,
+            record_dir=record_dir,
+            session_id=session_id,
+            program_config=program_config,
+            realtime=cfg.realtime,
+            record_frames=True,
+            curriculum=f"nursery/{scenario.name}",
+            name=cfg.name,
+        )
+        program = _build_scenario_program(cfg, program_config)
+        # Crafter's scripted scenarios always run against the (only) live env;
+        # Minecraft's scene-setup only makes sense against the simulated
+        # backend's in-process world (a remote server has no scriptable world to
+        # reach into).
+        if recording.scene_setup is not None and (
+            cfg.world == "crafter" or cfg.backend == "simulated"
+        ):
+            recording.scene_setup(program)
+        try:
+            CognitiveRuntime(program=program, policy=recording.policy, config=runtime_config).run()
+        finally:
+            close = getattr(program, "close", None)
+            if callable(close):
+                close()
+        # Counted only once the episode is actually on disk: in a failed run
+        # -- the trace where this counter is most worth reading -- an
+        # increment before the runtime would overstate the usable recordings
+        # by the very episode that killed the run.
+        trace_counter("episodes_recorded")
+        return os.path.join(record_dir, session_id)
 
 
 # --------------------------------------------------------------------------- benchmark harness
@@ -910,14 +922,20 @@ def run_nursery_scenario(
     if set(cfg.train_seeds) & set(cfg.holdout_seeds):
         raise ValueError("train_seeds and holdout_seeds must not overlap")
 
-    train_sessions = [
-        _record_scenario_episode(record_dir, f"nursery-{scenario_name}-train-{seed}", seed, scenario, cfg)
-        for seed in cfg.train_seeds
-    ]
-    holdout_sessions = [
-        _record_scenario_episode(record_dir, f"nursery-{scenario_name}-holdout-{seed}", seed, scenario, cfg)
-        for seed in cfg.holdout_seeds
-    ]
+    with span("nursery.record", scenario=scenario_name,
+              train_seeds=len(cfg.train_seeds), holdout_seeds=len(cfg.holdout_seeds)):
+        train_sessions = [
+            _record_scenario_episode(
+                record_dir, f"nursery-{scenario_name}-train-{seed}", seed, scenario, cfg
+            )
+            for seed in cfg.train_seeds
+        ]
+        holdout_sessions = [
+            _record_scenario_episode(
+                record_dir, f"nursery-{scenario_name}-holdout-{seed}", seed, scenario, cfg
+            )
+            for seed in cfg.holdout_seeds
+        ]
     log.info("recorded %d train + %d holdout sessions", len(train_sessions), len(holdout_sessions))
 
     if cfg.data_quality_gate:
@@ -927,6 +945,8 @@ def run_nursery_scenario(
             expected_pixel_source=cfg.expected_pixel_source,
         )
         if issues:
+            trace_event("nursery.quality_gate.failed",
+                        scenario=scenario_name, issues=issues)
             hint = (
                 " Hint: the remote backend plays on the server's persistent world -- "
                 "seeds do not vary terrain, sessions inherit the previous session's "
@@ -969,22 +989,26 @@ def run_nursery_scenario(
         initial_model = load_full_visual_model(cortex_checkpoint_path)
     log.info("training pixel encoder  samples=%d  epochs=%d  lr=%s",
              len(train_dataset), cfg.epochs, cfg.lr)
-    model, pretraining_stats = train_pixel_encoder_pretraining(
-        train_dataset, visual_config, initial_model=initial_model,
-    )
+    with span("nursery.train.pixel_encoder",
+              samples=len(train_dataset), epochs=cfg.epochs, lr=cfg.lr,
+              warm_start=initial_model is not None):
+        model, pretraining_stats = train_pixel_encoder_pretraining(
+            train_dataset, visual_config, initial_model=initial_model,
+        )
     log.info("pixel encoder training complete")
 
     consistency_stats: Dict[str, List[float]] = {}
     if cfg.consistency_epochs > 0:
-        consistency_stats = train_horizon_consistency(
-            model,
-            train_sessions,
-            horizon_frames,
-            epochs=cfg.consistency_epochs,
-            lr=cfg.consistency_lr,
-            batch_size=cfg.batch_size,
-            seed=cfg.seed,
-        )
+        with span("nursery.train.horizon_consistency", epochs=cfg.consistency_epochs):
+            consistency_stats = train_horizon_consistency(
+                model,
+                train_sessions,
+                horizon_frames,
+                epochs=cfg.consistency_epochs,
+                lr=cfg.consistency_lr,
+                batch_size=cfg.batch_size,
+                seed=cfg.seed,
+            )
     if cortex_checkpoint_path is not None:
         save_full_visual_model(model, cortex_checkpoint_path)
 
@@ -998,14 +1022,17 @@ def run_nursery_scenario(
                 )
 
     log.info("evaluating on %d holdout sessions", len(holdout_sessions))
-    horizon_metrics = evaluate_ego_motion_holdout(
-        model, holdout_sessions, horizon_frames, ssim_window=cfg.ssim_window
-    )
-    rollout_health = evaluate_rollout_health(model, holdout_sessions, horizon_frames)
+    with span("nursery.evaluate", scenario=scenario_name, sessions=len(holdout_sessions)):
+        horizon_metrics = evaluate_ego_motion_holdout(
+            model, holdout_sessions, horizon_frames, ssim_window=cfg.ssim_window
+        )
+        rollout_health = evaluate_rollout_health(model, holdout_sessions, horizon_frames)
     for h, metrics in horizon_metrics.items():
         log.info("  t+%d: model_mse=%.4f  copy_last_mse=%.4f  beats=%s",
                  h, metrics.get("model_mse", 0), metrics.get("copy_last_mse", 0),
                  metrics.get("beats_copy_last", "?"))
+    _trace_horizon_metrics("scenario", scenario_name, {"horizons": horizon_metrics,
+                                                       "rollout_health": rollout_health})
 
     entity_persistence_stats: Optional[Dict[str, Any]] = None
     if scenario.entity_persistence_metric:
@@ -1101,6 +1128,44 @@ class JointNurseryReport:
     ticks_per_frame: float = 1.0
 
 
+def _final_loss(training_stats: Dict[str, Any]) -> Optional[float]:
+    final = training_stats.get("final_total_loss")
+    if final is not None:
+        return float(final)
+    totals = (training_stats.get("loss_curves") or {}).get("total_loss") or []
+    return float(totals[-1]) if totals else None
+
+
+def _trace_horizon_metrics(split: str, scenario: str, metrics: Dict[str, Any]) -> None:
+    """Push one evaluation's per-horizon numbers into the trace as metric
+    series, so ``ccr trace show`` can answer "did it beat copy-last-frame?"
+    without re-reading the report JSON -- and so a run that dies during a
+    later scenario still has the earlier scenarios' verdicts on disk."""
+    for horizon, entry in (metrics.get("horizons") or {}).items():
+        trace_metrics(
+            **{
+                f"eval/{split}/{scenario}/t+{horizon}/model_mse": entry.get("model_mse"),
+                f"eval/{split}/{scenario}/t+{horizon}/copy_last_mse": entry.get("copy_last_mse"),
+                f"eval/{split}/{scenario}/t+{horizon}/beats_copy_last": float(
+                    bool(entry.get("beats_copy_last"))
+                ),
+            }
+        )
+    health = metrics.get("rollout_health") or {}
+    trace_event(
+        "nursery.evaluate.result", split=split, scenario=scenario,
+        horizons={
+            str(h): {
+                "model_mse": e.get("model_mse"),
+                "copy_last_mse": e.get("copy_last_mse"),
+                "beats_copy_last": e.get("beats_copy_last"),
+            }
+            for h, e in (metrics.get("horizons") or {}).items()
+        },
+        frozen_rollout=health.get("frozen_rollout"),
+    )
+
+
 def run_nursery_joint(
     record_dir: str,
     train_scenarios: Optional[Sequence[str]] = None,
@@ -1158,50 +1223,77 @@ def run_nursery_joint(
         seed=cfg.seed,
     )
 
+    log.info("=== nursery joint: train=%s  holdout=%s  world=%s ===",
+             train_names, holdout_names, cfg.world)
+    trace_event(
+        "nursery.joint.plan",
+        train_scenarios=train_names, holdout_scenarios=holdout_names, world=cfg.world,
+        train_seeds=list(cfg.train_seeds), holdout_seeds=list(cfg.holdout_seeds),
+        horizons=list(cfg.horizons), epochs=model_cfg.epochs, backbone=model_cfg.backbone,
+        training_objective=model_cfg.training_objective,
+    )
+
     train_sessions: Dict[str, List[str]] = {}
     eval_sessions: Dict[str, List[str]] = {}
-    for name in train_names:
-        scenario = NURSERY_SCENARIOS[name]
-        train_sessions[name] = [
-            _record_scenario_episode(
-                record_dir, f"nursery-{name}-train-{seed}", seed, scenario, cfg
-            )
-            for seed in cfg.train_seeds
-        ]
-        eval_sessions[name] = [
-            _record_scenario_episode(
-                record_dir, f"nursery-{name}-holdout-{seed}", seed, scenario, cfg
-            )
-            for seed in cfg.holdout_seeds
-        ]
-    for name in holdout_names:
-        scenario = NURSERY_SCENARIOS[name]
-        eval_sessions[name] = [
-            _record_scenario_episode(
-                record_dir, f"nursery-{name}-holdout-{seed}", seed, scenario, cfg
-            )
-            for seed in cfg.holdout_seeds
-        ]
+    with span("nursery.record",
+              scenarios=len(train_names) + len(holdout_names),
+              episodes=(len(train_names) * (len(cfg.train_seeds) + len(cfg.holdout_seeds))
+                        + len(holdout_names) * len(cfg.holdout_seeds))) as recording_span:
+        for name in train_names:
+            scenario = NURSERY_SCENARIOS[name]
+            with span("nursery.record.scenario", scenario=name, split="train+holdout"):
+                train_sessions[name] = [
+                    _record_scenario_episode(
+                        record_dir, f"nursery-{name}-train-{seed}", seed, scenario, cfg
+                    )
+                    for seed in cfg.train_seeds
+                ]
+                eval_sessions[name] = [
+                    _record_scenario_episode(
+                        record_dir, f"nursery-{name}-holdout-{seed}", seed, scenario, cfg
+                    )
+                    for seed in cfg.holdout_seeds
+                ]
+        for name in holdout_names:
+            scenario = NURSERY_SCENARIOS[name]
+            with span("nursery.record.scenario", scenario=name, split="zero-shot"):
+                eval_sessions[name] = [
+                    _record_scenario_episode(
+                        record_dir, f"nursery-{name}-holdout-{seed}", seed, scenario, cfg
+                    )
+                    for seed in cfg.holdout_seeds
+                ]
+        recording_span.set(
+            train_sessions=sum(len(v) for v in train_sessions.values()),
+            eval_sessions=sum(len(v) for v in eval_sessions.values()),
+        )
 
     if cfg.data_quality_gate:
-        issues: List[str] = []
-        for name in train_names:
-            issues += validate_nursery_recordings(
-                train_sessions[name] + eval_sessions[name],
-                NURSERY_SCENARIOS[name],
-                expected_pixel_source=cfg.expected_pixel_source,
-            )
-        for name in holdout_names:
-            issues += validate_nursery_recordings(
-                eval_sessions[name],
-                NURSERY_SCENARIOS[name],
-                expected_pixel_source=cfg.expected_pixel_source,
-            )
-        if issues:
-            raise ValueError(
-                "nursery joint run: recorded data fails the quality gate:\n  - "
-                + "\n  - ".join(issues)
-            )
+        with span("nursery.quality_gate") as gate_span:
+            issues: List[str] = []
+            for name in train_names:
+                issues += validate_nursery_recordings(
+                    train_sessions[name] + eval_sessions[name],
+                    NURSERY_SCENARIOS[name],
+                    expected_pixel_source=cfg.expected_pixel_source,
+                )
+            for name in holdout_names:
+                issues += validate_nursery_recordings(
+                    eval_sessions[name],
+                    NURSERY_SCENARIOS[name],
+                    expected_pixel_source=cfg.expected_pixel_source,
+                )
+            gate_span.set(issues=len(issues))
+            if issues:
+                # The gate's verdict belongs in the trace: a failed run whose
+                # only record is a traceback can't be compared against the
+                # run that passed.
+                trace_event("nursery.quality_gate.failed", issues=issues)
+                raise ValueError(
+                    "nursery joint run: recorded data fails the quality gate:\n  - "
+                    + "\n  - ".join(issues)
+                )
+            log.info("quality gate passed")
 
     # Pin the vocabulary to the full action space (plus NULL): a held-out
     # scenario may issue actions no training scenario used, and zero-shot
@@ -1210,39 +1302,61 @@ def run_nursery_joint(
     vocabulary = _action_keys_for_world(cfg.world)
 
     all_train_dirs = [d for name in train_names for d in train_sessions[name]]
-    dataset = build_action_sequence_dataset(all_train_dirs, action_keys=vocabulary)
-    if len(dataset) == 0:
-        raise ValueError("nursery joint run: no frame transitions in the training sessions")
-    ticks_per_frame = dataset.ticks_per_frame
-    horizon_frames = horizons_ticks_to_frames(cfg.horizons, ticks_per_frame)
+    with span("nursery.dataset", sessions=len(all_train_dirs)) as dataset_span:
+        dataset = build_action_sequence_dataset(all_train_dirs, action_keys=vocabulary)
+        if len(dataset) == 0:
+            raise ValueError("nursery joint run: no frame transitions in the training sessions")
+        ticks_per_frame = dataset.ticks_per_frame
+        horizon_frames = horizons_ticks_to_frames(cfg.horizons, ticks_per_frame)
+        dataset_span.set(
+            transitions=len(dataset), ticks_per_frame=ticks_per_frame,
+            horizon_frames=horizon_frames, action_vocabulary=len(vocabulary),
+        )
+    log.info("horizons (ticks): %s -> frames: %s  (%.2f ticks/frame)",
+             list(cfg.horizons), horizon_frames, ticks_per_frame)
 
-    model, training_stats = train_action_world_model(dataset, model_cfg)
+    with span("nursery.train", epochs=model_cfg.epochs, backbone=model_cfg.backbone,
+              objective=model_cfg.training_objective) as train_span:
+        model, training_stats = train_action_world_model(dataset, model_cfg)
+        train_span.set(final_total_loss=_final_loss(training_stats))
 
     scenario_metrics: Dict[str, Dict[str, Any]] = {}
-    for name in train_names:
-        holdout_dataset = build_action_sequence_dataset(
-            eval_sessions[name], action_keys=model.action_keys
-        )
-        scenario_metrics[name] = evaluate_action_world_model(
-            model, holdout_dataset, horizon_frames, warmup_frames=model_cfg.warmup_frames
-        )
+    with span("nursery.evaluate.in_distribution", scenarios=len(train_names)):
+        for name in train_names:
+            with span("nursery.evaluate.scenario", scenario=name, split="in_distribution"):
+                holdout_dataset = build_action_sequence_dataset(
+                    eval_sessions[name], action_keys=model.action_keys
+                )
+                scenario_metrics[name] = evaluate_action_world_model(
+                    model, holdout_dataset, horizon_frames,
+                    warmup_frames=model_cfg.warmup_frames,
+                )
+                _trace_horizon_metrics("in_distribution", name, scenario_metrics[name])
     zero_shot_metrics: Dict[str, Dict[str, Any]] = {}
-    for name in holdout_names:
-        holdout_dataset = build_action_sequence_dataset(
-            eval_sessions[name], action_keys=model.action_keys
-        )
-        zero_shot_metrics[name] = evaluate_action_world_model(
-            model, holdout_dataset, horizon_frames, warmup_frames=model_cfg.warmup_frames
-        )
+    with span("nursery.evaluate.zero_shot", scenarios=len(holdout_names)):
+        for name in holdout_names:
+            with span("nursery.evaluate.scenario", scenario=name, split="zero_shot"):
+                holdout_dataset = build_action_sequence_dataset(
+                    eval_sessions[name], action_keys=model.action_keys
+                )
+                zero_shot_metrics[name] = evaluate_action_world_model(
+                    model, holdout_dataset, horizon_frames,
+                    warmup_frames=model_cfg.warmup_frames,
+                )
+                _trace_horizon_metrics("zero_shot", name, zero_shot_metrics[name])
 
-    probe_dataset = build_action_sequence_dataset(
-        [d for dirs in eval_sessions.values() for d in dirs], action_keys=model.action_keys
-    )
-    yaw_probe = linear_probe_yaw(model, probe_dataset)
-    orientation_probe = linear_probe_orientation(model, probe_dataset)
-    representation_diagnostics = representation_collapse_diagnostics(
-        model, probe_dataset, config=model_cfg
-    )
+    with span("nursery.probes"):
+        probe_dataset = build_action_sequence_dataset(
+            [d for dirs in eval_sessions.values() for d in dirs], action_keys=model.action_keys
+        )
+        yaw_probe = linear_probe_yaw(model, probe_dataset)
+        orientation_probe = linear_probe_orientation(model, probe_dataset)
+        representation_diagnostics = representation_collapse_diagnostics(
+            model, probe_dataset, config=model_cfg
+        )
+        trace_event("nursery.probes.result",
+                    yaw=yaw_probe, orientation=orientation_probe,
+                    representation=representation_diagnostics)
 
     return model, JointNurseryReport(
         train_scenarios=train_names,
@@ -1415,9 +1529,10 @@ def run_action_ablation_eval(
     with_initial = None
     if cortex_checkpoint_path is not None and os.path.exists(cortex_checkpoint_path):
         with_initial, _ = load_action_world_model(cortex_checkpoint_path)
-    model_with, stats_with = train_action_world_model(
-        dataset, with_actions_cfg, initial_model=with_initial,
-    )
+    with span("ablation.train", arm="with_actions", epochs=with_actions_cfg.epochs):
+        model_with, stats_with = train_action_world_model(
+            dataset, with_actions_cfg, initial_model=with_initial,
+        )
     if cortex_checkpoint_path is not None:
         save_action_world_model(cortex_checkpoint_path, model_with, stats_with)
 
@@ -1427,21 +1542,27 @@ def run_action_ablation_eval(
     without_initial = None
     if without_actions_checkpoint_path is not None and os.path.exists(without_actions_checkpoint_path):
         without_initial, _ = load_action_world_model(without_actions_checkpoint_path)
-    model_without, stats_without = train_action_world_model(
-        dataset, without_actions_cfg, initial_model=without_initial,
-    )
+    with span("ablation.train", arm="without_actions", epochs=without_actions_cfg.epochs):
+        model_without, stats_without = train_action_world_model(
+            dataset, without_actions_cfg, initial_model=without_initial,
+        )
     if without_actions_checkpoint_path is not None:
         save_action_world_model(without_actions_checkpoint_path, model_without, stats_without)
 
     holdout_dataset = build_action_sequence_dataset(
         eval_sessions[eval_scenario], action_keys=model_with.action_keys
     )
-    with_actions_metrics = evaluate_action_world_model(
-        model_with, holdout_dataset, horizon_frames, warmup_frames=base_model_cfg.warmup_frames
-    )
-    without_actions_metrics = evaluate_action_world_model(
-        model_without, holdout_dataset, horizon_frames, warmup_frames=base_model_cfg.warmup_frames
-    )
+    with span("ablation.evaluate", scenario=eval_scenario):
+        with_actions_metrics = evaluate_action_world_model(
+            model_with, holdout_dataset, horizon_frames,
+            warmup_frames=base_model_cfg.warmup_frames,
+        )
+        without_actions_metrics = evaluate_action_world_model(
+            model_without, holdout_dataset, horizon_frames,
+            warmup_frames=base_model_cfg.warmup_frames,
+        )
+        _trace_horizon_metrics("ablation_with_actions", eval_scenario, with_actions_metrics)
+        _trace_horizon_metrics("ablation_without_actions", eval_scenario, without_actions_metrics)
 
     with_actions_stats = cortex_horizon_statistics(with_actions_metrics["per_episode_model_mse"])
     without_actions_stats = cortex_horizon_statistics(without_actions_metrics["per_episode_model_mse"])
@@ -1457,6 +1578,8 @@ def run_action_ablation_eval(
     )
 
     log.info("ablation result  degrades_without_actions=%s", degrades)
+    trace_event("ablation.result", degrades_without_actions=degrades,
+                eval_scenario=eval_scenario, comparisons=comparisons)
     return ActionAblationReport(
         train_scenarios=list(train_scenarios),
         eval_scenario=eval_scenario,
@@ -1590,14 +1713,19 @@ def run_backbone_benchmark(
     stats: Dict[str, Dict[int, MetricStats]] = {}
     beats_copy_last: Dict[str, Dict[int, bool]] = {}
     for name in backbones:
-        backbone_cfg = replace(base_model_cfg, backbone=name)
-        model, _train_stats = train_action_world_model(dataset, backbone_cfg)
-        report = evaluate_action_world_model(
-            model, holdout_dataset, horizon_frames, warmup_frames=base_model_cfg.warmup_frames
-        )
-        metrics[name] = report
-        stats[name] = cortex_horizon_statistics(report["per_episode_model_mse"])
-        beats_copy_last[name] = {h: entry["beats_copy_last"] for h, entry in report["horizons"].items()}
+        with span("benchmark.backbone", backbone=name, epochs=base_model_cfg.epochs):
+            backbone_cfg = replace(base_model_cfg, backbone=name)
+            model, _train_stats = train_action_world_model(dataset, backbone_cfg)
+            report = evaluate_action_world_model(
+                model, holdout_dataset, horizon_frames,
+                warmup_frames=base_model_cfg.warmup_frames,
+            )
+            metrics[name] = report
+            stats[name] = cortex_horizon_statistics(report["per_episode_model_mse"])
+            beats_copy_last[name] = {
+                h: entry["beats_copy_last"] for h, entry in report["horizons"].items()
+            }
+            _trace_horizon_metrics(f"backbone/{name}", eval_scenario, report)
         log.info("backbone %s  beats_copy_last=%s", name, beats_copy_last[name])
 
     comparisons: Dict[str, Dict[int, MetricComparison]] = {

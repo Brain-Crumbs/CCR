@@ -42,11 +42,13 @@ import copy
 import logging
 import math
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 log = logging.getLogger("ccr.training.cortex")
 
+from cognitive_runtime.observability import trace_event, trace_metrics
 from cognitive_runtime.runtime.replay import iter_cognitive_ticks, list_episodes
 from cognitive_runtime.runtime.frame_store import open_frame_store
 from cognitive_runtime.runtime.recorder import stream_event_from_log
@@ -581,9 +583,18 @@ def _train_autoregressive_objective(
         "closed_loop_loss": [], "workspace_loss": [],
     }
     log.info("training cortex (autoregressive)  episodes=%d  epochs=%d  horizons=%s  backbone=%s",
-             len(episodes), cfg.epochs, list(horizons_ticks), getattr(model, "backbone_name", "?"))
+             len(episodes), cfg.epochs, list(horizons_ticks), _backbone_name(model))
+    trace_event(
+        "cortex.train.start", objective="autoregressive", episodes=len(episodes),
+        epochs=cfg.epochs, horizons_ticks=list(horizons_ticks),
+        horizon_frames=list(horizon_frames), backbone=_backbone_name(model),
+        lr=cfg.lr, latent_width=cfg.latent_width, hidden_dim=cfg.hidden_dim,
+        context_length=max_context, ema_target=target_encoder is not None,
+    )
+    training_started = time.perf_counter()
     model.train()
     for epoch_idx in range(cfg.epochs):
+        epoch_started = time.perf_counter()
         if cfg.context_length_curriculum and max_context:
             progress = min(epoch_idx / max(curriculum_epochs - 1, 1), 1.0)
             model.set_context_length(max(1, round(1 + progress * (max_context - 1))))
@@ -701,13 +712,21 @@ def _train_autoregressive_objective(
                 epoch[key] += float(value.detach())
         for key in curves:
             curves[key].append(round(epoch[key] / max(seen, 1), 6))
-        epoch_total = curves["total_loss"][-1]
-        epoch_pixel = curves["pixel_loss"][-1]
-        epoch_latent = curves["latent_loss"][-1]
-        log.info("  epoch %d/%d  total=%.4f  pixel=%.4f  latent=%.4f",
-                 epoch_idx + 1, cfg.epochs, epoch_total, epoch_pixel, epoch_latent)
+        _report_epoch(
+            epoch_idx, cfg.epochs, curves,
+            epoch_seconds=time.perf_counter() - epoch_started,
+            training_started=training_started,
+            **{"train/episodes_seen": seen,
+               # only meaningful for the windowed backbones, which ramp it
+               # over the context-length curriculum; `None` for the GRU
+               **({"train/context_length": model.context_length}
+                  if getattr(model, "context_length", None) else {})},
+        )
 
     log.info("training complete  final_total=%.4f", curves["total_loss"][-1])
+    trace_event("cortex.train.done", objective="autoregressive",
+                final_total_loss=curves["total_loss"][-1],
+                duration_s=round(time.perf_counter() - training_started, 3))
     if cfg.context_length_curriculum and max_context:
         model.set_context_length(max_context)
     return {
@@ -857,9 +876,17 @@ def train_action_world_model(
     }
 
     log.info("training cortex (windowed_rollout)  windows=%d  epochs=%d  backbone=%s",
-             len(starts), cfg.epochs, getattr(model, "backbone_name", "?"))
+             len(starts), cfg.epochs, _backbone_name(model))
+    trace_event(
+        "cortex.train.start", objective="windowed_rollout", windows=len(starts),
+        epochs=cfg.epochs, backbone=_backbone_name(model),
+        lr=cfg.lr, batch_size=cfg.batch_size, latent_width=cfg.latent_width,
+        hidden_dim=cfg.hidden_dim, context_length=max_context,
+    )
+    training_started = time.perf_counter()
     model.train()
     for epoch_idx in range(cfg.epochs):
+        epoch_started = time.perf_counter()
         if cfg.context_length_curriculum and max_context:
             progress = min(epoch_idx / max(curriculum_epochs - 1, 1), 1.0)
             model.set_context_length(max(1, round(1 + progress * (max_context - 1))))
@@ -1019,13 +1046,21 @@ def train_action_world_model(
             epoch["workspace_loss"] += float(workspace_loss.detach()) * batch_n
         for key in curves:
             curves[key].append(round(epoch[key] / max(seen, 1), 6))
-        epoch_total = curves["total_loss"][-1]
-        epoch_pixel = curves["pixel_loss"][-1]
-        epoch_latent = curves["latent_loss"][-1]
-        log.info("  epoch %d/%d  total=%.4f  pixel=%.4f  latent=%.4f",
-                 epoch_idx + 1, cfg.epochs, epoch_total, epoch_pixel, epoch_latent)
+        _report_epoch(
+            epoch_idx, cfg.epochs, curves,
+            epoch_seconds=time.perf_counter() - epoch_started,
+            training_started=training_started,
+            **{"train/windows_seen": seen,
+               # only meaningful for the windowed backbones, which ramp it
+               # over the context-length curriculum; `None` for the GRU
+               **({"train/context_length": model.context_length}
+                  if getattr(model, "context_length", None) else {})},
+        )
 
     log.info("training complete  final_total=%.4f", curves["total_loss"][-1])
+    trace_event("cortex.train.done", objective="windowed_rollout",
+                final_total_loss=curves["total_loss"][-1],
+                duration_s=round(time.perf_counter() - training_started, 3))
     if cfg.context_length_curriculum and max_context:
         # Leave the model at its full window post-training regardless of how
         # the curriculum schedule landed (e.g. a curriculum longer than
@@ -1273,12 +1308,75 @@ def evaluate_action_world_model(
              rollout_health["frozen_rollout"],
              rollout_health["prediction_dispersion"],
              rollout_health["target_dispersion"])
+    if rollout_health["frozen_rollout"]:
+        # A collapsed model is the failure this evaluation exists to catch;
+        # a WARNING makes it visible in the console *and* the trace.
+        log.warning("frozen rollout detected: predictions barely vary across horizons "
+                    "(pred_disp=%.5f vs target_disp=%.5f) -- the cortex has collapsed",
+                    rollout_health["prediction_dispersion"],
+                    rollout_health["target_dispersion"])
     return {
         "horizons": report,
         "workspace_modalities": workspace_report,
         "rollout_health": rollout_health,
         "per_episode_model_mse": per_episode_model_mse,
     }
+
+
+def _backbone_name(model: Any) -> str:
+    """Which temporal backbone this cortex is running.
+
+    ``model.backbone_name`` never existed, so every training log printed
+    ``backbone=?`` -- which made the one line that identifies a
+    backbone-benchmark arm useless.  The name lives on the cortex config.
+    """
+    config = getattr(model, "config", None)
+    return str(getattr(config, "backbone", None) or getattr(model, "backbone_name", None) or "?")
+
+
+def _format_eta(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes, rest = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def _report_epoch(
+    epoch_idx: int,
+    epochs: int,
+    curves: Dict[str, List[float]],
+    *,
+    epoch_seconds: float,
+    training_started: float,
+    **extra: Any,
+) -> None:
+    """One console line per epoch (with per-epoch cost and ETA) and one
+    metrics line in the run trace.
+
+    The trace copy is what makes a long cortex run debuggable: the loss
+    curve is on disk epoch by epoch, so a run killed at epoch 25/30 still
+    shows where the loss was going instead of losing everything with the
+    process.
+    """
+    latest = {key: values[-1] for key, values in curves.items() if values}
+    done = epoch_idx + 1
+    elapsed = time.perf_counter() - training_started
+    eta = elapsed / max(done, 1) * max(epochs - done, 0)
+    log.info(
+        "  epoch %d/%d  total=%.4f  pixel=%.4f  latent=%.4f  (%.1fs/epoch, eta %s)",
+        done, epochs,
+        latest.get("total_loss", float("nan")),
+        latest.get("pixel_loss", float("nan")),
+        latest.get("latent_loss", float("nan")),
+        epoch_seconds, _format_eta(eta),
+    )
+    payload: Dict[str, Any] = {f"train/{key}": value for key, value in latest.items()}
+    payload["train/epoch_seconds"] = round(epoch_seconds, 4)
+    payload.update(extra)
+    trace_metrics(step=done, **payload)
 
 
 def _pairwise_dispersion(frames: List[Any]) -> float:

@@ -112,8 +112,49 @@ node viewer/server.js --data-dir runs/Pixel
 | `ccr replay --session <path>` | Replay a recorded session and verify determinism |
 | `ccr view --session <path> --episode <id>` | Inspect a single recorded episode |
 | `ccr review --session <path>` | Post-run session review with baseline comparison |
+| `ccr trace list` / `ccr trace show` | Inspect run traces: phase timings, loss curves, config, git commit |
 
 Run `ccr <command> --help` for full option details.
+
+## Watching a run (logging & tracing)
+
+Training runs are long, so every command logs its progress and writes a
+crash-safe trace of what it did. Full details in
+[docs/v2/09-tracing-and-logging.md](docs/v2/09-tracing-and-logging.md).
+
+```bash
+ccr nursery joint --record-dir runs/Pixel --epochs 30 --log-level info
+```
+
+```
+[+03:12.4] INFO    cortex         epoch 1/30  total=0.4412  pixel=0.3901  latent=0.0511  (11.4s/epoch, eta 5m30s)
+[+03:23.6] INFO    cortex         epoch 2/30  total=0.3120  pixel=0.2740  latent=0.0380  (11.2s/epoch, eta 5m14s)
+```
+
+| flag | effect |
+|---|---|
+| `--log-level debug\|info\|warning\|error` | console verbosity (default `info`, or `$CCR_LOG_LEVEL`) |
+| `--log-file run.log` | tee every record at DEBUG to a file, whatever the console shows |
+| `--log-format json` | one JSON object per line, for CI |
+| `--trace-dir DIR` | where traces go (default `runs/traces`, or `$CCR_TRACE_DIR`) |
+| `--no-trace` | skip tracing (logging still works) |
+
+Each run writes `runs/traces/<run-id>/{manifest.json,trace.jsonl}` **as it
+happens** — config, git commit, package versions, phase timings, per-epoch
+losses, evaluation verdicts — so a run that dies at epoch 25/30 still leaves
+everything up to the crash on disk. Read it back with:
+
+```bash
+ccr trace show            # the latest run: phase tree, metric summaries, config
+ccr trace list            # every traced run
+```
+
+In a notebook:
+
+```python
+from cognitive_runtime.observability import configure_notebook_logging
+configure_notebook_logging("info")
+```
 
 ## What gets measured
 
