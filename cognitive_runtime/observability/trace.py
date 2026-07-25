@@ -260,10 +260,29 @@ class RunTrace:
         self.started_at = time.time()
         self.status = "running"
         if self.enabled:
-            os.makedirs(self.dir, exist_ok=True)
-            self._handle = open(self.trace_path, "a", encoding="utf-8")
-            self._write_manifest()
-            self._link_latest()
+            try:
+                os.makedirs(self.dir, exist_ok=True)
+                # Truncating, not appending: a repeated explicit --run-id
+                # overwrites the manifest anyway, so appending would leave one
+                # manifest describing two concatenated runs -- `trace show`
+                # would merge both runs' spans, metrics and warnings into a
+                # single bogus picture.  One run id, one run.
+                if os.path.exists(self.trace_path) and os.path.getsize(self.trace_path):
+                    log.warning("run id %s already has a trace; overwriting %s",
+                                self.run_id, self.trace_path)
+                self._handle = open(self.trace_path, "w", encoding="utf-8")
+                self._write_manifest()
+                self._link_latest()
+            except OSError as exc:
+                # Tracing is diagnostics: an unwritable --trace-dir (or an
+                # unwritable cwd) must not stop the training run the user
+                # actually asked for.  Matches the fail-open behaviour of
+                # every later write.
+                self.enabled = False
+                self._handle = None
+                self.dir = ""
+                log.warning("run tracing disabled: cannot write to %s (%s)",
+                            os.path.join(self.root_dir, self.run_id), exc)
         self._token = _ACTIVE_TRACE.set(self)
         self._stack_token = _SPAN_STACK.set(())
         _GLOBAL_TRACE = self

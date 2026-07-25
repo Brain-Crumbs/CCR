@@ -809,7 +809,6 @@ def _record_scenario_episode(
     with span("nursery.record.episode", session=session_id, scenario=scenario.name,
               seed=seed, ticks=cfg.episode_ticks):
         log.info("recording %s  seed=%d  ticks=%d", session_id, seed, cfg.episode_ticks)
-        trace_counter("episodes_recorded")
         recording = scenario.build(seed, cfg)
         episode_ticks = recording.episode_ticks or cfg.episode_ticks
         program_config: Dict[str, Any] = {
@@ -843,6 +842,11 @@ def _record_scenario_episode(
             close = getattr(program, "close", None)
             if callable(close):
                 close()
+        # Counted only once the episode is actually on disk: in a failed run
+        # -- the trace where this counter is most worth reading -- an
+        # increment before the runtime would overstate the usable recordings
+        # by the very episode that killed the run.
+        trace_counter("episodes_recorded")
         return os.path.join(record_dir, session_id)
 
 

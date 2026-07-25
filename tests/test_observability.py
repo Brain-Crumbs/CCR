@@ -416,6 +416,37 @@ def test_run_can_be_finished_from_another_context(tmp_path):
     assert [e["name"] for e in _events(trace.dir) if e["kind"] == "event"] == ["training"]
 
 
+def test_unwritable_trace_dir_disables_tracing_instead_of_failing_the_run(tmp_path):
+    """`main()` opens a trace around every command, so a trace directory it
+    cannot write must not stop the training run the user asked for."""
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("this is a file, so it cannot contain run directories")
+
+    ran = []
+    with start_run("blocked", trace_dir=str(blocker)) as trace:
+        assert trace.enabled is False
+        with span("nursery.train"):
+            trace_metrics(step=1, total_loss=0.5)
+        ran.append(True)
+    assert ran == [True]  # the workload completed
+
+
+def test_reusing_a_run_id_replaces_the_previous_trace(tmp_path):
+    """Two runs under one `--run-id` must not concatenate: the manifest is
+    overwritten by the second, so a merged event stream would describe a run
+    that never happened."""
+    for loss in (0.9, 0.1):
+        with start_run("pinned", trace_dir=str(tmp_path), run_id="fixed-id") as trace:
+            trace_metrics(step=1, total_loss=loss)
+
+    events = _events(trace.dir)
+    assert [e["kind"] for e in events].count("run.start") == 1
+    assert [e["kind"] for e in events].count("run.end") == 1
+    metrics = [e for e in events if e["kind"] == "metrics"]
+    assert [e["data"]["total_loss"] for e in metrics] == [0.1]
+    assert _manifest(trace.dir)["metrics"]["total_loss"]["count"] == 1
+
+
 def test_trace_survives_a_closed_output_file(tmp_path):
     """Disk problems must degrade tracing, never kill the training run."""
     trace = RunTrace("fragile", trace_dir=str(tmp_path)).start()
