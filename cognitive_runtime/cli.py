@@ -1282,6 +1282,7 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
             save_action_world_model,
         )
         from cognitive_runtime.training.nursery import (
+            CRAFTER_SCENARIOS,
             NURSERY_SCENARIOS,
             NurseryConfig,
             run_nursery_joint,
@@ -1291,10 +1292,11 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
 
     holdout_scenarios = args.holdout_scenarios or ["approach_entity"]
     train_scenarios = args.train_scenarios or None
+    scenarios = CRAFTER_SCENARIOS if args.world == "crafter" else NURSERY_SCENARIOS
     for name in (train_scenarios or []) + holdout_scenarios:
-        if name not in NURSERY_SCENARIOS:
+        if name not in scenarios:
             sys.exit(
-                f"unknown nursery scenario {name!r}; choices: {sorted(NURSERY_SCENARIOS)}"
+                f"unknown nursery scenario {name!r}; choices: {sorted(scenarios)}"
             )
 
     train_seeds = list(range(args.train_seeds))
@@ -1304,6 +1306,7 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
         holdout_seeds=holdout_seeds,
         episode_ticks=args.episode_ticks,
         world_size=args.world_size,
+        world=args.world,
         backend=args.backend,
         realtime=args.realtime or args.backend == "remote",
         horizons=args.horizons,
@@ -2166,6 +2169,8 @@ def build_parser() -> argparse.ArgumentParser:
              "world model across them, with zero-shot held-out-scenario "
              "evaluation, a frozen-rollout detector, and a yaw linear probe",
     )
+    p_nursery_joint.add_argument("--world", default="crafter", choices=sorted(WORLDS),
+                                 help="world providing pixel frames and optional semantic grids")
     p_nursery_joint.add_argument("--record-dir", default="sessions")
     p_nursery_joint.add_argument("--train-scenarios", nargs="+", default=None,
                                  help="scenarios to train on (default: every scenario not held out)")

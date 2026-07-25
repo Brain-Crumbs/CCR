@@ -1586,20 +1586,18 @@ def evaluate_action_world_model(
                 starts = list(starts)[:max_starts_per_episode]
             episode_model_mse: Dict[int, List[float]] = {h: [] for h in horizons_sorted}
             for t in starts:
-                rolled, _h = model.rollout(
+                reference_encoding = model.encode_visual(pixels[t : t + 1])
+                rollout = model.forward_horizons(
                     latents[t : t + 1],
                     remap[t : t + max_horizon].unsqueeze(0),
                     hiddens[t],
-                )
-                reference_encoding = model.encode_visual(pixels[t : t + 1])
-                decoded_workspace = model.decode_workspace(
-                    rolled,
-                    reference_frame=targets[t : t + 1].expand(1, rolled.shape[1], -1, -1, -1),
-                    reference_spatial=reference_encoding.spatial.expand(1, rolled.shape[1], -1, -1, -1),
+                    horizon_frames=horizons_sorted,
+                    reference_frame=targets[t : t + 1],
+                    reference_spatial=reference_encoding.spatial,
                 )
                 decoded_by_horizon = {}
                 for h in horizons_sorted:
-                    decoded = decoded_workspace["vision"][0, h - 1]
+                    decoded = rollout[h].decoded.squeeze(0)
                     decoded_by_horizon[h] = decoded
                     target = targets[t + h]
                     model_mse_sample = float(F.mse_loss(decoded, target))
@@ -1612,7 +1610,7 @@ def evaluate_action_world_model(
                             float(F.mse_loss(targets[t + h - oracle_lag], target))
                         )
                     for name, by_horizon in workspace_samples.items():
-                        predicted_modality = decoded_workspace[name][0, h - 1]
+                        predicted_modality = rollout[h].modalities[name].squeeze(0)
                         target_modality = workspace[name][t + h]
                         by_horizon[h]["model"].append(
                             float(F.mse_loss(predicted_modality, target_modality))
@@ -1995,12 +1993,19 @@ def evaluate_static_holdout(model: Any, dataset: ActionSequenceDataset) -> Dict[
                 continue
             workspace = _episode_workspace_tensors(episode, dataset, model, actions=actions)
             latents = model.encode_workspace(pixels, workspace)
+            hiddens = [model.initial_state(1)]
+            hidden = hiddens[0]
+            for index in range(len(actions)):
+                _predicted, hidden = model.step(
+                    latents[index:index + 1], actions[index:index + 1], hidden
+                )
+                hiddens.append(hidden)
             for t in range(len(actions)):
                 before, after = episode.semantic_grids[t], episode.semantic_grids[t + 1]
                 if before is None or after is None or before != after:
                     continue
                 output = model.forward_horizons(
-                    latents[t:t + 1], actions[t:t + 1].unsqueeze(0), model.initial_state(1),
+                    latents[t:t + 1], actions[t:t + 1].unsqueeze(0), hiddens[t],
                     horizon_frames=[1], reference_frame=targets[t:t + 1],
                     reference_spatial=model.encode_visual(pixels[t:t + 1]).spatial,
                 )[1].decoded.squeeze(0)
