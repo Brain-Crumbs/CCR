@@ -499,10 +499,10 @@ def cmd_run(args: argparse.Namespace) -> None:
     world = getattr(args, "world", "minecraft")
     has_cortex_wm = getattr(args, "world_model", None) and args.world_model.startswith("cortex:")
     if args.policy is None:
-        if world == "minecraft":
-            args.policy = "scripted"
-        elif has_cortex_wm:
+        if has_cortex_wm:
             args.policy = "cortex-mpc"
+        elif world == "minecraft":
+            args.policy = "scripted"
         else:
             args.policy = "random"
     if world != "minecraft" and args.backend != "simulated":
@@ -527,13 +527,16 @@ def cmd_run(args: argparse.Namespace) -> None:
     if args.policy == "online":
         policy, learner = _make_online_policy_and_learner(args, program, encoders)
     elif args.policy == "cortex-mpc":
-        if world_model is None or not hasattr(world_model, "model"):
+        from cognitive_runtime.policies.cortex_world_model import CortexWorldModel
+        if not isinstance(world_model, CortexWorldModel):
             sys.exit(
                 "--policy cortex-mpc requires --world-model cortex:<ckpt>; "
                 "the MPC plans over the live cortex's recurrent hidden state"
             )
         from motor.cortex_mpc import build_cortex_mpc
-        policy = build_cortex_mpc(world_model)
+        from motor.organism_policy import MotorFreedomPolicy
+        controller = build_cortex_mpc(world_model)
+        policy = MotorFreedomPolicy("learned", action_space, voluntary=controller)
     else:
         policy = _make_policy(args.policy, args, action_space)
     entity_persistence = _make_entity_persistence(args)

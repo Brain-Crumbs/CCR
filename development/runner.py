@@ -282,9 +282,15 @@ def _run_stage_episodes(
         sense_stream_weights=sense_stream_mask(stage.senses, program.stream_catalog()) or None,
     )
     recorder = None if record_dir is not None else NullRecorder()
+    # A "learned" stage's voluntary_controller factory (e.g.
+    # motor.cortex_mpc.cortex_mpc_factory) may carry the world model backing
+    # its controller as a `.world_model` attribute; attaching the same
+    # instance here makes the runtime's tick loop call its predict(), which
+    # is what actually populates the recurrent state the controller reads.
+    world_model = getattr(voluntary_controller, "world_model", None)
     return CognitiveRuntime(
         program=program, policy=policy, learner=learner,
-        config=runtime_config, recorder=recorder,
+        config=runtime_config, recorder=recorder, world_model=world_model,
     ).run()
 
 
