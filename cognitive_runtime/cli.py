@@ -38,6 +38,8 @@ from cognitive_runtime.core.policy import Policy
 from cognitive_runtime.core.program import Program
 from cognitive_runtime.core.streams import TemporalFusion, default_encoder_registry
 from cognitive_runtime.models.online_q import OnlineQModel
+from cognitive_runtime.observability import DEFAULT_TRACE_DIR, configure_logging, start_run
+from cognitive_runtime.observability.logs import LEVELS
 from cognitive_runtime.policies import (
     HumanDemoPolicy,
     LearnedPolicy,
@@ -1679,6 +1681,100 @@ def cmd_review(args: argparse.Namespace) -> None:
     ))
 
 
+def cmd_trace_list(args: argparse.Namespace) -> None:
+    """``ccr trace list``: every traced run under --trace-dir, oldest first."""
+    from cognitive_runtime.observability import format_run_list, list_runs
+
+    print(format_run_list(list_runs(getattr(args, "trace_dir", None))))
+
+
+def cmd_trace_show(args: argparse.Namespace) -> None:
+    """``ccr trace show [run]``: the phase tree, metric summaries, config and
+    identity of one traced run (default: the latest)."""
+    from cognitive_runtime.observability import format_trace_summary, load_trace
+
+    try:
+        manifest, events = load_trace(args.run, trace_dir=getattr(args, "trace_dir", None))
+    except FileNotFoundError as exc:
+        sys.exit(str(exc))
+    print(format_trace_summary(manifest, events, tail=args.tail))
+
+
+# --------------------------------------------------------------------------- observability wiring
+
+
+def _add_observability_args(parser: argparse.ArgumentParser) -> None:
+    """Logging/tracing flags, added to the top-level parser *and* to every
+    subparser so they work in either position (``ccr --log-level debug
+    nursery joint`` and ``ccr nursery joint --log-level debug``).
+
+    Every option defaults to ``SUPPRESS`` so an unset subparser copy never
+    clobbers a value given before the subcommand.
+    """
+    group = parser.add_argument_group("logging & tracing")
+    group.add_argument("--log-level", choices=list(LEVELS), default=argparse.SUPPRESS,
+                       help="console log level (default: $CCR_LOG_LEVEL or 'info'). "
+                            "'debug' adds per-span/per-metric detail")
+    group.add_argument("--log-file", default=argparse.SUPPRESS,
+                       help="also write every log record at DEBUG to this file, "
+                            "whatever the console level is")
+    group.add_argument("--log-format", choices=["human", "json"], default=argparse.SUPPRESS,
+                       help="'human' (default) or 'json' (one object per line, for CI)")
+    group.add_argument("--trace-dir", default=argparse.SUPPRESS,
+                       help=f"root directory for run traces (default: $CCR_TRACE_DIR or "
+                            f"{DEFAULT_TRACE_DIR}); each run writes "
+                            f"<trace-dir>/<run-id>/{{manifest.json,trace.jsonl}}")
+    group.add_argument("--run-id", default=argparse.SUPPRESS,
+                       help="name this run's trace directory instead of generating an id")
+    group.add_argument("--no-trace", action="store_true", default=argparse.SUPPRESS,
+                       help="disable run tracing (logging still works)")
+
+
+def _add_observability_args_everywhere(parser: argparse.ArgumentParser) -> None:
+    """Recursively attach the observability flags to every subparser."""
+    _add_observability_args(parser)
+    for action in parser._actions:  # noqa: SLF001 - argparse exposes no public walk
+        if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+            for subparser in set(action.choices.values()):
+                _add_observability_args_everywhere(subparser)
+
+
+def _run_name(args: argparse.Namespace) -> str:
+    """``nursery joint`` -> ``nursery.joint``: the trace's name and the stem
+    of its generated run id."""
+    parts = [args.command]
+    for attr in ("nursery_command", "trace_command"):
+        value = getattr(args, attr, None)
+        if value:
+            parts.append(str(value))
+    scenario = getattr(args, "scenario", None)
+    if scenario:
+        parts.append(str(scenario))
+    return ".".join(parts)
+
+
+#: Read-only inspection commands.  They produce no result worth reproducing
+#: and get run often, so tracing them would bury the actual training runs in
+#: ``ccr trace list``.
+_UNTRACED_COMMANDS = frozenset({"trace", "view", "dashboard", "review", "nursery.list"})
+
+
+def _should_trace(args: argparse.Namespace, name: str) -> bool:
+    if getattr(args, "no_trace", False):
+        return False
+    return args.command not in _UNTRACED_COMMANDS and name not in _UNTRACED_COMMANDS
+
+
+def _trace_config(args: argparse.Namespace) -> Dict[str, Any]:
+    """Snapshot the parsed arguments into the trace manifest: the point of a
+    trace is being able to answer "what exactly produced this number?"."""
+    skip = {"func", "log_level", "log_file", "log_format", "trace_dir", "run_id", "no_trace"}
+    return {
+        key: value for key, value in sorted(vars(args).items())
+        if key not in skip and not key.startswith("_")
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cognitive_runtime", description="Continuous Cognitive Runtime (Minecraft MVP)"
@@ -2208,12 +2304,48 @@ def build_parser() -> argparse.ArgumentParser:
                           help="number of most-recent episodes to show in detail")
     p_review.set_defaults(func=cmd_review)
 
+    p_trace = sub.add_parser(
+        "trace",
+        help="inspect run traces written by any other command "
+             "(phase timings, metric curves, config, git commit)",
+    )
+    trace_sub = p_trace.add_subparsers(dest="trace_command", required=True)
+
+    p_trace_list = trace_sub.add_parser("list", help="list traced runs, oldest first")
+    p_trace_list.set_defaults(func=cmd_trace_list)
+
+    p_trace_show = trace_sub.add_parser(
+        "show", help="show one run's phase tree, metrics, config and identity"
+    )
+    p_trace_show.add_argument("run", nargs="?", default=None,
+                              help="run id, run directory, or trace.jsonl path "
+                                   "(default: the latest run)")
+    p_trace_show.add_argument("--tail", type=int, default=0,
+                              help="also print the last N raw trace events")
+    p_trace_show.set_defaults(func=cmd_trace_show)
+
+    _add_observability_args_everywhere(parser)
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    args.func(args)
+
+    configure_logging(
+        getattr(args, "log_level", None),
+        log_file=getattr(args, "log_file", None),
+        log_format=getattr(args, "log_format", "human"),
+    )
+
+    name = _run_name(args)
+    with start_run(
+        name,
+        trace_dir=getattr(args, "trace_dir", None),
+        run_id=getattr(args, "run_id", None),
+        config=_trace_config(args),
+        enabled=_should_trace(args, name),
+    ):
+        args.func(args)
 
 
 if __name__ == "__main__":

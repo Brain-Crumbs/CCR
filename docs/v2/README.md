@@ -31,6 +31,10 @@ For onboarding and presentation:
    contracts, plus one complete action-to-training-target trace.
 7. [**05-presentation-runbook.md**](05-presentation-runbook.md) — a 75–90 minute
    teaching sequence, live-demo script, slide outline, and presenter cautions.
+8. [**09-tracing-and-logging.md**](09-tracing-and-logging.md) — watching a
+   training run while it runs (progress logging with ETA) and reading it back
+   afterwards (`ccr trace show`: phase timings, loss curves, config, git
+   commit), plus how to instrument new code.
 
 **Design commitments** (the choices these docs are built on): re-architect +
 rename rather than rewrite; predict in latent space but always decode to the
