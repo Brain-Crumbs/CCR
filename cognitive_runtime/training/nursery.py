@@ -66,6 +66,7 @@ from cognitive_runtime.training.action_world_model import (
     ActionWorldModelConfig,
     build_action_sequence_dataset,
     evaluate_action_world_model,
+    evaluate_action_world_model_milestone,
     horizons_ticks_to_frames,
     linear_probe_yaw,
     linear_probe_orientation,
@@ -1739,20 +1740,24 @@ def _trace_horizon_metrics(split: str, scenario: str, metrics: Dict[str, Any]) -
     series, so ``ccr trace show`` can answer "did it beat copy-last-frame?"
     without re-reading the report JSON -- and so a run that dies during a
     later scenario still has the earlier scenarios' verdicts on disk."""
-    for horizon, entry in (metrics.get("horizons") or {}).items():
-        trace_metrics(
-            **{
-                f"eval/{split}/{scenario}/t+{horizon}/model_mse": entry.get("model_mse"),
-                f"eval/{split}/{scenario}/t+{horizon}/copy_last_mse": entry.get("copy_last_mse"),
-                f"eval/{split}/{scenario}/t+{horizon}/beats_copy_last": float(
-                    bool(entry.get("beats_copy_last"))
-                ),
-            }
-        )
+    # Keep direct and closed-loop metrics in disjoint trace namespaces.  The
+    # fallback preserves tracing for legacy single-mode reports.
+    mode_reports = (
+        (("direct", metrics["direct"]), ("rollout", metrics["rollout"]))
+        if "direct" in metrics and "rollout" in metrics
+        else ((metrics.get("prediction_mode", "rollout"), metrics),)
+    )
+    for mode, report in mode_reports:
+        for horizon, entry in (report.get("horizons") or {}).items():
+            trace_metrics(**{
+                f"eval/{split}/{scenario}/{mode}/t+{horizon}/model_mse": entry.get("model_mse"),
+                f"eval/{split}/{scenario}/{mode}/t+{horizon}/copy_last_mse": entry.get("copy_last_mse"),
+                f"eval/{split}/{scenario}/{mode}/t+{horizon}/beats_copy_last": float(bool(entry.get("beats_copy_last"))),
+            })
     health = metrics.get("rollout_health") or {}
     trace_event(
         "nursery.evaluate.result", split=split, scenario=scenario,
-        horizons={
+        primary_mode=metrics.get("primary_mode", metrics.get("prediction_mode", "rollout")), horizons={
             str(h): {
                 "model_mse": e.get("model_mse"),
                 "copy_last_mse": e.get("copy_last_mse"),
@@ -1819,7 +1824,11 @@ def run_nursery_joint(
         lr=cfg.lr,
         batch_size=cfg.batch_size,
         seed=cfg.seed,
+        horizons_ticks=tuple(cfg.horizons),
     )
+    # The nursery configuration owns the advertised/evaluated tick horizons;
+    # rebuild supplied training configs to that same contract.
+    model_cfg = replace(model_cfg, horizons_ticks=tuple(cfg.horizons))
 
     log.info("=== nursery joint: train=%s  holdout=%s  world=%s ===",
              train_names, holdout_names, cfg.world)
@@ -1982,8 +1991,8 @@ def run_nursery_joint(
                 holdout_dataset = build_action_sequence_dataset(
                     eval_sessions[name], action_keys=model.action_keys
                 )
-                scenario_metrics[name] = evaluate_action_world_model(
-                    model, holdout_dataset, horizon_frames,
+                scenario_metrics[name] = evaluate_action_world_model_milestone(
+                    model, holdout_dataset, model.horizons_ticks,
                     warmup_frames=model_cfg.warmup_frames,
                 )
                 _trace_horizon_metrics("in_distribution", name, scenario_metrics[name])
@@ -1994,8 +2003,8 @@ def run_nursery_joint(
                 holdout_dataset = build_action_sequence_dataset(
                     eval_sessions[name], action_keys=model.action_keys
                 )
-                zero_shot_metrics[name] = evaluate_action_world_model(
-                    model, holdout_dataset, horizon_frames,
+                zero_shot_metrics[name] = evaluate_action_world_model_milestone(
+                    model, holdout_dataset, model.horizons_ticks,
                     warmup_frames=model_cfg.warmup_frames,
                 )
                 _trace_horizon_metrics("zero_shot", name, zero_shot_metrics[name])
@@ -2132,7 +2141,9 @@ def run_action_ablation_eval(
         lr=cfg.lr,
         batch_size=cfg.batch_size,
         seed=cfg.seed,
+        horizons_ticks=tuple(cfg.horizons),
     )
+    base_model_cfg = replace(base_model_cfg, horizons_ticks=tuple(cfg.horizons))
 
     train_sessions: Dict[str, List[str]] = {}
     eval_sessions: Dict[str, List[str]] = {}
@@ -2209,12 +2220,12 @@ def run_action_ablation_eval(
         eval_sessions[eval_scenario], action_keys=model_with.action_keys
     )
     with span("ablation.evaluate", scenario=eval_scenario):
-        with_actions_metrics = evaluate_action_world_model(
-            model_with, holdout_dataset, horizon_frames,
+        with_actions_metrics = evaluate_action_world_model_milestone(
+            model_with, holdout_dataset, model_with.horizons_ticks,
             warmup_frames=base_model_cfg.warmup_frames,
         )
-        without_actions_metrics = evaluate_action_world_model(
-            model_without, holdout_dataset, horizon_frames,
+        without_actions_metrics = evaluate_action_world_model_milestone(
+            model_without, holdout_dataset, model_without.horizons_ticks,
             warmup_frames=base_model_cfg.warmup_frames,
         )
         _trace_horizon_metrics("ablation_with_actions", eval_scenario, with_actions_metrics)
@@ -2326,7 +2337,9 @@ def run_backbone_benchmark(
         lr=cfg.lr,
         batch_size=cfg.batch_size,
         seed=cfg.seed,
+        horizons_ticks=tuple(cfg.horizons),
     )
+    base_model_cfg = replace(base_model_cfg, horizons_ticks=tuple(cfg.horizons))
 
     train_sessions: Dict[str, List[str]] = {}
     eval_sessions: Dict[str, List[str]] = {}
