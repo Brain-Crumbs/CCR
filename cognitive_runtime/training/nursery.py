@@ -1895,33 +1895,28 @@ def run_nursery_joint(
 
     if cfg.split_overlap_gate:
         with span("nursery.split_overlap_gate") as overlap_span:
-            overlap_issues: List[str] = []
-            for name in train_names:
-                overlap_issues += audit_split_overlap(
-                    train_sessions[name], eval_sessions[name],
-                    max_corresponding_frame_fraction=cfg.max_corresponding_frame_fraction,
-                ).issues
-            overlap_span.set(issues=len(overlap_issues))
-            if overlap_issues:
-                trace_event("nursery.split_overlap_gate.failed", issues=overlap_issues)
+            # Pooled, not per-scenario (issue #202 review): the joint model
+            # trains on every train scenario's sessions at once, and
+            # zero-shot evaluation is exactly "did this model memorize
+            # *any* pooled training frame" -- checking each scenario only
+            # against its own holdout seeds would never audit a zero-shot
+            # scenario (`holdout_names`) at all, and would miss a holdout
+            # episode from one scenario duplicating another scenario's
+            # training data.
+            pooled_train_dirs = [d for name in train_names for d in train_sessions[name]]
+            pooled_eval_dirs = [d for dirs in eval_sessions.values() for d in dirs]
+            overlap_report = audit_split_overlap(
+                pooled_train_dirs, pooled_eval_dirs,
+                max_corresponding_frame_fraction=cfg.max_corresponding_frame_fraction,
+            )
+            overlap_span.set(issues=len(overlap_report.issues))
+            if overlap_report.issues:
+                trace_event("nursery.split_overlap_gate.failed", issues=overlap_report.issues)
                 raise ValueError(
                     "nursery joint run: recorded holdout data leaks into training:\n  - "
-                    + "\n  - ".join(overlap_issues)
+                    + "\n  - ".join(overlap_report.issues)
                 )
             log.info("split-overlap gate passed")
-
-    with span("nursery.sample_balance"):
-        labels_by_scenario: Dict[str, List[TransitionLabel]] = {}
-        for name in train_names:
-            labels_by_scenario[name] = [
-                label
-                for session_dir in train_sessions[name]
-                for episode_id in list_episodes(session_dir)
-                for label in compute_scenario_transition_labels(session_dir, episode_id, name)
-            ]
-        sample_balance = summarize_sample_balance(labels_by_scenario)
-        log_sample_balance(sample_balance)
-        trace_event("nursery.sample_balance", balance=sample_balance)
 
     # Pin the vocabulary to the full action space (plus NULL): a held-out
     # scenario may issue actions no training scenario used, and zero-shot
@@ -1943,9 +1938,41 @@ def run_nursery_joint(
     log.info("horizons (ticks): %s -> frames: %s  (%.2f ticks/frame)",
              list(cfg.horizons), horizon_frames, ticks_per_frame)
 
+    with span("nursery.sample_balance"):
+        # Computed from `dataset.episodes` (not re-walked independently)
+        # so labels/weights are aligned 1:1 with what training actually
+        # consumes -- each episode's `session_dir`/`episode_id` names the
+        # same recorded episode `compute_scenario_transition_labels` reads.
+        session_to_scenario = {
+            session_dir: name for name in train_names for session_dir in train_sessions[name]
+        }
+        labels_by_episode: List[List[TransitionLabel]] = [
+            compute_scenario_transition_labels(
+                episode.session_dir, episode.episode_id, session_to_scenario[episode.session_dir]
+            )
+            for episode in dataset.episodes
+        ]
+        flat_labels = [label for episode_labels in labels_by_episode for label in episode_labels]
+        flat_weights = balanced_transition_weights(flat_labels)
+        transition_weights: List[List[float]] = []
+        cursor = 0
+        for episode_labels in labels_by_episode:
+            transition_weights.append(flat_weights[cursor : cursor + len(episode_labels)])
+            cursor += len(episode_labels)
+
+        labels_by_scenario: Dict[str, List[TransitionLabel]] = {}
+        for episode, episode_labels in zip(dataset.episodes, labels_by_episode):
+            scenario = session_to_scenario[episode.session_dir]
+            labels_by_scenario.setdefault(scenario, []).extend(episode_labels)
+        sample_balance = summarize_sample_balance(labels_by_scenario)
+        log_sample_balance(sample_balance)
+        trace_event("nursery.sample_balance", balance=sample_balance)
+
     with span("nursery.train", epochs=model_cfg.epochs, backbone=model_cfg.backbone,
               objective=model_cfg.training_objective) as train_span:
-        model, training_stats = train_action_world_model(dataset, model_cfg)
+        model, training_stats = train_action_world_model(
+            dataset, model_cfg, transition_weights=transition_weights,
+        )
         train_span.set(final_total_loss=_final_loss(training_stats))
 
     scenario_metrics: Dict[str, Dict[str, Any]] = {}

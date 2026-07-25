@@ -13,6 +13,7 @@ from cognitive_runtime.training.action_world_model import (  # noqa: E402
     ActionWorldModelConfig,
     _episode_workspace_tensors,
     _episode_tensors,
+    _window_weights,
     build_action_sequence_dataset,
     build_action_world_model,
     evaluate_action_world_model,
@@ -103,6 +104,38 @@ def mixed_action_session(tmp_path_factory):
     scenario = NurseryScenario("mixed_action", "scripted two-phase fixture", _build_mixed_action)
     cfg = _small_nursery_config(episode_ticks=2 * _MIXED_PHASE_TICKS)
     return _record_scenario_episode(str(root), "awm-mixed", 0, scenario, cfg)
+
+
+def test_window_weights_averages_the_windows_transitions():
+    # window=3 -> each start's slice is transition_weights[e][t : t+2].
+    transition_weights = [[1.0, 2.0, 3.0, 4.0], [10.0, 20.0]]
+    starts = [(0, 0), (0, 1), (0, 2), (1, 0)]
+    weights = _window_weights(transition_weights, starts, window=3)
+    assert weights == [1.5, 2.5, 3.5, 15.0]
+
+
+def test_window_weights_falls_back_to_uniform_for_an_empty_span():
+    weights = _window_weights([[1.0]], starts=[(0, 0)], window=1)
+    assert weights == [1.0]  # window-1 == 0 transitions in range -> fallback
+
+
+def test_train_action_world_model_rejects_mismatched_transition_weights(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    with pytest.raises(ValueError, match="transition_weights has"):
+        train_action_world_model(
+            dataset, _small_model_config(), transition_weights=[[1.0]],
+        )
+
+
+def test_train_action_world_model_accepts_transition_weights(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    episode = dataset.episodes[0]
+    # Uniform weights should behave like the None (uniform-permutation) path.
+    transition_weights = [[1.0] * len(episode.actions)]
+    model, stats = train_action_world_model(
+        dataset, _small_model_config(), transition_weights=transition_weights,
+    )
+    assert stats["final_total_loss"] > 0.0
 
 
 def test_horizons_ticks_to_frames_converts_and_dedupes():

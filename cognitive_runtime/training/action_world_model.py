@@ -780,11 +780,32 @@ def _train_autoregressive_objective(
     }
 
 
+def _window_weights(
+    transition_weights: Sequence[Sequence[float]],
+    starts: Sequence[Tuple[int, int]],
+    window: int,
+) -> List[float]:
+    """Per-window sampling weight (issue #202) from per-transition weights:
+    the mean of the ``window - 1`` transition weights the window actually
+    trains on (``actions[t : t + window - 1]``, mirroring the batch-building
+    slice below) -- a window overlapping mostly-blocked/stationary
+    transitions is weighted down, one overlapping a rare entity entry/exit
+    is weighted up. Falls back to ``1.0`` (uniform) for a window with no
+    transitions in range, which should not occur given ``starts`` is built
+    from these same episodes."""
+    weights: List[float] = []
+    for e_idx, t in starts:
+        span = transition_weights[e_idx][t : t + window - 1]
+        weights.append(sum(span) / len(span) if span else 1.0)
+    return weights
+
+
 def train_action_world_model(
     dataset: ActionSequenceDataset,
     config: Optional[ActionWorldModelConfig] = None,
     *,
     initial_model: Optional[Any] = None,
+    transition_weights: Optional[Sequence[Sequence[float]]] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     """Train the action-conditioned world model with short-rollout scheduled
     sampling over every episode in ``dataset``.
@@ -805,6 +826,20 @@ def train_action_world_model(
     training a disposable one every time. Its shape/vocabulary must match
     the dataset (a mismatch is a wiring bug, not something to silently
     reinitialize around).
+
+    ``transition_weights`` (issue #202), when given, is one list per
+    episode of ``dataset.episodes`` -- ``transition_weights[e][i]`` is the
+    per-transition sampling weight for that episode's ``actions[i]``
+    (e.g. from ``training.nursery.balanced_transition_weights``), used
+    under the ``"windowed_rollout"`` objective to draw training windows
+    with replacement in proportion to their (mean) weight instead of
+    uniformly. This reweights *sampling frequency* only -- the recorded
+    dataset itself is never duplicated or altered; a window whose weight
+    is high may simply be drawn more than once in a given epoch (and a
+    low-weight one not at all), same as a standard
+    ``torch.utils.data.WeightedRandomSampler``. ``None`` (default)
+    preserves the original uniform-permutation behavior. Ignored under the
+    ``"autoregressive"`` objective, which does not sample windows this way.
     """
     torch, F = _torch()
 
@@ -897,6 +932,16 @@ def train_action_world_model(
             f"no training windows: every episode is shorter than warmup+rollout "
             f"({window} frames); record longer episodes or shrink the window"
         )
+    start_weights = None
+    if transition_weights is not None:
+        if len(transition_weights) != len(episodes):
+            raise ValueError(
+                f"transition_weights has {len(transition_weights)} episode(s), dataset has "
+                f"{len(episodes)}"
+            )
+        start_weights = torch.tensor(
+            _window_weights(transition_weights, starts, window), dtype=torch.float
+        )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     curves: Dict[str, List[float]] = {
@@ -925,7 +970,19 @@ def train_action_world_model(
         if cfg.context_length_curriculum and max_context:
             progress = min(epoch_idx / max(curriculum_epochs - 1, 1), 1.0)
             model.set_context_length(max(1, round(1 + progress * (max_context - 1))))
-        perm = torch.randperm(len(starts), generator=generator)
+        if start_weights is not None:
+            # Balanced sampling (issue #202): draw the same number of
+            # windows as a uniform epoch would, but weighted -- a
+            # standard WeightedRandomSampler-style draw with replacement,
+            # so an over-represented class (e.g. a long blocked/stationary
+            # phase) is drawn less often in expectation and an
+            # under-represented one (e.g. an entity entering/leaving) more
+            # often, without altering the recorded dataset itself.
+            perm = torch.multinomial(
+                start_weights, num_samples=len(starts), replacement=True, generator=generator,
+            )
+        else:
+            perm = torch.randperm(len(starts), generator=generator)
         epoch = {key: 0.0 for key in curves}
         seen = 0
         for batch_start in range(0, perm.numel(), cfg.batch_size):
