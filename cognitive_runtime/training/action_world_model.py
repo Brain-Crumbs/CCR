@@ -78,10 +78,16 @@ class EpisodeActionFrames:
     """One recorded episode as (frame, action, frame, action, ...).
 
     ``actions[i]`` is the action index driving the transition from
-    ``frames[i]`` to ``frames[i+1]`` (the ``motor.command`` of the cognitive
-    tick that observed ``frames[i+1]``).  ``yaw[i]`` is the agent heading in
-    degrees at ``frames[i]`` when ``spatial.rotation`` was observed that
-    tick, else ``None`` -- probe material, never a model input.
+    ``frames[i]`` to ``frames[i+1]`` -- the ``motor.command`` emitted by the
+    cognitive tick that observed ``frames[i]`` itself (issue #202), not the
+    tick that observed ``frames[i+1]``: the runtime documents one-tick motor
+    actuation latency (``runtime.loop``'s "Motor events emitted at cognitive
+    tick *t* ... are applied by ``program.step()`` at the start of tick
+    *t+1*"), so the command bundled with a tick's own log entry produces the
+    *next* tick's frame, not the frame observed alongside it.  ``yaw[i]`` is
+    the agent heading in degrees at ``frames[i]`` when ``spatial.rotation``
+    was observed that tick, else ``None`` -- probe material, never a model
+    input.
     """
 
     session_dir: str
@@ -246,7 +252,13 @@ def build_action_sequence_dataset(
             for episode_id in list_episodes(session_dir):
                 episode = EpisodeActionFrames(session_dir=session_dir, episode_id=episode_id)
                 workspace_buffer = TemporalBuffer()
-                last_action: Optional[str] = None
+                #: The motor command actually driving the transition into
+                #: whichever frame(s) the *current* tick's sensory window
+                #: contains -- i.e. the previous tick's own emission, held
+                #: here until *this* tick's frames are recorded (issue #202:
+                #: one-tick actuation latency, see the module-level comment
+                #: below).
+                last_committed_action: Optional[str] = None
                 last_facing: Optional[Tuple[float, float]] = None
                 for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
                     workspace_buffer.extend([
@@ -254,8 +266,18 @@ def build_action_sequence_dataset(
                     ])
                     workspace_vector = session_fusion.fuse(None, workspace_buffer).vector
                     tick = int(decision.get("tick_index", len(episode.ticks)))
-                    action_name = _tick_action_name(motor) or last_action
-                    last_action = action_name
+                    # One-tick motor actuation latency
+                    # (``runtime.loop``'s documented contract): the motor
+                    # command bundled with *this* tick's log entry is the
+                    # action *this* tick just decided -- ``program.step()``
+                    # applies it at the *start of the next* tick, so it
+                    # produces the *next* frame, not any frame in this
+                    # tick's own sensory window. Read it here, but do not
+                    # use it to label this tick's frames below; only fold
+                    # it into ``last_committed_action`` (used by the
+                    # *following* tick's frames) after this tick's frames
+                    # are recorded.
+                    this_tick_action_name = _tick_action_name(motor)
                     yaw = _tick_yaw(sensory)
                     facing = _tick_facing(sensory) or last_facing
                     if facing is not None:
@@ -276,7 +298,9 @@ def build_action_sequence_dataset(
                             )
                         frame = stream_event_from_log(record, frame_store=frame_store).payload
                         if episode.frames:
-                            episode.actions.append(action_index(action_name or "NULL"))
+                            episode.actions.append(
+                                action_index(last_committed_action or "NULL")
+                            )
                         episode.frames.append(frame)
                         episode.yaw.append(yaw)
                         episode.facing.append(facing)
@@ -285,6 +309,17 @@ def build_action_sequence_dataset(
                         episode.terminal.append(terminal)
                         episode.risk.append(risk)
                         episode.workspace.append(list(workspace_vector))
+                    # Now that this tick's frames (if any) are recorded
+                    # against the *previous* tick's command, fold this
+                    # tick's own emission in for the *next* tick's frame(s)
+                    # -- covers tick zero's two frames (the post-reset
+                    # snapshot, then the first `program.step()`'s NULL-
+                    # actuated frame) the same way: both are labelled
+                    # ``last_committed_action`` as of *before* this loop
+                    # iteration, i.e. still unset ("NULL") the first time
+                    # through.
+                    if this_tick_action_name is not None:
+                        last_committed_action = this_tick_action_name
                 if len(episode.frames) >= 2:
                     if dataset.pixel_shape is None:
                         first = episode.frames[0]

@@ -281,3 +281,55 @@ def test_achievement_events_are_repeatable_counters():
 def test_null_action_is_a_real_action_not_crafter_specific():
     assert Action("NULL") in ACTION_SPACE
     assert Action("NULL").is_null
+
+
+# --------------------------------------------------------- post-reset hook (issue #202)
+
+
+def test_post_reset_hook_edits_take_effect_before_the_reset_snapshot_publishes():
+    """Issue #202: a caller that edits the env only *after* ``reset()``
+    returns is too late -- the un-edited state was already captured into
+    ``_last_state`` and published as the episode's first recorded frame.
+    ``set_post_reset_hook`` runs the edit *inside* ``reset()``, before that
+    snapshot is built, so the very first published frame already reflects
+    it."""
+    program, sensory, motor = _stream_program(0)
+
+    def paint_a_wall(env):
+        x, y = int(env._player.pos[0]), int(env._player.pos[1])
+        env._world[(x + 1, y)] = "stone"
+
+    program.set_post_reset_hook(paint_a_wall)
+    program.reset(seed=1)
+    events = sensory.drain()
+    grid_events = [e for e in events if e.stream_id == "vision.frame.grid"]
+    assert grid_events, "reset() should republish a full snapshot"
+
+    # The player's east neighbor cell is "stone" in the very first published
+    # grid -- not just after a later reset.
+    grid = grid_events[-1].payload
+    radius = len(grid) // 2
+    assert grid[radius + 1][radius] == 3  # stone's semantic id
+
+
+def test_post_reset_hook_is_reapplied_on_every_reset():
+    program, sensory, motor = _stream_program(0)
+    calls = []
+    program.set_post_reset_hook(lambda env: calls.append(1))
+
+    program.reset(seed=1)
+    program.reset(seed=2)
+    program.reset(seed=3)
+    assert len(calls) == 3
+
+
+def test_set_post_reset_hook_none_clears_it():
+    program, sensory, motor = _stream_program(0)
+    calls = []
+    program.set_post_reset_hook(lambda env: calls.append(1))
+    program.reset(seed=1)
+    assert len(calls) == 1
+
+    program.set_post_reset_hook(None)
+    program.reset(seed=2)
+    assert len(calls) == 1  # not called again

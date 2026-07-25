@@ -33,3 +33,15 @@ class CrafterConfig:
             if hasattr(cfg, key):
                 setattr(cfg, key, value)
         return cfg
+
+
+def area_from_world_size(world_size: int) -> Tuple[int, int]:
+    """Translate a single ``world_size`` knob into Crafter's own ``area``
+    config key (issue #202): ``CrafterConfig.from_dict`` silently drops an
+    unrecognized ``world_size`` key (it isn't a field on this dataclass), so
+    a caller building a Crafter program config from a Minecraft-shaped
+    single-``world_size`` setting (``training.nursery.NurseryConfig``) must
+    go through this rather than passing ``world_size`` straight through --
+    the bug that left a notebook's requested 128-unit world silently
+    recording against Crafter's default 64x64 ``area``."""
+    return (int(world_size), int(world_size))
