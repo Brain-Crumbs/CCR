@@ -1265,28 +1265,22 @@ def evaluate_action_world_model_direct(
     """Evaluate direct autoregressive horizon heads in pixel space.
 
     Heads are addressed by tick horizon while recordings are indexed by frame
-    offset.  A pair of tick horizons which collapse to one frame offset would
-    make a frame-keyed report ambiguous, so reject it explicitly instead of
-    silently overwriting a metric.
+    offset.  Multiple valid tick horizons may map to one frame offset on a
+    downsampled recording, so report keys deliberately remain tick horizons.
     """
     torch, F = _torch()
     ticks = tuple(sorted({int(h) for h in horizons_ticks}))
     if not ticks or ticks[0] < 1:
         raise ValueError(f"horizons_ticks must be positive, got {horizons_ticks!r}")
     frames = tuple(horizons_ticks_to_frames((h,), dataset.ticks_per_frame)[0] for h in ticks)
-    if len(set(frames)) != len(frames):
-        raise ValueError(
-            "direct evaluation has ambiguous tick-to-frame horizons: "
-            f"ticks={list(ticks)}, frames={list(frames)}, ticks_per_frame={dataset.ticks_per_frame}"
-        )
     max_horizon = max(frames)
     action_index = {name: i for i, name in enumerate(model.action_keys)}
-    samples = {frame: {"model": [], "copy_last": [], "mean_frame": [], "oracle": []} for frame in frames}
+    samples = {tick: {"model": [], "copy_last": [], "mean_frame": [], "oracle": []} for tick in ticks}
     workspace_samples = {
-        name: {frame: {"model": [], "copy_last": []} for frame in frames}
+        name: {tick: {"model": [], "copy_last": []} for tick in ticks}
         for name in getattr(model, "workspace_modalities", {})
     }
-    per_episode_model_mse = {frame: [] for frame in frames}
+    per_episode_model_mse = {tick: [] for tick in ticks}
     prediction_dispersion: List[float] = []
     target_dispersion: List[float] = []
 
@@ -1311,43 +1305,43 @@ def evaluate_action_world_model_direct(
             starts = range(warmup_frames, n - max_horizon)
             if max_starts_per_episode is not None:
                 starts = list(starts)[:max_starts_per_episode]
-            episode_mse = {frame: [] for frame in frames}
+            episode_mse = {tick: [] for tick in ticks}
             for t in starts:
-                decoded_by_frame = {}
+                decoded_by_tick = {}
                 for tick, frame in zip(ticks, frames):
                     prediction = model.sequence_prediction(hidden[:, t : t + 1], tick)
                     decoded = prediction.decoded[0, 0]
-                    decoded_by_frame[frame] = decoded
+                    decoded_by_tick[tick] = decoded
                     target = targets[t + frame]
                     mse = float(F.mse_loss(decoded, target))
-                    samples[frame]["model"].append(mse)
-                    episode_mse[frame].append(mse)
-                    samples[frame]["copy_last"].append(float(F.mse_loss(targets[t], target)))
-                    samples[frame]["mean_frame"].append(float(F.mse_loss(mean_frame, target)))
+                    samples[tick]["model"].append(mse)
+                    episode_mse[tick].append(mse)
+                    samples[tick]["copy_last"].append(float(F.mse_loss(targets[t], target)))
+                    samples[tick]["mean_frame"].append(float(F.mse_loss(mean_frame, target)))
                     if oracle_lag is not None and t + frame - oracle_lag >= 0:
-                        samples[frame]["oracle"].append(float(F.mse_loss(targets[t + frame - oracle_lag], target)))
+                        samples[tick]["oracle"].append(float(F.mse_loss(targets[t + frame - oracle_lag], target)))
                     for name, by_horizon in workspace_samples.items():
                         predicted = prediction.modalities[name][0, 0]
                         target_modality = workspace[name][t + frame]
-                        by_horizon[frame]["model"].append(float(F.mse_loss(predicted, target_modality)))
-                        by_horizon[frame]["copy_last"].append(float(F.mse_loss(workspace[name][t], target_modality)))
+                        by_horizon[tick]["model"].append(float(F.mse_loss(predicted, target_modality)))
+                        by_horizon[tick]["copy_last"].append(float(F.mse_loss(workspace[name][t], target_modality)))
                 if len(frames) >= 2:
-                    prediction_dispersion.append(_pairwise_dispersion([decoded_by_frame[f] for f in frames]))
+                    prediction_dispersion.append(_pairwise_dispersion([decoded_by_tick[h] for h in ticks]))
                     target_dispersion.append(_pairwise_dispersion([targets[t + f] for f in frames]))
-            for frame in frames:
-                if episode_mse[frame]:
-                    per_episode_model_mse[frame].append(_mean(episode_mse[frame]))
+            for tick in ticks:
+                if episode_mse[tick]:
+                    per_episode_model_mse[tick].append(_mean(episode_mse[tick]))
     if was_training:
         model.train()
 
     report: Dict[int, Dict[str, Any]] = {}
     for tick, frame in zip(ticks, frames):
-        entry = samples[frame]
+        entry = samples[tick]
         if not entry["model"]:
             raise ValueError(f"no direct evaluation samples at horizon {tick} ticks ({frame} frames)")
         model_mse, copy_mse, mean_mse = _mean(entry["model"]), _mean(entry["copy_last"]), _mean(entry["mean_frame"])
         oracle_mse = _mean(entry["oracle"]) if entry["oracle"] else None
-        report[frame] = {
+        report[tick] = {
             "horizon_tick": tick, "horizon_frame": frame, "n_samples": len(entry["model"]),
             "model_mse": model_mse, "copy_last_mse": copy_mse, "mean_frame_mse": mean_mse,
             "oracle_mse": oracle_mse, "psnr_model": _psnr(model_mse),
@@ -1357,11 +1351,11 @@ def evaluate_action_world_model_direct(
             "beats_copy_last": bool(model_mse < copy_mse), "beats_mean_frame": bool(model_mse < mean_mse),
         }
     workspace_report = {
-        name: {frame: {"n_samples": len(values["model"]), "model_mse": _mean(values["model"]),
+        name: {tick: {"n_samples": len(values["model"]), "model_mse": _mean(values["model"]),
                        "copy_last_mse": _mean(values["copy_last"]),
                        "model_over_copy_last_mse": _ratio(_mean(values["model"]), _mean(values["copy_last"])),
                        "beats_copy_last": bool(_mean(values["model"]) < _mean(values["copy_last"]))}
-               for frame, values in by_frame.items()}
+               for tick, values in by_frame.items()}
         for name, by_frame in workspace_samples.items()
     }
     return {
@@ -1601,7 +1595,9 @@ def evaluate_action_world_model_milestone(
     direct = evaluate_action_world_model_direct(
         model, dataset, horizons_ticks, warmup_frames=warmup_frames
     )
-    frames = direct["horizons_frames"]
+    # Rollout has one prediction per *frame* step, whereas direct heads keep
+    # every tick identity even when two heads target the same recorded frame.
+    frames = sorted(set(direct["horizons_frames"]))
     rollout = evaluate_action_world_model(
         model, dataset, frames, warmup_frames=warmup_frames
     )

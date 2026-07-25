@@ -311,6 +311,20 @@ def test_direct_evaluation_uses_direct_heads_not_closed_loop_rollout(turn_sessio
     assert set(calls) == {1, 4}
 
 
+def test_direct_evaluation_preserves_colliding_tick_horizons(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    # Model a paced recording: tick horizons 1 and 2 both align to frame 1.
+    dataset.episodes[0].ticks = [tick * 2 for tick in dataset.episodes[0].ticks]
+    model, _stats = train_action_world_model(
+        dataset, _small_model_config(horizons_ticks=(1, 2))
+    )
+    report = evaluate_action_world_model_direct(model, dataset, [1, 2], warmup_frames=2)
+    assert set(report["horizons"]) == {1, 2}
+    assert report["horizons_frames"] == [1, 1]
+    assert report["horizons"][1]["horizon_frame"] == 1
+    assert report["horizons"][2]["horizon_frame"] == 1
+
+
 def test_ema_target_encoder_is_opt_in_and_reported(turn_session):
     dataset = build_action_sequence_dataset([turn_session])
     _model, default_stats = train_action_world_model(dataset, _small_model_config())

@@ -2235,10 +2235,17 @@ def run_action_ablation_eval(
     without_actions_stats = cortex_horizon_statistics(without_actions_metrics["per_episode_model_mse"])
     comparisons = compare_cortex_horizon_statistics(with_actions_stats, without_actions_stats)
 
-    degrades = bool(horizon_frames) and all(
+    # Metrics are keyed by the holdout recording's frame offsets (or direct
+    # tick horizons), not the training dataset's sampling rate.  Derive the
+    # comparison domain from the returned reports so remote train/holdout
+    # recordings with different tick rates cannot mis-index this verdict.
+    evaluated_horizons = sorted(
+        set(with_actions_metrics["horizons"]) & set(without_actions_metrics["horizons"])
+    )
+    degrades = bool(evaluated_horizons) and all(
         without_actions_metrics["horizons"][h]["model_mse"]
         > with_actions_metrics["horizons"][h]["model_mse"]
-        for h in horizon_frames
+        for h in evaluated_horizons
     )
     representation_diagnostics = representation_collapse_diagnostics(
         model_with, holdout_dataset, config=with_actions_cfg
