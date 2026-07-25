@@ -64,6 +64,17 @@ class SpatialVisualEncoder(nn.Module):
         """Token-only compatibility surface; use :meth:`encode` for layout."""
         return self.encode(pixels).token
 
+    def encode_frame(self, frame: Any) -> torch.Tensor:
+        """Compatibility helper matching :class:`PixelStreamEncoder`.
+
+        Live cortex users historically obtain the single-frame token directly
+        from ``model.encoder``.  Spatial callers can still request the map
+        through :meth:`encode`; this helper deliberately returns only the
+        temporal token.
+        """
+        batch = pixels_to_chw(frame).unsqueeze(0).to(next(self.parameters()).device)
+        return self.forward(batch).squeeze(0)
+
 
 def pixels_to_chw(frame: Any) -> torch.Tensor:
     """Convert an H x W x C RGB frame into a normalized C x H x W tensor.
