@@ -117,6 +117,9 @@ class EpisodeActionFrames:
     #: The non-visual half of the bound workspace, replayed through the same
     #: ``TemporalFusion`` code path as the live runtime at each visual frame.
     workspace: List[List[float]] = field(default_factory=list)
+    #: Latest recorded ``vision.frame.grid`` aligned to each pixel frame;
+    #: ``None`` means the recording predates semantic supervision.
+    semantic_grids: List[Optional[List[List[int]]]] = field(default_factory=list)
 
     @property
     def ticks_per_frame(self) -> float:
@@ -265,6 +268,7 @@ def build_action_sequence_dataset(
                 #: below).
                 last_committed_action: Optional[str] = None
                 last_facing: Optional[Tuple[float, float]] = None
+                last_semantic_grid: Optional[List[List[int]]] = None
                 for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
                     workspace_buffer.extend([
                         stream_event_from_log(record, frame_store=frame_store) for record in sensory
@@ -294,6 +298,11 @@ def build_action_sequence_dataset(
                     # see the module-level DEATH_STREAM comment for why.
                     risk = float(decision.get("risk", 0.0))
                     for record in sensory:
+                        if record.get("stream_id") == "vision.frame.grid":
+                            grid = record.get("payload")
+                            if isinstance(grid, list) and all(isinstance(row, list) for row in grid):
+                                last_semantic_grid = grid
+                    for record in sensory:
                         if record.get("stream_id") != PIXEL_STREAM:
                             continue
                         if record.get("elided"):
@@ -314,6 +323,7 @@ def build_action_sequence_dataset(
                         episode.terminal.append(terminal)
                         episode.risk.append(risk)
                         episode.workspace.append(list(workspace_vector))
+                        episode.semantic_grids.append(last_semantic_grid)
                     # Now that this tick's frames (if any) are recorded
                     # against the *previous* tick's command, fold this
                     # tick's own emission in for the *next* tick's frame(s)
@@ -358,6 +368,12 @@ class ActionWorldModelConfig:
     hidden_dim: int = 64
     action_embed_dim: int = 8
     reconstruction_size: int = 16
+    visual_architecture: str = "spatial_residual_v1"
+    change_mask_sparsity_weight: float = 0.01
+    scene_height: Optional[int] = None
+    hud_loss_weight: float = 0.25
+    semantic_loss_weight: float = 1.0
+    semantic_classes: int = 0
     epochs: int = 30
     lr: float = 1e-3
     batch_size: int = 32
@@ -469,6 +485,9 @@ def build_action_world_model(
         hidden_dim=cfg.hidden_dim,
         action_embed_dim=cfg.action_embed_dim,
         reconstruction_size=cfg.reconstruction_size,
+        visual_architecture=cfg.visual_architecture,
+        change_mask_sparsity_weight=cfg.change_mask_sparsity_weight,
+        semantic_classes=cfg.semantic_classes,
         horizons_ticks=tuple(cfg.horizons_ticks),
         backbone=cfg.backbone,
         context_length=cfg.context_length,
@@ -552,6 +571,25 @@ def _workspace_loss(model: Any, predicted: Any, targets: Dict[str, Any]) -> Any:
     return torch.stack(terms).mean()
 
 
+def _spatial_pixel_loss(model: Any, predicted: Any, reference: Any, target: Any, cfg: ActionWorldModelConfig,
+                        reference_spatial: Optional[Any] = None) -> Tuple[Any, Any, Dict[str, Any]]:
+    """Scene/HUD weighted residual loss and its mask regularizer."""
+    torch, F = _torch()
+    flat_reference = reference.reshape(-1, *reference.shape[-3:])
+    encoding = model.encode_visual(flat_reference) if reference_spatial is None else None
+    decoded = model.decode_prediction(
+        predicted.reshape(-1, predicted.shape[-1]),
+        reference_frame=flat_reference,
+        reference_spatial=(encoding.spatial if encoding is not None else reference_spatial.reshape(-1, *reference_spatial.shape[-3:])),
+    )
+    vision = decoded["vision"].reshape_as(target)
+    scene_h = cfg.scene_height if cfg.scene_height is not None else vision.shape[-2]
+    scene_h = max(0, min(int(scene_h), vision.shape[-2]))
+    scene = F.mse_loss(vision[..., :scene_h, :], target[..., :scene_h, :]) if scene_h else vision.new_zeros(())
+    hud = F.mse_loss(vision[..., scene_h:, :], target[..., scene_h:, :]) if scene_h < vision.shape[-2] else vision.new_zeros(())
+    return scene + cfg.hud_loss_weight * hud, decoded["change_mask"].mean(), decoded
+
+
 def _episode_head_targets(episode: EpisodeActionFrames, n_frames: int) -> Tuple[Any, Any, Any, bool]:
     """``(reward, terminal, risk, has_targets)`` for one episode, the first
     three aligned with :func:`_episode_tensors`' pixel/latent indexing
@@ -573,6 +611,17 @@ def _episode_head_targets(episode: EpisodeActionFrames, n_frames: int) -> Tuple[
         return torch.zeros(n_frames, dtype=torch.float32)
 
     return _column(episode.reward), _column(episode.terminal), _column(episode.risk), has_targets
+
+
+def _episode_semantic_targets(episode: EpisodeActionFrames, n_frames: int, classes: int) -> Optional[Any]:
+    """Return aligned 9x9 class targets, or ``None`` for old recordings."""
+    torch, F = _torch()
+    if classes <= 0 or len(episode.semantic_grids) != n_frames or any(g is None for g in episode.semantic_grids):
+        return None
+    grids = torch.tensor(episode.semantic_grids, dtype=torch.long)
+    if grids.ndim != 3 or grids.min() < 0 or grids.max() >= classes:
+        raise ValueError(f"semantic grids must contain ids in [0, {classes}), got shape {tuple(grids.shape)}")
+    return F.interpolate(grids.unsqueeze(1).float(), size=(9, 9), mode="nearest").squeeze(1).long()
 
 
 def _update_ema_target_encoder(target_encoder: Any, model: Any, decay: float) -> None:
@@ -626,7 +675,7 @@ def _train_autoregressive_objective(
         "total_loss": [], "pixel_loss": [], "latent_loss": [],
         "reward_loss": [], "terminal_loss": [], "risk_loss": [], "uncertainty_loss": [],
         "closed_loop_loss": [], "closed_loop_latent_loss": [],
-        "closed_loop_pixel_loss": [], "workspace_loss": [],
+        "closed_loop_pixel_loss": [], "workspace_loss": [], "semantic_loss": [],
     }
     log.info("training cortex (autoregressive)  episodes=%d  epochs=%d  horizons=%s  backbone=%s",
              len(episodes), cfg.epochs, list(horizons_ticks), _backbone_name(model))
@@ -654,6 +703,9 @@ def _train_autoregressive_objective(
         for episode_index in torch.randperm(len(episodes), generator=generator).tolist():
             _episode, pixels, targets, actions = episodes[episode_index]
             rewards, terminals, risks, has_targets = head_targets[episode_index]
+            semantic_targets = _episode_semantic_targets(
+                _episode, pixels.shape[0], cfg.semantic_classes
+            )
             if pixels.shape[0] <= min(horizon_frames):
                 continue
             optimizer.zero_grad()
@@ -670,24 +722,39 @@ def _train_autoregressive_objective(
 
             latent_terms = []
             pixel_terms = []
+            mask_terms = []
             reward_terms = []
             terminal_terms = []
             risk_terms = []
             uncertainty_terms = []
             workspace_terms = []
+            semantic_terms = []
             for horizon_tick, horizon_frame in zip(horizons_ticks, horizon_frames):
                 positions = pixels.shape[0] - horizon_frame
                 if positions <= 0:
                     continue
-                prediction = model.sequence_prediction(hidden[:, :positions], horizon_tick)
+                reference_encoding = model.encode_visual(pixels[:positions])
+                prediction = model.sequence_prediction(
+                    hidden[:, :positions], horizon_tick,
+                    reference_frame=targets[:positions].unsqueeze(0),
+                    reference_spatial=reference_encoding.spatial.unsqueeze(0),
+                )
                 target_latent = target_latents[:, horizon_frame:].detach()
                 per_error = (
                     F.normalize(prediction.latent, dim=-1) - F.normalize(target_latent, dim=-1)
                 ).pow(2).mean(dim=-1)
                 latent_terms.append(per_error.mean())
-                pixel_terms.append(F.mse_loss(
-                    prediction.decoded, targets[horizon_frame:].unsqueeze(0)
-                ))
+                pixel_term, mask_term, _decoded = _spatial_pixel_loss(
+                    model, prediction.latent, pixels[:positions].unsqueeze(0),
+                    targets[horizon_frame:].unsqueeze(0), cfg,
+                )
+                pixel_terms.append(pixel_term)
+                mask_terms.append(mask_term)
+                if semantic_targets is not None:
+                    assert prediction.semantic_logits is not None
+                    semantic_terms.append(F.cross_entropy(
+                        prediction.semantic_logits, semantic_targets[horizon_frame:].unsqueeze(0)
+                    ))
                 uncertainty_terms.append(F.mse_loss(prediction.uncertainty, per_error.detach()))
                 workspace_terms.append(_workspace_loss(
                     model, prediction.latent,
@@ -709,6 +776,8 @@ def _train_autoregressive_objective(
 
             latent_loss = _mean_or_zero(latent_terms)
             pixel_loss = _mean_or_zero(pixel_terms)
+            mask_sparsity_loss = _mean_or_zero(mask_terms)
+            semantic_loss = _mean_or_zero(semantic_terms)
             reward_loss = _mean_or_zero(reward_terms)
             terminal_loss = _mean_or_zero(terminal_terms)
             risk_loss = _mean_or_zero(risk_terms)
@@ -726,6 +795,10 @@ def _train_autoregressive_objective(
                 for index in range(warmup):
                     _prediction, state = model.step(latents[:, index], actions_b[:, index], state)
                 latent_in = latents[:, warmup]
+                reference_frame = targets[warmup].unsqueeze(0)
+                reference_spatial = model.encode_visual(F.interpolate(
+                    reference_frame, size=model.pixel_shape[:2], mode="nearest"
+                )).spatial
                 rollout_steps = min(cfg.rollout_frames, actions_b.shape[1] - warmup)
                 rollout_latent_terms = []
                 rollout_pixel_terms = []
@@ -739,14 +812,17 @@ def _train_autoregressive_objective(
                     # This is deliberately decoded from the *closed-loop*
                     # latent.  It gives gradients to both decoder and
                     # transition path, unlike the direct-head pixel term.
-                    rollout_pixel_terms.append(F.mse_loss(
-                        model.decoder(predicted), targets[index + 1].unsqueeze(0)
-                    ))
-                    latent_in = (
-                        predicted
-                        if float(torch.rand((), generator=generator)) < cfg.scheduled_sampling_p
-                        else latents[:, index + 1]
+                    pixel_term, _mask_term, decoded = _spatial_pixel_loss(
+                        model, predicted, reference_frame, targets[index + 1].unsqueeze(0), cfg,
+                        reference_spatial=reference_spatial,
                     )
+                    rollout_pixel_terms.append(pixel_term)
+                    use_prediction = float(torch.rand((), generator=generator)) < cfg.scheduled_sampling_p
+                    latent_in = predicted if use_prediction else latents[:, index + 1]
+                    reference_frame = decoded["vision"] if use_prediction else targets[index + 1].unsqueeze(0)
+                    reference_spatial = model.encode_visual(F.interpolate(
+                        reference_frame, size=model.pixel_shape[:2], mode="nearest"
+                    )).spatial
                 closed_loop_latent_loss = _mean_or_zero(rollout_latent_terms)
                 closed_loop_pixel_loss = _mean_or_zero(rollout_pixel_terms)
             closed_loop_loss = (
@@ -762,6 +838,8 @@ def _train_autoregressive_objective(
                 + cfg.risk_loss_weight * risk_loss
                 + cfg.uncertainty_loss_weight * uncertainty_loss
                 + workspace_loss
+                + cfg.change_mask_sparsity_weight * mask_sparsity_loss
+                + cfg.semantic_loss_weight * semantic_loss
                 + closed_loop_loss
             )
             total.backward()
@@ -778,6 +856,7 @@ def _train_autoregressive_objective(
                 ("closed_loop_latent_loss", closed_loop_latent_loss),
                 ("closed_loop_pixel_loss", closed_loop_pixel_loss),
                 ("workspace_loss", workspace_loss),
+                ("semantic_loss", semantic_loss),
             ):
                 epoch[key] += float(value.detach())
         for key in curves:
@@ -935,6 +1014,13 @@ def train_action_world_model(
     # Evaluation must know which prediction surface was optimized.  It is
     # serialized in training_stats as well for a reloaded checkpoint.
     model.training_objective = cfg.training_objective
+    model.training_visual_config = {
+        "scene_height": cfg.scene_height,
+        "hud_loss_weight": cfg.hud_loss_weight,
+        "semantic_loss_weight": cfg.semantic_loss_weight,
+        "semantic_classes": cfg.semantic_classes,
+        "change_mask_sparsity_weight": cfg.change_mask_sparsity_weight,
+    }
     target_encoder = None
     if cfg.ema_target_decay is not None:
         # The workspace binding is part of z, so the EMA target must carry
@@ -1000,6 +1086,7 @@ def train_action_world_model(
         "risk_loss": [],
         "uncertainty_loss": [],
         "workspace_loss": [],
+        "semantic_loss": [],
     }
 
     log.info("training cortex (windowed_rollout)  windows=%d  epochs=%d  backbone=%s",
@@ -1040,6 +1127,7 @@ def train_action_world_model(
             rewards_batch = []
             terminals_batch = []
             risks_batch = []
+            semantic_batch = []
             workspace_batch: Dict[str, List[Any]] = {name: [] for name in model.workspace_modalities}
             has_targets_batch = []
             for flat in batch_ids.tolist():
@@ -1049,6 +1137,7 @@ def train_action_world_model(
                 frames_batch.append(pixels[t : t + window])
                 targets_batch.append(targets[t : t + window])
                 actions_batch.append(actions[t : t + window - 1])
+                semantic_batch.append(_episode.semantic_grids[t : t + window])
                 rewards_batch.append(rewards[t : t + window])
                 terminals_batch.append(terminals[t : t + window])
                 risks_batch.append(risks[t : t + window])
@@ -1062,6 +1151,18 @@ def train_action_world_model(
             rewards_b = torch.stack(rewards_batch)
             terminals_b = torch.stack(terminals_batch)
             risks_b = torch.stack(risks_batch)
+            semantic_b = None
+            if cfg.semantic_classes and all(
+                len(grids) == window and all(grid is not None for grid in grids)
+                for grids in semantic_batch
+            ):
+                semantic_b = torch.tensor(semantic_batch, dtype=torch.long)
+                semantic_b = F.interpolate(
+                    semantic_b.reshape(-1, 1, *semantic_b.shape[-2:]).float(),
+                    size=(9, 9), mode="nearest",
+                ).reshape(len(semantic_batch), window, 9, 9).long()
+                if semantic_b.min() < 0 or semantic_b.max() >= cfg.semantic_classes:
+                    raise ValueError(f"semantic grids must contain ids in [0, {cfg.semantic_classes})")
             workspace_b = {name: torch.stack(values) for name, values in workspace_batch.items()}
             #: Per-sample mask (issue #169): episodes without recorded
             #: reward/terminal/risk streams (e.g. hand-built synthetic test
@@ -1100,6 +1201,8 @@ def train_action_world_model(
                 predicted, hidden = model.step(latents[:, i], actions_b[:, i], hidden)
 
             pixel_loss = frames_b.new_zeros(())
+            mask_sparsity_loss = frames_b.new_zeros(())
+            semantic_loss = frames_b.new_zeros(())
             latent_loss = frames_b.new_zeros(())
             reward_loss = frames_b.new_zeros(())
             terminal_loss = frames_b.new_zeros(())
@@ -1107,6 +1210,10 @@ def train_action_world_model(
             uncertainty_loss = frames_b.new_zeros(())
             workspace_loss = frames_b.new_zeros(())
             latent_in = latents[:, cfg.warmup_frames - 1]
+            reference_frame = targets_b[:, cfg.warmup_frames - 1]
+            reference_spatial = model.encode_visual(F.interpolate(
+                reference_frame, size=model.pixel_shape[:2], mode="nearest"
+            )).spatial
             for step in range(cfg.rollout_frames):
                 idx = cfg.warmup_frames - 1 + step
                 predicted, hidden = model.step(latent_in, actions_b[:, idx], hidden)
@@ -1118,8 +1225,17 @@ def train_action_world_model(
                     F.normalize(predicted, dim=1) - F.normalize(target_latent, dim=1)
                 ).pow(2).mean(dim=1)
                 latent_loss = latent_loss + per_sample_latent_error.mean()
-                decoded = model.decoder(predicted)
-                pixel_loss = pixel_loss + F.mse_loss(decoded, targets_b[:, idx + 1])
+                step_pixel_loss, step_mask_loss, decoded = _spatial_pixel_loss(
+                    model, predicted, reference_frame, targets_b[:, idx + 1], cfg,
+                    reference_spatial=reference_spatial,
+                )
+                pixel_loss = pixel_loss + step_pixel_loss
+                mask_sparsity_loss = mask_sparsity_loss + step_mask_loss
+                if semantic_b is not None:
+                    visual = decoded
+                    semantic_loss = semantic_loss + F.cross_entropy(
+                        visual["semantic_logits"], semantic_b[:, idx + 1]
+                    )
                 workspace_loss = workspace_loss + _workspace_loss(
                     model, predicted,
                     {name: values[:, idx + 1] for name, values in workspace_b.items()},
@@ -1149,11 +1265,15 @@ def train_action_world_model(
 
                 # Scheduled sampling: feed the prediction back in with
                 # probability p, else the observed latent.
-                if float(torch.rand((), generator=generator)) < cfg.scheduled_sampling_p:
-                    latent_in = predicted
-                else:
-                    latent_in = latents[:, idx + 1]
+                use_prediction = float(torch.rand((), generator=generator)) < cfg.scheduled_sampling_p
+                latent_in = predicted if use_prediction else latents[:, idx + 1]
+                reference_frame = decoded["vision"] if use_prediction else targets_b[:, idx + 1]
+                reference_spatial = model.encode_visual(F.interpolate(
+                    reference_frame, size=model.pixel_shape[:2], mode="nearest"
+                )).spatial
             pixel_loss = pixel_loss / cfg.rollout_frames
+            mask_sparsity_loss = mask_sparsity_loss / cfg.rollout_frames
+            semantic_loss = semantic_loss / cfg.rollout_frames
             latent_loss = latent_loss / cfg.rollout_frames
             reward_loss = reward_loss / cfg.rollout_frames
             terminal_loss = terminal_loss / cfg.rollout_frames
@@ -1168,6 +1288,8 @@ def train_action_world_model(
                 + cfg.risk_loss_weight * risk_loss
                 + cfg.uncertainty_loss_weight * uncertainty_loss
                 + workspace_loss
+                + cfg.change_mask_sparsity_weight * mask_sparsity_loss
+                + cfg.semantic_loss_weight * semantic_loss
             )
             total.backward()
             optimizer.step()
@@ -1183,6 +1305,7 @@ def train_action_world_model(
             epoch["risk_loss"] += float(risk_loss.detach()) * batch_n
             epoch["uncertainty_loss"] += float(uncertainty_loss.detach()) * batch_n
             epoch["workspace_loss"] += float(workspace_loss.detach()) * batch_n
+            epoch["semantic_loss"] += float(semantic_loss.detach()) * batch_n
         for key in curves:
             curves[key].append(round(epoch[key] / max(seen, 1), 6))
         _report_epoch(
@@ -1310,7 +1433,10 @@ def evaluate_action_world_model_direct(
                 decoded_by_tick = {}
                 for tick, frame in zip(ticks, frames):
                     prediction = model.sequence_prediction(hidden[:, t : t + 1], tick)
-                    decoded = prediction.decoded[0, 0]
+                    decoded = model.decode_prediction(
+                        prediction.latent[0], reference_frame=targets[t:t + 1],
+                        reference_spatial=model.encode_visual(pixels[t:t + 1]).spatial,
+                    )["vision"][0]
                     decoded_by_tick[tick] = decoded
                     target = targets[t + frame]
                     mse = float(F.mse_loss(decoded, target))
@@ -1465,10 +1591,15 @@ def evaluate_action_world_model(
                     remap[t : t + max_horizon].unsqueeze(0),
                     hiddens[t],
                 )
-                decoded_workspace = model.decode_workspace(rolled)
+                reference_encoding = model.encode_visual(pixels[t : t + 1])
+                decoded_workspace = model.decode_workspace(
+                    rolled,
+                    reference_frame=targets[t : t + 1].expand(1, rolled.shape[1], -1, -1, -1),
+                    reference_spatial=reference_encoding.spatial.expand(1, rolled.shape[1], -1, -1, -1),
+                )
                 decoded_by_horizon = {}
                 for h in horizons_sorted:
-                    decoded = model.decoder(rolled[:, h - 1]).squeeze(0)
+                    decoded = decoded_workspace["vision"][0, h - 1]
                     decoded_by_horizon[h] = decoded
                     target = targets[t + h]
                     model_mse_sample = float(F.mse_loss(decoded, target))
@@ -1844,6 +1975,53 @@ def evaluate_cortex_heads(
     return report
 
 
+def evaluate_static_holdout(model: Any, dataset: ActionSequenceDataset) -> Dict[str, Any]:
+    """Measure spatial residual predictions on semantic-static transitions.
+
+    Unlike a pixel-hash filter, this uses the recorded semantic grid: animated
+    HUD pixels are not mistaken for gameplay motion. The returned ratio is the
+    Fix 4 promotion metric (model MSE / copy-last MSE, with an absolute MSE
+    fallback when the target is exactly equal to the reference).
+    """
+    torch, F = _torch()
+    episodes = _episode_tensors(dataset, model.reconstruction_shape)
+    model_mse: List[float] = []
+    copy_mse: List[float] = []
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for episode, pixels, targets, actions in episodes:
+            if len(episode.semantic_grids) != len(episode.frames):
+                continue
+            workspace = _episode_workspace_tensors(episode, dataset, model, actions=actions)
+            latents = model.encode_workspace(pixels, workspace)
+            for t in range(len(actions)):
+                before, after = episode.semantic_grids[t], episode.semantic_grids[t + 1]
+                if before is None or after is None or before != after:
+                    continue
+                output = model.forward_horizons(
+                    latents[t:t + 1], actions[t:t + 1].unsqueeze(0), model.initial_state(1),
+                    horizon_frames=[1], reference_frame=targets[t:t + 1],
+                    reference_spatial=model.encode_visual(pixels[t:t + 1]).spatial,
+                )[1].decoded.squeeze(0)
+                target = targets[t + 1]
+                model_mse.append(float(F.mse_loss(output, target)))
+                copy_mse.append(float(F.mse_loss(targets[t], target)))
+    if was_training:
+        model.train()
+    if not model_mse:
+        raise ValueError("static holdout has no semantic-static transitions")
+    mean_model = sum(model_mse) / len(model_mse)
+    mean_copy = sum(copy_mse) / len(copy_mse)
+    return {
+        "n_samples": len(model_mse),
+        "model_mse": mean_model,
+        "copy_last_mse": mean_copy,
+        "model_over_copy_last_mse": mean_model / mean_copy if mean_copy > 1e-12 else None,
+        "passes_static_gate": mean_model <= 1.05 * mean_copy if mean_copy > 1e-12 else mean_model <= 1e-12,
+    }
+
+
 def _head_mse_vs_constant(preds: Sequence[float], targets: Sequence[float]) -> Tuple[float, float]:
     """``(model_mse, constant_predictor_mse)`` where the constant predictor
     always answers the held-out targets' own mean -- the same baseline
@@ -2150,7 +2328,13 @@ def save_action_world_model(path: str, model: Any, stats: Dict[str, Any]) -> Non
     torch, _F = _torch()
     torch.save(
         {
-            "format": "action-world-model-v1",
+            "format": "action-world-model-v2",
+            "visual_architecture": model.visual_architecture,
+            "visual_config": {
+                "semantic_classes": model.config.semantic_classes,
+                "change_mask_sparsity_weight": model.config.change_mask_sparsity_weight,
+                **getattr(model, "training_visual_config", {}),
+            },
             "pixel_shape": list(model.pixel_shape),
             "action_keys": list(model.action_keys),
             "latent_width": model.latent_width,
@@ -2174,11 +2358,32 @@ def save_action_world_model(path: str, model: Any, stats: Dict[str, Any]) -> Non
     )
 
 
-def load_action_world_model(path: str):
+def load_action_world_model(path: str, *, inspection_only: bool = False):
+    """Load a spatial checkpoint, or inspect a legacy checkpoint without migration.
+
+    ``inspection_only`` intentionally returns ``(None, training_stats)`` for
+    global-pool v1 files: their metadata remains available, but their dense
+    decoder is never silently inserted into the spatial architecture.
+    """
     torch, _F = _torch()
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if payload.get("format") != "action-world-model-v1":
+    if payload.get("format") == "action-world-model-v1":
+        if inspection_only:
+            stats = dict(payload.get("training_stats", {}))
+            stats["legacy_visual_architecture"] = "global_pool_v1"
+            stats["inspection_only"] = True
+            return None, stats
+        raise ValueError(
+            "checkpoint uses global_pool_v1; start a new spatial_residual_v1 experiment"
+        )
+    if payload.get("format") != "action-world-model-v2":
         raise ValueError(f"unsupported action world model format {payload.get('format')!r}")
+    if payload.get("visual_architecture") != "spatial_residual_v1":
+        raise ValueError(
+            f"checkpoint uses {payload.get('visual_architecture', 'global_pool_v1')}; "
+            "start a new spatial_residual_v1 experiment"
+        )
+    visual_config = payload.get("visual_config", {})
     cfg = ActionWorldModelConfig(
         latent_width=int(payload["latent_width"]),
         hidden_dim=int(payload["hidden_dim"]),
@@ -2187,6 +2392,12 @@ def load_action_world_model(path: str):
         backbone=payload.get("backbone", ActionWorldModelConfig.backbone),
         context_length=int(payload.get("context_length", ActionWorldModelConfig.context_length)),
         workspace_enabled=bool(payload.get("workspace_modalities", {})),
+        visual_architecture=payload["visual_architecture"],
+        semantic_classes=int(visual_config.get("semantic_classes", 0)),
+        change_mask_sparsity_weight=float(visual_config.get("change_mask_sparsity_weight", 0.01)),
+        scene_height=visual_config.get("scene_height"),
+        hud_loss_weight=float(visual_config.get("hud_loss_weight", 0.25)),
+        semantic_loss_weight=float(visual_config.get("semantic_loss_weight", 1.0)),
     )
     model = build_action_world_model(
         tuple(payload["pixel_shape"]), payload["action_keys"], cfg,
@@ -2196,6 +2407,7 @@ def load_action_world_model(path: str):
     model.training_objective = payload.get(
         "training_objective", payload.get("training_stats", {}).get("training_objective", "windowed_rollout")
     )
+    model.training_visual_config = dict(visual_config)
     # C1 added direct heads for tick horizons > 1.  Older v1 checkpoints
     # naturally lack only these freshly initialized modules; allow precisely
     # that omission while retaining strict corruption detection everywhere

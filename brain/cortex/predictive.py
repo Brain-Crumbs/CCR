@@ -68,6 +68,9 @@ class PredictiveCortexConfig:
     hidden_dim: int = 64
     action_embed_dim: int = 8
     reconstruction_size: int = 16
+    visual_architecture: str = "spatial_residual_v1"
+    change_mask_sparsity_weight: float = 0.01
+    semantic_classes: int = 0
     #: Horizons in ticks (per-organism configurable), stored with the
     #: checkpoint. Frame-space horizons for a given recording are derived
     #: via ``horizons_ticks_to_frames(horizons_ticks, ticks_per_frame)``.
@@ -108,6 +111,8 @@ class CortexHorizonPrediction:
     risk: torch.Tensor
     uncertainty: torch.Tensor
     modalities: Dict[str, torch.Tensor] = field(default_factory=dict)
+    change_mask: Optional[torch.Tensor] = None
+    semantic_logits: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -131,6 +136,67 @@ class CortexSequencePrediction:
     risk: torch.Tensor
     uncertainty: torch.Tensor
     modalities: Dict[str, torch.Tensor] = field(default_factory=dict)
+    change_mask: Optional[torch.Tensor] = None
+    semantic_logits: Optional[torch.Tensor] = None
+
+
+class SpatialResidualDecoder(nn.Module):
+    """Convolutional residual image decoder conditioned on observed layout."""
+
+    def __init__(self, latent_width: int, spatial_width: int, output_shape: Tuple[int, int, int], semantic_classes: int = 0):
+        super().__init__()
+        self.output_shape = tuple(output_shape)
+        self.semantic_classes = int(semantic_classes)
+        self.condition = nn.Linear(latent_width, spatial_width)
+        self.body = nn.Sequential(
+            nn.Conv2d(spatial_width, spatial_width, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(spatial_width, spatial_width, 3, padding=1), nn.ReLU(),
+        )
+        # The encoder starts at 8x8 for 64px Crafter frames.  These are
+        # deliberately separate post-upsample convolutions rather than one
+        # resize from 8px to RGB: each scale gets to sharpen local motion.
+        self.upsample_blocks = nn.ModuleList([
+            nn.Sequential(nn.Conv2d(spatial_width, spatial_width, 3, padding=1), nn.ReLU())
+            for _ in range(6)
+        ])
+        self.delta_head = nn.Conv2d(spatial_width, 3, 1)
+        # A token-conditioned RGB residual makes uniform, action-dependent
+        # changes learnable without asking the spatial stack to synthesize a
+        # full-frame bias through many upsampling layers.
+        self.delta_bias = nn.Linear(latent_width, 3)
+        self.mask_head = nn.Conv2d(spatial_width, 1, 1)
+        self.semantic_head = nn.Conv2d(spatial_width, self.semantic_classes, 1) if self.semantic_classes else None
+        nn.init.constant_(self.mask_head.bias, 2.0)
+
+    def forward(self, latent: torch.Tensor, reference_frame: Optional[torch.Tensor] = None,
+                reference_spatial: Optional[torch.Tensor] = None):
+        if latent.ndim != 2:
+            raise ValueError("latent must be [B, L]")
+        legacy = reference_frame is None or reference_spatial is None
+        if legacy:
+            reference_frame = latent.new_zeros((latent.shape[0], 3, *self.output_shape[:2]))
+            reference_spatial = latent.new_zeros((latent.shape[0], self.condition.out_features, 1, 1))
+        if reference_frame.ndim != 4 or reference_spatial.ndim != 4:
+            raise ValueError("reference_frame and reference_spatial must be [B, C, H, W]")
+        x = reference_spatial + self.condition(latent).unsqueeze(-1).unsqueeze(-1)
+        x = self.body(x)
+        size = self.output_shape[:2]
+        block = 0
+        while (x.shape[-2] < size[0] or x.shape[-1] < size[1]) and block < len(self.upsample_blocks):
+            x = F.interpolate(x, scale_factor=2, mode="nearest")
+            x = self.upsample_blocks[block](x)
+            block += 1
+        if tuple(x.shape[-2:]) != size:
+            x = F.interpolate(x, size=size, mode="nearest")
+        delta = torch.tanh(self.delta_head(x) + self.delta_bias(latent).unsqueeze(-1).unsqueeze(-1))
+        mask = torch.sigmoid(self.mask_head(x))
+        reference = reference_frame
+        if tuple(reference.shape[-2:]) != size:
+            reference = F.interpolate(reference, size=size, mode="area")
+        result = {"vision": torch.clamp(reference + mask * delta, 0, 1), "change_mask": mask}
+        if self.semantic_head is not None:
+            result["semantic_logits"] = F.interpolate(self.semantic_head(x), size=(9, 9), mode="bilinear", align_corners=False)
+        return result["vision"] if legacy else result
 
 
 class PredictiveCortex(nn.Module):
@@ -152,11 +218,8 @@ class PredictiveCortex(nn.Module):
     ) -> None:
         super().__init__()
         from brain.cortex.backbones import build_backbone
-        from cognitive_runtime.neural.pixel_stream_encoder import PixelStreamEncoder
-        from cognitive_runtime.training.visual_representation import (
-            PixelReconstructionDecoder,
-            _reconstruction_shape,
-        )
+        from cognitive_runtime.neural.pixel_stream_encoder import SpatialVisualEncoder
+        from cognitive_runtime.training.visual_representation import _reconstruction_shape
 
         cfg = config or PredictiveCortexConfig()
         horizons_ticks = tuple(sorted({int(h) for h in cfg.horizons_ticks}))
@@ -178,8 +241,14 @@ class PredictiveCortex(nn.Module):
         self.reconstruction_shape = _reconstruction_shape(
             self.pixel_shape, cfg.reconstruction_size
         )
+        if cfg.visual_architecture != "spatial_residual_v1":
+            raise ValueError(
+                f"unsupported visual architecture {cfg.visual_architecture!r}; "
+                "start a new spatial_residual_v1 experiment"
+            )
+        self.visual_architecture = cfg.visual_architecture
 
-        self.encoder = PixelStreamEncoder(self.pixel_shape, latent_width=cfg.latent_width)
+        self.encoder = SpatialVisualEncoder(self.pixel_shape, latent_width=cfg.latent_width)
         self.workspace_width = sum(self.workspace_modalities.values())
         # The token is a learned binding of vision with the stream-native
         # workspace slices, rather than the pixels-only encoder output.
@@ -197,8 +266,9 @@ class PredictiveCortex(nn.Module):
             **cfg.backbone_kwargs,
         )
         self.latent_head = nn.Linear(cfg.hidden_dim, cfg.latent_width)
-        self.decoder = PixelReconstructionDecoder(
-            cfg.latent_width, self.reconstruction_shape, hidden_dim=cfg.hidden_dim
+        self.decoder = SpatialResidualDecoder(
+            cfg.latent_width, self.encoder.spatial_width, self.reconstruction_shape,
+            semantic_classes=cfg.semantic_classes,
         )
         self.workspace_decoders = nn.ModuleDict({
             name: nn.Linear(cfg.latent_width, width)
@@ -261,17 +331,52 @@ class PredictiveCortex(nn.Module):
         assert self.workspace_fuser is not None
         return self.workspace_fuser(torch.cat(pieces, dim=-1))
 
-    def decode_workspace(self, latent: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def encode_visual(self, pixels: torch.Tensor):
+        """Return both the temporal token and spatial evidence for a frame."""
+        return self.encoder.encode(pixels)
+
+    def decode_prediction(
+        self, predicted_latent: torch.Tensor, *, reference_frame: torch.Tensor,
+        reference_spatial: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Decode a future as a residual over an explicit observed reference."""
+        return self.decoder(predicted_latent, reference_frame, reference_spatial)
+
+    def blank_visual_reference(self, batch: int, *, device: Optional[torch.device] = None,
+                               dtype: Optional[torch.dtype] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Explicit neutral reference for generative-only callers such as dreams."""
+        parameter = next(self.parameters())
+        device = device or parameter.device
+        dtype = dtype or parameter.dtype
+        frame = torch.zeros(batch, 3, *self.reconstruction_shape[:2], device=device, dtype=dtype)
+        spatial = self.encode_visual(F.interpolate(
+            frame, size=self.pixel_shape[:2], mode="nearest"
+        )).spatial
+        return frame, spatial
+
+    def decode_workspace(
+        self, latent: torch.Tensor, *, reference_frame: Optional[torch.Tensor] = None,
+        reference_spatial: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """Decode the visual frame and every non-visual workspace modality."""
         if latent.ndim not in {2, 3}:
             raise ValueError(f"latent must be [B, L] or [B, T, L], got {tuple(latent.shape)}")
         leading = latent.shape[:-1]
         flat = latent.reshape(-1, latent.shape[-1])
-        vision = self.decoder(flat).reshape(
-            *leading, self.reconstruction_shape[2], self.reconstruction_shape[0],
-            self.reconstruction_shape[1],
-        )
-        decoded: Dict[str, torch.Tensor] = {"vision": vision}
+        if reference_frame is None or reference_spatial is None:
+            # Compatibility surface for token-only callers. New training and
+            # rollout paths pass real observations; this fallback is never a
+            # source of hidden mutable state.
+            reference_frame = flat.new_zeros((flat.shape[0], 3, *self.reconstruction_shape[:2]))
+            reference_spatial = flat.new_zeros((flat.shape[0], self.encoder.spatial_width,
+                                                max(1, self.pixel_shape[0] // 8), max(1, self.pixel_shape[1] // 8)))
+        else:
+            reference_frame = reference_frame.reshape(flat.shape[0], *reference_frame.shape[-3:])
+            reference_spatial = reference_spatial.reshape(flat.shape[0], *reference_spatial.shape[-3:])
+        visual = self.decode_prediction(flat, reference_frame=reference_frame, reference_spatial=reference_spatial)
+        decoded: Dict[str, torch.Tensor] = {
+            name: value.reshape(*leading, *value.shape[1:]) for name, value in visual.items()
+        }
         for name, head in self.workspace_decoders.items():
             decoded[name] = head(flat).reshape(*leading, self.workspace_modalities[name])
         return decoded
@@ -342,7 +447,11 @@ class PredictiveCortex(nn.Module):
         embedded = self.action_embedding(action_idx)
         return self.transition_backbone.forward_sequence(torch.cat([latents, embedded], dim=-1))
 
-    def sequence_prediction(self, hidden: torch.Tensor, horizon: int) -> CortexSequencePrediction:
+    def sequence_prediction(
+        self, hidden: torch.Tensor, horizon: int, *,
+        reference_frame: Optional[torch.Tensor] = None,
+        reference_spatial: Optional[torch.Tensor] = None,
+    ) -> CortexSequencePrediction:
         """Apply direct horizon heads to every sequence position."""
         if horizon < 1:
             raise ValueError(f"horizon must be positive, got {horizon}")
@@ -367,7 +476,9 @@ class PredictiveCortex(nn.Module):
             uncertainty = F.softplus(heads["uncertainty"](hidden)).squeeze(-1)
         if latent.ndim != 3:
             raise ValueError(f"sequence hidden must be [B, T, H], got {tuple(hidden.shape)}")
-        decoded_workspace = self.decode_workspace(latent)
+        decoded_workspace = self.decode_workspace(
+            latent, reference_frame=reference_frame, reference_spatial=reference_spatial,
+        )
         return CortexSequencePrediction(
             latent=latent,
             decoded=decoded_workspace["vision"],
@@ -375,7 +486,10 @@ class PredictiveCortex(nn.Module):
             terminal_logit=terminal_logit,
             risk=risk,
             uncertainty=uncertainty,
-            modalities={name: value for name, value in decoded_workspace.items() if name != "vision"},
+            modalities={name: value for name, value in decoded_workspace.items()
+                        if name not in {"vision", "change_mask", "semantic_logits"}},
+            change_mask=decoded_workspace.get("change_mask"),
+            semantic_logits=decoded_workspace.get("semantic_logits"),
         )
 
     def heads(self, hidden: Any) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -402,12 +516,49 @@ class PredictiveCortex(nn.Module):
             predictions.append(latent)
         return torch.stack(predictions, dim=1), hidden
 
+    def rollout_visual(
+        self, start_latent: torch.Tensor, actions: torch.Tensor, hidden: Any, *,
+        reference_frame: torch.Tensor, reference_spatial: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Any]:
+        """Closed-loop latent *and visual* rollout with no observation reuse.
+
+        The returned ``vision`` at step ``n`` becomes the residual reference
+        for step ``n + 1``. This is the visual counterpart to :meth:`rollout`;
+        callers that only need tokens retain the lightweight old API.
+        """
+        latents, visions, masks, semantics = [], [], [], []
+        latent = start_latent
+        for i in range(actions.shape[1]):
+            latent, hidden = self.step(latent, actions[:, i], hidden)
+            decoded = self.decode_prediction(
+                latent, reference_frame=reference_frame, reference_spatial=reference_spatial,
+            )
+            latents.append(latent)
+            visions.append(decoded["vision"])
+            masks.append(decoded["change_mask"])
+            if "semantic_logits" in decoded:
+                semantics.append(decoded["semantic_logits"])
+            reference_frame = decoded["vision"]
+            reference_spatial = self.encode_visual(F.interpolate(
+                reference_frame, size=self.pixel_shape[:2], mode="nearest"
+            )).spatial
+        visual: Dict[str, torch.Tensor] = {
+            "vision": torch.stack(visions, dim=1),
+            "change_mask": torch.stack(masks, dim=1),
+        }
+        if semantics:
+            visual["semantic_logits"] = torch.stack(semantics, dim=1)
+        return torch.stack(latents, dim=1), visual, hidden
+
     def forward_horizons(
         self,
         start_latent: torch.Tensor,
         actions: torch.Tensor,
         hidden: torch.Tensor,
         horizon_frames: Optional[Sequence[int]] = None,
+        *,
+        reference_frame: Optional[torch.Tensor] = None,
+        reference_spatial: Optional[torch.Tensor] = None,
     ) -> CortexRolloutOutput:
         """One closed-loop rollout, sliced at every requested horizon.
 
@@ -433,6 +584,10 @@ class PredictiveCortex(nn.Module):
             )
 
         predictions: Dict[int, CortexHorizonPrediction] = {}
+        if reference_frame is None or reference_spatial is None:
+            reference_frame, reference_spatial = self.blank_visual_reference(
+                start_latent.shape[0], device=start_latent.device, dtype=start_latent.dtype,
+            )
         latent = start_latent
         wanted = set(horizons)
         for step in range(max_horizon):
@@ -440,7 +595,9 @@ class PredictiveCortex(nn.Module):
             h = step + 1
             if h in wanted:
                 reward, terminal_logit, risk, uncertainty = self.heads(hidden)
-                decoded_workspace = self.decode_workspace(latent)
+                decoded_workspace = self.decode_workspace(
+                    latent, reference_frame=reference_frame, reference_spatial=reference_spatial,
+                )
                 predictions[h] = CortexHorizonPrediction(
                     latent=latent,
                     decoded=decoded_workspace["vision"],
@@ -450,9 +607,19 @@ class PredictiveCortex(nn.Module):
                     uncertainty=uncertainty,
                     modalities={
                         name: value for name, value in decoded_workspace.items()
-                        if name != "vision"
+                        if name not in {"vision", "change_mask", "semantic_logits"}
                     },
+                    change_mask=decoded_workspace.get("change_mask"),
+                    semantic_logits=decoded_workspace.get("semantic_logits"),
                 )
+            # A rollout must not re-decode every horizon against the observed
+            # frame. The predicted frame becomes the next residual reference.
+            reference_frame = decoded_workspace["vision"] if h in wanted else self.decode_workspace(
+                latent, reference_frame=reference_frame, reference_spatial=reference_spatial,
+            )["vision"]
+            reference_spatial = self.encode_visual(F.interpolate(
+                reference_frame, size=self.pixel_shape[:2], mode="nearest"
+            )).spatial
         return CortexRolloutOutput(horizons=predictions)
 
     def checkpoint_metadata(self) -> Dict[str, Any]:
@@ -467,6 +634,8 @@ class PredictiveCortex(nn.Module):
             "context_length": self.config.context_length,
             "workspace_modalities": dict(self.workspace_modalities),
             "workspace_layout_hash": self.workspace_layout_hash,
+            "visual_architecture": self.visual_architecture,
+            "semantic_classes": self.config.semantic_classes,
         }
 
 
