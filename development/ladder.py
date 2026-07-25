@@ -218,6 +218,10 @@ def _ladder_model_config(**overrides: Any) -> Any:
     base: Dict[str, Any] = dict(
         latent_width=16, hidden_dim=32, reconstruction_size=8,
         epochs=4, batch_size=16, warmup_frames=2, rollout_frames=3,
+        # The Babbling gate is an intentionally tiny action-ablation smoke
+        # run. Keep Crafter's semantic head present, but do not let its
+        # auxiliary CE objective consume this gate's four-epoch budget.
+        semantic_loss_weight=0.0,
     )
     base.update(overrides)
     return ActionWorldModelConfig(**base)
@@ -284,11 +288,16 @@ def _action_ablation_margin(
     from cognitive_runtime.training.nursery import run_action_ablation_eval
 
     assert stage.scenario is not None
+    # A one-tick target becomes visually static after the CI model's 8x8
+    # reconstruction/downsampling.  In that case the exact static-scene
+    # fallback correctly makes both arms copy the reference and this gate
+    # cannot observe action conditioning.  Four ticks is still a short
+    # prediction horizon, while giving ``turn`` a visible consequence.
     report = run_action_ablation_eval(
         record_dir,
         train_scenarios=[stage.scenario],
         eval_scenario=stage.scenario,
-        config=_ladder_nursery_config(world=stage.world or "crafter"),
+        config=_ladder_nursery_config(world=stage.world or "crafter", horizons=(4,)),
         model_config=_ladder_model_config(),
         cortex_checkpoint_path=cortex_checkpoint_path,
     )

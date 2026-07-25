@@ -354,7 +354,9 @@ class RunTrace:
         elif isinstance(exc, SystemExit) and exc.code in (None, 0):
             self.finish("ok")
         else:
-            self.finish("failed", exc)
+            # Manifest consumers distinguish an expected interruption from a
+            # real exception with the stable ``error`` terminal status.
+            self.finish("error", exc)
         return False
 
     # -- emission ----------------------------------------------------------
