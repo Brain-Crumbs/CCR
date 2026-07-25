@@ -7,7 +7,11 @@ import ...`` entry points working.  See that module's docstring for the
 """
 
 from cognitive_runtime.training.prediction_export import (  # noqa: F401
+    ExperimentIdentity,
     FULL_MODEL_FORMAT,
+    checkpoint_sha256,
+    experiment_directory,
+    export_cortex_session_predictions,
     export_prediction_file,
     export_session_predictions,
     load_full_visual_model,

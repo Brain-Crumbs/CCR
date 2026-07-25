@@ -40,9 +40,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import dataclasses
+import datetime as dt
+import hashlib
 import json
 import os
-from typing import Any, Dict, Optional, Sequence
+import subprocess
+from typing import Any, Dict, Literal, Mapping, Optional, Sequence
 
 import torch
 
@@ -55,6 +59,48 @@ from cognitive_runtime.training.visual_representation import (
 )
 
 FULL_MODEL_FORMAT = "visual-representation-full-v1"
+
+
+@dataclasses.dataclass(frozen=True)
+class ExperimentIdentity:
+    """Stable identity shared by recordings, a cortex checkpoint and exports."""
+
+    experiment_id: str
+    organism: str
+    trace_id: Optional[str]
+    created_at: str
+    git_commit: Optional[str]
+
+    @classmethod
+    def create(cls, experiment_id: str, organism: str, *, trace_id: Optional[str] = None) -> "ExperimentIdentity":
+        try:
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+            ).strip() or None
+        except (OSError, subprocess.CalledProcessError):
+            git_commit = None
+        return cls(
+            experiment_id=experiment_id,
+            organism=organism,
+            trace_id=trace_id,
+            created_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+            git_commit=git_commit,
+        )
+
+
+def experiment_directory(root: str, experiment: ExperimentIdentity) -> str:
+    """Return (and create) ``runs/<organism>/<experiment-id>`` without touching legacy runs."""
+    path = os.path.join(root, experiment.organism, experiment.experiment_id)
+    os.makedirs(path, exist_ok=False)
+    return path
+
+
+def checkpoint_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def save_full_visual_model(model: VisualRepresentationModel, path: str) -> None:
@@ -193,6 +239,124 @@ def export_session_predictions(
                 model, session_dir, episode_id, horizons
             )
     return written
+
+
+def export_cortex_session_predictions(
+    model: Any,
+    dataset: Any,
+    session_dir: str,
+    episode_id: str,
+    *,
+    horizon_frames: Sequence[int],
+    prediction_mode: Literal["direct", "rollout"],
+    checkpoint_path: str,
+    experiment: ExperimentIdentity,
+    training_stats: Mapping[str, Any],
+    out_path: Optional[str] = None,
+) -> str:
+    """Export predictions from an evaluated :class:`PredictiveCortex` as v2.
+
+    ``dataset`` must be the same action/workspace dataset used for evaluation.
+    This deliberately refuses an incomplete workspace token or an action not
+    present in the checkpoint rather than silently exporting a pixel-only
+    approximation of a joint model.
+    """
+    from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
+    from cognitive_runtime.training.action_world_model import _episode_workspace_tensors
+    from cognitive_runtime.training.visual_representation import reconstruction_target
+
+    if prediction_mode not in {"direct", "rollout"}:
+        raise ValueError("prediction_mode must be 'direct' or 'rollout'")
+    horizons = sorted({int(h) for h in horizon_frames if int(h) > 0})
+    if not horizons:
+        raise ValueError("horizon_frames must contain at least one positive offset")
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"joint checkpoint does not exist: {checkpoint_path}")
+    if prediction_mode == "direct":
+        unsupported = set(horizons) - set(model.horizons_ticks)
+        if unsupported:
+            raise ValueError(
+                "direct export requires configured direct horizon heads; unsupported frame horizons: "
+                f"{sorted(unsupported)}"
+            )
+    episode = next(
+        (item for item in dataset.episodes
+         if item.session_dir == session_dir and item.episode_id == episode_id),
+        None,
+    )
+    if episode is None:
+        raise ValueError(f"{session_dir}/{episode_id} is not present in the evaluation dataset")
+    vocabulary = {key: index for index, key in enumerate(model.action_keys)}
+    unknown = [key for key in dataset.action_keys if key not in vocabulary]
+    if unknown:
+        raise ValueError(f"action vocabulary mismatch; checkpoint lacks {unknown!r}")
+
+    frames = episode.frames
+    if len(frames) <= horizons[-1]:
+        raise ValueError(f"{session_dir}/{episode_id} is too short for horizon {horizons[-1]}")
+    pixels = torch.stack([pixels_to_chw(frame) for frame in frames])
+    targets = reconstruction_target(pixels, model.reconstruction_shape)
+    actions = torch.tensor(
+        [vocabulary[dataset.action_keys[index]] for index in episode.actions], dtype=torch.long
+    )
+    # This performs the layout and per-modality checks for workspace-aware models.
+    workspace = _episode_workspace_tensors(episode, dataset, model, actions=actions)
+
+    predictions: Dict[str, Any] = {str(h): {"frames": []} for h in horizons}
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        latents = model.encode_workspace(pixels, workspace)
+        if prediction_mode == "direct":
+            hidden = model.forward_sequence(latents[:-1].unsqueeze(0), actions.unsqueeze(0))
+            for h in horizons:
+                direct = model.sequence_prediction(hidden, h).decoded[0]
+                for t in range(len(frames) - h):
+                    predictions[str(h)]["frames"].append(_b64_frame(direct[t]))
+        else:
+            state = model.initial_state(1)
+            states = [state]
+            for t in range(len(actions)):
+                _predicted, state = model.step(latents[t:t + 1], actions[t:t + 1], state)
+                states.append(state)
+            for t in range(len(frames) - horizons[-1]):
+                rolled, _state = model.rollout(
+                    latents[t:t + 1], actions[t:t + horizons[-1]].unsqueeze(0), states[t]
+                )
+                for h in horizons:
+                    predictions[str(h)]["frames"].append(_b64_frame(model.decoder(rolled[:, h - 1]).squeeze(0)))
+    if was_training:
+        model.train()
+
+    payload = {
+        "format": "pixel-predictions-v2",
+        "session_id": os.path.basename(os.path.normpath(session_dir)),
+        "episode_id": episode_id,
+        "experiment": dataclasses.asdict(experiment),
+        "model": {
+            "model_type": "predictive_cortex",
+            "checkpoint_sha256": checkpoint_sha256(checkpoint_path),
+            "backbone": model.config.backbone,
+            "training_objective": training_stats.get("training_objective"),
+            "uses_actions": True,
+            "uses_workspace": bool(getattr(model, "workspace_modalities", {})),
+            "horizons_ticks": list(model.horizons_ticks),
+            "reconstruction_shape": list(model.reconstruction_shape),
+        },
+        "training_sources": list(training_stats.get("training_sources", [])),
+        "evaluation_source": f"{session_dir}/{episode_id}",
+        "prediction_mode": prediction_mode,
+        "horizons": horizons,
+        "prediction_shape": list(model.reconstruction_shape),
+        "n_frames": len(frames),
+        "predictions": predictions,
+        "targets": [_b64_frame(target) for target in targets],
+    }
+    if out_path is None:
+        out_path = os.path.join(session_dir, f"{experiment.experiment_id}-predictions_{episode_id}.json")
+    with open(out_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    return out_path
 
 
 def main() -> None:

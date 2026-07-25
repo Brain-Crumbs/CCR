@@ -186,7 +186,21 @@ function createServer({ dataDir }) {
         if (p.length === 6 && p[3] === "episodes" && p[5] === "predictions") {
           const kind = url.searchParams.get("kind") === "dream" ? "dream" : "predictions";
           const candidates = [`${readJSON(path.join(dir, "session.json")).name}-${kind}_${p[4]}.json`, `${kind}_${p[4]}.json`];
-          const file = candidates.map((n) => path.join(dir, n)).find(fs.existsSync);
+          let file = candidates.map((n) => path.join(dir, n)).find(fs.existsSync);
+          // v2 files are experiment-prefixed. Never merge stale exports: an
+          // explicit experiment selects one, while an ambiguous directory is
+          // rejected instead of guessing which model the clinic should show.
+          if (!file && kind === "predictions") {
+            const experiment = url.searchParams.get("experiment");
+            const v2 = fs.readdirSync(dir).filter((name) =>
+              name.endsWith(`-predictions_${p[4]}.json`) &&
+              (!experiment || name.startsWith(`${experiment}-`))
+            );
+            if (v2.length === 1) file = path.join(dir, v2[0]);
+            if (v2.length > 1) return sendJSON(res, 409, {
+              error: "multiple experiment exports; pass ?experiment=<experiment-id>", experiments: v2,
+            });
+          }
           if (file) return sendJSON(res, 200, readJSON(file));
           if (kind === "predictions") {
             const live = livePredictionsFromDecisions(readDecisions(dir, p[4]), p[2], p[4]);

@@ -15,7 +15,7 @@
  *
  * Attributes:
  *   frames-src       URL returning the /frames API payload (required)
- *   predictions-src  URL returning a pixel-predictions-v1 payload (optional)
+ *   predictions-src  URL returning a pixel-predictions-v1 or v2 payload (optional)
  *   horizons         comma list, default "1,10,100"
  *   scale            CSS pixels per frame pixel, default 6
  *
@@ -241,7 +241,7 @@ class PixelHorizonViewer extends HTMLElement {
     if (predSrc) {
       try {
         const p = await (await fetch(predSrc)).json();
-        if (!p.error && p.format === "pixel-predictions-v1") {
+        if (!p.error && (p.format === "pixel-predictions-v1" || p.format === "pixel-predictions-v2")) {
           p._decoded = {};
           for (const [h, entry] of Object.entries(p.predictions)) {
             p._decoded[h] = entry.frames.map(b64ToBytes);
@@ -259,7 +259,9 @@ class PixelHorizonViewer extends HTMLElement {
     if (hasModel && !sourceSel.querySelector('option[value="model"]')) {
       const opt = document.createElement("option");
       opt.value = "model";
-      opt.textContent = this._pred.source === "live-record" ? "model (live record)" : "model (exported)";
+      opt.textContent = this._pred.source === "live-record" ? "model (live record)" :
+        (this._pred.format === "pixel-predictions-v1" ? "Legacy per-scenario actionless predictor" :
+          `joint cortex (${this._pred.prediction_mode || "unknown"})`);
       sourceSel.prepend(opt);
       sourceSel.value = "model";
     } else if (!hasModel) {
@@ -273,7 +275,7 @@ class PixelHorizonViewer extends HTMLElement {
     this._t = Math.min(this._t, Number(scrub.max));
     scrub.value = this._t;
     this._$("#status").textContent =
-      `${this._frames.length} frames (${this._shape.join("×")} ${this._pred ? `· ${this._pred.source === "live-record" ? "live" : "exported"} model predictions loaded` : "· no model predictions recorded — showing baselines"})`;
+      `${this._frames.length} frames (${this._shape.join("×")} ${this._pred ? `· ${this._pred.format === "pixel-predictions-v1" ? "legacy actionless" : "joint cortex"} model predictions loaded` : "· no model predictions recorded — showing baselines"})`;
     this._render(true);
   }
 

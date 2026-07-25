@@ -297,7 +297,7 @@ class RunTrace:
 
     def finish(self, status: str = "ok", error: Optional[BaseException] = None) -> None:
         global _GLOBAL_TRACE
-        if self.started_at is None or self.status in ("ok", "error", "interrupted"):
+        if self.started_at is None or self.status in ("ok", "error", "failed", "interrupted"):
             return
         self.duration_s = round(time.time() - self.started_at, 3)
         self.status = status
@@ -338,6 +338,14 @@ class RunTrace:
     def __enter__(self) -> "RunTrace":
         return self.start()
 
+    def managed(self) -> "RunTrace":
+        """Explicit notebook-friendly spelling of the trace context manager.
+
+        Keeping this as a method makes the intended lifecycle obvious in a
+        notebook cell: exceptions close the manifest before they are reraised.
+        """
+        return self
+
     def __exit__(self, exc_type, exc, tb) -> bool:
         if exc is None:
             self.finish("ok")
@@ -346,7 +354,7 @@ class RunTrace:
         elif isinstance(exc, SystemExit) and exc.code in (None, 0):
             self.finish("ok")
         else:
-            self.finish("error", exc)
+            self.finish("failed", exc)
         return False
 
     # -- emission ----------------------------------------------------------
