@@ -1454,6 +1454,11 @@ def _action_keys_for_world(world: str) -> List[str]:
     return [action.key() for action in ACTION_SPACE]
 
 
+def _semantic_classes_for_world(world: str) -> int:
+    """Number of grid ids available for semantic supervision in ``world``."""
+    return max(FRAME_LEGEND) + 1 if world == "crafter" else 0
+
+
 def run_nursery_scenario(
     record_dir: str,
     scenario_name: str,
@@ -1799,16 +1804,17 @@ def run_nursery_joint(
     if set(cfg.train_seeds) & set(cfg.holdout_seeds):
         raise ValueError("train_seeds and holdout_seeds must not overlap")
 
+    scenarios = _scenarios_for_world(cfg.world)
     holdout_names = list(holdout_scenarios)
     train_names = (
         list(train_scenarios)
         if train_scenarios is not None
-        else [n for n in sorted(NURSERY_SCENARIOS) if n not in holdout_names]
+        else [n for n in sorted(scenarios) if n not in holdout_names]
     )
     for name in list(train_names) + holdout_names:
-        if name not in NURSERY_SCENARIOS:
+        if name not in scenarios:
             raise ValueError(
-                f"unknown nursery scenario {name!r}; choices: {sorted(NURSERY_SCENARIOS)}"
+                f"unknown nursery scenario {name!r}; choices: {sorted(scenarios)}"
             )
     overlap = set(train_names) & set(holdout_names)
     if overlap:
@@ -1828,7 +1834,11 @@ def run_nursery_joint(
     )
     # The nursery configuration owns the advertised/evaluated tick horizons;
     # rebuild supplied training configs to that same contract.
-    model_cfg = replace(model_cfg, horizons_ticks=tuple(cfg.horizons))
+    model_cfg = replace(
+        model_cfg,
+        horizons_ticks=tuple(cfg.horizons),
+        semantic_classes=(model_cfg.semantic_classes or _semantic_classes_for_world(cfg.world)),
+    )
 
     log.info("=== nursery joint: train=%s  holdout=%s  world=%s ===",
              train_names, holdout_names, cfg.world)
@@ -2143,7 +2153,11 @@ def run_action_ablation_eval(
         seed=cfg.seed,
         horizons_ticks=tuple(cfg.horizons),
     )
-    base_model_cfg = replace(base_model_cfg, horizons_ticks=tuple(cfg.horizons))
+    base_model_cfg = replace(
+        base_model_cfg,
+        horizons_ticks=tuple(cfg.horizons),
+        semantic_classes=(base_model_cfg.semantic_classes or _semantic_classes_for_world(cfg.world)),
+    )
 
     train_sessions: Dict[str, List[str]] = {}
     eval_sessions: Dict[str, List[str]] = {}
@@ -2346,7 +2360,11 @@ def run_backbone_benchmark(
         seed=cfg.seed,
         horizons_ticks=tuple(cfg.horizons),
     )
-    base_model_cfg = replace(base_model_cfg, horizons_ticks=tuple(cfg.horizons))
+    base_model_cfg = replace(
+        base_model_cfg,
+        horizons_ticks=tuple(cfg.horizons),
+        semantic_classes=(base_model_cfg.semantic_classes or _semantic_classes_for_world(cfg.world)),
+    )
 
     train_sessions: Dict[str, List[str]] = {}
     eval_sessions: Dict[str, List[str]] = {}

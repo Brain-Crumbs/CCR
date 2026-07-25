@@ -340,15 +340,30 @@ class CortexWorldModel(CoreWorldModel):
             first_hidden = None
             first_latent = None
             decoded_by_horizon: dict[str, str] = {}
+            # Residual decoding is anchored to the observed frame once, then
+            # advances its own visual state with every imagined transition.
+            reference_frame = F.interpolate(
+                pixel_batch, size=self.model.reconstruction_shape[:2], mode="area"
+            )
+            reference_spatial = self.model.encode_visual(pixel_batch).spatial
             for step_i in range(self.horizons[-1]):
                 latent_i, hidden = self.model.step(latent_i, action_col, hidden)
                 if step_i == 0:
                     first_hidden, first_latent = hidden, latent_i
                 horizon = step_i + 1
+                decoded = self.model.decode_prediction(
+                    latent_i,
+                    reference_frame=reference_frame,
+                    reference_spatial=reference_spatial,
+                )
                 if horizon in self.horizons:
                     decoded_by_horizon[str(horizon)] = _record_frame(
-                        self.model.decoder(latent_i).squeeze(0)
+                        decoded["vision"].squeeze(0)
                     )
+                reference_frame = decoded["vision"]
+                reference_spatial = self.model.encode_visual(F.interpolate(
+                    reference_frame, size=self.model.pixel_shape[:2], mode="nearest"
+                )).spatial
 
             reconstruction_shape = tuple(self.model.reconstruction_shape)
             target = F.interpolate(

@@ -88,10 +88,35 @@ class ExperimentIdentity:
         )
 
 
-def experiment_directory(root: str, experiment: ExperimentIdentity) -> str:
-    """Return (and create) ``runs/<organism>/<experiment-id>`` without touching legacy runs."""
+def experiment_directory(root: str, experiment: ExperimentIdentity, *, resume: bool = False) -> str:
+    """Create or explicitly resume a validated experiment directory.
+
+    ``resume=False`` preserves the fail-fast default for an accidental reused
+    identifier. ``resume=True`` is safe only when this directory's identity
+    manifest matches the requested organism and experiment id; it allows a
+    notebook to add new runs without mixing two experiments' artifacts.
+    """
     path = os.path.join(root, experiment.organism, experiment.experiment_id)
-    os.makedirs(path, exist_ok=False)
+    manifest_path = os.path.join(path, "experiment.json")
+    if not os.path.exists(path):
+        os.makedirs(path)
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(dataclasses.asdict(experiment), handle, indent=2, sort_keys=True)
+        return path
+    if not resume:
+        raise FileExistsError(
+            f"experiment directory already exists: {path}; pass resume=True to append "
+            "only after identity validation"
+        )
+    try:
+        with open(manifest_path, encoding="utf-8") as handle:
+            saved = json.load(handle)
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"cannot safely resume legacy experiment directory without {manifest_path!r}"
+        ) from exc
+    if saved.get("experiment_id") != experiment.experiment_id or saved.get("organism") != experiment.organism:
+        raise ValueError("resume identity does not match the existing experiment directory")
     return path
 
 
@@ -310,7 +335,11 @@ def export_cortex_session_predictions(
         if prediction_mode == "direct":
             hidden = model.forward_sequence(latents[:-1].unsqueeze(0), actions.unsqueeze(0))
             for h in horizons:
-                direct = model.sequence_prediction(hidden, h).decoded[0]
+                direct = model.sequence_prediction(
+                    hidden, h,
+                    reference_frame=targets[:-1].unsqueeze(0),
+                    reference_spatial=model.encode_visual(pixels[:-1]).spatial.unsqueeze(0),
+                ).decoded[0]
                 for t in range(len(frames) - h):
                     predictions[str(h)]["frames"].append(_b64_frame(direct[t]))
         else:
@@ -320,11 +349,14 @@ def export_cortex_session_predictions(
                 _predicted, state = model.step(latents[t:t + 1], actions[t:t + 1], state)
                 states.append(state)
             for t in range(len(frames) - horizons[-1]):
-                rolled, _state = model.rollout(
-                    latents[t:t + 1], actions[t:t + horizons[-1]].unsqueeze(0), states[t]
+                rollout = model.forward_horizons(
+                    latents[t:t + 1], actions[t:t + horizons[-1]].unsqueeze(0), states[t],
+                    horizon_frames=horizons,
+                    reference_frame=targets[t:t + 1],
+                    reference_spatial=model.encode_visual(pixels[t:t + 1]).spatial,
                 )
                 for h in horizons:
-                    predictions[str(h)]["frames"].append(_b64_frame(model.decoder(rolled[:, h - 1]).squeeze(0)))
+                    predictions[str(h)]["frames"].append(_b64_frame(rollout[h].decoded.squeeze(0)))
     if was_training:
         model.train()
 
