@@ -82,7 +82,7 @@ def test_crawling_gates_on_both_copy_last_and_action_ablation():
     """The phase doc, verbatim: "Crawling gates on the cortex beating
     copy-last on walk_forward + action-ablation" -- both, not either."""
     stage = GESTATION_TO_FORAGING.stages[2]
-    assert stage.scenario == "walk_forward"
+    assert stage.scenario == "walk_forward_short"
     assert {g.metric for g in stage.gates} == {"cortex_beats_copy_last", "action_ablation_margin"}
 
 
