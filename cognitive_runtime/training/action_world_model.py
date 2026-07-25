@@ -44,7 +44,7 @@ import math
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 log = logging.getLogger("ccr.training.cortex")
 
@@ -68,6 +68,11 @@ FACING_STREAM = "spatial.facing"
 #: reading them out of a tick's *sensory* window would train the risk head
 #: on the previous tick's value.
 DEATH_STREAM = "event.died"
+
+# A prediction made by a direct multi-horizon head is not interchangeable
+# with a repeatedly-applied one-step transition.  Keep this distinction in
+# every report/export boundary rather than relying on a generic model_mse.
+PredictionMode = Literal["direct", "rollout"]
 
 
 # --------------------------------------------------------------------------- dataset
@@ -364,13 +369,18 @@ class ActionWorldModelConfig:
     rollout_frames: int = 8
     #: Probability a rollout step feeds its own prediction instead of the
     #: observed latent (scheduled sampling).
-    scheduled_sampling_p: float = 0.5
+    scheduled_sampling_p: float = 0.25
     #: ``"windowed_rollout"`` preserves the original short scheduled-
     #: sampling trainer; ``"autoregressive"`` trains every causal prefix
     #: and every configured direct horizon in one sequence pass (C1).
     training_objective: str = "windowed_rollout"
     #: Small exposure-bias term retained by the autoregressive objective.
-    autoregressive_rollout_weight: float = 0.1
+    #: Closed-loop auxiliary losses for the autoregressive objective.  The
+    #: legacy combined name is retained as a compatibility alias: when set it
+    #: supplies the latent weight unless the explicit field was changed.
+    autoregressive_rollout_weight: Optional[float] = None
+    autoregressive_rollout_latent_weight: float = 0.1
+    autoregressive_rollout_pixel_weight: float = 0.5
     pixel_loss_weight: float = 1.0
     latent_loss_weight: float = 1.0
     #: Weights for the previously-untrained heads (issue #169): reward MSE
@@ -615,7 +625,8 @@ def _train_autoregressive_objective(
     curves: Dict[str, List[float]] = {
         "total_loss": [], "pixel_loss": [], "latent_loss": [],
         "reward_loss": [], "terminal_loss": [], "risk_loss": [], "uncertainty_loss": [],
-        "closed_loop_loss": [], "workspace_loss": [],
+        "closed_loop_loss": [], "closed_loop_latent_loss": [],
+        "closed_loop_pixel_loss": [], "workspace_loss": [],
     }
     log.info("training cortex (autoregressive)  episodes=%d  epochs=%d  horizons=%s  backbone=%s",
              len(episodes), cfg.epochs, list(horizons_ticks), _backbone_name(model))
@@ -627,6 +638,11 @@ def _train_autoregressive_objective(
         context_length=max_context, ema_target=target_encoder is not None,
     )
     training_started = time.perf_counter()
+    rollout_latent_weight = (
+        cfg.autoregressive_rollout_latent_weight
+        if cfg.autoregressive_rollout_weight is None
+        else cfg.autoregressive_rollout_weight
+    )
     model.train()
     for epoch_idx in range(cfg.epochs):
         epoch_started = time.perf_counter()
@@ -699,28 +715,44 @@ def _train_autoregressive_objective(
             uncertainty_loss = _mean_or_zero(uncertainty_terms)
             workspace_loss = _mean_or_zero(workspace_terms)
 
-            closed_loop_loss = pixels.new_zeros(())
-            if cfg.autoregressive_rollout_weight > 0:
+            # ``autoregressive_rollout_weight`` was the old latent-only
+            # coefficient.  Prefer the explicit knobs, but interpret a
+            # supplied legacy value faithfully for old callers/checkpoints.
+            closed_loop_latent_loss = pixels.new_zeros(())
+            closed_loop_pixel_loss = pixels.new_zeros(())
+            if rollout_latent_weight > 0 or cfg.autoregressive_rollout_pixel_weight > 0:
                 state = model.initial_state(1)
                 warmup = min(max(cfg.warmup_frames - 1, 0), actions_b.shape[1] - 1)
                 for index in range(warmup):
                     _prediction, state = model.step(latents[:, index], actions_b[:, index], state)
                 latent_in = latents[:, warmup]
                 rollout_steps = min(cfg.rollout_frames, actions_b.shape[1] - warmup)
-                rollout_terms = []
+                rollout_latent_terms = []
+                rollout_pixel_terms = []
                 for offset in range(rollout_steps):
                     index = warmup + offset
                     predicted, state = model.step(latent_in, actions_b[:, index], state)
-                    rollout_terms.append((
+                    rollout_latent_terms.append((
                         F.normalize(predicted, dim=-1)
                         - F.normalize(target_latents[:, index + 1].detach(), dim=-1)
                     ).pow(2).mean())
+                    # This is deliberately decoded from the *closed-loop*
+                    # latent.  It gives gradients to both decoder and
+                    # transition path, unlike the direct-head pixel term.
+                    rollout_pixel_terms.append(F.mse_loss(
+                        model.decoder(predicted), targets[index + 1].unsqueeze(0)
+                    ))
                     latent_in = (
                         predicted
                         if float(torch.rand((), generator=generator)) < cfg.scheduled_sampling_p
                         else latents[:, index + 1]
                     )
-                closed_loop_loss = _mean_or_zero(rollout_terms)
+                closed_loop_latent_loss = _mean_or_zero(rollout_latent_terms)
+                closed_loop_pixel_loss = _mean_or_zero(rollout_pixel_terms)
+            closed_loop_loss = (
+                rollout_latent_weight * closed_loop_latent_loss
+                + cfg.autoregressive_rollout_pixel_weight * closed_loop_pixel_loss
+            )
 
             total = (
                 cfg.pixel_loss_weight * pixel_loss
@@ -730,7 +762,7 @@ def _train_autoregressive_objective(
                 + cfg.risk_loss_weight * risk_loss
                 + cfg.uncertainty_loss_weight * uncertainty_loss
                 + workspace_loss
-                + cfg.autoregressive_rollout_weight * closed_loop_loss
+                + closed_loop_loss
             )
             total.backward()
             optimizer.step()
@@ -742,7 +774,10 @@ def _train_autoregressive_objective(
                 ("total_loss", total), ("pixel_loss", pixel_loss), ("latent_loss", latent_loss),
                 ("reward_loss", reward_loss), ("terminal_loss", terminal_loss),
                 ("risk_loss", risk_loss), ("uncertainty_loss", uncertainty_loss),
-                ("closed_loop_loss", closed_loop_loss), ("workspace_loss", workspace_loss),
+                ("closed_loop_loss", closed_loop_loss),
+                ("closed_loop_latent_loss", closed_loop_latent_loss),
+                ("closed_loop_pixel_loss", closed_loop_pixel_loss),
+                ("workspace_loss", workspace_loss),
             ):
                 epoch[key] += float(value.detach())
         for key in curves:
@@ -775,6 +810,9 @@ def _train_autoregressive_objective(
         "training_objective": "autoregressive",
         "autoregressive_horizons": list(horizon_frames),
         "autoregressive_horizons_ticks": list(horizons_ticks),
+        "ticks_per_frame": ticks_per_frame,
+        "autoregressive_rollout_latent_weight": rollout_latent_weight,
+        "autoregressive_rollout_pixel_weight": cfg.autoregressive_rollout_pixel_weight,
         "ema_target_enabled": target_encoder is not None, "ema_target_decay": cfg.ema_target_decay,
         **{f"final_{key}": curves[key][-1] for key in curves},
     }
@@ -894,6 +932,9 @@ def train_action_world_model(
             workspace_modalities=expected_workspace_modalities,
             workspace_layout_hash=expected_workspace_layout,
         )
+    # Evaluation must know which prediction surface was optimized.  It is
+    # serialized in training_stats as well for a reloaded checkpoint.
+    model.training_objective = cfg.training_objective
     target_encoder = None
     if cfg.ema_target_decay is not None:
         # The workspace binding is part of z, so the EMA target must carry
@@ -939,6 +980,12 @@ def train_action_world_model(
                 f"transition_weights has {len(transition_weights)} episode(s), dataset has "
                 f"{len(episodes)}"
             )
+        for index, (weights, (_episode, _pixels, _targets, actions)) in enumerate(zip(transition_weights, episodes)):
+            if len(weights) != len(actions):
+                raise ValueError(
+                    f"transition_weights has {len(weights)} transitions for episode {index}, "
+                    f"dataset has {len(actions)}"
+                )
         start_weights = torch.tensor(
             _window_weights(transition_weights, starts, window), dtype=torch.float
         )
@@ -1207,6 +1254,120 @@ def _best_recurrence_lag(targets, max_lag: int = 60) -> Optional[int]:
     return best_lag
 
 
+def evaluate_action_world_model_direct(
+    model: Any,
+    dataset: ActionSequenceDataset,
+    horizons_ticks: Sequence[int],
+    *,
+    warmup_frames: int = 3,
+    max_starts_per_episode: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Evaluate direct autoregressive horizon heads in pixel space.
+
+    Heads are addressed by tick horizon while recordings are indexed by frame
+    offset.  Multiple valid tick horizons may map to one frame offset on a
+    downsampled recording, so report keys deliberately remain tick horizons.
+    """
+    torch, F = _torch()
+    ticks = tuple(sorted({int(h) for h in horizons_ticks}))
+    if not ticks or ticks[0] < 1:
+        raise ValueError(f"horizons_ticks must be positive, got {horizons_ticks!r}")
+    frames = tuple(horizons_ticks_to_frames((h,), dataset.ticks_per_frame)[0] for h in ticks)
+    max_horizon = max(frames)
+    action_index = {name: i for i, name in enumerate(model.action_keys)}
+    samples = {tick: {"model": [], "copy_last": [], "mean_frame": [], "oracle": []} for tick in ticks}
+    workspace_samples = {
+        name: {tick: {"model": [], "copy_last": []} for tick in ticks}
+        for name in getattr(model, "workspace_modalities", {})
+    }
+    per_episode_model_mse = {tick: [] for tick in ticks}
+    prediction_dispersion: List[float] = []
+    target_dispersion: List[float] = []
+
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for episode, pixels, targets, actions in _episode_tensors(dataset, model.reconstruction_shape):
+            n = pixels.shape[0]
+            if n <= max_horizon + warmup_frames:
+                continue
+            try:
+                remap = torch.tensor([action_index[dataset.action_keys[a]] for a in episode.actions], dtype=torch.long)
+            except KeyError as exc:
+                raise ValueError(f"action {exc.args[0]!r} is outside the model vocabulary") from None
+            workspace = _episode_workspace_tensors(episode, dataset, model, actions=remap)
+            latents = model.encode_workspace(pixels, workspace).unsqueeze(0)
+            # One encoder/backbone pass yields all causal prefixes; applying a
+            # direct head below is intentionally not a transition rollout.
+            hidden = model.forward_sequence(latents[:, :-1], remap.unsqueeze(0))
+            mean_frame = targets.mean(dim=0)
+            oracle_lag = _best_recurrence_lag(targets)
+            starts = range(warmup_frames, n - max_horizon)
+            if max_starts_per_episode is not None:
+                starts = list(starts)[:max_starts_per_episode]
+            episode_mse = {tick: [] for tick in ticks}
+            for t in starts:
+                decoded_by_tick = {}
+                for tick, frame in zip(ticks, frames):
+                    prediction = model.sequence_prediction(hidden[:, t : t + 1], tick)
+                    decoded = prediction.decoded[0, 0]
+                    decoded_by_tick[tick] = decoded
+                    target = targets[t + frame]
+                    mse = float(F.mse_loss(decoded, target))
+                    samples[tick]["model"].append(mse)
+                    episode_mse[tick].append(mse)
+                    samples[tick]["copy_last"].append(float(F.mse_loss(targets[t], target)))
+                    samples[tick]["mean_frame"].append(float(F.mse_loss(mean_frame, target)))
+                    if oracle_lag is not None and t + frame - oracle_lag >= 0:
+                        samples[tick]["oracle"].append(float(F.mse_loss(targets[t + frame - oracle_lag], target)))
+                    for name, by_horizon in workspace_samples.items():
+                        predicted = prediction.modalities[name][0, 0]
+                        target_modality = workspace[name][t + frame]
+                        by_horizon[tick]["model"].append(float(F.mse_loss(predicted, target_modality)))
+                        by_horizon[tick]["copy_last"].append(float(F.mse_loss(workspace[name][t], target_modality)))
+                if len(frames) >= 2:
+                    prediction_dispersion.append(_pairwise_dispersion([decoded_by_tick[h] for h in ticks]))
+                    target_dispersion.append(_pairwise_dispersion([targets[t + f] for f in frames]))
+            for tick in ticks:
+                if episode_mse[tick]:
+                    per_episode_model_mse[tick].append(_mean(episode_mse[tick]))
+    if was_training:
+        model.train()
+
+    report: Dict[int, Dict[str, Any]] = {}
+    for tick, frame in zip(ticks, frames):
+        entry = samples[tick]
+        if not entry["model"]:
+            raise ValueError(f"no direct evaluation samples at horizon {tick} ticks ({frame} frames)")
+        model_mse, copy_mse, mean_mse = _mean(entry["model"]), _mean(entry["copy_last"]), _mean(entry["mean_frame"])
+        oracle_mse = _mean(entry["oracle"]) if entry["oracle"] else None
+        report[tick] = {
+            "horizon_tick": tick, "horizon_frame": frame, "n_samples": len(entry["model"]),
+            "model_mse": model_mse, "copy_last_mse": copy_mse, "mean_frame_mse": mean_mse,
+            "oracle_mse": oracle_mse, "psnr_model": _psnr(model_mse),
+            "psnr_copy_last": _psnr(copy_mse), "psnr_mean_frame": _psnr(mean_mse),
+            "model_over_copy_last_mse": _ratio(model_mse, copy_mse),
+            "model_over_oracle_mse": _ratio(model_mse, oracle_mse),
+            "beats_copy_last": bool(model_mse < copy_mse), "beats_mean_frame": bool(model_mse < mean_mse),
+        }
+    workspace_report = {
+        name: {tick: {"n_samples": len(values["model"]), "model_mse": _mean(values["model"]),
+                       "copy_last_mse": _mean(values["copy_last"]),
+                       "model_over_copy_last_mse": _ratio(_mean(values["model"]), _mean(values["copy_last"])),
+                       "beats_copy_last": bool(_mean(values["model"]) < _mean(values["copy_last"]))}
+               for tick, values in by_frame.items()}
+        for name, by_frame in workspace_samples.items()
+    }
+    return {
+        "prediction_mode": "direct", "horizons": report, "horizons_ticks": list(ticks),
+        "horizons_frames": list(frames), "ticks_per_frame": dataset.ticks_per_frame,
+        "workspace_modalities": workspace_report,
+        "prediction_health": {"prediction_dispersion": _mean(prediction_dispersion) if prediction_dispersion else 0.0,
+                              "target_dispersion": _mean(target_dispersion) if target_dispersion else 0.0},
+        "per_episode_model_mse": per_episode_model_mse,
+    }
+
+
 def evaluate_action_world_model(
     model: Any,
     dataset: ActionSequenceDataset,
@@ -1408,10 +1569,51 @@ def evaluate_action_world_model(
                     rollout_health["prediction_dispersion"],
                     rollout_health["target_dispersion"])
     return {
+        "prediction_mode": "rollout",
         "horizons": report,
+        "horizons_frames": list(horizons_sorted),
+        "ticks_per_frame": dataset.ticks_per_frame,
         "workspace_modalities": workspace_report,
         "rollout_health": rollout_health,
         "per_episode_model_mse": per_episode_model_mse,
+    }
+
+
+def evaluate_action_world_model_milestone(
+    model: Any,
+    dataset: ActionSequenceDataset,
+    horizons_ticks: Sequence[int],
+    *,
+    warmup_frames: int = 3,
+) -> Dict[str, Any]:
+    """Evaluate both prediction paths and select the trained path as primary.
+
+    Compatibility aliases (``horizons`` and ``per_episode_model_mse``) point
+    at the primary report; consumers which need an unambiguous artifact use
+    ``direct``/``rollout`` and ``primary_mode``.
+    """
+    direct = evaluate_action_world_model_direct(
+        model, dataset, horizons_ticks, warmup_frames=warmup_frames
+    )
+    # Rollout has one prediction per *frame* step, whereas direct heads keep
+    # every tick identity even when two heads target the same recorded frame.
+    frames = sorted(set(direct["horizons_frames"]))
+    rollout = evaluate_action_world_model(
+        model, dataset, frames, warmup_frames=warmup_frames
+    )
+    primary_mode: PredictionMode = (
+        "direct" if getattr(model, "training_objective", None) == "autoregressive" else "rollout"
+    )
+    # The objective lives on the training config, not the module; callers can
+    # set it below on the model so checkpoint-loaded models retain the choice.
+    primary = direct if primary_mode == "direct" else rollout
+    return {
+        "primary_mode": primary_mode, "direct": direct, "rollout": rollout,
+        "rollout_health": rollout["rollout_health"],
+        "horizons": primary["horizons"],
+        "per_episode_model_mse": primary["per_episode_model_mse"],
+        "horizons_ticks": direct["horizons_ticks"], "horizons_frames": frames,
+        "ticks_per_frame": dataset.ticks_per_frame,
     }
 
 
@@ -1955,10 +2157,16 @@ def save_action_world_model(path: str, model: Any, stats: Dict[str, Any]) -> Non
             "hidden_dim": model.hidden_dim,
             "reconstruction_shape": list(model.reconstruction_shape),
             "horizons_ticks": list(model.horizons_ticks),
+            # Frame offsets are recording-rate dependent.  Persist the
+            # training-time mapping alongside the tick identity so an export
+            # can reproduce (or explicitly reject) the evaluated horizons.
+            "horizons_frames": stats.get("autoregressive_horizons"),
+            "ticks_per_frame": stats.get("ticks_per_frame"),
             "backbone": model.config.backbone,
             "context_length": model.config.context_length,
             "workspace_modalities": dict(model.workspace_modalities),
             "workspace_layout_hash": model.workspace_layout_hash,
+            "training_objective": stats.get("training_objective", getattr(model, "training_objective", "windowed_rollout")),
             "state_dict": model.state_dict(),
             "training_stats": stats,
         },
@@ -1984,6 +2192,9 @@ def load_action_world_model(path: str):
         tuple(payload["pixel_shape"]), payload["action_keys"], cfg,
         workspace_modalities=payload.get("workspace_modalities", {}),
         workspace_layout_hash=payload.get("workspace_layout_hash"),
+    )
+    model.training_objective = payload.get(
+        "training_objective", payload.get("training_stats", {}).get("training_objective", "windowed_rollout")
     )
     # C1 added direct heads for tick horizons > 1.  Older v1 checkpoints
     # naturally lack only these freshly initialized modules; allow precisely

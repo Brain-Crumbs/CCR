@@ -17,6 +17,7 @@ from cognitive_runtime.training.action_world_model import (  # noqa: E402
     build_action_sequence_dataset,
     build_action_world_model,
     evaluate_action_world_model,
+    evaluate_action_world_model_direct,
     evaluate_cortex_heads,
     horizons_ticks_to_frames,
     linear_probe_yaw,
@@ -290,6 +291,38 @@ def test_train_evaluate_probe_and_round_trip(turn_session, tmp_path):
             [torch.rand(3, *model.pixel_shape[:2]) for _ in range(2)]
         )
         assert torch.allclose(model.encoder(frames), reloaded.encoder(frames))
+
+
+def test_direct_evaluation_uses_direct_heads_not_closed_loop_rollout(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    calls = []
+    original = model.sequence_prediction
+
+    def direct_head(hidden, horizon):
+        calls.append(horizon)
+        return original(hidden, horizon)
+
+    model.sequence_prediction = direct_head
+    model.rollout = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected rollout"))
+    report = evaluate_action_world_model_direct(model, dataset, [1, 4], warmup_frames=2)
+    assert report["prediction_mode"] == "direct"
+    assert report["horizons_ticks"] == [1, 4]
+    assert set(calls) == {1, 4}
+
+
+def test_direct_evaluation_preserves_colliding_tick_horizons(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    # Model a paced recording: tick horizons 1 and 2 both align to frame 1.
+    dataset.episodes[0].ticks = [tick * 2 for tick in dataset.episodes[0].ticks]
+    model, _stats = train_action_world_model(
+        dataset, _small_model_config(horizons_ticks=(1, 2))
+    )
+    report = evaluate_action_world_model_direct(model, dataset, [1, 2], warmup_frames=2)
+    assert set(report["horizons"]) == {1, 2}
+    assert report["horizons_frames"] == [1, 1]
+    assert report["horizons"][1]["horizon_frame"] == 1
+    assert report["horizons"][2]["horizon_frame"] == 1
 
 
 def test_ema_target_encoder_is_opt_in_and_reported(turn_session):
