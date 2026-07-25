@@ -1,5 +1,5 @@
 :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: #f4f5f1; color: #172019; }
-body { margin: 0; } main { max-width: 1080px; margin: auto; padding: 48px 24px; }
+body { margin: 0; } main { margin: auto; padding: 48px 24px; }
 h1 { font-size: 2.25rem; margin: 0; letter-spacing: -.04em; } .lede { color: #657068; margin-top: 4px; }
 .organisms { display: grid; gap: 32px; margin-top: 40px; } h2 { font-size: 1.25rem; }
 .session-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
@@ -13,7 +13,7 @@ h1 { font-size: 2.25rem; margin: 0; letter-spacing: -.04em; } .lede { color: #65
 .episode-links button, .back { border: 1px solid #b8c2b9; border-radius: 7px; background: #f7faf7; color: #21452a; cursor: pointer; padding: 7px 10px; font: inherit; }
 .episode-links button:hover, .back:hover { background: #e9f3eb; }
 .back { margin: 24px 0 8px; }
-pixel-horizon-viewer { margin-top: 18px; border: 1px solid #dfe3dd; border-radius: 12px; overflow: hidden; }
+pixel-horizon-viewer { margin-top: 18px; border: 1px solid #dfe3dd; border-radius: 12px; overflow: scroll; }
 .spark { cursor: crosshair; }
 .time-cursor { stroke: #17231c; stroke-width: 1.5; stroke-dasharray: 2 2; pointer-events: none; }
 .mode[data-tick] { cursor: pointer; }

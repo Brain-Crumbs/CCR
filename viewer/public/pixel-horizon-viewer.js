@@ -194,7 +194,7 @@ class PixelHorizonViewer extends HTMLElement {
   get horizons() {
     return (this.getAttribute("horizons") || "1,10,100").split(",").map((s) => parseInt(s.trim(), 10)).filter((h) => h > 0);
   }
-  get scale() { return Number(this.getAttribute("scale") || 6); }
+  get scale() { return Number(this.getAttribute("scale") || 5); }
   get time() { return this._t; }
 
   setTick(tick) {
