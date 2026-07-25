@@ -753,7 +753,8 @@ def _train_autoregressive_objective(
                 if semantic_targets is not None:
                     assert prediction.semantic_logits is not None
                     semantic_terms.append(F.cross_entropy(
-                        prediction.semantic_logits, semantic_targets[horizon_frame:].unsqueeze(0)
+                        prediction.semantic_logits.reshape(-1, cfg.semantic_classes, 9, 9),
+                        semantic_targets[horizon_frame:].reshape(-1, 9, 9),
                     ))
                 uncertainty_terms.append(F.mse_loss(prediction.uncertainty, per_error.detach()))
                 workspace_terms.append(_workspace_loss(
