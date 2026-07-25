@@ -95,6 +95,18 @@ class CrafterWorld(Program):
         #: at episode start (mirrors Minecraft scene-setup's
         #: ``world.reset = lambda seed: None`` convention).
         self._env_frozen = False
+        #: One-shot-per-reset scripted-world hook (issue #202), e.g.
+        #: ``training.nursery``'s wildlife removal/terrain clearing for
+        #: scenarios that regenerate a fresh world every seed (not frozen):
+        #: called on the freshly (re)built ``self._env`` *before*
+        #: ``_last_state``/the initial reset snapshot are captured below, so
+        #: the edit takes effect before the reset ever publishes a frame --
+        #: not after. Without this, a scene edit applied to ``self._env``
+        #: only after ``reset()`` returns is too late: the un-edited state
+        #: (incidental world-generation wildlife included) was already
+        #: captured into ``_last_state`` and published as the episode's
+        #: first recorded frame.
+        self._post_reset_hook: Optional[Callable[[Any], None]] = None
         self.initialize(config)
 
     # ------------------------------------------------------------ interface
@@ -111,6 +123,11 @@ class CrafterWorld(Program):
         state to survive ``CognitiveRuntime.run()``'s own ``reset(seed)`` at
         episode start."""
         self._env_frozen = True
+
+    def set_post_reset_hook(self, hook: Optional[Callable[[Any], None]]) -> None:
+        """Register (or clear, with ``None``) the per-reset scripted-world
+        hook -- see ``self._post_reset_hook``'s docstring above."""
+        self._post_reset_hook = hook
 
     def reset(self, seed: Optional[int] = None) -> None:
         if seed is not None:
@@ -132,6 +149,9 @@ class CrafterWorld(Program):
                 length=self._config.episode_ticks, seed=self._seed,
             )
             pixels = self._env.reset()
+        if self._post_reset_hook is not None:
+            self._post_reset_hook(self._env)
+            pixels = self._env.render()  # re-render: the hook may have edited the world
         self._tick = 0
         self._dead = False
         self._done = False

@@ -17,6 +17,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from cognitive_runtime.record.quality import (  # noqa: E402
+    EpisodeRecordingQuality,
+    audit_split_overlap,
     validate_recording_quality,
     validate_recordings,
     verdict_for_session,
@@ -42,7 +44,7 @@ def _record_crafter_walk(tmp_path, session_id="crafter-walk"):
     pytest.importorskip("crafter")
     cfg = NurseryConfig(world="crafter", episode_ticks=40)
     return _record_scenario_episode(
-        str(tmp_path), session_id, 0, CRAFTER_SCENARIOS["walk_forward"], cfg
+        str(tmp_path), session_id, 0, CRAFTER_SCENARIOS["walk_forward_short"], cfg
     )
 
 
@@ -222,3 +224,60 @@ def test_verdict_for_session_is_amber_when_motion_is_close_to_the_floor(tmp_path
     verdict = verdict_for_session(session_dir, name="walk", min_blocks_per_tick=close_floor)
     assert verdict.verdict == "amber"
     assert any("motion" in w for w in verdict.warnings)
+
+
+def test_quality_gate_rejects_a_scene_whose_pixels_change_only_from_hud_animation():
+    """Issue #202: pixel-hash uniqueness alone is not proof of world motion
+    -- a scene can be 100% unique pixel frames (HUD flicker, render noise)
+    while the semantic grid -- the real world-motion signal -- never
+    changes. The unique-pixel-frame floor alone must not pass such a
+    recording; ``min_semantic_change_fraction`` catches what it misses."""
+    quality = EpisodeRecordingQuality(
+        session_dir="synthetic", episode_id="hud-animation",
+        n_frames=50, unique_frames=50,  # every pixel frame is unique...
+        net_displacement=0.0, duration_ticks=50,
+        semantic_frames=50, unique_semantic_frames=1,  # ...but the scene never changes
+        semantic_change_fraction=0.0,
+        moving_transition_fraction=0.0,
+    )
+    # The old-style gate (pixel uniqueness only) would wrongly pass this.
+    assert validate_recording_quality(
+        quality, name="turn", min_unique_frame_fraction=0.5,
+    ) == []
+    # The semantic-change floor correctly rejects it.
+    issues = validate_recording_quality(
+        quality, name="turn", min_unique_frame_fraction=0.5, min_semantic_change_fraction=0.1,
+    )
+    assert issues != []
+    assert any("semantic grid changed" in issue for issue in issues)
+
+
+def test_audit_split_overlap_is_clean_for_independently_recorded_episodes(tmp_path):
+    pytest.importorskip("crafter")
+    from cognitive_runtime.training.nursery import CRAFTER_SCENARIOS
+
+    cfg = NurseryConfig(world="crafter", episode_ticks=20)
+    scenario = CRAFTER_SCENARIOS["turn"]
+    train_dir = _record_scenario_episode(str(tmp_path), "turn-train", 0, scenario, cfg)
+    holdout_dir = _record_scenario_episode(str(tmp_path), "turn-holdout", 1000, scenario, cfg)
+
+    report = audit_split_overlap([train_dir], [holdout_dir])
+    assert report.duplicate_episode_pairs == []
+
+
+def test_audit_split_overlap_rejects_an_identical_holdout_episode(tmp_path):
+    """Issue #202's required test: holdout overlap validation rejects
+    identical episodes -- here, a holdout episode that is a byte-for-byte
+    copy of a training episode (e.g. an accidentally repeated seed)."""
+    pytest.importorskip("crafter")
+    from cognitive_runtime.training.nursery import CRAFTER_SCENARIOS
+
+    cfg = NurseryConfig(world="crafter", episode_ticks=20)
+    scenario = CRAFTER_SCENARIOS["turn"]
+    train_dir = _record_scenario_episode(str(tmp_path / "train"), "turn-train", 0, scenario, cfg)
+    # Same seed re-recorded under a "holdout" label -- byte-identical.
+    holdout_dir = _record_scenario_episode(str(tmp_path / "holdout"), "turn-holdout", 0, scenario, cfg)
+
+    report = audit_split_overlap([train_dir], [holdout_dir])
+    assert report.duplicate_episode_pairs
+    assert any("exactly matches" in issue for issue in report.issues)

@@ -113,12 +113,14 @@ _BABBLING = _stage(
 
 #: Crawling: "moving changes the view predictably (walk_forward, discrete
 #: turn)" -- the phase doc names both scenarios for this stage; ``scenario``
-#: only holds one, so ``walk_forward`` is the stage's *recorded* scenario
-#: (locomotion, the harder of the two) while both of its gates are the same
-#: two milestones Babbling/Gestation each proved individually, now required
+#: only holds one, so ``walk_forward_short`` is the stage's *recorded*
+#: scenario (locomotion, the harder of the two; issue #202 renamed/bounded
+#: it so a constant walk ends before the boundary instead of recording an
+#: accidental stationary tail) while both of its gates are the same two
+#: milestones Babbling/Gestation each proved individually, now required
 #: together on the harder scenario ("not a single scalar" -- task 4).
 _CRAWLING = _stage(
-    "crawling", "walk_forward",
+    "crawling", "walk_forward_short",
     senses=("vision", "proprioception"),
     motor_freedom="overridden",
     losses=("prediction", "action_conditioning"),

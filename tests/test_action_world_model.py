@@ -13,6 +13,7 @@ from cognitive_runtime.training.action_world_model import (  # noqa: E402
     ActionWorldModelConfig,
     _episode_workspace_tensors,
     _episode_tensors,
+    _window_weights,
     build_action_sequence_dataset,
     build_action_world_model,
     evaluate_action_world_model,
@@ -28,10 +29,14 @@ from cognitive_runtime.training.action_world_model import (  # noqa: E402
 from cognitive_runtime.training.nursery import (  # noqa: E402
     NURSERY_SCENARIOS,
     NurseryConfig,
+    NurseryScenario,
+    ScenarioRecording,
     _record_scenario_episode,
     run_nursery_joint,
 )
 from cognitive_runtime.training.action_world_model import ActionWorldModelConfig  # noqa: E402
+from cognitive_runtime.core.action import Action  # noqa: E402
+from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy  # noqa: E402
 from brain.cortex.predictive import PredictiveCortex  # noqa: E402
 
 
@@ -75,6 +80,64 @@ def turn_session(tmp_path_factory):
     )
 
 
+#: A scripted (non-constant) action fixture (issue #202): a constant-action
+#: recording can't detect a one-step motor/frame alignment error -- every
+#: transition is labelled with the same action either way. Two distinct
+#: actions with a known phase boundary can: an off-by-one alignment bug
+#: shows up as the wrong action label on the transition either side of the
+#: boundary.
+_MIXED_PHASE_TICKS = 5
+_MIXED_ACTION_A = Action("MOVE_FORWARD")
+_MIXED_ACTION_B = Action("LOOK_LEFT")
+
+
+def _build_mixed_action(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    policy = ScriptedSequencePolicy(
+        [(_MIXED_ACTION_A, _MIXED_PHASE_TICKS), (_MIXED_ACTION_B, _MIXED_PHASE_TICKS)]
+    )
+    return ScenarioRecording(policy=policy)
+
+
+@pytest.fixture(scope="module")
+def mixed_action_session(tmp_path_factory):
+    root = tmp_path_factory.mktemp("awm-mixed-sessions")
+    scenario = NurseryScenario("mixed_action", "scripted two-phase fixture", _build_mixed_action)
+    cfg = _small_nursery_config(episode_ticks=2 * _MIXED_PHASE_TICKS)
+    return _record_scenario_episode(str(root), "awm-mixed", 0, scenario, cfg)
+
+
+def test_window_weights_averages_the_windows_transitions():
+    # window=3 -> each start's slice is transition_weights[e][t : t+2].
+    transition_weights = [[1.0, 2.0, 3.0, 4.0], [10.0, 20.0]]
+    starts = [(0, 0), (0, 1), (0, 2), (1, 0)]
+    weights = _window_weights(transition_weights, starts, window=3)
+    assert weights == [1.5, 2.5, 3.5, 15.0]
+
+
+def test_window_weights_falls_back_to_uniform_for_an_empty_span():
+    weights = _window_weights([[1.0]], starts=[(0, 0)], window=1)
+    assert weights == [1.0]  # window-1 == 0 transitions in range -> fallback
+
+
+def test_train_action_world_model_rejects_mismatched_transition_weights(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    with pytest.raises(ValueError, match="transition_weights has"):
+        train_action_world_model(
+            dataset, _small_model_config(), transition_weights=[[1.0]],
+        )
+
+
+def test_train_action_world_model_accepts_transition_weights(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    episode = dataset.episodes[0]
+    # Uniform weights should behave like the None (uniform-permutation) path.
+    transition_weights = [[1.0] * len(episode.actions)]
+    model, stats = train_action_world_model(
+        dataset, _small_model_config(), transition_weights=transition_weights,
+    )
+    assert stats["final_total_loss"] > 0.0
+
+
 def test_horizons_ticks_to_frames_converts_and_dedupes():
     # Simulated backend: 1 tick per frame -- identity.
     assert horizons_ticks_to_frames([1, 10, 100], 1.0) == [1, 10, 100]
@@ -97,12 +160,44 @@ def test_build_action_sequence_dataset_aligns_frames_actions_and_yaw(turn_sessio
     episode = dataset.episodes[0]
     # One action per frame transition, and the scripted policy is constant.
     assert len(episode.actions) == len(episode.frames) - 1
-    assert dataset.action_keys == ["LOOK_LEFT"]
+    # "NULL" (issue #202): the very first transition -- between tick zero's
+    # post-reset snapshot and its first `program.step()`'s frame -- was
+    # produced before any motor command had ever been queued, so it is not
+    # labelled "LOOK_LEFT" even though the constant policy's first *decided*
+    # action is LOOK_LEFT (one-tick actuation latency; that decision drives
+    # the transition into the *following* frame instead).
+    assert dataset.action_keys == ["NULL", "LOOK_LEFT"]
+    assert episode.actions[0] == dataset.action_keys.index("NULL")
+    assert all(a == dataset.action_keys.index("LOOK_LEFT") for a in episode.actions[1:])
     assert dataset.pixel_shape is not None and dataset.pixel_shape[2] == 3
     # spatial.rotation publishes every tick, so yaw labels ride along.
     assert any(y is not None for y in episode.yaw)
     # Simulated backend records ~one frame per tick.
     assert 0.5 < dataset.ticks_per_frame < 1.5
+
+
+def test_build_action_sequence_dataset_applies_one_tick_motor_latency(mixed_action_session):
+    """Issue #202: ``actions[i]`` must be the motor command that produced
+    ``frames[i+1]`` -- the command *emitted at the same tick ``frames[i]``
+    was observed*, not the command bundled with ``frames[i+1]``'s own tick
+    (that command hasn't been applied yet; it drives the transition into
+    the frame *after* that). A constant-action fixture can't tell these
+    apart; this one can, via its known phase boundary."""
+    dataset = build_action_sequence_dataset([mixed_action_session])
+    episode = dataset.episodes[0]
+    null_idx = dataset.action_keys.index("NULL")
+    a_idx = dataset.action_keys.index("MOVE_FORWARD")
+    b_idx = dataset.action_keys.index("LOOK_LEFT")
+
+    # The very first transition predates any queued motor command; the next
+    # _MIXED_PHASE_TICKS transitions are driven by ticks 0..PHASE-1's own
+    # MOVE_FORWARD decisions (tick zero's decision drives the transition
+    # *after* the one consumed by the leading "NULL"); everything from
+    # there on is driven by a LOOK_LEFT decision. No MOVE_FORWARD/LOOK_LEFT
+    # label survives on the wrong side of the phase boundary.
+    assert episode.actions[0] == null_idx
+    assert all(a == a_idx for a in episode.actions[1 : 1 + _MIXED_PHASE_TICKS])
+    assert all(a == b_idx for a in episode.actions[1 + _MIXED_PHASE_TICKS :])
 
 
 def test_action_sequence_dataset_replays_fused_workspace_at_each_frame(turn_session):
@@ -157,16 +252,19 @@ def test_build_action_sequence_dataset_pins_and_extends_vocabulary(turn_session)
     dataset = build_action_sequence_dataset(
         [turn_session], action_keys=["MOVE_FORWARD", "LOOK_LEFT"]
     )
-    assert dataset.action_keys == ["MOVE_FORWARD", "LOOK_LEFT"]
+    # "NULL" (issue #202's leading un-actuated transition) is not in the
+    # pinned vocabulary either, so it extends it just like any other
+    # unseen name -- appended in encounter order after whatever's pinned.
+    assert dataset.action_keys == ["MOVE_FORWARD", "LOOK_LEFT", "NULL"]
     dataset = build_action_sequence_dataset([turn_session], action_keys=["MOVE_FORWARD"])
-    assert dataset.action_keys == ["MOVE_FORWARD", "LOOK_LEFT"]
+    assert dataset.action_keys == ["MOVE_FORWARD", "NULL", "LOOK_LEFT"]
 
 
 def test_train_evaluate_probe_and_round_trip(turn_session, tmp_path):
     dataset = build_action_sequence_dataset([turn_session])
     model, stats = train_action_world_model(dataset, _small_model_config())
     assert stats["final_total_loss"] > 0.0
-    assert stats["action_keys"] == ["LOOK_LEFT"]
+    assert stats["action_keys"] == ["NULL", "LOOK_LEFT"]
 
     report = evaluate_action_world_model(model, dataset, [1, 3], warmup_frames=2)
     assert set(report["horizons"]) == {1, 3}
@@ -186,7 +284,7 @@ def test_train_evaluate_probe_and_round_trip(turn_session, tmp_path):
     save_action_world_model(path, model, stats)
     reloaded, reloaded_stats = load_action_world_model(path)
     assert reloaded.action_keys == model.action_keys
-    assert reloaded_stats["action_keys"] == ["LOOK_LEFT"]
+    assert reloaded_stats["action_keys"] == ["NULL", "LOOK_LEFT"]
     with torch.no_grad():
         frames = torch.stack(
             [torch.rand(3, *model.pixel_shape[:2]) for _ in range(2)]
@@ -327,6 +425,13 @@ def test_run_nursery_joint_trains_one_model_across_scenarios(tmp_path):
     assert set(report.representation_diagnostics["latent"]) >= {
         "mean_variance", "effective_rank", "matrix_rank"
     }
+    # Issue #202 acceptance criterion: the report carries per-scenario
+    # sample counts and event balance.
+    assert set(report.sample_balance) == {"walk_forward", "turn_in_place"}
+    for stats in report.sample_balance.values():
+        assert stats["samples"] > 0
+        assert set(stats["movement_state_counts"]) == {"continuing", "blocked", "turning"}
+        assert set(stats["entity_state_counts"]) == {"absent", "present", "entering", "leaving"}
 
 
 def test_run_nursery_joint_rejects_overlapping_scenarios(tmp_path):

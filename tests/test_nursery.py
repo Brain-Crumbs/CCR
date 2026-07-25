@@ -20,12 +20,21 @@ from cognitive_runtime.training.nursery import (  # noqa: E402
     NurseryConfig,
     NurseryScenario,
     ScenarioRecording,
+    TransitionLabel,
+    _APPROACH_ENTITY_HOLDOUT_DISTANCES,
+    _APPROACH_ENTITY_TRAIN_DISTANCES,
+    _OBJECT_PERMANENCE_HOLDOUT_OFFSETS,
+    _OBJECT_PERMANENCE_TRAIN_OFFSETS,
     _record_scenario_episode,
+    _split_parameter,
+    balanced_transition_weights,
+    compute_scenario_transition_labels,
     measure_recording_quality,
     render_dream_strip,
     run_nursery_scenario,
     run_nursery_suite,
     save_nursery_scenario_checkpoint,
+    summarize_sample_balance,
     validate_nursery_recordings,
 )
 from cognitive_runtime.training.prediction_export import (  # noqa: E402
@@ -554,3 +563,125 @@ def test_nursery_report_carries_tick_horizon_mapping_and_rollout_health(tmp_path
     for entry in report.horizon_metrics.values():
         assert "model_over_copy_last_mse" in entry
         assert entry["model_mse"] > 0.0
+
+
+def test_split_parameter_train_and_holdout_tuples_are_disjoint():
+    """Issue #202's required test: train and holdout scripted parameter
+    tuples are disjoint -- a small modulus used to derive a scenario
+    parameter from ``seed`` can make a holdout seed silently repeat a
+    training variant; explicit, disjoint tuples make that impossible."""
+    assert set(_APPROACH_ENTITY_TRAIN_DISTANCES) & set(_APPROACH_ENTITY_HOLDOUT_DISTANCES) == set()
+    assert set(_OBJECT_PERMANENCE_TRAIN_OFFSETS) & set(_OBJECT_PERMANENCE_HOLDOUT_OFFSETS) == set()
+
+    from cognitive_runtime.training.nursery import (
+        _CRAFTER_OBJECT_PERMANENCE_HOLDOUT_HIDDEN_DELTAS,
+        _CRAFTER_OBJECT_PERMANENCE_TRAIN_HIDDEN_DELTAS,
+    )
+    assert (
+        set(_CRAFTER_OBJECT_PERMANENCE_TRAIN_HIDDEN_DELTAS)
+        & set(_CRAFTER_OBJECT_PERMANENCE_HOLDOUT_HIDDEN_DELTAS)
+    ) == set()
+
+
+def test_split_parameter_draws_from_the_seeds_own_pool():
+    cfg = NurseryConfig(train_seeds=(10, 11, 12), holdout_seeds=(20, 21))
+    train_values = ("a", "b", "c")
+    holdout_values = ("x", "y")
+
+    assert _split_parameter(10, cfg, train_values, holdout_values) == "a"
+    assert _split_parameter(12, cfg, train_values, holdout_values) == "c"
+    assert _split_parameter(20, cfg, train_values, holdout_values) == "x"
+    assert _split_parameter(21, cfg, train_values, holdout_values) == "y"
+    with pytest.raises(ValueError, match="neither a train nor a holdout seed"):
+        _split_parameter(999, cfg, train_values, holdout_values)
+
+
+def test_compute_scenario_transition_labels_reads_a_recorded_episode(tmp_path):
+    cfg = _small_config()
+    session_dir = _record_scenario_episode(
+        str(tmp_path), "labels-turn", 0, NURSERY_SCENARIOS["turn_in_place"], cfg
+    )
+    episode_id = list_episodes(session_dir)[0]
+    labels = compute_scenario_transition_labels(session_dir, episode_id, "turn_in_place")
+
+    assert len(labels) > 0
+    assert all(label.scenario == "turn_in_place" for label in labels)
+    assert all(label.movement_state in ("continuing", "blocked", "turning") for label in labels)
+    assert all(
+        label.entity_state in ("absent", "present", "entering", "leaving") for label in labels
+    )
+    # turn_in_place issues a constant turn with no scripted entity: no
+    # semantic-grid stream on Minecraft, so entity state is always "absent".
+    assert all(label.entity_state == "absent" for label in labels)
+
+
+def test_summarize_sample_balance_counts_per_scenario():
+    labels = {
+        "a": [
+            TransitionLabel("a", True, "continuing", "absent"),
+            TransitionLabel("a", False, "blocked", "present"),
+        ],
+        "b": [TransitionLabel("b", True, "turning", "entering")],
+    }
+    summary = summarize_sample_balance(labels)
+    assert summary["a"]["samples"] == 2
+    assert summary["a"]["semantic_changed_fraction"] == pytest.approx(0.5)
+    assert summary["a"]["movement_state_counts"] == {"continuing": 1, "blocked": 1, "turning": 0}
+    assert summary["b"]["entity_state_counts"]["entering"] == 1
+
+
+def test_balanced_transition_weights_caps_the_stationary_fraction():
+    """Issue #202's recommended starting policy: no more than 25%
+    stationary/blocked transitions -- a pool that's 90% blocked should have
+    its blocked transitions' *total* sampling weight capped near 25%."""
+    labels = (
+        [TransitionLabel("s", False, "blocked", "absent") for _ in range(90)]
+        + [TransitionLabel("s", True, "continuing", "absent") for _ in range(10)]
+    )
+    weights = balanced_transition_weights(labels, max_stationary_fraction=0.25)
+    assert len(weights) == 100
+    total = sum(weights)
+    blocked_weight = sum(w for w, l in zip(weights, labels) if l.movement_state == "blocked")
+    assert blocked_weight / total <= 0.30  # capped near the 0.25 target, with slack for rounding
+
+
+def test_balanced_transition_weights_balances_entity_present_and_absent():
+    labels = (
+        [TransitionLabel("s", True, "continuing", "present") for _ in range(80)]
+        + [TransitionLabel("s", True, "continuing", "absent") for _ in range(20)]
+    )
+    weights = balanced_transition_weights(labels, entity_balance_target=0.5)
+    total = sum(weights)
+    present_weight = sum(w for w, l in zip(weights, labels) if l.entity_state == "present")
+    absent_weight = sum(w for w, l in zip(weights, labels) if l.entity_state == "absent")
+    assert present_weight / total == pytest.approx(absent_weight / total, abs=0.05)
+
+
+def test_balanced_transition_weights_oversamples_entry_and_exit_events():
+    labels = (
+        [TransitionLabel("s", True, "continuing", "present") for _ in range(48)]
+        + [TransitionLabel("s", True, "continuing", "entering") for _ in range(1)]
+        + [TransitionLabel("s", True, "continuing", "leaving") for _ in range(1)]
+    )
+    weights = balanced_transition_weights(labels)
+    entering_weight = weights[48]
+    present_weight_each = weights[0]
+    assert entering_weight > present_weight_each
+
+
+def test_balanced_transition_weights_weighs_scenarios_uniformly():
+    """Sample scenarios uniformly before sampling a transition: a scenario
+    with 10x the transitions of another should not get 10x the total
+    weight."""
+    labels = (
+        [TransitionLabel("big", True, "continuing", "absent") for _ in range(100)]
+        + [TransitionLabel("small", True, "continuing", "absent") for _ in range(10)]
+    )
+    weights = balanced_transition_weights(labels)
+    big_total = sum(w for w, l in zip(weights, labels) if l.scenario == "big")
+    small_total = sum(w for w, l in zip(weights, labels) if l.scenario == "small")
+    assert big_total == pytest.approx(small_total, rel=0.05)
+
+
+def test_balanced_transition_weights_empty_input():
+    assert balanced_transition_weights([]) == []
