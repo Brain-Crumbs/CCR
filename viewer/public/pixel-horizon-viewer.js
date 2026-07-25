@@ -70,6 +70,8 @@ const TEMPLATE = `
   }
   button { cursor: pointer; }
   .status { color: var(--text-secondary); margin: 8px 0; }
+  .identity { color: var(--text-secondary); font-size: 12px; margin: 4px 0 8px; }
+  .event-nav { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
   .horizons { display: flex; flex-wrap: wrap; gap: 16px; }
   .panel { background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
   .panel h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
@@ -106,6 +108,8 @@ const TEMPLATE = `
     </label>
   </div>
   <div class="status" id="status">loading…</div>
+  <div class="identity" id="identity"></div>
+  <div class="event-nav"><button data-event="surprise">Previous surprise</button><button data-event="entity_entered">Next entity entry</button><button data-event="entity_left">Next entity exit</button><button data-event="blocked_forward">Next blocked transition</button><button data-event="false_positive">Worst false positive</button><button data-event="static">Worst static mismatch</button></div>
   <div class="horizons" id="horizons"></div>
   <div class="chartwrap">
     <div class="legend" id="legend"></div>
@@ -176,6 +180,7 @@ class PixelHorizonViewer extends HTMLElement {
     this._$("#scrub").addEventListener("input", (e) => this.setTime(Number(e.target.value), true));
     this._$("#source").addEventListener("change", () => this._render(true));
     this._$("#play").addEventListener("click", () => this._togglePlay());
+    this.shadowRoot.querySelectorAll("[data-event]").forEach((button) => button.addEventListener("click", () => this._jumpEvent(button.dataset.event)));
     this._load();
   }
 
@@ -274,9 +279,36 @@ class PixelHorizonViewer extends HTMLElement {
     scrub.max = Math.max(0, this._frames.length - 1 - maxH);
     this._t = Math.min(this._t, Number(scrub.max));
     scrub.value = this._t;
+    this._renderIdentity();
+    const eventful = this._pred?.events?.findIndex((event) => event.entity_entered || event.entity_left || event.blocked_forward || event.semantic_scene_changed);
+    if (eventful > 0) this._t = Math.min(eventful, Number(scrub.max));
     this._$("#status").textContent =
       `${this._frames.length} frames (${this._shape.join("×")} ${this._pred ? `· ${this._pred.format === "pixel-predictions-v1" ? "legacy actionless" : "joint cortex"} model predictions loaded` : "· no model predictions recorded — showing baselines"})`;
     this._render(true);
+  }
+
+  _renderIdentity() {
+    const p = this._pred, identity = this._$("#identity");
+    if (!p) { identity.textContent = "No export identity; baselines only."; return; }
+    if (p.format === "pixel-predictions-v1") { identity.textContent = "Legacy export — actionless per-scenario model; not comparable to current joint cortex experiments."; return; }
+    const experiment = p.experiment || {}, model = p.model || {};
+    const source = p.evaluation_source || "unknown", split = /-(train|holdout)-/.exec(source)?.[1] || "unknown";
+    identity.textContent = `Experiment ${experiment.experiment_id || "unknown"} · Trace ${experiment.trace_id || "unknown"} · Checkpoint hash ${(model.checkpoint_sha256 || "unknown").slice(0, 12)} · Model type ${model.model_type || "unknown"} · Backbone ${model.backbone || "unknown"} · Objective ${model.training_objective || "unknown"} · Prediction mode ${p.prediction_mode || "unknown"} · actions ${model.uses_actions ? "on" : "off"}, workspace ${model.uses_workspace ? "on" : "off"} · Split ${split} · current joint export`;
+  }
+
+  _jumpEvent(kind) {
+    if (!this._frames?.length) return;
+    const events = this._pred?.events || [];
+    let index = -1;
+    if (kind === "surprise" || kind === "false_positive" || kind === "static") {
+      const series = this._mseSeries("model", this.horizons[0]);
+      const candidates = [...series.keys()].filter((i) => kind !== "static" || !events[i]?.position_changed);
+      index = candidates.reduce((best, i) => Number.isNaN(series[i]) || (best >= 0 && series[i] <= series[best]) ? best : i, -1);
+    } else {
+      index = events.findIndex((event, i) => i > this._t && event[kind]);
+      if (index < 0) index = events.findIndex((event) => event[kind]);
+    }
+    if (index >= 0) this.setTime(index, true);
   }
 
   _computeMean() {
@@ -392,9 +424,11 @@ class PixelHorizonViewer extends HTMLElement {
           <h3>horizon t+${h}</h3>
           <div class="strip">
             <figure class="cell"><canvas class="px seen"></canvas><figcaption>seen t</figcaption></figure>
-            <figure class="cell"><canvas class="px pred"></canvas><figcaption>predicted t+${h}</figcaption></figure>
+            <figure class="cell"><canvas class="px pred"></canvas><figcaption>model prediction t+${h}</figcaption></figure>
+            <figure class="cell"><canvas class="px copy"></canvas><figcaption>copy-last t</figcaption></figure>
             <figure class="cell"><canvas class="px actual"></canvas><figcaption>actual t+${h}</figcaption></figure>
-            <figure class="cell"><canvas class="px diff"></canvas><figcaption>|error|</figcaption></figure>
+            <figure class="cell"><canvas class="px diff"></canvas><figcaption>model error</figcaption></figure>
+            <figure class="cell"><canvas class="px copydiff"></canvas><figcaption>copy-last error</figcaption></figure>
           </div>
           <div class="metrics"></div>`;
         host.appendChild(panel);
@@ -404,17 +438,25 @@ class PixelHorizonViewer extends HTMLElement {
     const rows = [];
     for (const panel of host.children) {
       const h = Number(panel.dataset.h);
-      const pred = this._predicted(source, t, h);
-      const target = this._target(source, t + h);
-      const seen = this._target(source, t); // the input frame the model saw at t
+      const comparisonSource = this._pred ? "model" : source;
+      const pred = this._predicted(comparisonSource, t, h);
+      const target = this._target(comparisonSource, t + h);
+      const seen = this._target(comparisonSource, t); // the input frame the model saw at t
+      const copy = this._predicted("copy-last", t, h);
       const shape = pred ? pred.shape : this._shape;
       this._drawFrame(panel.querySelector(".seen"), seen?.bytes ?? null, seen?.shape ?? this._shape);
       this._drawFrame(panel.querySelector(".actual"), target?.bytes ?? null, target?.shape ?? this._shape);
       this._drawFrame(panel.querySelector(".pred"), pred?.bytes ?? null, shape);
+      this._drawFrame(panel.querySelector(".copy"), copy?.bytes ?? null, copy?.shape ?? this._shape);
       const comparable = pred && target && pred.bytes.length === target.bytes.length;
       this._drawDiff(panel.querySelector(".diff"), comparable ? pred.bytes : null, comparable ? target.bytes : null, shape);
+      const copyComparable = copy && target && copy.bytes.length === target.bytes.length;
+      this._drawDiff(panel.querySelector(".copydiff"), copyComparable ? copy.bytes : null, copyComparable ? target.bytes : null, shape);
       const m = comparable ? mse(pred.bytes, target.bytes) : NaN;
-      panel.querySelector(".metrics").innerHTML = comparable
+      const cm = copyComparable ? mse(copy.bytes, target.bytes) : NaN;
+      panel.querySelector(".metrics").innerHTML = comparable && !Number.isNaN(cm)
+        ? `model MSE <b>${m.toExponential(2)}</b> · copy-last <b>${cm.toExponential(2)}</b> · <b>${m < cm ? "model beats copy-last" : "copy-last wins"}</b>`
+        : comparable
         ? `MSE <b>${m.toExponential(2)}</b> · PSNR <b>${psnrText(m)}</b> dB`
         : `no comparable frames at t=${t}`;
       rows.push({ h, mse: m });

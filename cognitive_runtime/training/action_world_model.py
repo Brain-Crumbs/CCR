@@ -55,11 +55,16 @@ from cognitive_runtime.runtime.recorder import stream_event_from_log
 from cognitive_runtime.core.streams import TemporalBuffer, TemporalFusion
 from cognitive_runtime.core.streams.events import StreamSpec
 from cognitive_runtime.runtime.replay import load_session_metadata, require_streams_v2
+from cognitive_runtime.training.event_evaluation import (
+    COW_ID, evaluate_entity_predictions, extract_frame_event_labels, flattened_motion_metrics,
+    motion_stratified_metrics, rollout_health as classify_rollout_health,
+)
 
 PIXEL_STREAM = "vision.frame.pixels"
 MOTOR_STREAM = "motor.command"
 ROTATION_STREAM = "spatial.rotation"
 FACING_STREAM = "spatial.facing"
+POSITION_STREAM = "spatial.position"
 #: Recorded ground-truth stream for the cortex's terminal head (issue #169).
 #: Reward and risk targets instead come straight off the decision record
 #: (``reward_window_total``/``risk``) -- not the ``internal.*`` streams
@@ -103,6 +108,10 @@ class EpisodeActionFrames:
     #: Discrete grid facing ``(x, y)`` labels (Crafter).  The current value is
     #: forward-filled between delta-published facing events.
     facing: List[Optional[Tuple[float, float]]] = field(default_factory=list)
+    #: Agent grid position aligned to each frame when the spatial stream is
+    #: available.  Unlike semantic-grid equality this distinguishes a true
+    #: blocked movement attempt from an ordinary idle frame.
+    positions: List[Optional[Tuple[float, float]]] = field(default_factory=list)
     ticks: List[int] = field(default_factory=list)
     #: Per-frame supervision for the cortex's reward/terminal/risk heads
     #: (issue #169) -- ``reward_window_total`` off the decision record,
@@ -214,6 +223,19 @@ def _tick_facing(
     return None
 
 
+def _tick_position(
+    sensory_records: List[Dict[str, Any]],
+) -> Optional[Tuple[float, float]]:
+    for record in reversed(sensory_records):
+        if record.get("stream_id") != POSITION_STREAM:
+            continue
+        payload = record.get("payload") or {}
+        x, y = payload.get("x"), payload.get("y")
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            return float(x), float(y)
+    return None
+
+
 def _tick_terminal(sensory_records: List[Dict[str, Any]]) -> bool:
     return any(record.get("stream_id") == DEATH_STREAM for record in sensory_records)
 
@@ -268,6 +290,7 @@ def build_action_sequence_dataset(
                 #: below).
                 last_committed_action: Optional[str] = None
                 last_facing: Optional[Tuple[float, float]] = None
+                last_position: Optional[Tuple[float, float]] = None
                 last_semantic_grid: Optional[List[List[int]]] = None
                 for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
                     workspace_buffer.extend([
@@ -291,6 +314,9 @@ def build_action_sequence_dataset(
                     facing = _tick_facing(sensory) or last_facing
                     if facing is not None:
                         last_facing = facing
+                    position = _tick_position(sensory) or last_position
+                    if position is not None:
+                        last_position = position
                     reward = float(decision.get("reward_window_total", 0.0))
                     terminal = _tick_terminal(sensory)
                     # Straight off the decision record (this tick's own
@@ -318,6 +344,7 @@ def build_action_sequence_dataset(
                         episode.frames.append(frame)
                         episode.yaw.append(yaw)
                         episode.facing.append(facing)
+                        episode.positions.append(position)
                         episode.ticks.append(tick)
                         episode.reward.append(reward)
                         episode.terminal.append(terminal)
@@ -1406,6 +1433,11 @@ def evaluate_action_world_model_direct(
     per_episode_model_mse = {tick: [] for tick in ticks}
     prediction_dispersion: List[float] = []
     target_dispersion: List[float] = []
+    entity_labels = {tick: [] for tick in ticks}
+    entity_probabilities = {tick: [] for tick in ticks}
+    entity_cells = {tick: [] for tick in ticks}
+    strata = {tick: {name: [] for name in ("moving", "static", "blocked", "turning", "entity_entry", "entity_exit")}
+               for tick in ticks}
 
     was_training = model.training
     model.eval()
@@ -1429,14 +1461,19 @@ def evaluate_action_world_model_direct(
             if max_starts_per_episode is not None:
                 starts = list(starts)[:max_starts_per_episode]
             episode_mse = {tick: [] for tick in ticks}
+            action_names = [dataset.action_keys[index] for index in episode.actions]
+            labels = extract_frame_event_labels(
+                episode.semantic_grids, positions=episode.positions, actions=action_names,
+            ) if len(episode.semantic_grids) == len(episode.frames) else []
             for t in starts:
                 decoded_by_tick = {}
                 for tick, frame in zip(ticks, frames):
                     prediction = model.sequence_prediction(hidden[:, t : t + 1], tick)
-                    decoded = model.decode_prediction(
+                    visual = model.decode_prediction(
                         prediction.latent[0], reference_frame=targets[t:t + 1],
                         reference_spatial=model.encode_visual(pixels[t:t + 1]).spatial,
-                    )["vision"][0]
+                    )
+                    decoded = visual["vision"][0]
                     decoded_by_tick[tick] = decoded
                     target = targets[t + frame]
                     mse = float(F.mse_loss(decoded, target))
@@ -1444,6 +1481,27 @@ def evaluate_action_world_model_direct(
                     episode_mse[tick].append(mse)
                     samples[tick]["copy_last"].append(float(F.mse_loss(targets[t], target)))
                     samples[tick]["mean_frame"].append(float(F.mse_loss(mean_frame, target)))
+                    event_label = labels[t + frame] if t + frame < len(labels) else None
+                    row = {
+                        "model_mse": mse, "copy_last_mse": float(F.mse_loss(targets[t], target)),
+                        "target_motion": float(F.mse_loss(targets[t], target)),
+                        "predicted_motion": float(F.mse_loss(decoded, targets[t])),
+                    }
+                    if visual.get("change_mask") is not None:
+                        row["change_mask_mean"] = float(visual["change_mask"].mean())
+                    if event_label is not None:
+                        strata[tick]["moving" if event_label.position_changed else "static"].append(row)
+                        if event_label.blocked_forward: strata[tick]["blocked"].append(row)
+                        if event_label.entity_entered: strata[tick]["entity_entry"].append(row)
+                        if event_label.entity_left: strata[tick]["entity_exit"].append(row)
+                        if t < len(episode.facing) and t + frame < len(episode.facing) and episode.facing[t] != episode.facing[t + frame]:
+                            strata[tick]["turning"].append(row)
+                        logits = visual.get("semantic_logits")
+                        if logits is not None and logits.shape[1] > COW_ID:
+                            probabilities = torch.softmax(logits[0], dim=0)[COW_ID]
+                            entity_labels[tick].append(event_label)
+                            entity_probabilities[tick].append(float(probabilities.max()))
+                            entity_cells[tick].append([(int(r), int(c)) for r, c in (probabilities >= .5).nonzero().tolist()])
                     if oracle_lag is not None and t + frame - oracle_lag >= 0:
                         samples[tick]["oracle"].append(float(F.mse_loss(targets[t + frame - oracle_lag], target)))
                     for name, by_horizon in workspace_samples.items():
@@ -1490,6 +1548,13 @@ def evaluate_action_world_model_direct(
         "workspace_modalities": workspace_report,
         "prediction_health": {"prediction_dispersion": _mean(prediction_dispersion) if prediction_dispersion else 0.0,
                               "target_dispersion": _mean(target_dispersion) if target_dispersion else 0.0},
+        "event_metrics": {
+            tick: (lambda motion: {
+                "entity": evaluate_entity_predictions(entity_labels[tick], entity_probabilities[tick], entity_cells[tick]),
+                "motion": motion, **flattened_motion_metrics(motion),
+            })(motion_stratified_metrics(strata[tick]))
+            for tick in ticks
+        },
         "per_episode_model_mse": per_episode_model_mse,
     }
 
@@ -1554,6 +1619,13 @@ def evaluate_action_world_model(
     per_episode_model_mse: Dict[int, List[float]] = {h: [] for h in horizons_sorted}
     prediction_dispersion: List[float] = []
     target_dispersion: List[float] = []
+    entity_labels: Dict[int, List[Any]] = {h: [] for h in horizons_sorted}
+    entity_probabilities: Dict[int, List[float]] = {h: [] for h in horizons_sorted}
+    entity_cells: Dict[int, List[List[Tuple[int, int]]]] = {h: [] for h in horizons_sorted}
+    strata: Dict[int, Dict[str, List[Dict[str, float]]]] = {
+        h: {name: [] for name in ("moving", "static", "blocked", "turning", "entity_entry", "entity_exit")}
+        for h in horizons_sorted
+    }
 
     was_training = model.training
     model.eval()
@@ -1585,6 +1657,10 @@ def evaluate_action_world_model(
             if max_starts_per_episode is not None:
                 starts = list(starts)[:max_starts_per_episode]
             episode_model_mse: Dict[int, List[float]] = {h: [] for h in horizons_sorted}
+            action_names = [dataset.action_keys[index] for index in episode.actions]
+            labels = extract_frame_event_labels(
+                episode.semantic_grids, positions=episode.positions, actions=action_names,
+            ) if len(episode.semantic_grids) == len(episode.frames) else []
             for t in starts:
                 reference_encoding = model.encode_visual(pixels[t : t + 1])
                 rollout = model.forward_horizons(
@@ -1605,6 +1681,37 @@ def evaluate_action_world_model(
                     episode_model_mse[h].append(model_mse_sample)
                     samples[h]["copy_last"].append(float(F.mse_loss(targets[t], target)))
                     samples[h]["mean_frame"].append(float(F.mse_loss(mean_frame, target)))
+                    event_label = labels[t + h] if t + h < len(labels) else None
+                    change_mask = rollout[h].change_mask
+                    row = {
+                        "model_mse": model_mse_sample,
+                        "copy_last_mse": float(F.mse_loss(targets[t], target)),
+                        "target_motion": float(F.mse_loss(targets[t], target)),
+                        "predicted_motion": float(F.mse_loss(decoded, targets[t])),
+                    }
+                    if change_mask is not None:
+                        row["change_mask_mean"] = float(change_mask.mean())
+                    if event_label is not None:
+                        if event_label.position_changed:
+                            strata[h]["moving"].append(row)
+                        else:
+                            strata[h]["static"].append(row)
+                        if event_label.blocked_forward:
+                            strata[h]["blocked"].append(row)
+                        if event_label.entity_entered:
+                            strata[h]["entity_entry"].append(row)
+                        if event_label.entity_left:
+                            strata[h]["entity_exit"].append(row)
+                        if t < len(episode.facing) and t + h < len(episode.facing) and episode.facing[t] != episode.facing[t + h]:
+                            strata[h]["turning"].append(row)
+                        logits = rollout[h].semantic_logits
+                        if logits is not None and logits.shape[1] > COW_ID:
+                            probabilities = torch.softmax(logits.squeeze(0), dim=0)[COW_ID]
+                            entity_labels[h].append(event_label)
+                            entity_probabilities[h].append(float(probabilities.max()))
+                            entity_cells[h].append([
+                                (int(r), int(c)) for r, c in (probabilities >= .5).nonzero().tolist()
+                            ])
                     if oracle_lag is not None and t + h - oracle_lag >= 0:
                         samples[h]["oracle"].append(
                             float(F.mse_loss(targets[t + h - oracle_lag], target))
@@ -1659,13 +1766,7 @@ def evaluate_action_world_model(
 
     pred_disp = _mean(prediction_dispersion) if prediction_dispersion else 0.0
     tgt_disp = _mean(target_dispersion) if target_dispersion else 0.0
-    rollout_health = {
-        "prediction_dispersion": pred_disp,
-        "target_dispersion": tgt_disp,
-        # Predictions vary < 5% as much across horizons as reality does:
-        # the rollout is frozen (identical frames at t+10 and t+100).
-        "frozen_rollout": bool(tgt_disp > 1e-6 and pred_disp < 0.05 * tgt_disp),
-    }
+    rollout_health = classify_rollout_health(pred_disp, tgt_disp)
     workspace_report = {
         name: {
             h: {
@@ -1704,6 +1805,13 @@ def evaluate_action_world_model(
         "ticks_per_frame": dataset.ticks_per_frame,
         "workspace_modalities": workspace_report,
         "rollout_health": rollout_health,
+        "event_metrics": {
+            h: (lambda motion: {
+                "entity": evaluate_entity_predictions(entity_labels[h], entity_probabilities[h], entity_cells[h]),
+                "motion": motion, **flattened_motion_metrics(motion),
+            })(motion_stratified_metrics(strata[h]))
+            for h in horizons_sorted
+        },
         "per_episode_model_mse": per_episode_model_mse,
     }
 

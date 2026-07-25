@@ -1281,6 +1281,8 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
             ActionWorldModelConfig,
             save_action_world_model,
         )
+        from cognitive_runtime.training.prediction_export import ExperimentIdentity, checkpoint_sha256
+        from cognitive_runtime.training.statistical_evaluation import build_experiment_report, write_experiment_report
         from cognitive_runtime.training.nursery import (
             CRAFTER_SCENARIOS,
             NURSERY_SCENARIOS,
@@ -1399,14 +1401,17 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
         f"effective rank={latent['effective_rank']:.2f}/{latent['dimensions']}"
     )
 
+    checkpoint = {}
     if args.out_dir:
         os.makedirs(args.out_dir, exist_ok=True)
         model_path = os.path.join(args.out_dir, "joint-world-model.pt")
         save_action_world_model(model_path, model, report.training_stats)
+        checkpoint = {"path": os.path.abspath(model_path), "sha256": checkpoint_sha256(model_path),
+                      "model_type": "predictive_cortex"}
         print(f"\njoint world model saved to {model_path}")
 
-    if args.report:
-        payload = {
+    if args.report or args.out_dir:
+        legacy_payload = {
             "train_scenarios": report.train_scenarios,
             "holdout_scenarios": report.holdout_scenarios,
             "horizon_frames": report.horizon_frames,
@@ -1420,10 +1425,25 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
             "train_sessions": report.train_sessions,
             "eval_sessions": report.eval_sessions,
         }
-        os.makedirs(os.path.dirname(os.path.abspath(args.report)) or ".", exist_ok=True)
-        with open(args.report, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2)
-        print(f"report written to {args.report}")
+        # Keep the report inspectable without notebook state. The selected
+        # metric is the first evaluated scenario; every scenario's direct and
+        # rollout reports remain alongside it under ``by_scenario``.
+        all_metrics = {**report.scenario_metrics, **report.zero_shot_metrics}
+        selected = next(iter(all_metrics.values()), {})
+        identity = ExperimentIdentity.create(
+            f"nursery-joint-{args.seed}", config.name or "PixelTwo"
+        )
+        payload = build_experiment_report(
+            experiment=identity.__dict__, data_quality={"gate_enabled": config.data_quality_gate},
+            split_overlap={"gate_enabled": config.split_overlap_gate}, training_stats=report.training_stats,
+            direct_metrics={**(selected.get("direct") or {}), "by_scenario": {name: value.get("direct") for name, value in all_metrics.items()}},
+            rollout_metrics={**(selected.get("rollout") or {}), "by_scenario": {name: value.get("rollout") for name, value in all_metrics.items()}},
+            checkpoint=checkpoint,
+        )
+        payload["joint_nursery"] = legacy_payload
+        report_path = args.report or os.path.join(args.out_dir, "experiment_report.json")
+        write_experiment_report(report_path, payload)
+        print(f"experiment report written to {report_path}")
 
 
 def cmd_nursery_backbone_benchmark(args: argparse.Namespace) -> None:

@@ -31,7 +31,8 @@ function readJSON(file, fallback = {}) {
 function isSessionDir(dir) { return fs.existsSync(path.join(dir, "session.json")); }
 
 function qualityVerdict(dir) {
-  const result = spawnSync(process.env.PYTHON || "python3", ["-m", "cognitive_runtime.record.quality_cli", dir], {
+  const python = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
+  const result = spawnSync(python, ["-m", "cognitive_runtime.record.quality_cli", dir], {
     cwd: REPO_DIR, encoding: "utf8", env: process.env,
   });
   if (result.status === 0) return JSON.parse(result.stdout);
@@ -61,16 +62,33 @@ function makeStore(dataDir, { qualityCheck = qualityVerdict } = {}) {
     const stamp = qualityStamp(dir), cached = qualityCache.get(id);
     const quality = cached?.stamp === stamp ? cached.value : qualityCheck(dir);
     if (cached?.stamp !== stamp) qualityCache.set(id, { stamp, value: quality });
+    const match = id.match(/^nursery-(.+)-(train|holdout)-(\d+)$/);
+    const exports = exportsFor(dir).map((entry) => entry.data).filter((entry) => entry?.format === "pixel-predictions-v2");
+    const experiments = [...new Map(exports.map((entry) => [entry.experiment?.experiment_id, {
+      id: entry.experiment?.experiment_id, prediction_mode: entry.prediction_mode,
+      created_at: entry.experiment?.created_at,
+      has_entity_event: (entry.events || []).some((event) => event.entity_entered || event.entity_left),
+      has_moving: (entry.events || []).some((event) => event.position_changed),
+      has_static: (entry.events || []).some((event) => !event.position_changed),
+      has_blocked: (entry.events || []).some((event) => event.blocked_forward),
+    }])).values()].filter((entry) => entry.id);
     return { id, name: meta.name ?? "legacy", curriculum: meta.curriculum ?? null,
       program: meta.program ?? null, tick_rate: meta.tick_rate ?? null, episodes,
+      scenario: match?.[1] ?? null, split: match?.[2] ?? null, seed: match?.[3] ?? null, experiments,
       development: meta.development ?? meta.ladder ?? meta.developmental ?? null,
       quality };
   }
-  function list(name = null) {
+  function list(name = null, filters = {}) {
     if (!fs.existsSync(dataDir)) return [];
     return fs.readdirSync(dataDir, { withFileTypes: true })
       .filter((e) => e.isDirectory() && isSessionDir(path.join(dataDir, e.name)))
       .map((e) => describe(e.name)).filter((s) => !name || s.name === name)
+      .filter((s) => !filters.scenario || s.scenario === filters.scenario)
+      .filter((s) => !filters.seed || String(s.seed) === String(filters.seed))
+      .filter((s) => !filters.split || s.split === filters.split)
+      .filter((s) => !filters.prediction_mode || s.experiments.some((e) => e.prediction_mode === filters.prediction_mode))
+      .filter((s) => !filters.entity_event || s.experiments.some((e) => e.has_entity_event))
+      .filter((s) => !filters.motion || s.experiments.some((e) => filters.motion === "blocked" ? e.has_blocked : filters.motion === "moving" ? e.has_moving : e.has_static))
       .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
   }
   return { dataDir, sessionDir, describe, list };
@@ -171,7 +189,7 @@ function createServer({ dataDir }) {
     const url = new URL(req.url, "http://localhost"), p = url.pathname.split("/").filter(Boolean);
     try {
       if (p[0] !== "api") return serveStatic(res, url.pathname);
-      if (p.length === 2 && p[1] === "sessions") return sendJSON(res, 200, { data_dir: store.dataDir, sessions: store.list(url.searchParams.get("name")) });
+      if (p.length === 2 && p[1] === "sessions") return sendJSON(res, 200, { data_dir: store.dataDir, sessions: store.list(url.searchParams.get("name"), Object.fromEntries(["scenario", "seed", "split", "prediction_mode", "entity_event", "motion"].map((key) => [key, url.searchParams.get(key)])) ) });
       if (p.length >= 3 && p[1] === "sessions") {
         const dir = store.sessionDir(p[2]); if (!dir) return sendJSON(res, 404, { error: `unknown session ${p[2]}` });
         if (p.length === 3) {
