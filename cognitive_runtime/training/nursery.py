@@ -1857,7 +1857,7 @@ def run_nursery_joint(
               episodes=(len(train_names) * (len(cfg.train_seeds) + len(cfg.holdout_seeds))
                         + len(holdout_names) * len(cfg.holdout_seeds))) as recording_span:
         for name in train_names:
-            scenario = NURSERY_SCENARIOS[name]
+            scenario = scenarios[name]
             with span("nursery.record.scenario", scenario=name, split="train+holdout"):
                 train_sessions[name] = [
                     _record_scenario_episode(
@@ -1872,7 +1872,7 @@ def run_nursery_joint(
                     for seed in cfg.holdout_seeds
                 ]
         for name in holdout_names:
-            scenario = NURSERY_SCENARIOS[name]
+            scenario = scenarios[name]
             with span("nursery.record.scenario", scenario=name, split="zero-shot"):
                 eval_sessions[name] = [
                     _record_scenario_episode(
@@ -1891,13 +1891,13 @@ def run_nursery_joint(
             for name in train_names:
                 issues += validate_nursery_recordings(
                     train_sessions[name] + eval_sessions[name],
-                    NURSERY_SCENARIOS[name],
+                    scenarios[name],
                     expected_pixel_source=cfg.expected_pixel_source,
                 )
             for name in holdout_names:
                 issues += validate_nursery_recordings(
                     eval_sessions[name],
-                    NURSERY_SCENARIOS[name],
+                    scenarios[name],
                     expected_pixel_source=cfg.expected_pixel_source,
                 )
             gate_span.set(issues=len(issues))
