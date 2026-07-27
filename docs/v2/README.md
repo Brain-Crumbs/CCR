@@ -35,10 +35,6 @@ For onboarding and presentation:
    training run while it runs (progress logging with ETA) and reading it back
    afterwards (`ccr trace show`: phase timings, loss curves, config, git
    commit), plus how to instrument new code.
-9. [**10-live-forecasting-world.md**](10-live-forecasting-world.md) — the
-   paper-forecasting extension: external-data stream contracts, provenance and
-   leakage controls, a prediction-market-first delivery plan, proper scoring,
-   and the path to news and macro context.
 
 **Design commitments** (the choices these docs are built on): re-architect +
 rename rather than rewrite; predict in latent space but always decode to the
