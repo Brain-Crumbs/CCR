@@ -424,10 +424,10 @@ class PixelHorizonViewer extends HTMLElement {
           <h3>horizon t+${h}</h3>
           <div class="strip">
             <figure class="cell"><canvas class="px seen"></canvas><figcaption>seen t</figcaption></figure>
-            <figure class="cell"><canvas class="px pred"></canvas><figcaption>model prediction t+${h}</figcaption></figure>
+            <figure class="cell"><canvas class="px pred"></canvas><figcaption class="pred-label">prediction t+${h}</figcaption></figure>
             <figure class="cell"><canvas class="px copy"></canvas><figcaption>copy-last t</figcaption></figure>
             <figure class="cell"><canvas class="px actual"></canvas><figcaption>actual t+${h}</figcaption></figure>
-            <figure class="cell"><canvas class="px diff"></canvas><figcaption>model error</figcaption></figure>
+            <figure class="cell"><canvas class="px diff"></canvas><figcaption class="diff-label">prediction error</figcaption></figure>
             <figure class="cell"><canvas class="px copydiff"></canvas><figcaption>copy-last error</figcaption></figure>
           </div>
           <div class="metrics"></div>`;
@@ -438,7 +438,11 @@ class PixelHorizonViewer extends HTMLElement {
     const rows = [];
     for (const panel of host.children) {
       const h = Number(panel.dataset.h);
-      const comparisonSource = this._pred ? "model" : source;
+      // The source selector controls every primary panel and metric.  A
+      // loaded model adds an option; it must not silently override a selected
+      // baseline while the chart and table continue to report that baseline.
+      const comparisonSource = source;
+      const sourceLabel = comparisonSource === "model" ? "model" : comparisonSource;
       const pred = this._predicted(comparisonSource, t, h);
       const target = this._target(comparisonSource, t + h);
       const seen = this._target(comparisonSource, t); // the input frame the model saw at t
@@ -448,16 +452,18 @@ class PixelHorizonViewer extends HTMLElement {
       this._drawFrame(panel.querySelector(".actual"), target?.bytes ?? null, target?.shape ?? this._shape);
       this._drawFrame(panel.querySelector(".pred"), pred?.bytes ?? null, shape);
       this._drawFrame(panel.querySelector(".copy"), copy?.bytes ?? null, copy?.shape ?? this._shape);
+      panel.querySelector(".pred-label").textContent = `${sourceLabel} prediction t+${h}`;
+      panel.querySelector(".diff-label").textContent = `${sourceLabel} error`;
       const comparable = pred && target && pred.bytes.length === target.bytes.length;
       this._drawDiff(panel.querySelector(".diff"), comparable ? pred.bytes : null, comparable ? target.bytes : null, shape);
       const copyComparable = copy && target && copy.bytes.length === target.bytes.length;
       this._drawDiff(panel.querySelector(".copydiff"), copyComparable ? copy.bytes : null, copyComparable ? target.bytes : null, shape);
       const m = comparable ? mse(pred.bytes, target.bytes) : NaN;
       const cm = copyComparable ? mse(copy.bytes, target.bytes) : NaN;
-      panel.querySelector(".metrics").innerHTML = comparable && !Number.isNaN(cm)
+      panel.querySelector(".metrics").innerHTML = comparisonSource === "model" && comparable && !Number.isNaN(cm)
         ? `model MSE <b>${m.toExponential(2)}</b> · copy-last <b>${cm.toExponential(2)}</b> · <b>${m < cm ? "model beats copy-last" : "copy-last wins"}</b>`
         : comparable
-        ? `MSE <b>${m.toExponential(2)}</b> · PSNR <b>${psnrText(m)}</b> dB`
+        ? `${sourceLabel} MSE <b>${m.toExponential(2)}</b> · PSNR <b>${psnrText(m)}</b> dB`
         : `no comparable frames at t=${t}`;
       rows.push({ h, mse: m });
     }

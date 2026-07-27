@@ -44,11 +44,21 @@ def test_motion_counts_and_rollout_health_states():
 
 def test_experiment_report_round_trips_with_checkpoint_identity(tmp_path):
     report = build_experiment_report(
-        experiment={"experiment_id": "smoke"}, checkpoint={"sha256": "abc"},
+        experiment={"experiment_id": "smoke"},
+        checkpoint={"path": "/models/smoke.pt", "sha256": "abc"},
         rollout_metrics={"horizons": {1: {"beats_copy_last": True}}, "event_metrics": {}},
     )
     path = write_experiment_report(str(tmp_path / "experiment_report.json"), report)
     assert load_experiment_report(path)["checkpoint"]["sha256"] == "abc"
+
+
+def test_experiment_report_without_checkpoint_cannot_be_promoted():
+    report = build_experiment_report(
+        experiment={"experiment_id": "untracked"},
+        rollout_metrics={"horizons": {1: {"beats_copy_last": True}}, "event_metrics": {}},
+    )
+    assert report["promotion_verdict"]["promoted"] is False
+    assert "checkpoint identity requires path and sha256" in report["promotion_verdict"]["reasons"]
 
 
 def test_training_replay_experiment_cannot_be_promoted():

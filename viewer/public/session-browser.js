@@ -21,9 +21,13 @@ function qualityNode(quality) {
   return wrap;
 }
 
-export function episodeUrls(sessionId, episodeId) {
+export function episodeUrls(sessionId, episodeId, experimentId = null) {
   const base = `/api/sessions/${encodeURIComponent(sessionId)}/episodes/${encodeURIComponent(episodeId)}`;
-  return { frames: `${base}/frames`, predictions: `${base}/predictions` };
+  const predictions = `${base}/predictions`;
+  return {
+    frames: `${base}/frames`,
+    predictions: experimentId ? `${predictions}?experiment=${encodeURIComponent(experimentId)}` : predictions,
+  };
 }
 
 export function mountSessionBrowser(root, { loadSessions = () => fetch("/api/sessions").then((r) => {
@@ -37,11 +41,16 @@ export function mountSessionBrowser(root, { loadSessions = () => fetch("/api/ses
     const title = document.createElement("h2"); title.textContent = `${session.id} / ${episode}`;
     const stripTitle = document.createElement("h3"); stripTitle.textContent = "Predicted vs actual";
     const viewer = document.createElement("pixel-horizon-viewer");
-    const urls = episodeUrls(session.id, episode);
+    const selectedExperiment = filtersState.experiment === "__current__"
+      ? currentExperiment : filtersState.experiment;
+    const experimentId = session.experiments?.some((entry) => entry.id === selectedExperiment)
+      ? selectedExperiment : null;
+    const urls = episodeUrls(session.id, episode, experimentId);
     viewer.setAttribute("frames-src", urls.frames); viewer.setAttribute("predictions-src", urls.predictions);
     const dreamTitle = document.createElement("h3"); dreamTitle.textContent = "Dreamed vs actual";
     const dream = document.createElement("pixel-horizon-viewer");
-    dream.setAttribute("frames-src", urls.frames); dream.setAttribute("predictions-src", `${urls.predictions}?kind=dream`);
+    dream.setAttribute("frames-src", urls.frames);
+    dream.setAttribute("predictions-src", `${urls.predictions}${experimentId ? "&" : "?"}kind=dream`);
     const diagnostics = document.createElement("div"); diagnostics.className = "diagnostics"; diagnostics.textContent = "Loading diagnostic streams…";
     let diagnosticCursor = null;
     const syncTime = (source, t, tick) => {

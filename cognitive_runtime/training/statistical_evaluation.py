@@ -68,8 +68,11 @@ def build_experiment_report(
     """
     rollout_metrics = rollout_metrics or {}
     training_stats = training_stats or {}
+    checkpoint = dict(checkpoint or {})
     horizons = rollout_metrics.get("horizons", {})
     reasons: list[str] = []
+    if not checkpoint.get("path") or not checkpoint.get("sha256"):
+        reasons.append("checkpoint identity requires path and sha256")
     if training_stats.get("evaluation_mode") == "training_replay":
         reasons.append("training-replay evaluation cannot support promotion")
     for horizon, values in horizons.items():
@@ -90,7 +93,7 @@ def build_experiment_report(
         "training_stats": training_stats,
         "metrics": {"direct": direct_metrics or {}, "rollout": rollout_metrics},
         "event_stratified_metrics": rollout_metrics.get("event_metrics", {}),
-        "checkpoint": checkpoint or {},
+        "checkpoint": checkpoint,
         "promotion_verdict": {"promoted": not reasons, "reasons": reasons or ["all configured gates passed"]},
     }
 
