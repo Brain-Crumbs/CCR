@@ -112,6 +112,9 @@ class CortexHorizonPrediction:
     uncertainty: torch.Tensor
     modalities: Dict[str, torch.Tensor] = field(default_factory=dict)
     change_mask: Optional[torch.Tensor] = None
+    #: The RGB residual before it is gated and added to the reference frame.
+    #: Exposed for rollout-collapse diagnostics; it is never a workspace modality.
+    residual_delta: Optional[torch.Tensor] = None
     semantic_logits: Optional[torch.Tensor] = None
 
 
@@ -137,6 +140,7 @@ class CortexSequencePrediction:
     uncertainty: torch.Tensor
     modalities: Dict[str, torch.Tensor] = field(default_factory=dict)
     change_mask: Optional[torch.Tensor] = None
+    residual_delta: Optional[torch.Tensor] = None
     semantic_logits: Optional[torch.Tensor] = None
 
 
@@ -193,7 +197,14 @@ class SpatialResidualDecoder(nn.Module):
         reference = reference_frame
         if tuple(reference.shape[-2:]) != size:
             reference = F.interpolate(reference, size=size, mode="area")
-        result = {"vision": torch.clamp(reference + mask * delta, 0, 1), "change_mask": mask}
+        result = {
+            "vision": torch.clamp(reference + mask * delta, 0, 1),
+            "change_mask": mask,
+            # Keep the un-gated value visible to the training/evaluation
+            # diagnostics.  A tiny gate and a tiny residual are distinct
+            # collapse modes and need different fixes.
+            "residual_delta": delta,
+        }
         if self.semantic_head is not None:
             result["semantic_logits"] = F.interpolate(self.semantic_head(x), size=(9, 9), mode="bilinear", align_corners=False)
         return result["vision"] if legacy else result
@@ -487,8 +498,9 @@ class PredictiveCortex(nn.Module):
             risk=risk,
             uncertainty=uncertainty,
             modalities={name: value for name, value in decoded_workspace.items()
-                        if name not in {"vision", "change_mask", "semantic_logits"}},
+                        if name not in {"vision", "change_mask", "residual_delta", "semantic_logits"}},
             change_mask=decoded_workspace.get("change_mask"),
+            residual_delta=decoded_workspace.get("residual_delta"),
             semantic_logits=decoded_workspace.get("semantic_logits"),
         )
 
@@ -515,40 +527,6 @@ class PredictiveCortex(nn.Module):
             latent, hidden = self.step(latent, actions[:, i], hidden)
             predictions.append(latent)
         return torch.stack(predictions, dim=1), hidden
-
-    def rollout_visual(
-        self, start_latent: torch.Tensor, actions: torch.Tensor, hidden: Any, *,
-        reference_frame: torch.Tensor, reference_spatial: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Any]:
-        """Closed-loop latent *and visual* rollout with no observation reuse.
-
-        The returned ``vision`` at step ``n`` becomes the residual reference
-        for step ``n + 1``. This is the visual counterpart to :meth:`rollout`;
-        callers that only need tokens retain the lightweight old API.
-        """
-        latents, visions, masks, semantics = [], [], [], []
-        latent = start_latent
-        for i in range(actions.shape[1]):
-            latent, hidden = self.step(latent, actions[:, i], hidden)
-            decoded = self.decode_prediction(
-                latent, reference_frame=reference_frame, reference_spatial=reference_spatial,
-            )
-            latents.append(latent)
-            visions.append(decoded["vision"])
-            masks.append(decoded["change_mask"])
-            if "semantic_logits" in decoded:
-                semantics.append(decoded["semantic_logits"])
-            reference_frame = decoded["vision"]
-            reference_spatial = self.encode_visual(F.interpolate(
-                reference_frame, size=self.pixel_shape[:2], mode="nearest"
-            )).spatial
-        visual: Dict[str, torch.Tensor] = {
-            "vision": torch.stack(visions, dim=1),
-            "change_mask": torch.stack(masks, dim=1),
-        }
-        if semantics:
-            visual["semantic_logits"] = torch.stack(semantics, dim=1)
-        return torch.stack(latents, dim=1), visual, hidden
 
     def forward_horizons(
         self,
@@ -607,9 +585,10 @@ class PredictiveCortex(nn.Module):
                     uncertainty=uncertainty,
                     modalities={
                         name: value for name, value in decoded_workspace.items()
-                        if name not in {"vision", "change_mask", "semantic_logits"}
+                        if name not in {"vision", "change_mask", "residual_delta", "semantic_logits"}
                     },
                     change_mask=decoded_workspace.get("change_mask"),
+                    residual_delta=decoded_workspace.get("residual_delta"),
                     semantic_logits=decoded_workspace.get("semantic_logits"),
                 )
             # A rollout must not re-decode every horizon against the observed

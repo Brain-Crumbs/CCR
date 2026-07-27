@@ -67,8 +67,11 @@ def build_experiment_report(
     the clinic do not need hidden in-memory state to explain a verdict.
     """
     rollout_metrics = rollout_metrics or {}
+    training_stats = training_stats or {}
     horizons = rollout_metrics.get("horizons", {})
     reasons: list[str] = []
+    if training_stats.get("evaluation_mode") == "training_replay":
+        reasons.append("training-replay evaluation cannot support promotion")
     for horizon, values in horizons.items():
         if not values.get("beats_copy_last", False):
             reasons.append(f"rollout t+{horizon} does not beat copy-last")
@@ -84,7 +87,7 @@ def build_experiment_report(
         "experiment": dict(experiment),
         "data_quality_summary": data_quality or {},
         "split_overlap_summary": split_overlap or {},
-        "training_stats": training_stats or {},
+        "training_stats": training_stats,
         "metrics": {"direct": direct_metrics or {}, "rollout": rollout_metrics},
         "event_stratified_metrics": rollout_metrics.get("event_metrics", {}),
         "checkpoint": checkpoint or {},

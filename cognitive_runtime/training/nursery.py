@@ -160,33 +160,30 @@ class NurseryConfig:
     #: near-exact duplicate of a recorded training episode (issue #202:
     #: ``record.quality.audit_split_overlap``) -- a "held-out" evaluation
     #: that leaky cannot support the generalization claim it exists to make.
-    #: Defaults off (unlike ``data_quality_gate``), for two independent
-    #: reasons:
+    #: Defaults off (unlike ``data_quality_gate``), because callers may use
+    #: deliberately repeated smoke-test recordings.  The bundled Crafter
+    #: scenarios retain seed-specific visual context and pass this gate at
+    #: the default threshold.
     #:
-    #: - Minecraft's simulated backend does not re-render
+    #: Minecraft's simulated backend does not re-render
     #:   ``vision.frame.pixels`` for a scripted non-player entity's own
     #:   movement (only for the player's own position/facing changing), so
     #:   ``object_permanence``/``approach_entity`` recordings there are
     #:   pixel-frozen regardless of scripted parameter or seed -- a
     #:   pre-existing rendering gap this issue's Crafter-focused fixes do
     #:   not reach.
-    #: - Any scenario (either world) that places its scripted entity/wall
-    #:   relative to the player's spawn point -- always the exact world
-    #:   center in Crafter, regardless of seed -- legitimately shares much
-    #:   of its early "approach" background across every episode; only the
-    #:   scripted parameter (distance/depth) varies. That is by design (the
-    #:   issue's own guidance: hold out a new distance/depth, not a new
-    #:   world), not evidence of a leaked recording, but it also means the
-    #:   default ``max_corresponding_frame_fraction`` is far looser than
-    #:   these scenarios would need to pass cleanly.
-    #:
-    #: Turn this on explicitly for scenarios with no such convergence point
-    #: (``turn``, ``walk_forward_short`` -- verified leak-free at the
-    #: default threshold in ``tests/test_crafter_scenarios.py``), and treat
-    #: ``approach_entity``/``object_permanence``/``blocked_forward`` as
-    #: needing their own, much looser (or disabled) threshold if enabled at
-    #: all.
+    #: A custom scenario that intentionally erases its seeded background or
+    #: places exactly the same scripted path in every seed can still need a
+    #: looser, scenario-specific threshold; it must not use that as a way to
+    #: bless an otherwise invalid generalization split.
     split_overlap_gate: bool = False
+    #: Diagnostic-only mode: evaluate each trained scenario on the exact
+    #: recorded sessions used for training.  This is an intentional
+    #: memorization/overfit canary, never a generalization result.  It
+    #: requires no zero-shot scenarios and bypasses the split-overlap gate
+    #: because the evaluation set is deliberately identical to the training
+    #: set.
+    overfit_evaluation: bool = False
     #: Hard-fail threshold (fraction of index-aligned matching frames) for
     #: ``split_overlap_gate`` -- see ``audit_split_overlap``'s docstring for
     #: why this defaults looser than the <1% acceptance target: an exact
@@ -556,6 +553,28 @@ def _crafter_clear_terrain(world: Any, cx: int, cy: int, radius: int) -> None:
             world[(x, y)] = "grass"
 
 
+def _crafter_clear_route(
+    world: Any, x: int, y: int, dx: int, dy: int, length: int, *, width: int = 1,
+) -> None:
+    """Clear only a narrow, deterministic route through a seeded world.
+
+    The earlier entity scenarios cleared a square whose radius grew with the
+    target distance.  That made a different Crafter seed visually irrelevant:
+    most of every train and holdout frame was the same synthetic grass field.
+    A route gives scripted actions and mobs reliable collision-free cells
+    while retaining the seed-specific terrain around them as useful context.
+    """
+    area = world.area
+    perpendicular_x, perpendicular_y = -dy, dx
+    for step in range(max(0, int(length)) + 1):
+        cx, cy = x + dx * step, y + dy * step
+        for offset in range(-width, width + 1):
+            px = cx + perpendicular_x * offset
+            py = cy + perpendicular_y * offset
+            if 0 <= px < area[0] and 0 <= py < area[1]:
+                world[(px, py)] = "grass"
+
+
 def _crafter_disable_neglect_and_spawn_balance(env: Any) -> None:
     """Disable Crafter's own periodic spawn/despawn chunk balancing
     (``Env._balance_chunk``, no Minecraft-style ``max_mobs=0`` knob exists)
@@ -698,7 +717,36 @@ def _crafter_occlusion_distances(close: int, hidden: int, phase_ticks: int) -> L
 
 
 _CRAFTER_MOVE_UP = Action("MOVE_UP")
+_CRAFTER_MOVE_DOWN = Action("MOVE_DOWN")
 _CRAFTER_MOVE_LEFT = Action("MOVE_LEFT")
+_CRAFTER_MOVE_RIGHT = Action("MOVE_RIGHT")
+
+
+def _crafter_seeded_route(seed: int) -> Tuple[int, int, Action, Action]:
+    """Return one cardinal route, deterministically varied by episode seed."""
+    routes = (
+        (0, -1, _CRAFTER_MOVE_UP, _CRAFTER_MOVE_DOWN),
+        (1, 0, _CRAFTER_MOVE_RIGHT, _CRAFTER_MOVE_LEFT),
+        (0, 1, _CRAFTER_MOVE_DOWN, _CRAFTER_MOVE_UP),
+        (-1, 0, _CRAFTER_MOVE_LEFT, _CRAFTER_MOVE_RIGHT),
+    )
+    return routes[seed % len(routes)]
+
+
+def _crafter_alternating_policy(
+    forward: Action, backward: Action, forward_steps: int, episode_ticks: int,
+) -> ScriptedSequencePolicy:
+    """Keep an entity-approach recording dynamic without hitting its target."""
+    steps = max(1, int(forward_steps))
+    remaining = max(1, int(episode_ticks))
+    sequence: List[Tuple[Action, int]] = []
+    direction = forward
+    while remaining:
+        count = min(steps, remaining)
+        sequence.append((direction, count))
+        remaining -= count
+        direction = backward if direction == forward else forward
+    return ScriptedSequencePolicy(sequence)
 
 
 def _crafter_safe_corridor_length(world_size: int, margin: int = 2) -> int:
@@ -739,17 +787,21 @@ _BLOCKED_FORWARD_TRAIN_COLLISION_DISTANCES = (4, 6, 8, 10)
 _BLOCKED_FORWARD_HOLDOUT_COLLISION_DISTANCES = (5, 7, 9, 11)
 
 
-def _crafter_setup_blocked_corridor(collision_distance: int, env: Any) -> None:
+def _crafter_setup_blocked_corridor(
+    collision_distance: int, dx: int, dy: int, recovery_dx: int, recovery_dy: int, env: Any,
+) -> None:
     _crafter_remove_wildlife(env)
     x, y = int(env._player.pos[0]), int(env._player.pos[1])
-    collision_y = y - collision_distance
-    # Clear enough room around the collision point for the recovery phase's
-    # sideways move too, not just the forward approach -- the recovery
-    # action must reliably succeed regardless of what world generation put
-    # there for this seed.
-    clear_radius = max(collision_distance, _BLOCKED_FORWARD_RECOVER_TICKS) + 3
-    _crafter_clear_terrain(env._world, x, collision_y, radius=clear_radius)
-    env._world[(x, collision_y)] = "stone"
+    # Retain the generated world around the route; only the forward lane and
+    # short recovery lane need editing for deterministic scripted behaviour.
+    _crafter_clear_route(env._world, x, y, dx, dy, collision_distance, width=1)
+    before_wall_x = x + dx * max(0, collision_distance - 1)
+    before_wall_y = y + dy * max(0, collision_distance - 1)
+    _crafter_clear_route(
+        env._world, before_wall_x, before_wall_y,
+        recovery_dx, recovery_dy, _BLOCKED_FORWARD_RECOVER_TICKS, width=1,
+    )
+    env._world[(x + dx * collision_distance, y + dy * collision_distance)] = "stone"
 
 
 def _crafter_blocked_forward(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
@@ -768,19 +820,22 @@ def _crafter_blocked_forward(seed: int, cfg: NurseryConfig) -> ScenarioRecording
         seed, cfg,
         _BLOCKED_FORWARD_TRAIN_COLLISION_DISTANCES, _BLOCKED_FORWARD_HOLDOUT_COLLISION_DISTANCES,
     )
+    dx, dy, forward_action, recovery_action = _crafter_seeded_route(seed)
 
     def scene_setup(program: Any) -> None:
         # Registered as a post-reset hook (issue #202, mirrors
         # ``_crafter_clear_walk_corridor``) so each seed's fresh world is
         # edited before its first frame is ever published, not after.
         program.set_post_reset_hook(
-            lambda env: _crafter_setup_blocked_corridor(collision_distance, env)
+            lambda env: _crafter_setup_blocked_corridor(
+                collision_distance, dx, dy, -dx, -dy, env,
+            )
         )
 
     policy = ScriptedSequencePolicy(
         [
-            (_CRAFTER_MOVE_UP, collision_distance + _BLOCKED_FORWARD_BLOCKED_HOLD),
-            (_CRAFTER_MOVE_LEFT, _BLOCKED_FORWARD_RECOVER_TICKS),
+            (forward_action, collision_distance + _BLOCKED_FORWARD_BLOCKED_HOLD),
+            (recovery_action, _BLOCKED_FORWARD_RECOVER_TICKS),
         ]
     )
     episode_ticks = collision_distance + _BLOCKED_FORWARD_BLOCKED_HOLD + _BLOCKED_FORWARD_RECOVER_TICKS
@@ -802,19 +857,28 @@ def _crafter_approach_entity(seed: int, cfg: NurseryConfig) -> ScenarioRecording
     distance = _split_parameter(
         seed, cfg, _APPROACH_ENTITY_TRAIN_DISTANCES, _APPROACH_ENTITY_HOLDOUT_DISTANCES
     )
+    dx, dy, forward_action, backward_action = _crafter_seeded_route(seed)
+    lateral_offset = (seed // 4) % 3 - 1
+    # Stop two cells short of the cow, then retreat and repeat.  This keeps
+    # scale-change supervision while avoiding the long collision-induced
+    # stationary tail that previously dominated short approach recordings.
+    forward_steps = max(1, distance - 2)
 
     def _setup_approach(env: Any) -> None:
         import crafter as crafter_pkg
 
         x, y = int(env._player.pos[0]), int(env._player.pos[1])
-        target = (x, y - distance)
-        _crafter_clear_terrain(env._world, x, y - distance // 2, radius=distance + 3)
+        target = (x + dx * distance - dy * lateral_offset,
+                  y + dy * distance + dx * lateral_offset)
+        _crafter_clear_route(env._world, x, y, dx, dy, distance, width=1)
+        # The seed-specific world can place wildlife on the target cell.
+        # Clear those objects before adding our scripted cow; changing terrain
+        # alone does not clear Crafter's object-occupancy map.
+        _crafter_remove_wildlife(env)
         cow = crafter_pkg.objects.Cow(env._world, target)
         env._world.add(cow)
-        # Remove whatever wildlife world generation happened to spawn and
-        # freeze the scripted cow in place -- an entity scenario's recorded
-        # population must be exactly its own scripted entity, nothing else
-        # (issue #202).
+        # Freeze the scripted cow in place; it is now the scenario's only
+        # non-player entity.
         _crafter_freeze_scripted_entities(env, keep=[cow])
 
     def scene_setup(program: Any) -> None:
@@ -825,7 +889,12 @@ def _crafter_approach_entity(seed: int, cfg: NurseryConfig) -> ScenarioRecording
         # already-published first recorded frame.
         program.set_post_reset_hook(_setup_approach)
 
-    return ScenarioRecording(policy=ConstantActionPolicy(_CRAFTER_MOVE_UP), scene_setup=scene_setup)
+    return ScenarioRecording(
+        policy=_crafter_alternating_policy(
+            forward_action, backward_action, forward_steps, cfg.episode_ticks,
+        ),
+        scene_setup=scene_setup,
+    )
 
 
 #: Disjoint by construction (issue #202) -- how many cells past the
@@ -844,16 +913,23 @@ def _crafter_object_permanence(seed: int, cfg: NurseryConfig) -> ScenarioRecordi
         _CRAFTER_OBJECT_PERMANENCE_HOLDOUT_HIDDEN_DELTAS,
     )
     hidden = CrafterConfig().grid_radius + 3 + hidden_delta
+    dx, dy, _forward_action, _backward_action = _crafter_seeded_route(seed)
 
     def _setup_occlusion(env: Any) -> None:
         import crafter as crafter_pkg
 
         x, y = int(env._player.pos[0]), int(env._player.pos[1])
-        _crafter_clear_terrain(env._world, x, y, radius=hidden + 3)
-        cow = crafter_pkg.objects.Cow(env._world, (x + close, y))
+        _crafter_clear_route(env._world, x, y, dx, dy, hidden, width=1)
+        # As above, remove a seed-generated object before claiming the
+        # scripted path's initial cell for the cow.
+        _crafter_remove_wildlife(env)
+        cow = crafter_pkg.objects.Cow(env._world, (x + dx * close, y + dy * close))
         env._world.add(cow)
         _crafter_freeze_scripted_entities(env, keep=[cow])
-        path = [(x + d, y) for d in _crafter_occlusion_distances(close, hidden, phase_ticks)]
+        path = [
+            (x + dx * distance, y + dy * distance)
+            for distance in _crafter_occlusion_distances(close, hidden, phase_ticks)
+        ]
         _crafter_script_mob_path(cow, path)
 
     def scene_setup(program: Any) -> None:
@@ -926,12 +1002,14 @@ CRAFTER_SCENARIOS: Dict[str, NurseryScenario] = {
     ),
     "approach_entity": NurseryScenario(
         "approach_entity",
-        "scripted approach to a frozen entity -- scale change with distance.",
+        "seed-varied approach and retreat around a frozen entity -- scale change with distance.",
         _crafter_approach_entity,
-        # The approach distance is 6-11 blocks (seed-dependent) and the
-        # agent stops once blocked by the entity, so with 400 ticks the
-        # per-tick rate is only 6/400=0.015 at the shortest distance.
+        # The approach route turns around before collision, so a short
+        # recording remains motion-rich rather than becoming a long blocked
+        # tail after reaching the cow.
         min_blocks_per_tick=0.01,
+        min_moving_transition_fraction=0.6,
+        max_longest_stationary_tail=2,
     ),
 }
 
@@ -1710,8 +1788,13 @@ class JointNurseryReport:
     model_config: ActionWorldModelConfig
     #: scenario -> its recorded train-seed session dirs (training pool).
     train_sessions: Dict[str, List[str]] = field(default_factory=dict)
-    #: scenario -> its recorded holdout-seed session dirs (evaluation).
+    #: scenario -> its recorded evaluation session dirs.  In
+    #: ``overfit_evaluation`` mode these are intentionally the same paths as
+    #: ``train_sessions``.
     eval_sessions: Dict[str, List[str]] = field(default_factory=dict)
+    #: ``"held_out"`` for ordinary evaluation or ``"training_replay"`` for
+    #: the diagnostic memorization canary.
+    evaluation_mode: str = "held_out"
     training_stats: Dict[str, Any] = field(default_factory=dict)
     #: In-distribution generalization: per train scenario, evaluated on that
     #: scenario's held-out seeds ({"horizons": ..., "rollout_health": ...}).
@@ -1785,7 +1868,8 @@ def run_nursery_joint(
     model on the train scenarios' train seeds, then evaluate:
 
     - per train scenario on its held-out seeds (in-distribution
-      generalization),
+      generalization), or, when ``config.overfit_evaluation`` is enabled,
+      on the exact training recordings as a memorization diagnostic,
     - per held-out scenario the model never saw (zero-shot generality --
       the metric that separates "memorized six scripted policies" from
       "learned how actions move the view"),
@@ -1821,6 +1905,11 @@ def run_nursery_joint(
         raise ValueError(f"scenarios cannot be both trained and held out: {sorted(overlap)}")
     if not train_names:
         raise ValueError("no training scenarios left after excluding holdouts")
+    if cfg.overfit_evaluation and holdout_names:
+        raise ValueError(
+            "overfit_evaluation requires no holdout_scenarios; it evaluates "
+            "the supplied train_scenarios on their exact training recordings"
+        )
 
     model_cfg = model_config or ActionWorldModelConfig(
         latent_width=cfg.latent_width,
@@ -1842,19 +1931,27 @@ def run_nursery_joint(
 
     log.info("=== nursery joint: train=%s  holdout=%s  world=%s ===",
              train_names, holdout_names, cfg.world)
+    if cfg.overfit_evaluation:
+        log.warning(
+            "OVERFIT DIAGNOSTIC: evaluating exact training recordings; "
+            "metrics are not generalization results"
+        )
     trace_event(
         "nursery.joint.plan",
         train_scenarios=train_names, holdout_scenarios=holdout_names, world=cfg.world,
         train_seeds=list(cfg.train_seeds), holdout_seeds=list(cfg.holdout_seeds),
         horizons=list(cfg.horizons), epochs=model_cfg.epochs, backbone=model_cfg.backbone,
         training_objective=model_cfg.training_objective,
+        evaluation_mode="training_replay" if cfg.overfit_evaluation else "held_out",
     )
 
     train_sessions: Dict[str, List[str]] = {}
     eval_sessions: Dict[str, List[str]] = {}
     with span("nursery.record",
               scenarios=len(train_names) + len(holdout_names),
-              episodes=(len(train_names) * (len(cfg.train_seeds) + len(cfg.holdout_seeds))
+              episodes=(len(train_names) * (len(cfg.train_seeds) + (
+                  0 if cfg.overfit_evaluation else len(cfg.holdout_seeds)
+              ))
                         + len(holdout_names) * len(cfg.holdout_seeds))) as recording_span:
         for name in train_names:
             scenario = scenarios[name]
@@ -1865,12 +1962,16 @@ def run_nursery_joint(
                     )
                     for seed in cfg.train_seeds
                 ]
-                eval_sessions[name] = [
-                    _record_scenario_episode(
-                        record_dir, f"nursery-{name}-holdout-{seed}", seed, scenario, cfg
-                    )
-                    for seed in cfg.holdout_seeds
-                ]
+                eval_sessions[name] = (
+                    list(train_sessions[name])
+                    if cfg.overfit_evaluation
+                    else [
+                        _record_scenario_episode(
+                            record_dir, f"nursery-{name}-holdout-{seed}", seed, scenario, cfg
+                        )
+                        for seed in cfg.holdout_seeds
+                    ]
+                )
         for name in holdout_names:
             scenario = scenarios[name]
             with span("nursery.record.scenario", scenario=name, split="zero-shot"):
@@ -1889,8 +1990,11 @@ def run_nursery_joint(
         with span("nursery.quality_gate") as gate_span:
             issues: List[str] = []
             for name in train_names:
+                sessions = train_sessions[name] if cfg.overfit_evaluation else (
+                    train_sessions[name] + eval_sessions[name]
+                )
                 issues += validate_nursery_recordings(
-                    train_sessions[name] + eval_sessions[name],
+                    sessions,
                     scenarios[name],
                     expected_pixel_source=cfg.expected_pixel_source,
                 )
@@ -1912,7 +2016,7 @@ def run_nursery_joint(
                 )
             log.info("quality gate passed")
 
-    if cfg.split_overlap_gate:
+    if cfg.split_overlap_gate and not cfg.overfit_evaluation:
         with span("nursery.split_overlap_gate") as overlap_span:
             # Pooled, not per-scenario (issue #202 review): the joint model
             # trains on every train scenario's sessions at once, and
@@ -1936,6 +2040,12 @@ def run_nursery_joint(
                     + "\n  - ".join(overlap_report.issues)
                 )
             log.info("split-overlap gate passed")
+    elif cfg.overfit_evaluation:
+        # The diagnostic intentionally evaluates identical session paths;
+        # running the normal leakage detector would reject the condition this
+        # mode exists to test.
+        trace_event("nursery.split_overlap_gate.skipped", reason="overfit_evaluation")
+        log.info("split-overlap gate skipped for overfit diagnostic")
 
     # Pin the vocabulary to the full action space (plus NULL): a held-out
     # scenario may issue actions no training scenario used, and zero-shot
@@ -1992,12 +2102,16 @@ def run_nursery_joint(
         model, training_stats = train_action_world_model(
             dataset, model_cfg, transition_weights=transition_weights,
         )
+        training_stats["evaluation_mode"] = (
+            "training_replay" if cfg.overfit_evaluation else "held_out"
+        )
         train_span.set(final_total_loss=_final_loss(training_stats))
 
     scenario_metrics: Dict[str, Dict[str, Any]] = {}
-    with span("nursery.evaluate.in_distribution", scenarios=len(train_names)):
+    evaluation_split = "training_replay" if cfg.overfit_evaluation else "in_distribution"
+    with span(f"nursery.evaluate.{evaluation_split}", scenarios=len(train_names)):
         for name in train_names:
-            with span("nursery.evaluate.scenario", scenario=name, split="in_distribution"):
+            with span("nursery.evaluate.scenario", scenario=name, split=evaluation_split):
                 holdout_dataset = build_action_sequence_dataset(
                     eval_sessions[name], action_keys=model.action_keys
                 )
@@ -2005,7 +2119,7 @@ def run_nursery_joint(
                     model, holdout_dataset, model.horizons_ticks,
                     warmup_frames=model_cfg.warmup_frames,
                 )
-                _trace_horizon_metrics("in_distribution", name, scenario_metrics[name])
+                _trace_horizon_metrics(evaluation_split, name, scenario_metrics[name])
     zero_shot_metrics: Dict[str, Dict[str, Any]] = {}
     with span("nursery.evaluate.zero_shot", scenarios=len(holdout_names)):
         for name in holdout_names:
@@ -2039,6 +2153,7 @@ def run_nursery_joint(
         model_config=model_cfg,
         train_sessions=train_sessions,
         eval_sessions=eval_sessions,
+        evaluation_mode="training_replay" if cfg.overfit_evaluation else "held_out",
         training_stats=training_stats,
         scenario_metrics=scenario_metrics,
         zero_shot_metrics=zero_shot_metrics,

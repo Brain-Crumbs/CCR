@@ -49,3 +49,13 @@ def test_experiment_report_round_trips_with_checkpoint_identity(tmp_path):
     )
     path = write_experiment_report(str(tmp_path / "experiment_report.json"), report)
     assert load_experiment_report(path)["checkpoint"]["sha256"] == "abc"
+
+
+def test_training_replay_experiment_cannot_be_promoted():
+    report = build_experiment_report(
+        experiment={"experiment_id": "overfit"},
+        training_stats={"evaluation_mode": "training_replay"},
+        rollout_metrics={"horizons": {1: {"beats_copy_last": True}}, "event_metrics": {}},
+    )
+    assert report["promotion_verdict"]["promoted"] is False
+    assert "training-replay evaluation cannot support promotion" in report["promotion_verdict"]["reasons"]

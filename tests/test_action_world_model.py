@@ -35,6 +35,10 @@ from cognitive_runtime.training.nursery import (  # noqa: E402
     _record_scenario_episode,
     run_nursery_joint,
 )
+from cognitive_runtime.training.prediction_export import (  # noqa: E402
+    ExperimentIdentity,
+    export_cortex_session_predictions,
+)
 from cognitive_runtime.training.action_world_model import ActionWorldModelConfig  # noqa: E402
 from cognitive_runtime.core.action import Action  # noqa: E402
 from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy  # noqa: E402
@@ -309,6 +313,41 @@ def test_direct_evaluation_uses_direct_heads_not_closed_loop_rollout(turn_sessio
     assert report["prediction_mode"] == "direct"
     assert report["horizons_ticks"] == [1, 4]
     assert set(calls) == {1, 4}
+
+
+def test_windowed_rollout_trains_nondefault_direct_horizon_head(turn_session):
+    """T+4 direct evaluation must not read an untouched random head."""
+    dataset = build_action_sequence_dataset([turn_session])
+    cfg = _small_model_config(
+        epochs=1, horizons_ticks=(1, 3), workspace_enabled=False,
+    )
+    model = build_action_world_model(dataset.pixel_shape, dataset.action_keys, cfg)
+    before = model.multi_token_heads["3"]["latent"].weight.detach().clone()
+    trained, stats = train_action_world_model(dataset, cfg, initial_model=model)
+    after = trained.multi_token_heads["3"]["latent"].weight.detach().cpu()
+    assert not torch.equal(before, after)
+    assert stats["final_direct_pixel_loss"] > 0
+    assert stats["final_direct_latent_loss"] > 0
+    assert stats["device"] == str(next(trained.parameters()).device)
+
+
+def test_cortex_prediction_export_follows_model_device(turn_session, tmp_path):
+    """CUDA cortex exports must move input frames to the model, then JSON back to CPU."""
+    dataset = build_action_sequence_dataset([turn_session])
+    cfg = _small_model_config(horizons_ticks=(1, 3), workspace_enabled=False)
+    model = build_action_world_model(dataset.pixel_shape, dataset.action_keys, cfg)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    checkpoint = tmp_path / "cortex.pt"
+    save_action_world_model(str(checkpoint), model, {})
+    episode = dataset.episodes[0]
+    written = export_cortex_session_predictions(
+        model, dataset, episode.session_dir, episode.episode_id,
+        horizon_frames=[1, 3], prediction_mode="rollout",
+        checkpoint_path=str(checkpoint), experiment=ExperimentIdentity.create("device-test", "test"),
+        training_stats={}, out_path=str(tmp_path / "predictions.json"),
+    )
+    assert os.path.isfile(written)
 
 
 def test_direct_evaluation_preserves_colliding_tick_horizons(turn_session):
