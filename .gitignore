@@ -6,6 +6,9 @@ dist/
 .pytest_cache/
 sessions/
 /models/
+/runs/
+**/runs/
+*.log
 .venv/
 node_modules/
 package-lock.json

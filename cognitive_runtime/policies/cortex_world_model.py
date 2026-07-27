@@ -1,0 +1,443 @@
+"""Predictive-cortex world-model bridge: drive a trained recurrent,
+action-conditioned :class:`~brain.cortex.predictive.PredictiveCortex` as the
+loop's *live* ``WorldModel`` (issue #166).
+
+Until now the cortex was only trained/evaluated offline; the live runtime
+predicted with the trivial ``TrendWorldModel`` or the memoryless
+``MLPWorldModel``.  This adapter closes that gap behind the same
+``core.world_model.WorldModel`` seam every policy already reads through, so no
+loop or policy change is needed to switch the live world model over to the
+recurrent one.
+
+Unlike the memoryless bridges, the cortex carries a *world state* -- the
+backbone hidden state -- that must persist across cognitive ticks and reset on
+an episode boundary.  The loop already calls ``world_model.reset()`` at the
+start of every episode, so the rolling state lives entirely inside this adapter
+(no loop plumbing).
+
+Each tick:
+
+- encode the live ``vision.frame.pixels`` frame with the cortex's own encoder
+  into a latent (the cortex's own visual pathway, not the fused latent the
+  memoryless bridge reads);
+- score *this* tick's prediction error as how wrong last tick's forecast of
+  this latent was -- the genuine surprise/novelty signal, computed from the
+  cortex's own closed-loop forecast rather than a self-reported estimate;
+- advance the world state by one real ``(latent, last-action)`` step and read
+  the reward / terminal / risk heads off it, caching the one-step latent
+  forecast for next tick's prediction-error comparison.
+
+Like the other bridges it cannot condition on the action about to be taken
+(``predict`` runs before the policy chooses), so the rollout repeats the last
+action the runtime emitted -- the steady-state "if we keep doing what we just
+did" assumption a curiosity/novelty consumer has available this tick.
+
+Imports torch (via the cortex), so the CLI imports it lazily; the rest of the
+runtime stays torch-free.
+"""
+
+from __future__ import annotations
+
+import base64
+from typing import Any, Optional, Sequence, Union
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from brain.hippocampus import HippocampalRetrievalConfig, Hippocampus, Recall
+from cognitive_runtime.core.memory import Memory
+from cognitive_runtime.core.perception import State
+from cognitive_runtime.core.world_model import Prediction
+from cognitive_runtime.core.world_model import WorldModel as CoreWorldModel
+from cognitive_runtime.neural.pixel_stream_encoder import PIXEL_STREAM_ID
+
+
+def _record_frame(chw: torch.Tensor) -> str:
+    """Encode a decoded ``[C,H,W]`` frame for the JSONL decision record."""
+    hwc = (chw.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).permute(1, 2, 0)
+    return base64.b64encode(hwc.contiguous().cpu().numpy().tobytes()).decode("ascii")
+
+
+class CortexWorldModel(CoreWorldModel):
+    """Bridges a trained ``PredictiveCortex`` into the loop's ``WorldModel``
+    seam, holding the recurrent hidden state across ticks within an episode."""
+
+    def __init__(
+        self,
+        model: Union["PredictiveCortex", str],  # noqa: F821 -- lazy torch type
+        action_keys: Optional[Sequence[str]] = None,
+        horizons: Optional[Sequence[int]] = None,
+        retrieval_config: Optional[HippocampalRetrievalConfig] = None,
+        cortex_version: int = 0,
+        consolidator: Optional[Any] = None,
+        consolidate_every_ticks: int = 0,
+        consolidation_steps: int = 1,
+        checkpoint_path: Optional[str] = None,
+    ):
+        # A string `model` is a checkpoint path (--world-model cortex:PATH):
+        # default the online-consolidation save target to that same path, so
+        # `--async-trainer` persists consolidated weights back where the run
+        # loaded them from unless the caller overrides `checkpoint_path`
+        # explicitly (issue #175 review: without this, in-memory-only
+        # `publish_to` weights are lost on episode end/crash/interrupt).
+        if isinstance(model, str):
+            from cognitive_runtime.training.action_world_model import (
+                load_action_world_model,
+            )
+
+            if checkpoint_path is None:
+                checkpoint_path = model
+            model, _stats = load_action_world_model(model)
+        self.model = model
+        self.model.eval()
+        self.checkpoint_path = checkpoint_path
+
+        keys = list(action_keys) if action_keys is not None else list(model.action_keys)
+        if not keys:
+            raise ValueError(
+                "CortexWorldModel needs action_keys (the checkpoint carried none); "
+                "pass the program's ordered action space explicitly"
+            )
+        self.action_keys = keys
+        self._action_index = {key: i for i, key in enumerate(self.action_keys)}
+
+        # Forecast horizons in frame steps. The live loop advances one frame per
+        # cognitive tick, so the checkpoint's tick-space horizons double as frame
+        # steps here (the common ~1-tick-per-frame case), matching
+        # ``PredictiveCortex.forward_horizons``' own default.
+        picked = horizons if horizons is not None else model.horizons_ticks
+        self.horizons = sorted({int(h) for h in picked})
+        if not self.horizons or self.horizons[0] < 1:
+            raise ValueError(f"horizons must be positive frame steps, got {picked!r}")
+
+        self.retrieval_config = retrieval_config or HippocampalRetrievalConfig()
+        self.cortex_version = int(cortex_version)
+        self._hippocampus: Optional[Hippocampus] = None
+        self._retrieval_surprise = 0.0
+        self._last_recalls: tuple[Recall, ...] = ()
+
+        # Rolling world state (reset on episode boundary):
+        self._hidden = None  # backbone hidden state, opaque to this adapter
+        # The cortex's one-step latent forecast for the *current* tick, made
+        # last tick -- compared against the actually-observed latent to score
+        # this tick's prediction error. ``None`` at episode start.
+        self._predicted_latent: Optional[torch.Tensor] = None
+        # The most recently encoded observation latent and the hidden state
+        # *before* predict()'s one-step advance — exposed for the cortex MPC
+        # predictor (issue #168), which evaluates each candidate action from
+        # the same pre-advance starting point.
+        self._latent: Optional[torch.Tensor] = None
+        self._pre_advance_hidden = None
+        self._latest_live_prediction: Optional[dict[str, Any]] = None
+
+        # Optional online-consolidation wiring (issue #175): a live
+        # `sleep.cortex_consolidation.CortexConsolidator` feeding real
+        # `(z0, actions, next_latents)` transitions from every tick and
+        # running a bounded sleep pass (then publishing the result back into
+        # this adapter) every `consolidate_every_ticks` ticks. `0` disables
+        # it -- the default, byte-for-byte unchanged behavior.
+        self.consolidator = consolidator
+        self.consolidate_every_ticks = consolidate_every_ticks
+        self.consolidation_steps = consolidation_steps
+        self._tick = 0
+
+    def configure_retrieval(self, hippocampus: Hippocampus) -> None:
+        """Attach the live organism's episodic store to this cortex."""
+        self._hippocampus = hippocampus
+
+    def set_retrieval_surprise(self, calibrated_surprise: float) -> None:
+        """Supply the loop's calibrated surprise gate for the next tick."""
+        self._retrieval_surprise = float(calibrated_surprise)
+
+    def set_cortex_version(self, version: int) -> None:
+        """Advance provenance after consolidated weights are published."""
+        self.cortex_version = int(version)
+        self.reset()
+
+    def hippocampal_context_latent(self) -> Optional[list[float]]:
+        """Cortex-native value stored beside the fused retrieval key."""
+        if self._latent is None:
+            return None
+        return self._latent.squeeze(0).detach().cpu().tolist()
+
+    def _workspace_modalities(self, memory: Memory) -> dict[str, torch.Tensor]:
+        """Bind the runtime's actual fused workspace plus efference copy."""
+        if not self.model.workspace_modalities:
+            return {}
+        latent = memory.fused_latent()
+        if latent is None:
+            raise ValueError("fused workspace is required by this cortex checkpoint")
+        if self.model.workspace_layout_hash != latent.layout_hash:
+            raise ValueError(
+                "fused workspace layout mismatch: cortex expects "
+                f"{self.model.workspace_layout_hash!r}, runtime has {latent.layout_hash!r}"
+            )
+        values: dict[str, torch.Tensor] = {}
+        if "workspace" in self.model.workspace_modalities:
+            values["workspace"] = torch.tensor([latent.vector], dtype=torch.float32)
+        if "efference" in self.model.workspace_modalities:
+            action = self._last_action_column(memory)
+            one_hot = torch.zeros(1, len(self.model.action_keys), dtype=torch.float32)
+            one_hot.scatter_(1, action.unsqueeze(1), 1.0)
+            values["efference"] = one_hot
+        return values
+
+    def reset(self) -> None:
+        self._hidden = None
+        self._predicted_latent = None
+        self._latent = None
+        self._pre_advance_hidden = None
+        self._retrieval_surprise = 0.0
+        self._last_recalls = ()
+        self._latest_live_prediction = None
+
+    def live_prediction_record(self) -> Optional[dict[str, Any]]:
+        """Return this tick's decoded live forecasts for the clinic Record."""
+        return self._latest_live_prediction
+
+    def _recall_into_context(self, memory: Memory) -> float:
+        """Retrieve, gate, and prepend compatible workspace-latent seeds."""
+        self._last_recalls = ()
+        if self._hippocampus is None:
+            return 0.0
+        fused = memory.fused_latent()
+        if fused is None:
+            return 0.0
+        recalls = self._hippocampus.retrieve(
+            fused.vector,
+            surprise=self._retrieval_surprise,
+            current_cortex_version=self.cortex_version,
+            config=self.retrieval_config,
+        )
+        best_first = tuple(
+            recall
+            for recall in recalls
+            if len(self._recall_token(recall)) == self.model.latent_width
+        )
+        if not best_first:
+            return 0.0
+
+        # ``retrieve`` ranks best-to-worst, while context is chronological:
+        # the last injected token sits nearest the next live input. Keep only
+        # recalls the configured window can hold, then inject weakest-to-best
+        # so truncation/the following live step discard weaker matches first.
+        context_capacity = self.model.context_length_max
+        if context_capacity is not None:
+            best_first = best_first[:context_capacity]
+        injection_order = tuple(reversed(best_first))
+
+        parameter = next(self.model.parameters())
+        recalled_latents = torch.tensor(
+            [[self._recall_token(recall) for recall in injection_order]],
+            dtype=parameter.dtype,
+            device=parameter.device,
+        )
+        recalled_actions = torch.tensor(
+            [[self._seed_action_index(recall) for recall in injection_order]],
+            dtype=torch.long,
+            device=parameter.device,
+        )
+        self._hidden = self.model.inject_context(
+            recalled_latents, recalled_actions, self._hidden
+        )
+        self._last_recalls = best_first
+        return max(self._recall_threat(recall) for recall in best_first)
+
+    @staticmethod
+    def _recall_token(recall: Recall) -> list[float]:
+        return recall.seed.context_z if recall.seed.context_z is not None else recall.seed.z
+
+    def _seed_action_index(self, recall: Recall) -> int:
+        for action in reversed(recall.seed.actions):
+            if action in self._action_index:
+                return self._action_index[action]
+        return 0
+
+    @staticmethod
+    def _recall_threat(recall: Recall) -> float:
+        tags = recall.seed.tags
+        tagged = float(tags.threat) if tags.threat is not None else 0.0
+        return max(0.0, min(1.0, max(tagged, 1.0 if tags.damage or tags.done else 0.0)))
+
+    def _last_action_column(self, memory: Memory) -> torch.Tensor:
+        """The last emitted action as a ``Tensor[1]`` index column (0 -- the
+        first action -- when nothing has been emitted yet, matching the
+        all-zero action one-hot the memoryless bridges fall back to)."""
+        index = 0
+        last_actions = memory.last_actions(1)
+        if last_actions:
+            found = self._action_index.get(last_actions[-1].key())
+            if found is not None:
+                index = found
+        return torch.tensor([index], dtype=torch.long)
+
+    def predict(self, state: State, memory: Memory) -> Prediction:
+        latest_pixels = memory.buffer.latest(PIXEL_STREAM_ID)
+        if latest_pixels is None:
+            # No pixel frame yet (first tick of an episode before the program
+            # publishes): no learned signal, like the memoryless bridge.
+            self._latest_live_prediction = None
+            return Prediction()
+
+        frame = latest_pixels.payload
+        shape = tuple(frame.shape) if isinstance(frame, np.ndarray) else None
+        if shape is not None and shape != tuple(self.model.pixel_shape):
+            raise ValueError(
+                f"pixel-frame shape {shape} != cortex's {tuple(self.model.pixel_shape)}; "
+                "re-train or align the render geometry"
+            )
+
+        with torch.no_grad():
+            # ``encode_frame`` is intentionally not used as the token: C2's
+            # token is the bound vision + TemporalFusion workspace state.
+            from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
+            pixel_batch = pixels_to_chw(frame).unsqueeze(0).to(next(self.model.parameters()).device)
+            latent = self.model.encode_workspace(pixel_batch, self._workspace_modalities(memory))
+
+            if self._hidden is None:
+                self._hidden = self.model.initial_state(1)
+
+            # This tick's prediction error: how wrong last tick's forecast of
+            # *this* latent turned out to be. ``None`` on the first tick, when
+            # there is no prior forecast to score against -- the same "no
+            # learned signal yet" fall-back the heuristic model uses.
+            prediction_error: Optional[float] = None
+            if self._predicted_latent is not None:
+                prediction_error = float(F.mse_loss(latent, self._predicted_latent))
+
+            # The action emitted since last tick's encoded latent -- computed
+            # once and reused both for recording the real transition below
+            # (issue #175) and for the rollout's steady-state repeat.
+            action_col = self._last_action_column(memory)
+
+            # Feed the live consolidator the real transition that just
+            # completed: last tick's latent + the action taken since ->
+            # this tick's actually-observed latent (dream_length=1). Must
+            # happen before ``self._latent`` below overwrites the previous
+            # tick's value.
+            if self.consolidator is not None and self._latent is not None:
+                self.consolidator.record_transition(
+                    z0=self._latent.squeeze(0).tolist(),
+                    actions=[self.action_keys[int(action_col.item())]],
+                    next_latents=latent.detach(),
+                )
+
+            recalled_threat = self._recall_into_context(memory)
+
+            # Snapshot for cortex MPC (issue #168): the encoded observation
+            # and the hidden state *before* the one-step advance below.
+            self._latent = latent
+            self._pre_advance_hidden = self._hidden
+
+            # Closed-loop rollout from the current world state, repeating the
+            # last action across every horizon (steady-state assumption). The
+            # first step is the *real* advance whose hidden state and latent
+            # forecast we persist; further steps are what-if look-ahead that
+            # must not corrupt the rolling state.
+            hidden = self._hidden
+            latent_i = latent
+            first_hidden = None
+            first_latent = None
+            decoded_by_horizon: dict[str, str] = {}
+            # Residual decoding is anchored to the observed frame once, then
+            # advances its own visual state with every imagined transition.
+            reference_frame = F.interpolate(
+                pixel_batch, size=self.model.reconstruction_shape[:2], mode="area"
+            )
+            reference_spatial = self.model.encode_visual(pixel_batch).spatial
+            for step_i in range(self.horizons[-1]):
+                latent_i, hidden = self.model.step(latent_i, action_col, hidden)
+                if step_i == 0:
+                    first_hidden, first_latent = hidden, latent_i
+                horizon = step_i + 1
+                decoded = self.model.decode_prediction(
+                    latent_i,
+                    reference_frame=reference_frame,
+                    reference_spatial=reference_spatial,
+                )
+                if horizon in self.horizons:
+                    decoded_by_horizon[str(horizon)] = _record_frame(
+                        decoded["vision"].squeeze(0)
+                    )
+                reference_frame = decoded["vision"]
+                reference_spatial = self.model.encode_visual(F.interpolate(
+                    reference_frame, size=self.model.pixel_shape[:2], mode="nearest"
+                )).spatial
+
+            reconstruction_shape = tuple(self.model.reconstruction_shape)
+            target = F.interpolate(
+                pixel_batch,
+                size=reconstruction_shape[:2],
+                mode="area",
+            ).squeeze(0)
+            self._latest_live_prediction = {
+                "prediction_shape": list(reconstruction_shape),
+                "frames": decoded_by_horizon,
+                "target": _record_frame(target),
+            }
+
+            # Persist exactly one real step of world state.
+            self._hidden = first_hidden
+            self._predicted_latent = first_latent
+
+            reward, terminal_logit, risk, uncertainty = self.model.heads(first_hidden)
+
+        # Sleep-phase consolidation (issue #175): outside `no_grad` above --
+        # `consolidate()` takes real gradient steps. Phasic/synchronous by
+        # design: this blocks the tick until the pass (and the weight
+        # publish back into `self`) completes, exactly the integration
+        # `CortexConsolidator`'s own docstring describes.
+        self._tick += 1
+        if (
+            self.consolidator is not None
+            and self.consolidate_every_ticks > 0
+            and self._tick % self.consolidate_every_ticks == 0
+        ):
+            self.consolidator.consolidate(self.consolidation_steps)
+            # `publish_to` calls `self.reset()` to clear the rolling backbone
+            # state under the fresh weights -- but that also wipes `_latent`,
+            # this tick's own encoded observation, which the *next* tick's
+            # `record_transition` needs as z0. Losing it would drop exactly
+            # the one transition following every consolidation (all of them,
+            # forever, at `--async-wake-ticks 1`) -- preserve it across the
+            # reset; it's still a valid (if slightly stale, pre-update)
+            # encoding of this tick's real observation.
+            pending_latent = self._latent
+            pending_live_prediction = self._latest_live_prediction
+            self.consolidator.publish_to(self)
+            self._latent = pending_latent
+            self._latest_live_prediction = pending_live_prediction
+            if self.checkpoint_path is not None:
+                # In-memory-only weights are lost on episode end, a crash, or
+                # KeyboardInterrupt -- persist every publish so a completed
+                # consolidation always survives the process, not only a
+                # graceful shutdown (mirrors the old async trainer's periodic
+                # checkpoint-write cadence).
+                from cognitive_runtime.training.action_world_model import (
+                    save_action_world_model,
+                )
+
+                save_action_world_model(
+                    self.checkpoint_path, self.model, self.consolidator.stats(),
+                )
+
+        return Prediction(
+            # ``risk_head`` is softplus'd (non-negative, unbounded); clamp into
+            # the heuristic model's 0..1 range the reflex/veto thresholds expect.
+            risk=max(float(torch.clamp(risk, 0.0, 1.0)), recalled_threat),
+            p_death=float(torch.sigmoid(terminal_logit)),
+            predicted_reward=float(reward),
+            next_latent=first_latent.squeeze(0).tolist(),
+            prediction_error=prediction_error,
+            # The cortex's own forward-uncertainty head (issue #169), read
+            # off the same real one-step advance as the other heads above --
+            # the dedicated sigma the arbiter's surprise calibration reads
+            # in preference to the prediction_error stand-in.
+            predicted_uncertainty=float(uncertainty),
+            recalled_seed_count=len(self._last_recalls),
+            retrieval_similarity=(
+                self._last_recalls[0].similarity if self._last_recalls else None
+            ),
+            recalled_threat=recalled_threat if self._last_recalls else None,
+        )

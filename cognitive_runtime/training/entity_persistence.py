@@ -208,6 +208,7 @@ def save_entity_persistence_checkpoint(
     model: EntityPersistenceModel,
     dataset: EntityPersistenceDataset,
     stats: Dict[str, Any],
+    name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Save the trained persistence model in the unified checkpoint format.
 
@@ -233,6 +234,7 @@ def save_entity_persistence_checkpoint(
             "model_type": "entity-persistence",
             "losses": ["persistence_feature_prediction", "self_supervised_surprise"],
         },
+        name=name,
     )
     return manager.save(reason="entity_persistence_training")
 

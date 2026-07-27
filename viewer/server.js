@@ -1,22 +1,14 @@
 #!/usr/bin/env node
-/**
- * Zero-dependency HTTP server for browsing recorded streams-v2 sessions:
- * lists sessions/episodes, decodes `vision.frame.pixels` events out of the
- * binary frame store (frames/segment_*.bin + .index.jsonl), and serves the
- * static <pixel-horizon-viewer> component from public/.
- *
- *   node viewer/server.js [--data-dir shared] [--port 8787]
- *
- * API:
- *   GET /api/sessions
- *   GET /api/sessions/:sid/episodes/:eid/frames       frames as base64 raw bytes
- *   GET /api/sessions/:sid/episodes/:eid/predictions  predictions_<eid>.json, if exported
- */
+/** Read-only clinic service over streams-v2 Record sessions. */
 "use strict";
 
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
+const { spawnSync } = require("child_process");
+
+const PUBLIC_DIR = path.join(__dirname, "public");
+const REPO_DIR = path.join(__dirname, "..");
 
 function parseArgs(argv) {
   const args = { dataDir: null, port: 8787 };
@@ -28,99 +20,117 @@ function parseArgs(argv) {
       process.exit(0);
     }
   }
-  args.dataDir = path.resolve(args.dataDir || path.join(__dirname, "..", "shared"));
+  args.dataDir = path.resolve(args.dataDir || path.join(REPO_DIR, "shared"));
   return args;
 }
 
-const ARGS = parseArgs(process.argv);
-const PUBLIC_DIR = path.join(__dirname, "public");
-
-// ---------------------------------------------------------------- sessions
-
-function isSessionDir(dir) {
-  return fs.existsSync(path.join(dir, "session.json"));
+function readJSON(file, fallback = {}) {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; }
 }
 
-function listSessions() {
-  if (!fs.existsSync(ARGS.dataDir)) return [];
-  return fs
-    .readdirSync(ARGS.dataDir, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && isSessionDir(path.join(ARGS.dataDir, e.name)))
-    .map((e) => {
-      const dir = path.join(ARGS.dataDir, e.name);
-      let meta = {};
-      try {
-        meta = JSON.parse(fs.readFileSync(path.join(dir, "session.json"), "utf8"));
-      } catch {
-        /* unreadable metadata; still list the session */
-      }
-      const episodes = fs
-        .readdirSync(dir)
-        .filter((f) => /^episode_\d+\.streams\.jsonl$/.test(f))
-        .map((f) => f.replace(".streams.jsonl", ""))
-        .sort();
-      return {
-        id: e.name,
-        curriculum: meta.curriculum ?? null,
-        program: meta.program ?? null,
-        tick_rate: meta.tick_rate ?? null,
-        episodes,
-      };
-    })
-    .sort((a, b) => a.id.localeCompare(b.id));
+function isSessionDir(dir) { return fs.existsSync(path.join(dir, "session.json")); }
+
+function qualityVerdict(dir) {
+  const python = process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
+  const result = spawnSync(python, ["-m", "cognitive_runtime.record.quality_cli", dir], {
+    cwd: REPO_DIR, encoding: "utf8", env: process.env,
+  });
+  if (result.status === 0) return JSON.parse(result.stdout);
+  return { verdict: "red", issues: ["quality check could not be evaluated"], warnings: [] };
 }
 
-/** Resolve a client-supplied session id to a real directory, refusing traversal. */
-function sessionDir(sid) {
-  if (!/^[\w.-]+$/.test(sid)) return null;
-  const dir = path.join(ARGS.dataDir, sid);
-  if (!dir.startsWith(ARGS.dataDir + path.sep) || !isSessionDir(dir)) return null;
-  return dir;
+function qualityStamp(dir) {
+  return fs.readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .reduce((latest, entry) => Math.max(latest, fs.statSync(path.join(dir, entry.name)).mtimeMs), 0);
 }
 
-// ---------------------------------------------------------------- frame store
+function makeStore(dataDir, { qualityCheck = qualityVerdict } = {}) {
+  dataDir = path.resolve(dataDir);
+  const qualityCache = new Map();
+  function sessionDir(sid) {
+    if (!/^[\w.-]+$/.test(sid)) return null;
+    const dir = path.join(dataDir, sid);
+    return dir.startsWith(dataDir + path.sep) && isSessionDir(dir) ? dir : null;
+  }
+  function describe(id) {
+    const dir = sessionDir(id);
+    if (!dir) return null;
+    const meta = readJSON(path.join(dir, "session.json"));
+    const episodes = fs.readdirSync(dir).filter((f) => /^episode_\d+\.streams\.jsonl$/.test(f))
+      .map((f) => f.replace(".streams.jsonl", "")).sort();
+    const stamp = qualityStamp(dir), cached = qualityCache.get(id);
+    const quality = cached?.stamp === stamp ? cached.value : qualityCheck(dir);
+    if (cached?.stamp !== stamp) qualityCache.set(id, { stamp, value: quality });
+    const match = id.match(/^nursery-(.+)-(train|holdout)-(\d+)$/);
+    const exports = exportsFor(dir).map((entry) => entry.data).filter((entry) => entry?.format === "pixel-predictions-v2");
+    const experiments = [...new Map(exports.map((entry) => [entry.experiment?.experiment_id, {
+      id: entry.experiment?.experiment_id, prediction_mode: entry.prediction_mode,
+      created_at: entry.experiment?.created_at,
+      has_entity_event: (entry.events || []).some((event) => event.entity_entered || event.entity_left),
+      has_moving: (entry.events || []).some((event) => event.position_changed),
+      has_static: (entry.events || []).some((event) => !event.position_changed),
+      has_blocked: (entry.events || []).some((event) => event.blocked_forward),
+    }])).values()].filter((entry) => entry.id);
+    return { id, name: meta.name ?? "legacy", curriculum: meta.curriculum ?? null,
+      program: meta.program ?? null, tick_rate: meta.tick_rate ?? null, episodes,
+      scenario: match?.[1] ?? null, split: match?.[2] ?? null, seed: match?.[3] ?? null, experiments,
+      development: meta.development ?? meta.ladder ?? meta.developmental ?? null,
+      quality };
+  }
+  function list(name = null, filters = {}) {
+    if (!fs.existsSync(dataDir)) return [];
+    return fs.readdirSync(dataDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && isSessionDir(path.join(dataDir, e.name)))
+      .map((e) => describe(e.name)).filter((s) => !name || s.name === name)
+      .filter((s) => !filters.scenario || s.scenario === filters.scenario)
+      .filter((s) => !filters.seed || String(s.seed) === String(filters.seed))
+      .filter((s) => !filters.split || s.split === filters.split)
+      .filter((s) => !filters.prediction_mode || s.experiments.some((e) => e.prediction_mode === filters.prediction_mode))
+      .filter((s) => !filters.entity_event || s.experiments.some((e) => e.has_entity_event))
+      .filter((s) => !filters.motion || s.experiments.some((e) => filters.motion === "blocked" ? e.has_blocked : filters.motion === "moving" ? e.has_moving : e.has_static))
+      .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+  }
+  return { dataDir, sessionDir, describe, list };
+}
 
-/** Build hash -> {bin, offset, length, shape, dtype} from every segment index. */
 function loadFrameIndex(dir) {
-  const framesDir = path.join(dir, "frames");
-  const index = new Map();
+  const framesDir = path.join(dir, "frames"), index = new Map();
   if (!fs.existsSync(framesDir)) return index;
   for (const name of fs.readdirSync(framesDir).sort()) {
     if (!name.endsWith(".index.jsonl")) continue;
     const bin = path.join(framesDir, name.replace(".index.jsonl", ".bin"));
     for (const line of fs.readFileSync(path.join(framesDir, name), "utf8").split("\n")) {
       if (!line.trim()) continue;
-      const rec = JSON.parse(line);
-      index.set(rec.hash, { bin, offset: rec.offset, length: rec.length, shape: rec.shape, dtype: rec.dtype });
+      const rec = JSON.parse(line); index.set(rec.hash, { ...rec, bin });
     }
   }
   return index;
 }
 
 function readEpisodeFrames(dir, sid, eid) {
-  if (!/^episode_\d+$/.test(eid)) return null;
-  const streamsPath = path.join(dir, `${eid}.streams.jsonl`);
-  if (!fs.existsSync(streamsPath)) return null;
-
-  const index = loadFrameIndex(dir);
-  const bins = new Map(); // bin path -> Buffer, read once
-  const frames = [];
-  let shape = null;
-  let dtype = null;
-
-  for (const line of fs.readFileSync(streamsPath, "utf8").split("\n")) {
-    if (!line.trim()) continue;
-    let rec;
-    try {
-      rec = JSON.parse(line);
-    } catch {
-      continue;
-    }
+  const records = readStreams(dir, eid); if (!records) return null;
+  const decisions = readDecisions(dir, eid) || [];
+  const decisionWindows = decisions.flatMap((decision) => {
+    const span = decision.window_span;
+    return Array.isArray(span) && span.length >= 2
+      ? [{ start: Number(span[0]), end: Number(span[1]), tick: decision.tick_index }]
+      : [];
+  });
+  let decisionIndex = 0;
+  const index = loadFrameIndex(dir), bins = new Map(), frames = [];
+  let shape = null, dtype = null;
+  for (const rec of records) {
     if (rec.stream_id !== "vision.frame.pixels") continue;
-    shape = rec.shape ?? shape;
-    dtype = rec.dtype ?? dtype;
-    const entry = { i: frames.length, t: rec.timestamp, seq: rec.seq, hash: rec.frame_ref ?? null, data: null };
-    const loc = entry.hash ? index.get(entry.hash) : undefined;
+    shape = rec.shape ?? shape; dtype = rec.dtype ?? dtype;
+    while (decisionIndex < decisionWindows.length && rec.timestamp > decisionWindows[decisionIndex].end) {
+      decisionIndex += 1;
+    }
+    const window = decisionWindows[decisionIndex];
+    const matchingTick = window && rec.timestamp >= window.start && rec.timestamp <= window.end ? window.tick : null;
+    const entry = { i: frames.length, t: rec.timestamp, tick: matchingTick ?? rec.seq ?? frames.length,
+      seq: rec.seq, hash: rec.frame_ref ?? null, data: null };
+    const loc = entry.hash ? index.get(entry.hash) : null;
     if (loc && !rec.elided) {
       if (!bins.has(loc.bin)) bins.set(loc.bin, fs.readFileSync(loc.bin));
       entry.data = bins.get(loc.bin).subarray(loc.offset, loc.offset + loc.length).toString("base64");
@@ -130,71 +140,100 @@ function readEpisodeFrames(dir, sid, eid) {
   return { session_id: sid, episode_id: eid, shape, dtype, n_frames: frames.length, frames };
 }
 
-// ---------------------------------------------------------------- http
-
-const MIME = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
-  ".svg": "image/svg+xml",
-};
-
-function sendJSON(res, status, payload) {
-  const body = JSON.stringify(payload);
-  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-  res.end(body);
-}
-
-function serveStatic(res, urlPath) {
-  const rel = urlPath === "/" ? "index.html" : urlPath.replace(/^\/+/, "");
-  const file = path.join(PUBLIC_DIR, path.normalize(rel));
-  if (!file.startsWith(PUBLIC_DIR + path.sep) && file !== path.join(PUBLIC_DIR, "index.html")) {
-    return sendJSON(res, 404, { error: "not found" });
-  }
-  fs.readFile(file, (err, data) => {
-    if (err) return sendJSON(res, 404, { error: "not found" });
-    res.writeHead(200, { "Content-Type": MIME[path.extname(file)] || "application/octet-stream" });
-    res.end(data);
+function readEpisodeJSONL(dir, eid, kind) {
+  if (!/^episode_\d+$/.test(eid)) return null;
+  if (!new Set(["streams", "decisions"]).has(kind)) return null;
+  const file = path.join(dir, `${eid}.${kind}.jsonl`); if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, "utf8").split("\n").filter(Boolean).flatMap((line) => {
+    try { return [JSON.parse(line)]; } catch { return []; }
   });
 }
 
-const server = http.createServer((req, res) => {
-  const url = new URL(req.url, "http://localhost");
-  const parts = url.pathname.split("/").filter(Boolean);
+function readStreams(dir, eid) { return readEpisodeJSONL(dir, eid, "streams"); }
+function readDecisions(dir, eid) { return readEpisodeJSONL(dir, eid, "decisions"); }
 
-  try {
-    if (parts[0] === "api") {
-      if (parts.length === 2 && parts[1] === "sessions") {
-        return sendJSON(res, 200, { data_dir: ARGS.dataDir, sessions: listSessions() });
-      }
-      // /api/sessions/:sid/episodes/:eid/(frames|predictions)
-      if (parts.length === 6 && parts[1] === "sessions" && parts[3] === "episodes") {
-        const dir = sessionDir(parts[2]);
-        if (!dir) return sendJSON(res, 404, { error: `unknown session ${parts[2]}` });
-        if (parts[5] === "frames") {
-          const payload = readEpisodeFrames(dir, parts[2], parts[4]);
-          if (!payload) return sendJSON(res, 404, { error: `unknown episode ${parts[4]}` });
-          return sendJSON(res, 200, payload);
+function exportsFor(dir) {
+  return fs.readdirSync(dir).filter((f) => f.endsWith(".json") && f !== "session.json" && !f.endsWith(".summary.json"))
+    .sort().map((file) => ({ file, data: readJSON(path.join(dir, file), null) }));
+}
+
+function livePredictionsFromDecisions(decisions, sid, eid) {
+  const live = decisions.filter((decision) => decision.live_prediction?.prediction_shape);
+  if (!live.length) return null;
+  const shape = live[0].live_prediction.prediction_shape;
+  const horizons = [...new Set(live.flatMap((decision) => Object.keys(decision.live_prediction.frames || {}).map(Number)))]
+    .filter((h) => Number.isInteger(h) && h > 0).sort((a, b) => a - b);
+  if (!horizons.length) return null;
+  const predictions = Object.fromEntries(horizons.map((h) => [String(h), {
+    frames: live.slice(0, Math.max(0, live.length - h))
+      .map((decision) => decision.live_prediction.frames?.[String(h)]).filter(Boolean),
+  }]));
+  return {
+    format: "pixel-predictions-v1", source: "live-record", session_id: sid, episode_id: eid,
+    horizons, prediction_shape: shape, n_frames: live.length,
+    predictions, targets: live.map((decision) => decision.live_prediction.target).filter(Boolean),
+  };
+}
+
+const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
+function sendJSON(res, status, payload) { res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" }); res.end(JSON.stringify(payload)); }
+function serveStatic(res, urlPath) {
+  const rel = urlPath === "/" ? "index.html" : urlPath.replace(/^\/+/, ""), file = path.join(PUBLIC_DIR, path.normalize(rel));
+  if (!file.startsWith(PUBLIC_DIR + path.sep)) return sendJSON(res, 404, { error: "not found" });
+  fs.readFile(file, (err, data) => { if (err) return sendJSON(res, 404, { error: "not found" }); res.writeHead(200, { "Content-Type": MIME[path.extname(file)] || "application/octet-stream" }); res.end(data); });
+}
+
+function createServer({ dataDir }) {
+  const store = makeStore(dataDir);
+  return http.createServer((req, res) => {
+    const url = new URL(req.url, "http://localhost"), p = url.pathname.split("/").filter(Boolean);
+    try {
+      if (p[0] !== "api") return serveStatic(res, url.pathname);
+      if (p.length === 2 && p[1] === "sessions") return sendJSON(res, 200, { data_dir: store.dataDir, sessions: store.list(url.searchParams.get("name"), Object.fromEntries(["scenario", "seed", "split", "prediction_mode", "entity_event", "motion"].map((key) => [key, url.searchParams.get(key)])) ) });
+      if (p.length >= 3 && p[1] === "sessions") {
+        const dir = store.sessionDir(p[2]); if (!dir) return sendJSON(res, 404, { error: `unknown session ${p[2]}` });
+        if (p.length === 3) {
+          const session = store.describe(p[2]);
+          const streams = Object.fromEntries(session.episodes.map((eid) => [eid, readStreams(dir, eid)]));
+          const decisions = Object.fromEntries(session.episodes.map((eid) => [eid, readDecisions(dir, eid)]));
+          return sendJSON(res, 200, { session, streams, decisions, exports: exportsFor(dir), quality: session.quality });
         }
-        if (parts[5] === "predictions") {
-          if (!/^episode_\d+$/.test(parts[4])) return sendJSON(res, 404, { error: "bad episode id" });
-          const predPath = path.join(dir, `predictions_${parts[4]}.json`);
-          if (!fs.existsSync(predPath)) {
-            return sendJSON(res, 404, { error: "no predictions exported for this episode", hint: "see viewer/export_predictions.py" });
+        if (p.length === 6 && p[3] === "episodes" && p[5] === "streams") return sendJSON(res, 200, { records: readStreams(dir, p[4]) });
+        if (p.length === 6 && p[3] === "episodes" && p[5] === "decisions") return sendJSON(res, 200, { records: readDecisions(dir, p[4]) });
+        if (p.length === 6 && p[3] === "episodes" && p[5] === "frames") return sendJSON(res, 200, readEpisodeFrames(dir, p[2], p[4]));
+        if (p.length === 6 && p[3] === "episodes" && p[5] === "predictions") {
+          const kind = url.searchParams.get("kind") === "dream" ? "dream" : "predictions";
+          const candidates = [`${readJSON(path.join(dir, "session.json")).name}-${kind}_${p[4]}.json`, `${kind}_${p[4]}.json`];
+          let file = candidates.map((n) => path.join(dir, n)).find(fs.existsSync);
+          // v2 files are experiment-prefixed. Never merge stale exports: an
+          // explicit experiment selects one, while an ambiguous directory is
+          // rejected instead of guessing which model the clinic should show.
+          if (!file && kind === "predictions") {
+            const experiment = url.searchParams.get("experiment");
+            const v2 = fs.readdirSync(dir).filter((name) =>
+              name.endsWith(`-predictions_${p[4]}.json`) &&
+              (!experiment || name.startsWith(`${experiment}-`))
+            );
+            if (v2.length === 1) file = path.join(dir, v2[0]);
+            if (v2.length > 1) return sendJSON(res, 409, {
+              error: "multiple experiment exports; pass ?experiment=<experiment-id>", experiments: v2,
+            });
           }
-          res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-          return fs.createReadStream(predPath).pipe(res);
+          if (file) return sendJSON(res, 200, readJSON(file));
+          if (kind === "predictions") {
+            const live = livePredictionsFromDecisions(readDecisions(dir, p[4]), p[2], p[4]);
+            if (live) return sendJSON(res, 200, live);
+          }
+          return sendJSON(res, 404, { error: "no recorded predictions for this episode" });
         }
       }
       return sendJSON(res, 404, { error: "unknown API route" });
-    }
-    return serveStatic(res, url.pathname);
-  } catch (err) {
-    return sendJSON(res, 500, { error: String((err && err.message) || err) });
-  }
-});
+    } catch (err) { return sendJSON(res, 500, { error: String(err.message || err) }); }
+  });
+}
 
-server.listen(ARGS.port, () => {
-  console.log(`pixel viewer: http://localhost:${ARGS.port}  (data dir: ${ARGS.dataDir})`);
-});
+if (require.main === module) {
+  const args = parseArgs(process.argv);
+  createServer(args).listen(args.port, () => console.log(`CCR clinic: http://localhost:${args.port}  (Record: ${args.dataDir})`));
+}
+module.exports = { createServer, livePredictionsFromDecisions, makeStore };

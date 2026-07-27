@@ -1,5 +1,5 @@
 """Action-conditioned recurrent world model (phases 1-3 of
-docs/nursery-turn-in-place-analysis.md)."""
+docs/history/nursery-turn-in-place-analysis.md)."""
 
 from __future__ import annotations
 
@@ -11,10 +11,18 @@ torch = pytest.importorskip("torch")
 
 from cognitive_runtime.training.action_world_model import (  # noqa: E402
     ActionWorldModelConfig,
+    _episode_workspace_tensors,
+    _episode_tensors,
+    _window_weights,
     build_action_sequence_dataset,
+    build_action_world_model,
     evaluate_action_world_model,
+    evaluate_action_world_model_direct,
+    evaluate_cortex_heads,
     horizons_ticks_to_frames,
     linear_probe_yaw,
+    representation_collapse_diagnostics,
+    _tick_facing,
     load_action_world_model,
     save_action_world_model,
     train_action_world_model,
@@ -22,10 +30,19 @@ from cognitive_runtime.training.action_world_model import (  # noqa: E402
 from cognitive_runtime.training.nursery import (  # noqa: E402
     NURSERY_SCENARIOS,
     NurseryConfig,
+    NurseryScenario,
+    ScenarioRecording,
     _record_scenario_episode,
     run_nursery_joint,
 )
+from cognitive_runtime.training.prediction_export import (  # noqa: E402
+    ExperimentIdentity,
+    export_cortex_session_predictions,
+)
 from cognitive_runtime.training.action_world_model import ActionWorldModelConfig  # noqa: E402
+from cognitive_runtime.core.action import Action  # noqa: E402
+from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy  # noqa: E402
+from brain.cortex.predictive import PredictiveCortex  # noqa: E402
 
 
 def _small_nursery_config(**overrides) -> NurseryConfig:
@@ -68,6 +85,64 @@ def turn_session(tmp_path_factory):
     )
 
 
+#: A scripted (non-constant) action fixture (issue #202): a constant-action
+#: recording can't detect a one-step motor/frame alignment error -- every
+#: transition is labelled with the same action either way. Two distinct
+#: actions with a known phase boundary can: an off-by-one alignment bug
+#: shows up as the wrong action label on the transition either side of the
+#: boundary.
+_MIXED_PHASE_TICKS = 5
+_MIXED_ACTION_A = Action("MOVE_FORWARD")
+_MIXED_ACTION_B = Action("LOOK_LEFT")
+
+
+def _build_mixed_action(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    policy = ScriptedSequencePolicy(
+        [(_MIXED_ACTION_A, _MIXED_PHASE_TICKS), (_MIXED_ACTION_B, _MIXED_PHASE_TICKS)]
+    )
+    return ScenarioRecording(policy=policy)
+
+
+@pytest.fixture(scope="module")
+def mixed_action_session(tmp_path_factory):
+    root = tmp_path_factory.mktemp("awm-mixed-sessions")
+    scenario = NurseryScenario("mixed_action", "scripted two-phase fixture", _build_mixed_action)
+    cfg = _small_nursery_config(episode_ticks=2 * _MIXED_PHASE_TICKS)
+    return _record_scenario_episode(str(root), "awm-mixed", 0, scenario, cfg)
+
+
+def test_window_weights_averages_the_windows_transitions():
+    # window=3 -> each start's slice is transition_weights[e][t : t+2].
+    transition_weights = [[1.0, 2.0, 3.0, 4.0], [10.0, 20.0]]
+    starts = [(0, 0), (0, 1), (0, 2), (1, 0)]
+    weights = _window_weights(transition_weights, starts, window=3)
+    assert weights == [1.5, 2.5, 3.5, 15.0]
+
+
+def test_window_weights_falls_back_to_uniform_for_an_empty_span():
+    weights = _window_weights([[1.0]], starts=[(0, 0)], window=1)
+    assert weights == [1.0]  # window-1 == 0 transitions in range -> fallback
+
+
+def test_train_action_world_model_rejects_mismatched_transition_weights(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    with pytest.raises(ValueError, match="transition_weights has"):
+        train_action_world_model(
+            dataset, _small_model_config(), transition_weights=[[1.0]],
+        )
+
+
+def test_train_action_world_model_accepts_transition_weights(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    episode = dataset.episodes[0]
+    # Uniform weights should behave like the None (uniform-permutation) path.
+    transition_weights = [[1.0] * len(episode.actions)]
+    model, stats = train_action_world_model(
+        dataset, _small_model_config(), transition_weights=transition_weights,
+    )
+    assert stats["final_total_loss"] > 0.0
+
+
 def test_horizons_ticks_to_frames_converts_and_dedupes():
     # Simulated backend: 1 tick per frame -- identity.
     assert horizons_ticks_to_frames([1, 10, 100], 1.0) == [1, 10, 100]
@@ -77,13 +152,28 @@ def test_horizons_ticks_to_frames_converts_and_dedupes():
         horizons_ticks_to_frames([1], 0.0)
 
 
+def test_tick_facing_reads_crafter_discrete_direction():
+    assert _tick_facing([
+        {"stream_id": "spatial.facing", "payload": {"x": 0, "y": -1}}
+    ]) == (0.0, -1.0)
+    assert _tick_facing([]) is None
+
+
 def test_build_action_sequence_dataset_aligns_frames_actions_and_yaw(turn_session):
     dataset = build_action_sequence_dataset([turn_session])
     assert len(dataset.episodes) == 1
     episode = dataset.episodes[0]
     # One action per frame transition, and the scripted policy is constant.
     assert len(episode.actions) == len(episode.frames) - 1
-    assert dataset.action_keys == ["LOOK_LEFT"]
+    # "NULL" (issue #202): the very first transition -- between tick zero's
+    # post-reset snapshot and its first `program.step()`'s frame -- was
+    # produced before any motor command had ever been queued, so it is not
+    # labelled "LOOK_LEFT" even though the constant policy's first *decided*
+    # action is LOOK_LEFT (one-tick actuation latency; that decision drives
+    # the transition into the *following* frame instead).
+    assert dataset.action_keys == ["NULL", "LOOK_LEFT"]
+    assert episode.actions[0] == dataset.action_keys.index("NULL")
+    assert all(a == dataset.action_keys.index("LOOK_LEFT") for a in episode.actions[1:])
     assert dataset.pixel_shape is not None and dataset.pixel_shape[2] == 3
     # spatial.rotation publishes every tick, so yaw labels ride along.
     assert any(y is not None for y in episode.yaw)
@@ -91,20 +181,95 @@ def test_build_action_sequence_dataset_aligns_frames_actions_and_yaw(turn_sessio
     assert 0.5 < dataset.ticks_per_frame < 1.5
 
 
+def test_build_action_sequence_dataset_applies_one_tick_motor_latency(mixed_action_session):
+    """Issue #202: ``actions[i]`` must be the motor command that produced
+    ``frames[i+1]`` -- the command *emitted at the same tick ``frames[i]``
+    was observed*, not the command bundled with ``frames[i+1]``'s own tick
+    (that command hasn't been applied yet; it drives the transition into
+    the frame *after* that). A constant-action fixture can't tell these
+    apart; this one can, via its known phase boundary."""
+    dataset = build_action_sequence_dataset([mixed_action_session])
+    episode = dataset.episodes[0]
+    null_idx = dataset.action_keys.index("NULL")
+    a_idx = dataset.action_keys.index("MOVE_FORWARD")
+    b_idx = dataset.action_keys.index("LOOK_LEFT")
+
+    # The very first transition predates any queued motor command; the next
+    # _MIXED_PHASE_TICKS transitions are driven by ticks 0..PHASE-1's own
+    # MOVE_FORWARD decisions (tick zero's decision drives the transition
+    # *after* the one consumed by the leading "NULL"); everything from
+    # there on is driven by a LOOK_LEFT decision. No MOVE_FORWARD/LOOK_LEFT
+    # label survives on the wrong side of the phase boundary.
+    assert episode.actions[0] == null_idx
+    assert all(a == a_idx for a in episode.actions[1 : 1 + _MIXED_PHASE_TICKS])
+    assert all(a == b_idx for a in episode.actions[1 + _MIXED_PHASE_TICKS :])
+
+
+def test_action_sequence_dataset_replays_fused_workspace_at_each_frame(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    episode = dataset.episodes[0]
+    assert dataset.workspace_layout_hash
+    assert dataset.workspace_width == len(dataset.workspace_feature_names)
+    assert len(episode.workspace) == len(episode.frames)
+    assert all(len(token) == dataset.workspace_width for token in episode.workspace)
+
+
+def test_build_action_sequence_dataset_aligns_reward_terminal_risk(turn_session):
+    """issue #169: reward/terminal/risk ride along per-frame like yaw does,
+    read off the decision record's ``reward_window_total`` and the tick's
+    ``internal.risk``/``event.died`` streams."""
+    dataset = build_action_sequence_dataset([turn_session])
+    episode = dataset.episodes[0]
+    assert len(episode.reward) == len(episode.frames)
+    assert len(episode.terminal) == len(episode.frames)
+    assert len(episode.risk) == len(episode.frames)
+    assert all(isinstance(r, float) for r in episode.reward)
+    assert all(isinstance(t, bool) for t in episode.terminal)
+    # turn_in_place never dies; risk should be a recorded, mostly-small float,
+    # not a placeholder constant across the whole episode.
+    assert all(0.0 <= r <= 1.0 for r in episode.risk)
+    assert not any(episode.terminal)
+
+
+def test_build_action_sequence_dataset_risk_matches_decision_record_not_lagged_stream(turn_session):
+    """issue #169 review: ``internal.risk`` in a tick's *sensory* window is
+    published one tick late (``runtime/loop.py``'s documented "primes the
+    next tick's evaluation" comment) -- reading it out of ``sensory`` would
+    train the risk head on the previous tick's value. Risk must instead come
+    straight off that tick's own decision record."""
+    from cognitive_runtime.runtime.replay import iter_cognitive_ticks
+
+    dataset = build_action_sequence_dataset([turn_session])
+    episode = dataset.episodes[0]
+    decision_risk_by_tick = {
+        decision["tick_index"]: decision["risk"]
+        for decision, _sensory, _motor in iter_cognitive_ticks(
+            episode.session_dir, episode.episode_id
+        )
+    }
+
+    assert len(decision_risk_by_tick) > 0
+    for tick, risk in zip(episode.ticks, episode.risk):
+        assert risk == pytest.approx(decision_risk_by_tick[tick])
+
+
 def test_build_action_sequence_dataset_pins_and_extends_vocabulary(turn_session):
     dataset = build_action_sequence_dataset(
         [turn_session], action_keys=["MOVE_FORWARD", "LOOK_LEFT"]
     )
-    assert dataset.action_keys == ["MOVE_FORWARD", "LOOK_LEFT"]
+    # "NULL" (issue #202's leading un-actuated transition) is not in the
+    # pinned vocabulary either, so it extends it just like any other
+    # unseen name -- appended in encounter order after whatever's pinned.
+    assert dataset.action_keys == ["MOVE_FORWARD", "LOOK_LEFT", "NULL"]
     dataset = build_action_sequence_dataset([turn_session], action_keys=["MOVE_FORWARD"])
-    assert dataset.action_keys == ["MOVE_FORWARD", "LOOK_LEFT"]
+    assert dataset.action_keys == ["MOVE_FORWARD", "NULL", "LOOK_LEFT"]
 
 
 def test_train_evaluate_probe_and_round_trip(turn_session, tmp_path):
     dataset = build_action_sequence_dataset([turn_session])
     model, stats = train_action_world_model(dataset, _small_model_config())
     assert stats["final_total_loss"] > 0.0
-    assert stats["action_keys"] == ["LOOK_LEFT"]
+    assert stats["action_keys"] == ["NULL", "LOOK_LEFT"]
 
     report = evaluate_action_world_model(model, dataset, [1, 3], warmup_frames=2)
     assert set(report["horizons"]) == {1, 3}
@@ -124,12 +289,162 @@ def test_train_evaluate_probe_and_round_trip(turn_session, tmp_path):
     save_action_world_model(path, model, stats)
     reloaded, reloaded_stats = load_action_world_model(path)
     assert reloaded.action_keys == model.action_keys
-    assert reloaded_stats["action_keys"] == ["LOOK_LEFT"]
+    assert reloaded_stats["action_keys"] == ["NULL", "LOOK_LEFT"]
     with torch.no_grad():
         frames = torch.stack(
             [torch.rand(3, *model.pixel_shape[:2]) for _ in range(2)]
         )
         assert torch.allclose(model.encoder(frames), reloaded.encoder(frames))
+
+
+def test_direct_evaluation_uses_direct_heads_not_closed_loop_rollout(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    calls = []
+    original = model.sequence_prediction
+
+    def direct_head(hidden, horizon):
+        calls.append(horizon)
+        return original(hidden, horizon)
+
+    model.sequence_prediction = direct_head
+    model.rollout = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected rollout"))
+    report = evaluate_action_world_model_direct(model, dataset, [1, 4], warmup_frames=2)
+    assert report["prediction_mode"] == "direct"
+    assert report["horizons_ticks"] == [1, 4]
+    assert set(calls) == {1, 4}
+
+
+def test_windowed_rollout_trains_nondefault_direct_horizon_head(turn_session):
+    """T+4 direct evaluation must not read an untouched random head."""
+    dataset = build_action_sequence_dataset([turn_session])
+    cfg = _small_model_config(
+        epochs=1, horizons_ticks=(1, 3), workspace_enabled=False,
+    )
+    model = build_action_world_model(dataset.pixel_shape, dataset.action_keys, cfg)
+    before = model.multi_token_heads["3"]["latent"].weight.detach().clone()
+    trained, stats = train_action_world_model(dataset, cfg, initial_model=model)
+    after = trained.multi_token_heads["3"]["latent"].weight.detach().cpu()
+    assert not torch.equal(before, after)
+    assert stats["final_direct_pixel_loss"] > 0
+    assert stats["final_direct_latent_loss"] > 0
+    assert stats["device"] == str(next(trained.parameters()).device)
+
+
+def test_cortex_prediction_export_follows_model_device(turn_session, tmp_path):
+    """CUDA cortex exports must move input frames to the model, then JSON back to CPU."""
+    dataset = build_action_sequence_dataset([turn_session])
+    cfg = _small_model_config(horizons_ticks=(1, 3), workspace_enabled=False)
+    model = build_action_world_model(dataset.pixel_shape, dataset.action_keys, cfg)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    checkpoint = tmp_path / "cortex.pt"
+    save_action_world_model(str(checkpoint), model, {})
+    episode = dataset.episodes[0]
+    written = export_cortex_session_predictions(
+        model, dataset, episode.session_dir, episode.episode_id,
+        horizon_frames=[1, 3], prediction_mode="rollout",
+        checkpoint_path=str(checkpoint), experiment=ExperimentIdentity.create("device-test", "test"),
+        training_stats={}, out_path=str(tmp_path / "predictions.json"),
+    )
+    assert os.path.isfile(written)
+
+
+def test_direct_evaluation_preserves_colliding_tick_horizons(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    # Model a paced recording: tick horizons 1 and 2 both align to frame 1.
+    dataset.episodes[0].ticks = [tick * 2 for tick in dataset.episodes[0].ticks]
+    model, _stats = train_action_world_model(
+        dataset, _small_model_config(horizons_ticks=(1, 2))
+    )
+    report = evaluate_action_world_model_direct(model, dataset, [1, 2], warmup_frames=2)
+    assert set(report["horizons"]) == {1, 2}
+    assert report["horizons_frames"] == [1, 1]
+    assert report["horizons"][1]["horizon_frame"] == 1
+    assert report["horizons"][2]["horizon_frame"] == 1
+
+
+def test_ema_target_encoder_is_opt_in_and_reported(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    _model, default_stats = train_action_world_model(dataset, _small_model_config())
+    assert default_stats["ema_target_enabled"] is False
+    assert default_stats["ema_target_decay"] is None
+
+    _model, ema_stats = train_action_world_model(
+        dataset, _small_model_config(ema_target_decay=0.9)
+    )
+    assert ema_stats["ema_target_enabled"] is True
+    assert ema_stats["ema_target_decay"] == pytest.approx(0.9)
+    assert "representation_diagnostics" in ema_stats
+
+    with pytest.raises(ValueError, match="ema_target_decay"):
+        train_action_world_model(dataset, _small_model_config(ema_target_decay=1.0))
+
+
+def test_representation_gate_catches_synthetic_constant_latent(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model = build_action_world_model(
+        dataset.pixel_shape, dataset.action_keys, _small_model_config()
+    )
+    with torch.no_grad():
+        for parameter in model.encoder.parameters():
+            parameter.zero_()
+
+    def collapsed_step(latent, action, hidden):
+        return (
+            torch.zeros(latent.shape[0], model.latent_width),
+            torch.zeros(latent.shape[0], model.hidden_dim),
+        )
+
+    model.step = collapsed_step
+    report = representation_collapse_diagnostics(model, dataset)
+    assert report["gate_evaluable"] is True
+    assert report["passed"] is False
+    assert report["latent"]["mean_variance"] == pytest.approx(0.0)
+    assert report["latent"]["effective_rank"] == pytest.approx(0.0)
+    assert report["hidden_yaw_r2"] < report["thresholds"]["min_hidden_yaw_r2"]
+
+
+def test_train_action_world_model_trains_reward_terminal_risk_uncertainty_heads(turn_session):
+    """issue #169: the previously-untrained heads now get a loss curve each,
+    and ``evaluate_cortex_heads`` reports a well-formed diagnostic against
+    held-out data."""
+    dataset = build_action_sequence_dataset([turn_session])
+    model, stats = train_action_world_model(dataset, _small_model_config())
+
+    for key in ("reward_loss", "terminal_loss", "risk_loss", "uncertainty_loss"):
+        assert key in stats["loss_curves"]
+        assert len(stats["loss_curves"][key]) == stats["epochs"]
+        assert all(v >= 0.0 for v in stats["loss_curves"][key])
+        assert stats[f"final_{key}"] == stats["loss_curves"][key][-1]
+
+    report = evaluate_cortex_heads(model, dataset, [1, 3], warmup_frames=2)
+    assert set(report) == {1, 3}
+    for row in report.values():
+        assert row["n_samples"] > 0
+        for head in ("reward", "terminal", "risk"):
+            assert row[f"{head}_mse"] >= 0.0
+            assert row[f"{head}_constant_mse"] >= 0.0
+            # None for a degenerate (zero-variance) target column, e.g. no
+            # deaths in this holdout split -- see _beats_constant.
+            assert row[f"{head}_beats_constant"] in (True, False, None)
+        # turn_in_place never dies: the terminal target column is a constant
+        # 0.0, so "beats the constant baseline" isn't a meaningful question.
+        assert row["terminal_constant_mse"] == pytest.approx(0.0, abs=1e-9)
+        assert row["terminal_beats_constant"] is None
+        correlation = row["uncertainty_error_correlation"]
+        ci_low, ci_high = row["uncertainty_error_correlation_ci"]
+        assert -1.0 <= correlation <= 1.0
+        assert -1.0 <= ci_low <= ci_high <= 1.0
+
+
+def test_evaluate_cortex_heads_rejects_actions_outside_the_model_vocabulary(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    foreign = build_action_sequence_dataset([turn_session])
+    foreign.action_keys = ["SOMETHING_ELSE"]
+    with pytest.raises(ValueError, match="vocabulary"):
+        evaluate_cortex_heads(model, foreign, [1])
 
 
 def test_evaluate_rejects_actions_outside_the_model_vocabulary(turn_session):
@@ -178,6 +493,17 @@ def test_run_nursery_joint_trains_one_model_across_scenarios(tmp_path):
         assert set(metrics["horizons"]) == set(report.horizon_frames)
         assert "frozen_rollout" in metrics["rollout_health"]
     assert report.yaw_probe.get("n_samples", 0) > 0
+    assert report.representation_diagnostics["gate_evaluable"] is True
+    assert set(report.representation_diagnostics["latent"]) >= {
+        "mean_variance", "effective_rank", "matrix_rank"
+    }
+    # Issue #202 acceptance criterion: the report carries per-scenario
+    # sample counts and event balance.
+    assert set(report.sample_balance) == {"walk_forward", "turn_in_place"}
+    for stats in report.sample_balance.values():
+        assert stats["samples"] > 0
+        assert set(stats["movement_state_counts"]) == {"continuing", "blocked", "turning"}
+        assert set(stats["entity_state_counts"]) == {"absent", "present", "entering", "leaving"}
 
 
 def test_run_nursery_joint_rejects_overlapping_scenarios(tmp_path):
@@ -188,3 +514,106 @@ def test_run_nursery_joint_rejects_overlapping_scenarios(tmp_path):
             holdout_scenarios=["turn_in_place"],
             config=_small_nursery_config(),
         )
+
+
+# ---------------------------------------------------------------- issue #91
+# Predictive Cortex: promotion to brain/cortex/predictive.py, merged
+# multi-horizon + uncertainty heads, ticks-denominated horizons.
+
+
+def test_build_action_world_model_returns_predictive_cortex(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model = build_action_world_model(
+        dataset.pixel_shape, dataset.action_keys, _small_model_config()
+    )
+    assert isinstance(model, PredictiveCortex)
+
+
+def test_cortex_binds_and_decodes_workspace_modalities(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    episode, pixels, _targets, actions = _episode_tensors(dataset, model.reconstruction_shape)[0]
+    workspace = _episode_workspace_tensors(episode, dataset, model, actions=actions)
+    latents = model.encode_workspace(pixels[:2], {name: value[:2] for name, value in workspace.items()})
+    decoded = model.decode_workspace(latents)
+
+    assert decoded["vision"].shape[0] == 2
+    assert decoded["workspace"].shape == (2, dataset.workspace_width)
+    assert decoded["efference"].shape == (2, len(dataset.action_keys))
+    horizons = model.forward_horizons(
+        latents[:1], actions[:1].unsqueeze(0), model.initial_state(1), horizon_frames=[1]
+    )
+    assert horizons[1].modalities["workspace"].shape == (1, dataset.workspace_width)
+    assert horizons[1].modalities["efference"].shape == (1, len(dataset.action_keys))
+    report = evaluate_action_world_model(model, dataset, [1], warmup_frames=2)
+    assert set(report["workspace_modalities"]) == {"workspace", "efference"}
+    assert report["workspace_modalities"]["workspace"][1]["n_samples"] > 0
+
+
+def test_forward_horizons_yields_decoded_frame_and_heads_at_every_horizon(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    episodes = _episode_tensors(dataset, model.reconstruction_shape)
+    _episode, pixels, _targets, actions = episodes[0]
+    assert actions.shape[0] >= 3
+
+    with torch.no_grad():
+        latents = model.encoder(pixels)
+        hidden = model.initial_state(1)
+        out = model.forward_horizons(
+            latents[:1], actions[:3].unsqueeze(0), hidden, horizon_frames=[1, 3]
+        )
+
+    h, w, c = model.reconstruction_shape
+    assert set(out.horizons) == {1, 3}
+    for horizon, pred in out.horizons.items():
+        # Decoder output is CHW (matches the pixel/reconstruction-target
+        # convention elsewhere in this module), same input shape at every
+        # horizon -- the "decoded-frame shape equals input shape" criterion.
+        assert pred.decoded.shape == (1, c, h, w)
+        assert pred.latent.shape == (1, model.latent_width)
+        assert pred.reward.shape == (1,)
+        assert pred.terminal_logit.shape == (1,)
+        assert pred.risk.shape == (1,)
+        assert pred.uncertainty.shape == (1,)
+        assert bool((pred.uncertainty >= 0).all())
+        assert bool((pred.risk >= 0).all())
+    # Horizon 3's decoded frame is not just a repeat of horizon 1's: the
+    # heads read a state that actually advanced through the rollout.
+    assert not torch.allclose(out[1].latent, out[3].latent)
+
+
+def test_forward_horizons_rejects_non_positive_horizon(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    start_latent = torch.zeros(1, model.latent_width)
+    actions = torch.zeros(1, 1, dtype=torch.long)
+    with pytest.raises(ValueError, match="positive"):
+        model.forward_horizons(start_latent, actions, model.initial_state(1), horizon_frames=[0])
+
+
+def test_forward_horizons_rejects_insufficient_actions(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    start_latent = torch.zeros(1, model.latent_width)
+    actions = torch.zeros(1, 1, dtype=torch.long)
+    with pytest.raises(ValueError, match="actions must cover"):
+        model.forward_horizons(start_latent, actions, model.initial_state(1), horizon_frames=[5])
+
+
+def test_default_horizons_ticks_is_1_4_8(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    assert model.horizons_ticks == (1, 4, 8)
+
+
+def test_horizons_ticks_persist_through_checkpoint_round_trip(turn_session, tmp_path):
+    dataset = build_action_sequence_dataset([turn_session])
+    cfg = _small_model_config(horizons_ticks=(1, 2, 5))
+    model, stats = train_action_world_model(dataset, cfg)
+    assert model.horizons_ticks == (1, 2, 5)
+
+    path = os.path.join(str(tmp_path), "cortex.pt")
+    save_action_world_model(path, model, stats)
+    reloaded, _stats = load_action_world_model(path)
+    assert reloaded.horizons_ticks == (1, 2, 5)

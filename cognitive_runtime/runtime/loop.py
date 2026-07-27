@@ -34,6 +34,21 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
+from brain.amygdala import Amygdala
+from brain.arbiter import (
+    ARBITER_MODE_STREAM,
+    ARBITER_MODE_STREAM_SPEC,
+    FIGHT_OR_FLIGHT,
+    INFO_GATHERING,
+    Arbiter,
+    SurpriseCalibrator,
+)
+from brain.hippocampus import Hippocampus, SeedTags
+from brain.neuromod import (
+    NAMED_NEUROMODULATOR_STREAM_SPECS,
+    compute_acetylcholine,
+    named_neuromodulator_payloads,
+)
 from cognitive_runtime.core.action_registry import ActionRegistry, DEFAULT_ACTION_REGISTRY
 from cognitive_runtime.core.action_space import action_space_hash
 from cognitive_runtime.core.attention import ATTENTION_MODES, AttentionController
@@ -117,6 +132,18 @@ ATTENTION_WEIGHTS_STREAM_SPEC = StreamSpec(
     payload_schema="{mode, weights, selected_streams, focus_stream, budget_used, budget_total}",
 )
 
+#: Attention-budget multiplier per arbiter mode (issue #95: "the mode gates
+#: attention breadth"). Info-gathering widens the net to sample broadly;
+#: fight-or-flight narrows it to whatever is most salient right now.
+#: Reward-seeking (and no mode yet, at the very first tick) is the
+#: unscaled baseline -- absent from this map so `.get(mode, 1.0)` covers
+#: it without a redundant entry. Full motor-path precedence is Phase 6's
+#: job; this is the arbiter's only gate.
+ARBITER_ATTENTION_BREADTH_MULTIPLIER: Dict[str, float] = {
+    INFO_GATHERING: 1.5,
+    FIGHT_OR_FLIGHT: 0.6,
+}
+
 
 class CognitiveRuntime:
     def __init__(
@@ -132,6 +159,7 @@ class CognitiveRuntime:
         stream_registry: Optional[StreamRegistry] = None,
         learned_fusion: Optional[Any] = None,
         action_registry: Optional[ActionRegistry] = None,
+        hippocampus: Optional[Hippocampus] = None,
     ):
         self.program = program
         self.policy = policy
@@ -202,6 +230,9 @@ class CognitiveRuntime:
         self.sensory_bus.register(ATTENTION_WEIGHTS_STREAM_SPEC)
         for spec in INTERNAL_MODULATION_STREAM_SPECS:
             self.sensory_bus.register(spec)
+        for spec in NAMED_NEUROMODULATOR_STREAM_SPECS:
+            self.sensory_bus.register(spec)
+        self.sensory_bus.register(ARBITER_MODE_STREAM_SPEC)
         #: Interoceptive modulation signals (issue #58) plus the risk-gated
         #: intrinsic-drive terms derived from them (issue #61): prediction
         #: error, reward-prediction error, learning progress, novelty, risk,
@@ -214,6 +245,41 @@ class CognitiveRuntime:
             risk_threshold=self.config.intrinsic_risk_threshold,
             temperature=self.config.intrinsic_risk_temperature,
         )
+        #: Fast threat appraisal -> adrenaline release (issue #94):
+        #: appraises the same risk reading `self.modulation` already
+        #: computes into a two-rate-EMA'd adrenaline level, published as
+        #: `internal.adrenaline`.
+        self.amygdala = Amygdala()
+        #: The three-mode switch (issue #95): a hand-authored 2x2 lookup
+        #: over (calibrated surprise, amygdala pain) picking reward-seeking
+        #: / info-gathering / fight-or-flight each tick, with hysteresis
+        #: against flapping. Published as `internal.arbiter_mode`.
+        self.arbiter = Arbiter()
+        #: Temperature-scales the raw surprise reading (the same
+        #: prediction-error stand-in `compute_acetylcholine` uses) into a
+        #: calibrated `[0, 1)` probability before it reaches the arbiter
+        #: (issue #95, task 4), reporting Expected Calibration Error as it
+        #: goes.
+        self.surprise_calibrator = SurpriseCalibrator()
+        #: The episodic seed store (issue #96): every waking tick hands it
+        #: a sparse `(z, actions, tags)` seed, prioritised by this tick's
+        #: neuromodulator tags. Persists across episodes within a run, like
+        #: `self.modulation` -- episodic memory is a property of the
+        #: organism's run, not of any one episode.
+        #: Shared with a live `sleep.cortex_consolidation.CortexConsolidator`
+        #: (issue #175) when one is wired into the CLI's `--world-model
+        #: cortex:` path: the consolidator's dream mixer needs the *same*
+        #: hippocampus instance this loop writes seeds into, not an empty one.
+        #: Defaults to a fresh instance for every other caller (unchanged).
+        self.hippocampus = hippocampus if hippocampus is not None else Hippocampus()
+        configure_retrieval = getattr(self.world_model, "configure_retrieval", None)
+        if callable(configure_retrieval):
+            configure_retrieval(self.hippocampus)
+        #: Previous tick's arbiter mode, applied to *this* tick's attention
+        #: budget (issue #95: "the mode gates attention breadth") -- one
+        #: tick lagged like every other internal.* signal, since the mode
+        #: itself isn't known until after this tick's prediction runs.
+        self._arbiter_attention_mode: Optional[str] = None
         #: Optional Program hook (issue #61) that primes a profile-driven
         #: reward engine's `internal.*` view -- see the call site below for
         #: why this can't just flow through the Program's own tick_events.
@@ -237,6 +303,8 @@ class CognitiveRuntime:
                 VALUE_ESTIMATE_STREAM_SPEC,
                 ATTENTION_WEIGHTS_STREAM_SPEC,
                 *INTERNAL_MODULATION_STREAM_SPECS,
+                *NAMED_NEUROMODULATOR_STREAM_SPECS,
+                ARBITER_MODE_STREAM_SPEC,
             ],
             stream_registry=self.stream_registry,
             mode=attention_mode,
@@ -277,6 +345,7 @@ class CognitiveRuntime:
         meta = self.program.metadata()
         session_metadata = {
             "session_id": self.recorder.session_id,
+            "name": self.config.resolve_name(),
             "program": meta.name,
             "program_version": meta.version,
             "program_tags": list(meta.tags),
@@ -359,6 +428,10 @@ class CognitiveRuntime:
         self.scheduler.reset()
         self.attention.reset()
         self.reflex.reset()
+        self.amygdala.reset()
+        self.arbiter.reset()
+        self.surprise_calibrator.reset()
+        self._arbiter_attention_mode = None
         episode_id = self.recorder.start_episode(episode_index)
 
         ratio = self.config.program_ticks_per_cognitive_tick
@@ -376,6 +449,7 @@ class CognitiveRuntime:
         attention_budget_total = 0.0
         attention_budget_ticks = 0
         attention_focus_counts: Dict[str, int] = {}
+        arbiter_mode_counts: Dict[str, int] = {}
         reflex_activations = 0
         recoverable_error: Optional[str] = None
 
@@ -401,6 +475,7 @@ class CognitiveRuntime:
             decide_start = time.perf_counter()
             window = self.synchronizer.collect(self.sensory_bus)
             self.memory.update(window)
+            self._gate_attention_breadth(self._arbiter_attention_mode)
             attention_state = self.attention.compute(window.tick_index, self.memory.buffer)
             self.memory.set_attention_state(attention_state)
             self.sensory_bus.publish(
@@ -423,16 +498,33 @@ class CognitiveRuntime:
                     attention_focus_counts[attention_state.focus_stream] = (
                         attention_focus_counts.get(attention_state.focus_stream, 0) + 1
                     )
+            # issue #135: `sense_stream_weights` (e.g. a curriculum stage's
+            # declared `senses`) composes into the controller's own weights
+            # rather than replacing them -- a stream silenced by one stays
+            # silenced regardless of what the other says. The published
+            # ATTENTION_WEIGHTS_STREAM telemetry above still reports the
+            # controller's own weights unchanged: that stream documents the
+            # dynamic salience system, not this static per-stage override.
+            # `fuse_weights` only genuinely masks under the default fixed
+            # `self.fusion` below -- `self.learned_fusion` (`--fusion
+            # learned`) never forwards attention_weights into its own
+            # latents either (pre-existing to this field: see
+            # `RuntimeConfig.sense_stream_weights`'s docstring).
+            fuse_weights = attention_state.weights
+            if self.config.sense_stream_weights:
+                fuse_weights = dict(attention_state.weights)
+                for stream_id, weight in self.config.sense_stream_weights.items():
+                    fuse_weights[stream_id] = fuse_weights.get(stream_id, 1.0) * weight
             if self.learned_fusion is not None:
                 self.memory.set_fused_latent(
                     self.learned_fusion.fuse(
-                        window, self.memory.buffer, attention_weights=attention_state.weights
+                        window, self.memory.buffer, attention_weights=fuse_weights
                     )
                 )
             else:
                 self.memory.set_fused_latent(
                     self.fusion.fuse(
-                        None, self.memory.buffer, attention_weights=attention_state.weights
+                        None, self.memory.buffer, attention_weights=fuse_weights
                     )
                 )
             # The policy's State is derived from stream state, not pulled from
@@ -458,6 +550,13 @@ class CognitiveRuntime:
                     window.ended_at,
                     source="model",
                 )
+            # Policies with an organism-owned reflex stack consume fresh
+            # stimuli every cognitive tick. Keep this duck-typed so the core
+            # runtime does not depend on the optional motor implementation;
+            # ordinary policies expose no hook and remain unchanged.
+            update_runtime_stimuli = getattr(self.policy, "update_runtime_stimuli", None)
+            if callable(update_runtime_stimuli):
+                update_runtime_stimuli(attention_state, self.amygdala.level)
             emissions = self.policy.emit(state, self.memory, prediction)
             # Scripted orienting reflex (issue #60): may substitute a
             # look/turn action for the policy's this tick -- never when the
@@ -512,7 +611,7 @@ class CognitiveRuntime:
                     window,
                     self.memory.buffer,
                     reward=window_training_reward(window),
-                    attention_weights=attention_state.weights,
+                    attention_weights=fuse_weights,
                 )
 
             reward_value = window_reward(window)
@@ -535,6 +634,90 @@ class CognitiveRuntime:
                 self.sensory_bus.publish(
                     stream_id, payload, window.ended_at, source="model"
                 )
+            # Named neuromodulators (issue #94): dopamine mirrors
+            # reward_prediction_error above; acetylcholine is derived from
+            # this tick's predicted-error estimate (the closest available
+            # stand-in for a dedicated cortex sigma head -- no WorldModel
+            # exposes one yet) plus learning progress; adrenaline is the
+            # amygdala's appraisal of the same risk reading the modulation
+            # tracker already computed.
+            acetylcholine = compute_acetylcholine(
+                prediction.prediction_error, modulation.learning_progress
+            )
+            adrenaline = self.amygdala.appraise(
+                modulation.risk, modulation.predicted_risk_aversion
+            )
+            neuromod_payloads = named_neuromodulator_payloads(modulation, acetylcholine, adrenaline)
+            for stream_id, payload in neuromod_payloads.items():
+                self.sensory_bus.publish(
+                    stream_id, payload, window.ended_at, source="model"
+                )
+            # The arbiter (issue #95): calibrates this tick's raw surprise
+            # reading and feeds it, plus the amygdala's pain reading
+            # (adrenaline) just computed, through the hand-authored 2x2
+            # switch. `self._arbiter_attention_mode` (consumed at the top
+            # of *next* tick) is set here, one tick lagged like every other
+            # internal.* signal.
+            #
+            # Prefers the world model's own dedicated forward-uncertainty
+            # head (issue #169: `PredictiveCortex.uncertainty_head`, wired
+            # through `CortexWorldModel`) over the realized-error stand-in
+            # acetylcholine uses above -- a genuine forward sigma calibrated
+            # against held-out latent error, not this tick's already-known
+            # outcome. Falls back to `prediction_error` (then 0.0) for any
+            # bridge without one (the heuristic `TrendWorldModel`, the
+            # legacy `MLPWorldModel` bridge).
+            if prediction.predicted_uncertainty is not None:
+                raw_surprise = prediction.predicted_uncertainty
+            elif prediction.prediction_error is not None:
+                raw_surprise = prediction.prediction_error
+            else:
+                raw_surprise = 0.0
+            calibrated_surprise = self.surprise_calibrator.update(raw_surprise)
+            set_retrieval_surprise = getattr(
+                self.world_model, "set_retrieval_surprise", None
+            )
+            if callable(set_retrieval_surprise):
+                set_retrieval_surprise(calibrated_surprise)
+            arbiter_mode = self.arbiter.decide(surprise=calibrated_surprise, pain=adrenaline)
+            self._arbiter_attention_mode = arbiter_mode
+            arbiter_payload = self.arbiter.as_payload(self.surprise_calibrator.calibration_error)
+            self.sensory_bus.publish(
+                ARBITER_MODE_STREAM, arbiter_payload, window.ended_at, source="model"
+            )
+            arbiter_mode_counts[arbiter_mode] = arbiter_mode_counts.get(arbiter_mode, 0) + 1
+            # The hippocampus (issue #96): a sparse, one-shot seed write
+            # every waking tick -- cheap (a handful of arithmetic ops plus
+            # an O(log capacity) heap insertion), so it never stalls the
+            # tick. `done`/`damage` are read off this tick's raw sensory
+            # events the same way `neural.replay_buffer.
+            # load_session_into_buffer` reads them from a recorded log.
+            fused_latent = self.memory.fused_latent()
+            if fused_latent is not None:
+                died = any(event.stream_id == "event.died" for event in window.events)
+                damaged = any(
+                    event.stream_id == "event.damage_taken" for event in window.events
+                )
+                context_latent = getattr(
+                    self.world_model, "hippocampal_context_latent", None
+                )
+                self.hippocampus.encode(
+                    z=fused_latent.vector,
+                    actions=[action.key() for action in emissions],
+                    tags=SeedTags(
+                        reward=reward_value,
+                        done=died,
+                        damage=damaged,
+                        novelty=novelty,
+                        surprise=calibrated_surprise,
+                        dopamine=modulation.reward_prediction_error,
+                        threat=adrenaline,
+                    ),
+                    tick_index=window.tick_index,
+                    source=self.recorder.session_id,
+                    cortex_version=getattr(self.world_model, "cortex_version", None),
+                    context_z=(context_latent() if callable(context_latent) else None),
+                )
             # `internal.*` streams are computed here, after this tick's
             # `program.step()` already ran -- a Program's own reward
             # evaluation can never see them the same tick it's published, so
@@ -543,8 +726,16 @@ class CognitiveRuntime:
             # no-op for Programs that don't expose the hook (e.g. no active
             # reward profile).
             if self._observe_external_streams is not None:
-                self._observe_external_streams(modulation_payloads)
+                self._observe_external_streams({**modulation_payloads, **neuromod_payloads})
 
+            motor_decision_attr = getattr(self.policy, "latest_motor_decision", None)
+            motor_decision_record = (
+                motor_decision_attr.to_dict() if motor_decision_attr is not None else None
+            )
+            live_prediction_attr = getattr(self.world_model, "live_prediction_record", None)
+            live_prediction_record = (
+                live_prediction_attr() if callable(live_prediction_attr) else None
+            )
             self.recorder.write_cognitive_tick(
                 sensory_events=window.events,
                 motor_events=motor_events,
@@ -569,6 +760,9 @@ class CognitiveRuntime:
                     ),
                     attention=attention_state.to_dict(),
                     reflex=reflex_decision.to_dict() if reflex_decision is not None else None,
+                    arbiter_mode=arbiter_payload,
+                    motor_decision=motor_decision_record,
+                    live_prediction=live_prediction_record,
                 ),
             )
 
@@ -578,6 +772,7 @@ class CognitiveRuntime:
             episode_id=episode_id,
             seed=seed,
             policy_name=self.policy.name,
+            name=self.config.resolve_name(),
             curriculum=self.config.curriculum,
             curriculum_stage_index=self.config.curriculum_stage_index,
             duration_ticks=ticks,
@@ -630,6 +825,9 @@ class CognitiveRuntime:
             attention_mode=self.attention.mode,
             reflex_mode=self.reflex.config.mode,
             reflex_activations=reflex_activations,
+            arbiter_mode_counts=dict(sorted(arbiter_mode_counts.items())),
+            surprise_calibration_error=self.surprise_calibrator.calibration_error,
+            hippocampus_seeds=len(self.hippocampus),
         )
         self.recorder.write_summary(summary)
         self.recorder.end_episode_file()
@@ -639,6 +837,14 @@ class CognitiveRuntime:
         if not recoverable_error:
             self._end_online_episode()
         return summary
+
+    def _gate_attention_breadth(self, mode: Optional[str]) -> None:
+        """Apply the previous tick's arbiter mode to this tick's attention
+        budget (issue #95: "the mode gates attention breadth"). `None`
+        (before any mode is known) is the unscaled baseline, same as
+        `reward_seeking`."""
+        multiplier = ARBITER_ATTENTION_BREADTH_MULTIPLIER.get(mode, 1.0) if mode else 1.0
+        self.attention.apply_budget_multiplier(multiplier)
 
     def _stream_rates(self, sim_elapsed: float) -> dict:
         """Events/sec per stream_id over the episode's simulated duration."""

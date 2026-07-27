@@ -207,7 +207,7 @@ V2 raises the infant in a **fast, deterministic, pixel-native nursery world**
 pain), and keeps **Minecraft via mineflayer** as the richer *graduation* world.
 Both are just Worlds behind the same seam; adding a third requires no changes to
 the brain. (This directly fixes the recording-quality problems documented in
-`docs/nursery-turn-in-place-analysis.md`, which were mostly headless-render and
+`docs/history/nursery-turn-in-place-analysis.md`, which were mostly headless-render and
 non-determinism artifacts of using live survival Minecraft as a nursery.)
 
 Two honesties about the nursery: Crafter is itself **2-D and top-down**, so it

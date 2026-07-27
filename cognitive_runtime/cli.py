@@ -1,6 +1,7 @@
 """Command-line interface for the Continuous Cognitive Runtime.
 
-    python -m cognitive_runtime run --policy scripted --episodes 3
+    python -m cognitive_runtime run --episodes 3
+    python -m cognitive_runtime run --world minecraft --policy scripted --episodes 3
     python -m cognitive_runtime demo
     python -m cognitive_runtime evaluate --episodes 3
     python -m cognitive_runtime statistical-evaluate --episodes 20 --baseline random
@@ -18,13 +19,27 @@ import argparse
 import dataclasses
 import os
 import sys
-from typing import Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
+if TYPE_CHECKING:
+    # Issue #176: the CLI's default --world is now "crafter", and the
+    # survival-economy world (MinecraftSurvivalBox, its --backend registry,
+    # the profile-driven reward system) is only imported, at runtime, from
+    # the functions below that actually select --world minecraft or pass
+    # --reward-profile -- not at module import time.
+    from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+    from cognitive_runtime.programs.minecraft.reward_profile import RewardProfile
+    from cognitive_runtime.programs.minecraft.rewards import SurvivalRewardConfig
+
+from brain.hippocampus import Hippocampus
 from cognitive_runtime.core.attention import ATTENTION_MODES
 from cognitive_runtime.core.orienting_reflex import REFLEX_MODES
 from cognitive_runtime.core.policy import Policy
+from cognitive_runtime.core.program import Program
 from cognitive_runtime.core.streams import TemporalFusion, default_encoder_registry
 from cognitive_runtime.models.online_q import OnlineQModel
+from cognitive_runtime.observability import DEFAULT_TRACE_DIR, configure_logging, start_run
+from cognitive_runtime.observability.logs import LEVELS
 from cognitive_runtime.policies import (
     HumanDemoPolicy,
     LearnedPolicy,
@@ -34,18 +49,6 @@ from cognitive_runtime.policies import (
     RandomPolicy,
     ScriptedSurvivalPolicy,
 )
-from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
-from cognitive_runtime.programs.minecraft.adapter import BACKENDS, MinecraftSurvivalBox
-from cognitive_runtime.programs.minecraft.curriculum import CURRICULUM_ORDER, get_curriculum
-from cognitive_runtime.programs.minecraft.evaluation import comparison_table, summarize_episodes
-from cognitive_runtime.programs.minecraft.reward_profile import (
-    RewardProfile,
-    RewardProfileError,
-    load_reward_profile,
-)
-from cognitive_runtime.programs.minecraft.rewards import SurvivalRewardConfig
-from cognitive_runtime.programs.minecraft.action_registry import MINECRAFT_ACTION_REGISTRY
-from cognitive_runtime.programs.minecraft.stream_registry import MINECRAFT_STREAM_REGISTRY
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
 from cognitive_runtime.runtime.replay import NonDeterministicSessionError
@@ -59,7 +62,6 @@ from cognitive_runtime.training.imitation import train_bc
 
 DEFAULT_MODEL_OUT = "models/bc.json"
 DEFAULT_ONLINE_MODEL_OUT = "models/online-q.json"
-DEFAULT_ACTOR_CRITIC_MODEL_OUT = "models/actor-critic.pt"
 
 #: Issue #32 "raw input" ablation: which stream classifications the online
 #: policy's fused state is built from. "full" preserves the pre-#32 behavior
@@ -68,28 +70,32 @@ DEFAULT_ACTOR_CRITIC_MODEL_OUT = "models/actor-critic.pt"
 #: semantic streams keep publishing/recording but stop reaching the policy.
 INPUT_PROFILES = {"full", "raw"}
 
-#: Issue #57 "learned fusion primary" bridge: which fusion path
-#: `--policy actor-critic` reads its fused agent state from. "fixed" is the
-#: `TemporalFusion` concatenation of hand-written encoders (the default,
-#: unchanged); "learned" runs trainable stream encoders + `LatentFusionModel`
-#: in the live tick (`cognitive_runtime.neural.live_fusion.LiveLearnedFusion`).
-FUSION_MODES = {"fixed", "learned"}
+#: ``--backend`` choices for ``--world minecraft`` (the ``BACKENDS`` registry
+#: itself lives in ``programs.minecraft.adapter``; its keys are mirrored here,
+#: statically, so building the parser -- which needs these for every
+#: subcommand's ``--backend``/``choices=`` metadata, regardless of the world
+#: actually selected -- never imports the survival-economy adapter module
+#: (issue #176).
+MINECRAFT_BACKEND_NAMES = ("remote", "simulated")
 
 
 def _default_nursery_backend() -> str:
     """Use the live backend by default when live connection env is present."""
     env_default = os.environ.get("CCR_NURSERY_BACKEND")
-    if env_default in BACKENDS:
+    if env_default in MINECRAFT_BACKEND_NAMES:
         return env_default
     if os.environ.get("CCR_MINECRAFT_HOST"):
         return "remote"
     return "simulated"
 
 
-def _encoders_for_input_profile(profile: str):
+def _encoders_for_input_profile(profile: str, stream_registry=None):
     if profile == "full":
         return None
-    return MINECRAFT_STREAM_REGISTRY.to_encoder_registry(classifications={"agent_input"})
+    if stream_registry is None:
+        from cognitive_runtime.programs.minecraft.stream_registry import MINECRAFT_STREAM_REGISTRY
+        stream_registry = MINECRAFT_STREAM_REGISTRY
+    return stream_registry.to_encoder_registry(classifications={"agent_input"})
 
 
 #: Historical CLI defaults for the world knobs a curriculum preset can also
@@ -111,7 +117,11 @@ def _resolve_world_args(args: argparse.Namespace) -> None:
     """Fill unset world/seed args from `--curriculum`'s preset, falling back
     to the historical CLI defaults; mutates `args` in place so every caller
     downstream sees plain resolved values, curriculum or not."""
-    preset = get_curriculum(args.curriculum) if args.curriculum else None
+    if args.curriculum:
+        from cognitive_runtime.programs.minecraft.curriculum import get_curriculum
+        preset = get_curriculum(args.curriculum)
+    else:
+        preset = None
     for key, default in _WORLD_DEFAULTS.items():
         if getattr(args, key, None) is None:
             value = preset.world_config.get(key, default) if preset else default
@@ -120,23 +130,36 @@ def _resolve_world_args(args: argparse.Namespace) -> None:
         args.seed = preset.seed if preset else 0
 
 
-def _reward_config_for(args: argparse.Namespace) -> Optional[SurvivalRewardConfig]:
+def _reward_config_for(args: argparse.Namespace) -> Optional["SurvivalRewardConfig"]:
     """The curriculum's reward-weight bundle applied over the defaults, or
     `None` (default reward config) when no curriculum was chosen."""
     if not args.curriculum:
         return None
+    from cognitive_runtime.programs.minecraft.curriculum import get_curriculum
+    from cognitive_runtime.programs.minecraft.rewards import SurvivalRewardConfig
+
     preset = get_curriculum(args.curriculum)
     return dataclasses.replace(SurvivalRewardConfig(), **preset.reward_config)
 
 
-def _reward_profile_for(args: argparse.Namespace) -> Optional[RewardProfile]:
+def _reward_profile_for(args: argparse.Namespace) -> Optional["RewardProfile"]:
     """The loaded `--reward-profile`, or `None` for the legacy hard-coded
     reward path.  Fails the whole invocation immediately (issue #41: "a
     malformed profile fails at startup with a clear message, not mid-run")
-    rather than letting a bad profile surface as a mid-episode crash."""
+    rather than letting a bad profile surface as a mid-episode crash.
+
+    Issue #176: the profile-driven reward economy (reward_profile.py) is
+    only imported here, when `--reward-profile` is actually given -- not at
+    CLI module import time.
+    """
     path = getattr(args, "reward_profile", None)
     if not path:
         return None
+    from cognitive_runtime.programs.minecraft.reward_profile import (
+        RewardProfileError,
+        load_reward_profile,
+    )
+
     try:
         return load_reward_profile(path)
     except RewardProfileError as exc:
@@ -155,12 +178,23 @@ def _program_config(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 
-def _make_policy(name: str, args: argparse.Namespace) -> Policy:
+def _make_policy(
+    name: str, args: argparse.Namespace, action_space: Optional[list] = None
+) -> Policy:
     if name == "null":
         return NullPolicy()
     if name == "random":
-        return RandomPolicy(ACTION_SPACE, seed=args.seed)
+        if not action_space:
+            from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
+            action_space = ACTION_SPACE
+        return RandomPolicy(action_space, seed=args.seed)
     if name == "scripted":
+        if getattr(args, "world", "minecraft") != "minecraft":
+            sys.exit(
+                f"--policy scripted is Minecraft-specific (a hand-authored heuristic over "
+                f"Minecraft's own actions); it does not support --world {args.world!r}. "
+                "Pick --policy null/random/human/online/learned/neural instead."
+            )
         return ScriptedSurvivalPolicy(seed=args.seed)
     if name == "human":
         return HumanDemoPolicy(realtime=getattr(args, "realtime", False))
@@ -179,25 +213,84 @@ def _make_policy(name: str, args: argparse.Namespace) -> Policy:
     sys.exit(f"unknown policy: {name}")
 
 
-def _make_world_model(args: argparse.Namespace, program: MinecraftSurvivalBox):
+def _make_world_model(
+    args: argparse.Namespace,
+    program: Program,
+    hippocampus: Optional[Any] = None,
+):
     """The heuristic default (`None`, `TrendWorldModel`), or a trained neural
-    world-model checkpoint bridged behind the same `world_model` seam
-    (issue #26); `--world-model` is unset unless the caller opts in."""
+    world-model checkpoint bridged behind the same `world_model` seam.
+
+    Two neural paths, both requiring the `neural` extra:
+
+    - `--world-model cortex:PATH` drives the recurrent, action-conditioned
+      `PredictiveCortex` as the live world model (issue #166) -- its backbone
+      hidden state persists across ticks and resets on each episode boundary.
+      `--async-trainer` (issue #175) additionally wires a live
+      `sleep.cortex_consolidation.CortexConsolidator` into it, so the cortex
+      itself is the online learner instead of a separate actor/critic stack;
+      consolidated weights are persisted back to the same checkpoint path on
+      every publish (`CortexWorldModel.checkpoint_path` defaults from the
+      loaded path), so the run survives an episode end, crash, or interrupt.
+    - `--world-model PATH` bridges the memoryless `MLPWorldModel` (issue #26).
+
+    `--world-model` is unset unless the caller opts in. `hippocampus` is only
+    consulted for the cortex path with `--async-trainer` set -- it must be the
+    *same* instance the runtime loop is writing seeds into, so the
+    consolidator's dream mixer has real seeds to draw from (`cmd_run` builds
+    one `Hippocampus()` and passes it to both). Other callers (e.g. `cmd_demo`,
+    whose args namespace has no `async_trainer` attribute) can omit it."""
     path = getattr(args, "world_model", None)
+    async_trainer = getattr(args, "async_trainer", False)
     if not path:
+        if async_trainer:
+            sys.exit(
+                "--async-trainer (cortex consolidation, issue #175) requires "
+                "--world-model cortex:<ckpt>; it repoints the online learner at the "
+                "predictive cortex, so a live cortex world model must be selected"
+            )
         return None
+    action_keys = [action.key() for action in program.metadata().action_space]
+    cortex_prefix = "cortex:"
+    if path.startswith(cortex_prefix):
+        checkpoint = path[len(cortex_prefix):]
+        if not checkpoint:
+            sys.exit("--world-model cortex: needs a checkpoint path (cortex:PATH)")
+        try:
+            from cognitive_runtime.policies.cortex_world_model import CortexWorldModel
+        except ImportError as exc:  # torch not installed
+            sys.exit(f"the predictive cortex needs PyTorch ({exc}); install '.[neural]'.")
+        world_model = CortexWorldModel(checkpoint, action_keys=action_keys)
+        if async_trainer:
+            try:
+                from sleep.cortex_consolidation import CortexConsolidator
+            except ImportError as exc:  # torch not installed
+                sys.exit(f"cortex consolidation needs PyTorch ({exc}); install '.[neural]'.")
+            world_model.consolidator = CortexConsolidator(
+                cortex=world_model.model, hippocampus=hippocampus,
+            )
+            world_model.consolidate_every_ticks = args.async_wake_ticks
+            world_model.consolidation_steps = args.async_consolidation_steps
+        return world_model
+    if async_trainer:
+        sys.exit(
+            "--async-trainer (cortex consolidation, issue #175) requires "
+            "--world-model cortex:<ckpt>; it repoints the online learner at the "
+            "predictive cortex, so a live cortex world model must be selected"
+        )
     try:
         from cognitive_runtime.policies.neural_world_model import NeuralWorldModel
     except ImportError as exc:  # torch not installed
         sys.exit(f"the neural world model needs PyTorch ({exc}); install '.[neural]'.")
-    action_keys = [action.key() for action in program.metadata().action_space]
     return NeuralWorldModel(path, action_keys=action_keys)
 
 
 def _add_world_model_arg(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--world-model", default=None,
                         help="path to a trained neural world-model checkpoint (.pt bundle, "
-                             "--model-type world-model); default: the heuristic TrendWorldModel")
+                             "--model-type world-model); prefix with 'cortex:' to drive a "
+                             "trained recurrent PredictiveCortex checkpoint as the live world "
+                             "model (issue #166); default: the heuristic TrendWorldModel")
 
 
 def _make_entity_persistence(args: argparse.Namespace):
@@ -221,7 +314,7 @@ def _add_entity_persistence_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def _make_online_policy_and_learner(
-    args: argparse.Namespace, program: MinecraftSurvivalBox, encoders=None
+    args: argparse.Namespace, program: Program, encoders=None
 ) -> tuple[OnlineQPolicy, OnlineQLearner]:
     action_space = list(program.metadata().action_space)
     action_keys = [action.key() for action in action_space]
@@ -267,258 +360,8 @@ def _make_online_policy_and_learner(
     return policy, learner
 
 
-def _make_actor_critic_policy_and_learner(
-    args: argparse.Namespace, program: MinecraftSurvivalBox, encoders=None
-):
-    """``--policy actor-critic``: the neural actor/critic online policy
-    (issue #29, docs/neural-stream-agent.md Phase E), wired the same way
-    ``_make_online_policy_and_learner`` wires the linear online-Q baseline.
-    Imported lazily -- torch stays optional for every other policy.
-    """
-    try:
-        import torch
-
-        from cognitive_runtime.neural import (
-            ActorCriticOptimizer,
-            MLPPolicyModel,
-            MLPValueModel,
-            MLPWorldModel,
-            NeuralAgentCheckpoint,
-            read_checkpoint_metadata,
-        )
-        from cognitive_runtime.neural.replay_buffer import MixedTrainingSchedule, ReplayBuffer
-        from cognitive_runtime.policies.actor_critic import (
-            ActorCriticLearner,
-            ActorCriticPolicy,
-            world_feature_width,
-        )
-    except ImportError as exc:  # torch not installed
-        sys.exit(f"the actor-critic policy needs PyTorch ({exc}); install '.[neural]'.")
-
-    action_space = list(program.metadata().action_space)
-    action_keys = [action.key() for action in action_space]
-    fusion = TemporalFusion(program.stream_catalog(), encoders or default_encoder_registry())
-    model_path = args.actor_critic_model
-    fusion_mode = getattr(args, "fusion", "fixed")
-    if fusion_mode not in FUSION_MODES:
-        sys.exit(f"unknown --fusion {fusion_mode!r}; expected one of {sorted(FUSION_MODES)}")
-
-    arch: Dict[str, Any] = {
-        "fused_width": fusion.width,
-        "world_feature_width": world_feature_width(action_keys),
-        "n_actions": len(action_keys),
-        "hidden_dim": args.actor_critic_hidden_dim,
-        "has_world_model": args.actor_critic_world_model_loss,
-        "fusion_mode": fusion_mode,
-    }
-    if os.path.exists(model_path):
-        saved_arch = read_checkpoint_metadata(model_path).get("extra", {}).get("actor_critic")
-        if saved_arch:
-            arch = saved_arch
-            saved_fusion_mode = arch.get("fusion_mode", "fixed")
-            if saved_fusion_mode != fusion_mode:
-                sys.exit(
-                    f"checkpoint {model_path!r} was trained with --fusion "
-                    f"{saved_fusion_mode!r}, but this run requested --fusion "
-                    f"{fusion_mode!r}; use the matching flag, or --fresh to start a new "
-                    "checkpoint (issue #57: fusion mode is not silently interchangeable)"
-                )
-
-    if fusion_mode == "learned" and getattr(args, "actor_critic_async", False):
-        sys.exit(
-            "--fusion learned does not support --async-trainer yet (issue #37's async "
-            "trainer only knows the fixed fused-latent transition shape); drop one of "
-            "the two flags"
-        )
-
-    live_fusion = None
-    if fusion_mode == "learned":
-        from cognitive_runtime.neural.live_fusion import LiveLearnedFusion
-
-        live_fusion = LiveLearnedFusion(
-            program.stream_catalog(),
-            MINECRAFT_STREAM_REGISTRY,
-            base_layout_hash=fusion.layout_hash,
-            fused_width=arch.get("fused_width"),
-            hidden_dim=arch["hidden_dim"],
-            lr=args.actor_critic_lr,
-        )
-        arch["fused_width"] = live_fusion.fused_width()
-        layout_hash = live_fusion.layout_hash
-    else:
-        layout_hash = fusion.layout_hash
-
-    if getattr(args, "actor_critic_async", False):
-        return _make_async_actor_critic_policy_and_learner(
-            args, arch=arch, model_path=model_path,
-            layout_hash=layout_hash, action_keys=action_keys, action_space=action_space,
-        ) + (None,)
-
-    # Deterministic weight init: ActorCriticOptimizer's own `seed` only covers
-    # its later stochastic ops, not construction, which happens before it exists.
-    torch.manual_seed(args.seed)
-    policy_model = MLPPolicyModel(
-        arch["fused_width"], arch["world_feature_width"], arch["n_actions"],
-        hidden_dim=arch["hidden_dim"], layout_hash=layout_hash, action_keys=action_keys,
-    )
-    critic_model = MLPValueModel(
-        arch["fused_width"], arch["world_feature_width"],
-        hidden_dim=arch["hidden_dim"], layout_hash=layout_hash, action_keys=action_keys,
-    )
-    world_model = None
-    if arch["has_world_model"]:
-        world_model = MLPWorldModel(
-            arch["fused_width"], arch["n_actions"],
-            hidden_dim=arch["hidden_dim"], layout_hash=layout_hash, action_keys=action_keys,
-        )
-
-    optimizer = ActorCriticOptimizer(
-        policy_model,
-        critic_model,
-        world_model=world_model,
-        lr=args.actor_critic_lr,
-        gamma=args.actor_critic_gamma,
-        entropy_coef=args.actor_critic_entropy_coef,
-        grad_clip_norm=args.actor_critic_grad_clip_norm,
-        seed=args.seed,
-    )
-
-    checkpoint_kwargs: Dict[str, Any] = dict(
-        layout_hash=layout_hash,
-        action_keys=action_keys,
-        online_optimizer=optimizer,
-        extra_metadata={"actor_critic": arch},
-    )
-    if live_fusion is not None:
-        checkpoint_kwargs["encoders"] = live_fusion.encoders
-        checkpoint_kwargs["fusion"] = live_fusion.module
-        checkpoint_kwargs["optimizers"] = {"live_fusion": live_fusion.optimizer}
-    checkpoint = NeuralAgentCheckpoint(model_path, **checkpoint_kwargs)
-    if os.path.exists(model_path):
-        try:
-            checkpoint.load()
-        except ValueError as exc:
-            sys.exit(str(exc))
-
-    policy = ActorCriticPolicy(
-        policy_model, critic_model, action_keys, action_space=action_space,
-        history=args.actor_critic_history, training=args.actor_critic_train, seed=args.seed,
-    )
-    if live_fusion is not None:
-        (live_fusion.train_mode if args.actor_critic_train else live_fusion.eval_mode)()
-    replay_buffer = ReplayBuffer()
-    learner = ActorCriticLearner(
-        optimizer,
-        policy,
-        training=args.actor_critic_train,
-        checkpoint=checkpoint,
-        save_every_ticks=args.actor_critic_save_every,
-        replay_buffer=replay_buffer,
-        mixed_schedule=MixedTrainingSchedule(replay_every_n_ticks=args.actor_critic_replay_every),
-        replay_batch_size=args.actor_critic_replay_batch_size,
-        live_fusion=live_fusion,
-    )
-    return policy, learner, live_fusion
-
-
-def _make_async_actor_critic_policy_and_learner(
-    args: argparse.Namespace,
-    *,
-    arch: Dict[str, Any],
-    model_path: str,
-    layout_hash: str,
-    action_keys: list,
-    action_space: list,
-):
-    """``--policy actor-critic --async-trainer`` (issue #37): spawns a
-    background trainer process and wires the actor side (inference-only
-    policy + :class:`AsyncActorCriticLearner`) to it via a shared-memory
-    live-experience ring and a polling weight subscriber, instead of the
-    synchronous in-tick ``ActorCriticLearner``.
-    """
-    from cognitive_runtime.neural.checkpoint import NeuralAgentCheckpoint
-    from cognitive_runtime.neural.experience_queue import SharedExperienceRing
-    from cognitive_runtime.neural.weight_publisher import WeightSubscriber
-    from cognitive_runtime.policies.actor_critic import (
-        ActorCriticPolicy,
-        AsyncActorCriticLearner,
-    )
-    from cognitive_runtime.training.async_trainer import (
-        ActorCriticArch,
-        build_actor_critic_modules,
-        spawn_trainer_process,
-    )
-
-    trainer_arch = ActorCriticArch(
-        fused_width=arch["fused_width"],
-        world_feature_width=arch["world_feature_width"],
-        n_actions=arch["n_actions"],
-        action_keys=tuple(action_keys),
-        layout_hash=layout_hash,
-        hidden_dim=arch["hidden_dim"],
-        has_world_model=arch["has_world_model"],
-    )
-
-    ring = SharedExperienceRing(args.async_ring_capacity, arch["fused_width"])
-    trainer_process, trainer_stop_event = spawn_trainer_process(
-        trainer_arch,
-        model_path,
-        live_ring_handle=ring.handle(),
-        trainer_kwargs={
-            "lr": args.actor_critic_lr,
-            "gamma": args.actor_critic_gamma,
-            "entropy_coef": args.actor_critic_entropy_coef,
-            "grad_clip_norm": args.actor_critic_grad_clip_norm,
-            "seed": args.seed,
-            "batch_size": args.async_batch_size,
-            "min_buffer_size": args.async_min_buffer_size,
-            "publish_every_steps": args.async_publish_every,
-        },
-    )
-
-    policy_model, critic_model, _world_model, _optimizer = build_actor_critic_modules(
-        trainer_arch, seed=args.seed,
-    )
-    actor_bundle = NeuralAgentCheckpoint(
-        model_path, layout_hash=layout_hash, action_keys=action_keys,
-        policy=policy_model, critic=critic_model,
-    )
-    subscriber = WeightSubscriber(path=model_path, bundle=actor_bundle)
-
-    policy = ActorCriticPolicy(
-        policy_model, critic_model, action_keys, action_space=action_space,
-        history=args.actor_critic_history, training=args.actor_critic_train, seed=args.seed,
-    )
-    learner = AsyncActorCriticLearner(
-        policy, ring, weight_subscriber=subscriber,
-        reload_every_ticks=args.async_reload_every_ticks,
-    )
-    # Stashed for `cmd_run`'s shutdown; not part of the `Learner` contract.
-    learner.async_resources = (ring, trainer_process, trainer_stop_event)
-    return policy, learner
-
-
-def _shutdown_async_trainer(learner: Optional[Any]) -> None:
-    """Best-effort, always-runs cleanup for ``--async-trainer``: ask the
-    trainer process to stop (it publishes once more on its way out -- see
-    ``AsyncTrainer.run_forever``), then release the shared-memory ring. A
-    trainer that already died (e.g. a deliberate ``kill -9`` during a
-    supervised run) is simply already gone; nothing here depends on it
-    being alive."""
-    resources = getattr(learner, "async_resources", None)
-    if resources is None:
-        return
-    ring, trainer_process, trainer_stop_event = resources
-    trainer_stop_event.set()
-    trainer_process.join(timeout=10)
-    if trainer_process.is_alive():
-        trainer_process.terminate()
-        trainer_process.join(timeout=5)
-    ring.close()
-    ring.unlink()
-
-
 def _add_world_args(parser: argparse.ArgumentParser) -> None:
+    from cognitive_runtime.programs.minecraft.curriculum import CURRICULUM_ORDER
     parser.add_argument("--curriculum", default=None, choices=CURRICULUM_ORDER,
                         help="named curriculum preset: world config + reward weights + a "
                              "default seed, staged flat-safe -> resource-world -> "
@@ -544,13 +387,13 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
                              "prismarine-viewer first-person snapshots (default); "
                              "'grid' uses the compact colorized semantic-grid fallback")
     parser.add_argument("--model", default=None, help="path to a trained BC model (learned policy)")
-    parser.add_argument("--backend", default="simulated", choices=sorted(BACKENDS),
+    parser.add_argument("--backend", default="simulated", choices=sorted(MINECRAFT_BACKEND_NAMES),
                         help="survival backend: the deterministic simulated world, or "
                              "a real-Minecraft client (remote; not yet implemented)")
     parser.add_argument("--reward-profile", default=None,
                         help="path to a YAML/JSON reward profile (e.g. goals/survival.yaml, "
                              "goals/ender_dragon.yaml); overrides --curriculum's reward weights "
-                             "with a profile-driven reward engine (docs/reward_profiles.md). "
+                             "with a profile-driven reward engine (docs/history/reward_profiles.md). "
                              "Malformed profiles fail immediately with a diagnosis.")
     parser.add_argument("--intrinsic-risk-threshold", type=float, default=0.5,
                         help="risk-gated intrinsic drive (issue #61): the internal.risk level "
@@ -560,9 +403,69 @@ def _add_world_args(parser: argparse.ArgumentParser) -> None:
                              "sigmoid around --intrinsic-risk-threshold (default: 0.15)")
 
 
+#: Programs the ``--world`` selector can build (issue #89). Crafter is the
+#: default (issue #176): it's the live V2 nursery world and needs none of
+#: Minecraft's survival-economy weight (crafting/inventory/reward-profile
+#: system) the predictive objective doesn't use. Minecraft stays fully
+#: supported, opt-in via ``--world minecraft`` -- see
+#: ``cognitive_runtime/programs/minecraft/__init__.py`` for its quarantine
+#: note and the future graduation-world milestone it's kept for.
+WORLDS = {"minecraft", "crafter"}
+
+
+def _add_world_selector_arg(parser: argparse.ArgumentParser, default: str = "crafter") -> None:
+    parser.add_argument("--world", default=default, choices=sorted(WORLDS),
+                        help="which Program to run: the Crafter nursery world "
+                             f"or the legacy Minecraft-like survival sim "
+                             f"(default here: {default}). Both implement the "
+                             "same streams-v2 seam, so the runtime/policy code "
+                             "is unchanged either way.")
+
+
+def _build_program(args: argparse.Namespace, program_config: Dict[str, Any],
+                    reward_config, reward_profile):
+    """Construct the selected world's Program plus its stream/action
+    registries -- the "small factory" the ``--world`` selector routes
+    through (issue #89). ``reward_config``/``reward_profile`` only apply to
+    ``--world minecraft``; Crafter has no reward-profile system yet (it uses
+    the achievement/health reward the ``crafter`` package computes itself).
+    """
+    world = getattr(args, "world", "minecraft")
+    if world == "minecraft":
+        # Issue #176: MinecraftSurvivalBox (and the survival-economy reward
+        # system it pulls in) is only imported here, when --world minecraft
+        # is actually selected -- never for the default (crafter) path.
+        from cognitive_runtime.programs.minecraft.action_registry import MINECRAFT_ACTION_REGISTRY
+        from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+        from cognitive_runtime.programs.minecraft.stream_registry import MINECRAFT_STREAM_REGISTRY
+
+        program = MinecraftSurvivalBox(
+            config=program_config,
+            reward_config=None if reward_profile else reward_config,
+            backend=args.backend,
+            reward_profile=reward_profile,
+        )
+        return program, MINECRAFT_STREAM_REGISTRY, MINECRAFT_ACTION_REGISTRY
+    if world == "crafter":
+        from cognitive_runtime.programs.crafter.action_registry import CRAFTER_ACTION_REGISTRY
+        from cognitive_runtime.programs.crafter.adapter import CrafterWorld
+        from cognitive_runtime.programs.crafter.stream_registry import CRAFTER_STREAM_REGISTRY
+
+        # CrafterWorld imports the 'crafter' package (a core dependency,
+        # issue #176) lazily, inside __init__ -- a partial/dev install
+        # missing it only surfaces an ImportError here, at construction, not
+        # at the module import above.
+        try:
+            program = CrafterWorld(config=program_config)
+        except ImportError as exc:
+            sys.exit(str(exc))
+        return program, CRAFTER_STREAM_REGISTRY, CRAFTER_ACTION_REGISTRY
+    sys.exit(f"unknown --world {world!r}; expected one of {sorted(WORLDS)}")
+
+
 #: Online-learning policies whose model path needs a checkpoint-or-`--fresh`
 #: decision for live runs (issue #33).
-_CHECKPOINTED_POLICIES = {"online": "online_model", "actor-critic": "actor_critic_model"}
+_CHECKPOINTED_POLICIES = {"online": "online_model"}
 
 
 def _enforce_live_run_protocol(args: argparse.Namespace) -> None:
@@ -593,25 +496,49 @@ def _enforce_live_run_protocol(args: argparse.Namespace) -> None:
 
 def cmd_run(args: argparse.Namespace) -> None:
     _resolve_world_args(args)
+    world = getattr(args, "world", "minecraft")
+    has_cortex_wm = getattr(args, "world_model", None) and args.world_model.startswith("cortex:")
+    if args.policy is None:
+        if has_cortex_wm:
+            args.policy = "cortex-mpc"
+        elif world == "minecraft":
+            args.policy = "scripted"
+        else:
+            args.policy = "random"
+    if world != "minecraft" and args.backend != "simulated":
+        sys.exit(f"--backend only applies to --world minecraft (got --world {world!r})")
+    if world != "minecraft" and args.curriculum is not None:
+        sys.exit(f"--curriculum only applies to --world minecraft (got --world {world!r})")
     _enforce_live_run_protocol(args)
     program_config = _program_config(args)
     reward_profile = _reward_profile_for(args)
-    program = MinecraftSurvivalBox(
-        config=program_config,
-        reward_config=None if reward_profile else _reward_config_for(args),
-        backend=args.backend,
-        reward_profile=reward_profile,
+    if world != "minecraft" and reward_profile is not None:
+        sys.exit(f"--reward-profile only applies to --world minecraft (got --world {world!r})")
+    program, stream_registry, action_registry = _build_program(
+        args, program_config, _reward_config_for(args), reward_profile,
     )
-    encoders = _encoders_for_input_profile(args.input_profile)
+    encoders = _encoders_for_input_profile(args.input_profile, stream_registry)
+    action_space = list(program.metadata().action_space)
     learner = None
-    learned_fusion = None
+    # World model must be created before cortex-mpc policy, which reads
+    # the cortex's live hidden state every tick.
+    hippocampus = Hippocampus()
+    world_model = _make_world_model(args, program, hippocampus)
     if args.policy == "online":
         policy, learner = _make_online_policy_and_learner(args, program, encoders)
-    elif args.policy == "actor-critic":
-        policy, learner, learned_fusion = _make_actor_critic_policy_and_learner(args, program, encoders)
+    elif args.policy == "cortex-mpc":
+        from cognitive_runtime.policies.cortex_world_model import CortexWorldModel
+        if not isinstance(world_model, CortexWorldModel):
+            sys.exit(
+                "--policy cortex-mpc requires --world-model cortex:<ckpt>; "
+                "the MPC plans over the live cortex's recurrent hidden state"
+            )
+        from motor.cortex_mpc import build_cortex_mpc
+        from motor.organism_policy import MotorFreedomPolicy
+        controller = build_cortex_mpc(world_model)
+        policy = MotorFreedomPolicy("learned", action_space, voluntary=controller)
     else:
-        policy = _make_policy(args.policy, args)
-    world_model = _make_world_model(args, program)
+        policy = _make_policy(args.policy, args, action_space)
     entity_persistence = _make_entity_persistence(args)
     config = RuntimeConfig(
         tick_rate=args.tick_rate,
@@ -627,6 +554,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         frame_disk_budget_mb=args.frame_disk_budget_mb,
         pin_on_streams=args.pin_on_streams,
         session_id=args.session_id,
+        name=args.name,
         program_config=program_config,
         curriculum=args.curriculum,
         attention_mode=getattr(args, "attention", "off"),
@@ -641,15 +569,12 @@ def cmd_run(args: argparse.Namespace) -> None:
         learner=learner,
         world_model=world_model,
         entity_persistence=entity_persistence,
-        stream_registry=MINECRAFT_STREAM_REGISTRY,
+        stream_registry=stream_registry,
         encoders=encoders,
-        learned_fusion=learned_fusion,
-        action_registry=MINECRAFT_ACTION_REGISTRY,
+        action_registry=action_registry,
+        hippocampus=hippocampus,
     )
-    try:
-        summaries = runtime.run()
-    finally:
-        _shutdown_async_trainer(learner)
+    summaries = runtime.run()
     for summary in summaries:
         stats = summary.program_stats
         print(
@@ -659,6 +584,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             f"placed={stats.get('blocks_placed')} damage={stats.get('damage_taken')}"
         )
     if summaries:
+        from cognitive_runtime.programs.minecraft.evaluation import comparison_table, summarize_episodes
         row = summarize_episodes(summaries)
         print("\naggregate:")
         print(comparison_table([row]))
@@ -682,6 +608,11 @@ def cmd_demo(args: argparse.Namespace) -> None:
 
 
 def cmd_evaluate(args: argparse.Namespace) -> None:
+    # `evaluate` has no --world selector; it's a Minecraft-only tool (issue
+    # #176: imported here, not at CLI module load, since most commands
+    # never touch the survival economy).
+    from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+
     _resolve_world_args(args)
     program_config = _program_config(args)
     reward_profile = _reward_profile_for(args)
@@ -700,6 +631,7 @@ def cmd_evaluate(args: argparse.Namespace) -> None:
         seed=args.seed,
         max_ticks=args.episode_ticks,
     )
+    from cognitive_runtime.programs.minecraft.evaluation import comparison_table
     print(comparison_table(rows))
 
 
@@ -723,6 +655,11 @@ def cmd_statistical_evaluate(args: argparse.Namespace) -> None:
             for (curriculum, policy), s in sorted(by_group.items())
         }
     else:
+        # `statistical-evaluate` has no --world selector; it's a
+        # Minecraft-only tool (issue #176: imported here, not at CLI module
+        # load).
+        from cognitive_runtime.programs.minecraft.adapter import MinecraftSurvivalBox
+
         _resolve_world_args(args)
         program_config = _program_config(args)
         reward_profile = _reward_profile_for(args)
@@ -882,7 +819,7 @@ def _train_pixel_encoder(args: argparse.Namespace) -> None:
     model, stats = train_pixel_encoder_pretraining(dataset, config)
     out = args.out if args.out != DEFAULT_MODEL_OUT else "models/pixel_encoder.pt"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    save_pixel_encoder_pretraining_checkpoint(out, model, dataset, stats)
+    save_pixel_encoder_pretraining_checkpoint(out, model, dataset, stats, name=args.name)
     for key in (
         "final_total_loss",
         "final_reconstruction_loss",
@@ -931,7 +868,7 @@ def _train_latent_fusion(args: argparse.Namespace) -> None:
     model, stats = train_latent_fusion_model(dataset, config)
     out = args.out if args.out != DEFAULT_MODEL_OUT else "models/latent_fusion.pt"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    save_latent_fusion_checkpoint(out, model, dataset, stats)
+    save_latent_fusion_checkpoint(out, model, dataset, stats, name=args.name)
     for key in (
         "final_action_loss",
         "final_reward_loss",
@@ -980,7 +917,7 @@ def _train_world_model(args: argparse.Namespace) -> None:
     model, stats = train_world_model(dataset, config)
     out = args.out if args.out != DEFAULT_MODEL_OUT else "models/world_model.pt"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    save_world_model_checkpoint(out, model, dataset, stats)
+    save_world_model_checkpoint(out, model, dataset, stats, name=args.name)
     for key in (
         "final_next_latent_loss",
         "final_reward_loss",
@@ -1042,7 +979,7 @@ def _train_multi_horizon_world_model(args: argparse.Namespace) -> None:
     model, stats = train_multi_horizon_world_model(dataset, config)
     out = args.out if args.out != DEFAULT_MODEL_OUT else "models/multi_horizon_world_model.pt"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    save_multi_horizon_world_model_checkpoint(out, model, dataset, stats)
+    save_multi_horizon_world_model_checkpoint(out, model, dataset, stats, name=args.name)
     for h, entry in stats["evaluation"].items():
         print(
             f"  horizon t+{h}: model_mse={round(entry['model_mse'], 4)} "
@@ -1096,7 +1033,7 @@ def _train_entity_persistence(args: argparse.Namespace) -> None:
     model, stats = train_entity_persistence_model(dataset, config)
     out = args.out if args.out != DEFAULT_MODEL_OUT else "models/entity_persistence.pt"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    save_entity_persistence_checkpoint(out, model, dataset, stats)
+    save_entity_persistence_checkpoint(out, model, dataset, stats, name=args.name)
     for key in ("final_feature_loss", "final_surprise_loss", "final_total_loss",
                 "baseline_mse", "model_mse", "beats_forget_baseline"):
         print(f"  {key}: {stats[key]}")
@@ -1167,13 +1104,15 @@ def cmd_ego_motion_canary(args: argparse.Namespace) -> None:
 def cmd_nursery_list(args: argparse.Namespace) -> None:
     """``ccr nursery list`` (issue #62): print every registered nursery
     scenario -- scripted micro-scenarios that isolate one worldly regularity
-    each, feeding checkpoints into the survival curriculum's stage one."""
+    each, feeding checkpoints into the survival curriculum's stage one.
+    ``--world crafter`` (issue #90) lists the Crafter ports instead."""
     try:
-        from cognitive_runtime.training.nursery import NURSERY_SCENARIOS
+        from cognitive_runtime.training.nursery import _scenarios_for_world
     except ImportError as exc:  # torch not installed
         sys.exit(f"the nursery suite needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
-    for name in sorted(NURSERY_SCENARIOS):
-        scenario = NURSERY_SCENARIOS[name]
+    scenarios = _scenarios_for_world(getattr(args, "world", "minecraft"))
+    for name in sorted(scenarios):
+        scenario = scenarios[name]
         tag = " [+entity-persistence metric]" if scenario.entity_persistence_metric else ""
         print(f"{name}{tag}: {scenario.description}")
 
@@ -1193,20 +1132,22 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
         import json
 
         from cognitive_runtime.training.nursery import (
-            NURSERY_SCENARIOS,
             NurseryConfig,
+            _scenarios_for_world,
             run_nursery_scenario,
             save_nursery_scenario_checkpoint,
         )
     except ImportError as exc:  # torch not installed
         sys.exit(f"the nursery suite needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
 
-    if args.scenario != "all" and args.scenario not in NURSERY_SCENARIOS:
+    world = getattr(args, "world", "minecraft")
+    scenarios = _scenarios_for_world(world)
+    if args.scenario != "all" and args.scenario not in scenarios:
         sys.exit(
-            f"unknown nursery scenario {args.scenario!r}; choices: "
-            f"{sorted(NURSERY_SCENARIOS)} or 'all'"
+            f"unknown nursery scenario {args.scenario!r} for --world {world!r}; choices: "
+            f"{sorted(scenarios)} or 'all'"
         )
-    scenario_names = sorted(NURSERY_SCENARIOS) if args.scenario == "all" else [args.scenario]
+    scenario_names = sorted(scenarios) if args.scenario == "all" else [args.scenario]
 
     train_seeds = list(range(args.train_seeds))
     holdout_seeds = list(range(args.train_seeds, args.train_seeds + args.holdout_seeds))
@@ -1215,6 +1156,7 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
         holdout_seeds=holdout_seeds,
         episode_ticks=args.episode_ticks,
         world_size=args.world_size,
+        world=world,
         backend=args.backend,
         realtime=args.realtime or args.backend == "remote",
         horizons=args.horizons,
@@ -1229,14 +1171,15 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
         entity_persistence_epochs=args.entity_persistence_epochs,
         data_quality_gate=not args.skip_data_quality_gate,
         export_predictions=not args.no_export_predictions,
+        name=args.name,
     )
+    backend_note = f"backend={config.backend}" if world == "minecraft" else f"world={world}"
     print(
         f"nursery: running {'all scenarios' if args.scenario == 'all' else args.scenario} "
         f"({len(train_seeds)} train seeds, {len(holdout_seeds)} held-out seeds, "
-        f"{config.episode_ticks} ticks each, world_size={config.world_size}, "
-        f"backend={config.backend})"
+        f"{config.episode_ticks} ticks each, world_size={config.world_size}, {backend_note})"
     )
-    if config.backend != "simulated":
+    if world == "minecraft" and config.backend != "simulated":
         print(
             "nursery: WARNING -- the remote backend plays on the server's persistent "
             "world: seeds do NOT vary terrain, each session starts where the previous "
@@ -1327,7 +1270,7 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
 def cmd_nursery_joint(args: argparse.Namespace) -> None:
     """``ccr nursery joint``: record every scenario and train ONE
     action-conditioned recurrent world model across them (phase 3 of
-    docs/nursery-turn-in-place-analysis.md), evaluating in-distribution
+    docs/history/nursery-turn-in-place-analysis.md), evaluating in-distribution
     generalization (held-out seeds), zero-shot generality (held-out
     scenarios), rollout health (frozen-rollout detector), and a yaw linear
     probe."""
@@ -1338,7 +1281,10 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
             ActionWorldModelConfig,
             save_action_world_model,
         )
+        from cognitive_runtime.training.prediction_export import ExperimentIdentity, checkpoint_sha256
+        from cognitive_runtime.training.statistical_evaluation import build_experiment_report, write_experiment_report
         from cognitive_runtime.training.nursery import (
+            CRAFTER_SCENARIOS,
             NURSERY_SCENARIOS,
             NurseryConfig,
             run_nursery_joint,
@@ -1348,10 +1294,11 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
 
     holdout_scenarios = args.holdout_scenarios or ["approach_entity"]
     train_scenarios = args.train_scenarios or None
+    scenarios = CRAFTER_SCENARIOS if args.world == "crafter" else NURSERY_SCENARIOS
     for name in (train_scenarios or []) + holdout_scenarios:
-        if name not in NURSERY_SCENARIOS:
+        if name not in scenarios:
             sys.exit(
-                f"unknown nursery scenario {name!r}; choices: {sorted(NURSERY_SCENARIOS)}"
+                f"unknown nursery scenario {name!r}; choices: {sorted(scenarios)}"
             )
 
     train_seeds = list(range(args.train_seeds))
@@ -1361,6 +1308,7 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
         holdout_seeds=holdout_seeds,
         episode_ticks=args.episode_ticks,
         world_size=args.world_size,
+        world=args.world,
         backend=args.backend,
         realtime=args.realtime or args.backend == "remote",
         horizons=args.horizons,
@@ -1383,6 +1331,10 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
         seed=args.seed,
         warmup_frames=args.warmup_frames,
         rollout_frames=args.rollout_frames,
+        backbone=args.backbone,
+        context_length=args.context_length,
+        ema_target_decay=args.ema_target_decay,
+        training_objective=args.training_objective,
     )
     print(
         f"nursery joint: training one action-conditioned world model "
@@ -1438,15 +1390,28 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
             f"hidden r2={probe['hidden']['r2']:.3f} "
             f"({probe['hidden']['mean_angular_error_deg']:.1f} deg err)"
         )
+    representation = report.representation_diagnostics
+    latent = representation["latent"]
+    status = (
+        "PASS" if representation["passed"] else
+        "N/A" if not representation["gate_evaluable"] else "FAIL"
+    )
+    print(
+        f"representation gate: {status}; latent variance={latent['mean_variance']:.3e}, "
+        f"effective rank={latent['effective_rank']:.2f}/{latent['dimensions']}"
+    )
 
+    checkpoint = {}
     if args.out_dir:
         os.makedirs(args.out_dir, exist_ok=True)
         model_path = os.path.join(args.out_dir, "joint-world-model.pt")
         save_action_world_model(model_path, model, report.training_stats)
+        checkpoint = {"path": os.path.abspath(model_path), "sha256": checkpoint_sha256(model_path),
+                      "model_type": "predictive_cortex"}
         print(f"\njoint world model saved to {model_path}")
 
-    if args.report:
-        payload = {
+    if args.report or args.out_dir:
+        legacy_payload = {
             "train_scenarios": report.train_scenarios,
             "holdout_scenarios": report.holdout_scenarios,
             "horizon_frames": report.horizon_frames,
@@ -1455,74 +1420,142 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
             "scenario_metrics": report.scenario_metrics,
             "zero_shot_metrics": report.zero_shot_metrics,
             "yaw_probe": report.yaw_probe,
+            "orientation_probe": report.orientation_probe,
+            "representation_diagnostics": report.representation_diagnostics,
             "train_sessions": report.train_sessions,
             "eval_sessions": report.eval_sessions,
+        }
+        # Keep the report inspectable without notebook state. The selected
+        # metric is the first evaluated scenario; every scenario's direct and
+        # rollout reports remain alongside it under ``by_scenario``.
+        all_metrics = {**report.scenario_metrics, **report.zero_shot_metrics}
+        selected = next(iter(all_metrics.values()), {})
+        identity = ExperimentIdentity.create(
+            f"nursery-joint-{args.seed}", config.name or "PixelTwo"
+        )
+        payload = build_experiment_report(
+            experiment=identity.__dict__, data_quality={"gate_enabled": config.data_quality_gate},
+            split_overlap={"gate_enabled": config.split_overlap_gate}, training_stats=report.training_stats,
+            direct_metrics={**(selected.get("direct") or {}), "by_scenario": {name: value.get("direct") for name, value in all_metrics.items()}},
+            rollout_metrics={**(selected.get("rollout") or {}), "by_scenario": {name: value.get("rollout") for name, value in all_metrics.items()}},
+            checkpoint=checkpoint,
+        )
+        payload["joint_nursery"] = legacy_payload
+        report_path = args.report or os.path.join(args.out_dir, "experiment_report.json")
+        write_experiment_report(report_path, payload)
+        print(f"experiment report written to {report_path}")
+
+
+def cmd_nursery_backbone_benchmark(args: argparse.Namespace) -> None:
+    """``ccr nursery backbone-benchmark`` (issue #93): train the cortex once
+    per temporal backbone on identical recordings and report GRU vs
+    dilated-conv/transformer on the Phase 2 scoring gates (model/copy-last,
+    model/oracle, frozen-rollout) per horizon."""
+    try:
+        import json
+
+        from cognitive_runtime.training.action_world_model import ActionWorldModelConfig
+        from cognitive_runtime.training.nursery import (
+            NURSERY_SCENARIOS,
+            NurseryConfig,
+            run_backbone_benchmark,
+        )
+    except ImportError as exc:  # torch not installed
+        sys.exit(f"the nursery suite needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+
+    for name in args.train_scenarios:
+        if name not in NURSERY_SCENARIOS:
+            sys.exit(f"unknown nursery scenario {name!r}; choices: {sorted(NURSERY_SCENARIOS)}")
+    if args.eval_scenario not in args.train_scenarios:
+        sys.exit(
+            f"--eval-scenario {args.eval_scenario!r} must be one of --train-scenarios "
+            f"{args.train_scenarios!r}"
+        )
+
+    train_seeds = list(range(args.train_seeds))
+    holdout_seeds = list(range(args.train_seeds, args.train_seeds + args.holdout_seeds))
+    config = NurseryConfig(
+        train_seeds=train_seeds,
+        holdout_seeds=holdout_seeds,
+        episode_ticks=args.episode_ticks,
+        world_size=args.world_size,
+        backend=args.backend,
+        realtime=args.realtime or args.backend == "remote",
+        horizons=args.horizons,
+        latent_width=args.latent_width,
+        hidden_dim=args.hidden_dim,
+        reconstruction_size=args.reconstruction_size,
+        epochs=args.epochs,
+        lr=args.neural_lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        data_quality_gate=not args.skip_data_quality_gate,
+    )
+    model_config = ActionWorldModelConfig(
+        latent_width=args.latent_width,
+        hidden_dim=args.hidden_dim,
+        reconstruction_size=args.reconstruction_size,
+        epochs=args.epochs,
+        lr=args.neural_lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        warmup_frames=args.warmup_frames,
+        rollout_frames=args.rollout_frames,
+        context_length=args.context_length,
+    )
+    print(
+        f"nursery backbone-benchmark: {args.backbones} on {args.eval_scenario!r} "
+        f"({len(train_seeds)} train seeds, {len(holdout_seeds)} held-out seeds)"
+    )
+
+    report = run_backbone_benchmark(
+        args.record_dir,
+        train_scenarios=args.train_scenarios,
+        eval_scenario=args.eval_scenario,
+        backbones=args.backbones,
+        baseline_backbone=args.baseline_backbone,
+        config=config,
+        model_config=model_config,
+    )
+
+    for name in report.metrics:
+        print(f"\n{name}:")
+        for h, entry in report.metrics[name]["horizons"].items():
+            oracle = entry["model_over_oracle_mse"]
+            print(
+                f"  t+{h} frames (n={entry['n_samples']}): "
+                f"model_mse={entry['model_mse']:.5f} "
+                f"model/copy_last={entry['model_over_copy_last_mse']:.2f} "
+                f"model/oracle={f'{oracle:.2f}' if oracle is not None else 'n/a'} "
+                f"beats_copy_last={entry['beats_copy_last']}"
+            )
+        health = report.metrics[name]["rollout_health"]
+        if health.get("frozen_rollout"):
+            print(f"  WARNING: FROZEN ROLLOUT ({name})")
+        if name != report.baseline_backbone:
+            for h, comparison in report.comparisons[name].items():
+                print(f"  vs {report.baseline_backbone} at t+{h}: {comparison.direction}")
+
+    if args.report:
+        payload = {
+            "train_scenarios": report.train_scenarios,
+            "eval_scenario": report.eval_scenario,
+            "baseline_backbone": report.baseline_backbone,
+            "metrics": report.metrics,
+            "stats": {
+                name: {h: s.to_dict() for h, s in horizon_stats.items()}
+                for name, horizon_stats in report.stats.items()
+            },
+            "comparisons": {
+                name: {h: c.to_dict() for h, c in horizon_comparisons.items()}
+                for name, horizon_comparisons in report.comparisons.items()
+            },
+            "beats_copy_last": report.beats_copy_last,
         }
         os.makedirs(os.path.dirname(os.path.abspath(args.report)) or ".", exist_ok=True)
         with open(args.report, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2)
         print(f"report written to {args.report}")
-
-
-def cmd_trainer(args: argparse.Namespace) -> None:
-    """``ccr trainer`` (issue #37): run an ``AsyncTrainer`` to completion in
-    the foreground, pointed only at recorded sessions and no live actor --
-    "the same trainer, pointed only at recorded sessions with no live
-    actor, performs offline pretraining." The output checkpoint is exactly
-    what ``run --async-trainer`` (or the synchronous ``--policy
-    actor-critic``) reads back in.
-    """
-    try:
-        import multiprocessing as mp
-
-        from cognitive_runtime.policies.actor_critic import world_feature_width
-        from cognitive_runtime.training.async_trainer import ActorCriticArch, AsyncTrainer
-    except ImportError as exc:  # torch not installed
-        sys.exit(f"the trainer needs PyTorch ({exc}); install '.[neural]'.")
-    from cognitive_runtime.core.streams import TemporalFusion
-    from cognitive_runtime.core.streams.events import StreamSpec
-    from cognitive_runtime.runtime.replay import load_session_metadata, require_streams_v2
-
-    metadata = load_session_metadata(args.sessions[0])
-    require_streams_v2(metadata)
-    catalog = [StreamSpec.from_dict(s) for s in metadata.get("stream_catalog", [])]
-    fusion = TemporalFusion(catalog)
-    action_keys = tuple(metadata.get("action_space", []))
-    if not action_keys:
-        sys.exit(f"session {args.sessions[0]!r} has no recorded action_space")
-
-    arch = ActorCriticArch(
-        fused_width=fusion.width,
-        world_feature_width=world_feature_width(action_keys),
-        n_actions=len(action_keys),
-        action_keys=action_keys,
-        layout_hash=fusion.layout_hash,
-        hidden_dim=args.hidden_dim,
-        has_world_model=args.world_model_loss,
-    )
-    trainer = AsyncTrainer(
-        arch, args.out,
-        lr=args.lr, gamma=args.gamma, entropy_coef=args.entropy_coef,
-        grad_clip_norm=args.grad_clip_norm, seed=args.seed,
-        session_dirs=args.sessions,
-        max_transitions_from_sessions=args.max_transitions,
-        min_episode_reward=args.min_episode_reward,
-        batch_size=args.batch_size,
-        min_buffer_size=1,
-        publish_every_steps=args.publish_every,
-    )
-    resumed = trainer.resume_if_checkpoint_exists()
-    loaded = trainer.load_recorded_sessions()
-    print(
-        f"{'resumed from checkpoint; ' if resumed else ''}"
-        f"loaded {loaded} transitions from {len(args.sessions)} session(s)"
-    )
-    if loaded == 0:
-        sys.exit("no training transitions found in the given sessions")
-
-    stats = trainer.run_forever(mp.Event(), max_steps=args.steps)
-    print(f"trained {stats['step_count']} steps; checkpoint written to {args.out}")
-    print(f"last metrics: {stats['last_metrics']}")
 
 
 def cmd_replay(args: argparse.Namespace) -> None:
@@ -1575,6 +1608,7 @@ def cmd_evaluation_gates(args: argparse.Namespace) -> None:
         }
         for name, s in result.summaries.items()
     ]
+    from cognitive_runtime.programs.minecraft.evaluation import comparison_table
     print(comparison_table(rows, columns=columns))
     print()
     print(f"metric: {result.metric} (identical eval seeds)")
@@ -1614,6 +1648,17 @@ def cmd_curriculum_run(args: argparse.Namespace) -> None:
     except CurriculumDefinitionError as exc:
         sys.exit(str(exc))
 
+    voluntary_ctrl = None
+    cortex_ckpt = getattr(args, "cortex_checkpoint", None)
+    if cortex_ckpt:
+        try:
+            from cognitive_runtime.policies.cortex_world_model import CortexWorldModel
+            from motor.cortex_mpc import cortex_mpc_factory
+        except ImportError as exc:
+            sys.exit(f"cortex-mpc needs PyTorch ({exc}); install '.[neural]'.")
+        cortex_wm = CortexWorldModel(cortex_ckpt)
+        voluntary_ctrl = cortex_mpc_factory(cortex_wm)
+
     try:
         result = run_curriculum(
             definition,
@@ -1625,6 +1670,8 @@ def cmd_curriculum_run(args: argparse.Namespace) -> None:
             force_promote=args.force_promote,
             fresh=args.fresh,
             record_dir=None if args.no_record else args.record_dir,
+            name=args.name,
+            voluntary_controller=voluntary_ctrl,
         )
     except (CurriculumDefinitionError, ValueError) as exc:
         sys.exit(str(exc))
@@ -1647,7 +1694,7 @@ def cmd_curriculum_run(args: argparse.Namespace) -> None:
 
 
 def cmd_dashboard(args: argparse.Namespace) -> None:
-    print(dashboard(args.record_dir, statistical=args.statistical))
+    print(dashboard(args.record_dir, statistical=args.statistical, name=args.name))
 
 
 def cmd_review(args: argparse.Namespace) -> None:
@@ -1660,6 +1707,100 @@ def cmd_review(args: argparse.Namespace) -> None:
     ))
 
 
+def cmd_trace_list(args: argparse.Namespace) -> None:
+    """``ccr trace list``: every traced run under --trace-dir, oldest first."""
+    from cognitive_runtime.observability import format_run_list, list_runs
+
+    print(format_run_list(list_runs(getattr(args, "trace_dir", None))))
+
+
+def cmd_trace_show(args: argparse.Namespace) -> None:
+    """``ccr trace show [run]``: the phase tree, metric summaries, config and
+    identity of one traced run (default: the latest)."""
+    from cognitive_runtime.observability import format_trace_summary, load_trace
+
+    try:
+        manifest, events = load_trace(args.run, trace_dir=getattr(args, "trace_dir", None))
+    except FileNotFoundError as exc:
+        sys.exit(str(exc))
+    print(format_trace_summary(manifest, events, tail=args.tail))
+
+
+# --------------------------------------------------------------------------- observability wiring
+
+
+def _add_observability_args(parser: argparse.ArgumentParser) -> None:
+    """Logging/tracing flags, added to the top-level parser *and* to every
+    subparser so they work in either position (``ccr --log-level debug
+    nursery joint`` and ``ccr nursery joint --log-level debug``).
+
+    Every option defaults to ``SUPPRESS`` so an unset subparser copy never
+    clobbers a value given before the subcommand.
+    """
+    group = parser.add_argument_group("logging & tracing")
+    group.add_argument("--log-level", choices=list(LEVELS), default=argparse.SUPPRESS,
+                       help="console log level (default: $CCR_LOG_LEVEL or 'info'). "
+                            "'debug' adds per-span/per-metric detail")
+    group.add_argument("--log-file", default=argparse.SUPPRESS,
+                       help="also write every log record at DEBUG to this file, "
+                            "whatever the console level is")
+    group.add_argument("--log-format", choices=["human", "json"], default=argparse.SUPPRESS,
+                       help="'human' (default) or 'json' (one object per line, for CI)")
+    group.add_argument("--trace-dir", default=argparse.SUPPRESS,
+                       help=f"root directory for run traces (default: $CCR_TRACE_DIR or "
+                            f"{DEFAULT_TRACE_DIR}); each run writes "
+                            f"<trace-dir>/<run-id>/{{manifest.json,trace.jsonl}}")
+    group.add_argument("--run-id", default=argparse.SUPPRESS,
+                       help="name this run's trace directory instead of generating an id")
+    group.add_argument("--no-trace", action="store_true", default=argparse.SUPPRESS,
+                       help="disable run tracing (logging still works)")
+
+
+def _add_observability_args_everywhere(parser: argparse.ArgumentParser) -> None:
+    """Recursively attach the observability flags to every subparser."""
+    _add_observability_args(parser)
+    for action in parser._actions:  # noqa: SLF001 - argparse exposes no public walk
+        if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+            for subparser in set(action.choices.values()):
+                _add_observability_args_everywhere(subparser)
+
+
+def _run_name(args: argparse.Namespace) -> str:
+    """``nursery joint`` -> ``nursery.joint``: the trace's name and the stem
+    of its generated run id."""
+    parts = [args.command]
+    for attr in ("nursery_command", "trace_command"):
+        value = getattr(args, attr, None)
+        if value:
+            parts.append(str(value))
+    scenario = getattr(args, "scenario", None)
+    if scenario:
+        parts.append(str(scenario))
+    return ".".join(parts)
+
+
+#: Read-only inspection commands.  They produce no result worth reproducing
+#: and get run often, so tracing them would bury the actual training runs in
+#: ``ccr trace list``.
+_UNTRACED_COMMANDS = frozenset({"trace", "view", "dashboard", "review", "nursery.list"})
+
+
+def _should_trace(args: argparse.Namespace, name: str) -> bool:
+    if getattr(args, "no_trace", False):
+        return False
+    return args.command not in _UNTRACED_COMMANDS and name not in _UNTRACED_COMMANDS
+
+
+def _trace_config(args: argparse.Namespace) -> Dict[str, Any]:
+    """Snapshot the parsed arguments into the trace manifest: the point of a
+    trace is being able to answer "what exactly produced this number?"."""
+    skip = {"func", "log_level", "log_file", "log_format", "trace_dir", "run_id", "no_trace"}
+    return {
+        key: value for key, value in sorted(vars(args).items())
+        if key not in skip and not key.startswith("_")
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cognitive_runtime", description="Continuous Cognitive Runtime (Minecraft MVP)"
@@ -1667,9 +1808,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_run = sub.add_parser("run", help="run the runtime with a policy")
-    p_run.add_argument("--policy", default="scripted",
+    p_run.add_argument("--name", default=None,
+                       help="issue #88: organism name, threaded into the session id, "
+                            "recorded metadata, checkpoints and exports; default: a "
+                            "generated Docker-style name (e.g. vigorous-shannon)")
+    p_run.add_argument("--policy", default=None,
                        choices=["null", "random", "scripted", "learned", "neural", "online",
-                                "actor-critic", "human"])
+                                "human", "cortex-mpc"],
+                       help="default: 'cortex-mpc' when --world-model cortex:* is given "
+                            "(one-step MPC over the live cortex), 'scripted' for --world "
+                            "minecraft, 'random' otherwise")
     p_run.add_argument("--input-profile", default="full", choices=sorted(INPUT_PROFILES),
                        help="issue #32: 'full' (default) fuses every stream the legacy "
                             "encoder registry binds, including hand-computed semantic "
@@ -1711,17 +1859,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--no-online-train", dest="online_train", action="store_false",
                        help="run online Q in eval mode without mutating the model")
     p_run.add_argument("--fresh", action="store_true",
-                       help="initialize online/actor-critic weights fresh even though no "
-                            "checkpoint exists yet at the model path; required for "
-                            "--backend remote with no existing checkpoint (issue #33)")
-    p_run.add_argument("--actor-critic-model", default=DEFAULT_ACTOR_CRITIC_MODEL_OUT,
-                       help="actor-critic checkpoint bundle path (.pt)")
-    p_run.add_argument("--fusion", choices=sorted(FUSION_MODES), default="fixed",
-                       help="actor-critic's fused-state source (issue #57): 'fixed' (default) "
-                            "is TemporalFusion's hand-written concatenation; 'learned' runs "
-                            "trainable stream encoders + LatentFusionModel in the tick's "
-                            "inference path instead. A checkpoint trained under one mode "
-                            "fails loudly if resumed under the other.")
+                       help="initialize online weights fresh even though no checkpoint "
+                            "exists yet at the model path; required for --backend remote "
+                            "with no existing checkpoint (issue #33)")
     p_run.add_argument("--attention", choices=sorted(ATTENTION_MODES), default="off",
                        help="deterministic attention controller (issue #59): 'off' (default) "
                             "gives every agent-input stream uniform weight 1.0, reproducing "
@@ -1736,49 +1876,25 @@ def build_parser() -> argparse.ArgumentParser:
                             "survival-critical policy action; 'off' disables it (the "
                             "ablation); 'learned-only' leaves orienting to the policy "
                             "instead. Only fires when --attention=budgeted.")
-    p_run.add_argument("--actor-critic-save-every", type=int, default=1000,
-                       help="save the actor-critic checkpoint every N gradient steps")
-    p_run.add_argument("--actor-critic-lr", type=float, default=1e-3)
-    p_run.add_argument("--actor-critic-gamma", type=float, default=0.99)
-    p_run.add_argument("--actor-critic-entropy-coef", type=float, default=0.01,
-                       help="entropy-bonus weight encouraging exploration")
-    p_run.add_argument("--actor-critic-grad-clip-norm", type=float, default=5.0)
-    p_run.add_argument("--actor-critic-hidden-dim", type=int, default=128)
-    p_run.add_argument("--actor-critic-history", type=int, default=8,
-                       help="recent-action window fed into world_features")
-    p_run.add_argument("--actor-critic-replay-every", type=int, default=32,
-                       help="pull a replay minibatch every N ticks")
-    p_run.add_argument("--actor-critic-replay-batch-size", type=int, default=32)
-    p_run.add_argument("--actor-critic-world-model-loss", dest="actor_critic_world_model_loss",
-                       action="store_true", default=True,
-                       help="jointly train an action-conditioned world model from the same "
-                            "transitions (default: on)")
-    p_run.add_argument("--no-actor-critic-world-model-loss", dest="actor_critic_world_model_loss",
-                       action="store_false")
-    p_run.add_argument("--actor-critic-train", dest="actor_critic_train", action="store_true",
-                       default=True, help="train the actor-critic model while running")
-    p_run.add_argument("--no-actor-critic-train", dest="actor_critic_train", action="store_false",
-                       help="run actor-critic in eval mode without mutating weights")
-    p_run.add_argument("--async-trainer", dest="actor_critic_async", action="store_true",
+    p_run.add_argument("--async-trainer", dest="async_trainer", action="store_true",
                        default=False,
-                       help="actor/learner split (issue #37): run gradient steps in a "
-                            "separate trainer process instead of inline in the tick; the "
-                            "loop only does inference and pushes transitions to a shared "
-                            "live-experience ring")
-    p_run.add_argument("--async-ring-capacity", type=int, default=20_000,
-                       help="live-experience ring buffer capacity (transitions); "
-                            "drop-oldest once full")
-    p_run.add_argument("--async-batch-size", type=int, default=32,
-                       help="trainer process minibatch size")
-    p_run.add_argument("--async-min-buffer-size", type=int, default=256,
-                       help="trainer process waits for this many transitions before its "
-                            "first gradient step")
-    p_run.add_argument("--async-publish-every", type=int, default=50,
-                       help="trainer process publishes a new weight snapshot every N "
-                            "gradient steps")
-    p_run.add_argument("--async-reload-every-ticks", type=int, default=5,
-                       help="actor polls for a newer published snapshot every N ticks")
+                       help="issue #175: consolidate the live predictive cortex online -- "
+                            "requires --world-model cortex:<ckpt>. Every --async-wake-ticks "
+                            "ticks, the tick blocks for a bounded sleep pass (a "
+                            "sleep.cortex_consolidation.CortexConsolidator draws quality-"
+                            "gated replay batches -- real transitions recorded from every "
+                            "tick, mixed with guardrailed generative dreams -- and takes "
+                            "--async-consolidation-steps gradient steps), then publishes "
+                            "the result back into the cortex. The world model is the "
+                            "online learner; nothing in the motor path trains online.")
+    p_run.add_argument("--async-wake-ticks", type=int, default=50,
+                       help="number of acting ticks between cortex consolidation passes "
+                            "(only with --async-trainer)")
+    p_run.add_argument("--async-consolidation-steps", type=int, default=50,
+                       help="gradient steps taken in each consolidation pass "
+                            "(only with --async-trainer)")
     _add_world_args(p_run)
+    _add_world_selector_arg(p_run)
     _add_world_model_arg(p_run)
     _add_entity_persistence_arg(p_run)
     p_run.set_defaults(func=cmd_run)
@@ -1788,7 +1904,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_demo.add_argument("--tick-rate", type=float, default=20.0)
     p_demo.add_argument("--record-dir", default="sessions")
     p_demo.add_argument("--session-id", default=None)
+    p_demo.add_argument("--name", default=None,
+                        help="issue #88: organism name (see 'run --name'); default: generated")
     _add_world_args(p_demo)
+    # `demo` forces HumanDemoPolicy (cmd_demo below), a Minecraft-specific
+    # terminal keymap/status display (world.front_block, body.hunger, ...);
+    # it doesn't understand Crafter's action space or streams, so unlike
+    # `run`/`nursery`, this default stays "minecraft" (issue #193 review).
+    _add_world_selector_arg(p_demo, default="minecraft")
     _add_world_model_arg(p_demo)
     _add_entity_persistence_arg(p_demo)
     p_demo.set_defaults(func=cmd_demo)
@@ -1829,7 +1952,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="evaluation gates: actor/critic vs random/scripted/linear-Q "
              "on identical seeds (issue #31)",
     )
-    p_gates.add_argument("--curriculum", default=None, choices=CURRICULUM_ORDER,
+    from cognitive_runtime.programs.minecraft.curriculum import CURRICULUM_ORDER as _CURRICULUM_ORDER
+    p_gates.add_argument("--curriculum", default=None, choices=_CURRICULUM_ORDER,
                          help="curriculum preset supplying world + reward config "
                               "(default: the fixed DEFAULT_GATE_CONFIG)")
     p_gates.add_argument("--train-episodes", type=int, default=20,
@@ -1876,6 +2000,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--fresh", action="store_true",
         help="ignore any existing checkpoint and start stage 0 with fresh weights",
     )
+    p_curriculum_run.add_argument("--name", default=None,
+                                  help="issue #88: organism name threaded into every stage's "
+                                       "recorded session metadata and the actor/critic "
+                                       "checkpoint; default: generated per stage run")
     p_curriculum_run.add_argument("--model-seed", type=int, default=1)
     p_curriculum_run.add_argument("--train-seed", type=int, default=100)
     p_curriculum_run.add_argument("--eval-seed", type=int, default=500)
@@ -1883,9 +2011,17 @@ def build_parser() -> argparse.ArgumentParser:
                                    help="record train/eval sessions here")
     p_curriculum_run.add_argument("--no-record", action="store_true",
                                    help="skip recording sessions")
+    p_curriculum_run.add_argument("--cortex-checkpoint", default=None,
+                                   help="path to a PredictiveCortex checkpoint; enables "
+                                        "cortex-MPC as the voluntary controller for "
+                                        "'learned' motor-freedom stages")
     p_curriculum_run.set_defaults(func=cmd_curriculum_run)
 
     p_train = sub.add_parser("train", help="train a behavioral-cloning policy from sessions")
+    p_train.add_argument("--name", default=None,
+                         help="issue #88: organism name stamped into the trained checkpoint's "
+                              "metadata (model-type checkpoints only, not the plain linear BC "
+                              "model); default: unstamped")
     p_train.add_argument("--sessions", nargs="+", required=True,
                          help="session directories (e.g. sessions/20260101-...-scripted)")
     p_train.add_argument("--out", default=DEFAULT_MODEL_OUT,
@@ -1938,41 +2074,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--seed", type=int, default=0)
     p_train.set_defaults(func=cmd_train)
 
-    p_trainer = sub.add_parser(
-        "trainer",
-        help="standalone actor/critic AsyncTrainer (issue #37): pointed only at recorded "
-             "sessions with no live actor, this is offline pretraining -- the same trainer "
-             "`run --async-trainer` spawns as a background process, run here to completion "
-             "in the foreground",
-    )
-    p_trainer.add_argument("--sessions", nargs="+", required=True,
-                           help="session directories to pretrain from (streams-v2)")
-    p_trainer.add_argument("--out", default=DEFAULT_ACTOR_CRITIC_MODEL_OUT,
-                           help="checkpoint bundle path (.pt); resumed from if it already "
-                                "exists")
-    p_trainer.add_argument("--steps", type=int, default=2000,
-                           help="gradient steps to run (an offline trainer has no live "
-                                "stream to keep waiting on, so it stops here)")
-    p_trainer.add_argument("--max-transitions", type=int, default=None,
-                           help="cap on transitions loaded from the sessions")
-    p_trainer.add_argument("--min-episode-reward", type=float, default=None,
-                           help="skip episodes below this total reward")
-    p_trainer.add_argument("--batch-size", type=int, default=32)
-    p_trainer.add_argument("--publish-every", type=int, default=100,
-                           help="write a checkpoint every N gradient steps, plus once more "
-                                "at the end")
-    p_trainer.add_argument("--hidden-dim", type=int, default=128)
-    p_trainer.add_argument("--lr", type=float, default=1e-3)
-    p_trainer.add_argument("--gamma", type=float, default=0.99)
-    p_trainer.add_argument("--entropy-coef", type=float, default=0.01)
-    p_trainer.add_argument("--grad-clip-norm", type=float, default=5.0)
-    p_trainer.add_argument("--world-model-loss", dest="world_model_loss",
-                           action="store_true", default=True)
-    p_trainer.add_argument("--no-world-model-loss", dest="world_model_loss",
-                           action="store_false")
-    p_trainer.add_argument("--seed", type=int, default=0)
-    p_trainer.set_defaults(func=cmd_trainer)
-
     p_canary = sub.add_parser(
         "ego-motion-canary",
         help="issue #39: walk_forward next-frame prediction benchmark on held-out seeds, "
@@ -2015,6 +2116,9 @@ def build_parser() -> argparse.ArgumentParser:
     nursery_sub = p_nursery.add_subparsers(dest="nursery_command", required=True)
 
     p_nursery_list = nursery_sub.add_parser("list", help="list available nursery scenarios")
+    p_nursery_list.add_argument("--world", default="crafter", choices=sorted(WORLDS),
+                                help="issue #90/#176: list Crafter's scenarios (default) or "
+                                     "Minecraft's legacy ports (--world minecraft)")
     p_nursery_list.set_defaults(func=cmd_nursery_list)
 
     p_nursery_run = nursery_sub.add_parser(
@@ -2023,6 +2127,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_run.add_argument(
         "scenario", help="scenario name (see 'nursery list'), or 'all' to run the full suite"
     )
+    p_nursery_run.add_argument("--world", default="crafter", choices=sorted(WORLDS),
+                               help="issue #90/#176: record against the Crafter nursery world "
+                                    "(default) or Minecraft's legacy simulated/remote backend "
+                                    "(--world minecraft). --backend/--world-size only apply to "
+                                    "--world minecraft.")
+    p_nursery_run.add_argument("--name", default=None,
+                               help="issue #88: organism name threaded into every recorded "
+                                    "episode's session metadata, prediction exports, and the "
+                                    "trained encoder checkpoint; default: generated per episode")
     p_nursery_run.add_argument("--record-dir", default="sessions",
                                help="directory to record each scenario's train/holdout episodes into")
     p_nursery_run.add_argument("--train-seeds", type=int, default=6,
@@ -2032,7 +2145,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_run.add_argument("--episode-ticks", type=int, default=400)
     p_nursery_run.add_argument("--world-size", type=int, default=48)
     p_nursery_run.add_argument("--backend", default=_default_nursery_backend(),
-                               choices=sorted(BACKENDS),
+                               choices=sorted(MINECRAFT_BACKEND_NAMES),
                                help="backend used to record nursery episodes. Defaults to "
                                     "remote when CCR_MINECRAFT_HOST is set, otherwise "
                                     "simulated; CCR_NURSERY_BACKEND can override this.")
@@ -2076,6 +2189,8 @@ def build_parser() -> argparse.ArgumentParser:
              "world model across them, with zero-shot held-out-scenario "
              "evaluation, a frozen-rollout detector, and a yaw linear probe",
     )
+    p_nursery_joint.add_argument("--world", default="crafter", choices=sorted(WORLDS),
+                                 help="world providing pixel frames and optional semantic grids")
     p_nursery_joint.add_argument("--record-dir", default="sessions")
     p_nursery_joint.add_argument("--train-scenarios", nargs="+", default=None,
                                  help="scenarios to train on (default: every scenario not held out)")
@@ -2087,7 +2202,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_joint.add_argument("--episode-ticks", type=int, default=400)
     p_nursery_joint.add_argument("--world-size", type=int, default=48)
     p_nursery_joint.add_argument("--backend", default=_default_nursery_backend(),
-                                 choices=sorted(BACKENDS))
+                                 choices=sorted(MINECRAFT_BACKEND_NAMES))
     p_nursery_joint.add_argument("--realtime", action="store_true")
     p_nursery_joint.add_argument("--horizons", type=int, nargs="+", default=[1, 10, 100],
                                  help="tick offsets to evaluate at (converted to recorded-frame "
@@ -2100,6 +2215,23 @@ def build_parser() -> argparse.ArgumentParser:
                                  help="teacher-forced frames before each training rollout")
     p_nursery_joint.add_argument("--rollout-frames", type=int, default=8,
                                  help="closed-loop steps per training window (short on purpose)")
+    p_nursery_joint.add_argument("--backbone", default="gru",
+                                 choices=["gru", "dilated_conv", "transformer"],
+                                 help="cortex temporal backbone (issue #93): the default recurrent "
+                                      "GRU, a WaveNet-style dilated causal conv, or a small causal "
+                                      "transformer, both windowed over --context-length")
+    p_nursery_joint.add_argument("--context-length", type=int, default=8,
+                                 help="window size the dilated_conv/transformer backbones attend "
+                                      "over (ignored by gru); ramped 1 -> this value over training "
+                                      "via the context-length curriculum")
+    p_nursery_joint.add_argument(
+        "--ema-target-decay", type=float, default=None,
+        help="enable a Polyak target encoder for latent targets (e.g. 0.99); off by default",
+    )
+    p_nursery_joint.add_argument(
+        "--training-objective", choices=["windowed_rollout", "autoregressive"],
+        default="windowed_rollout", help="cortex training objective",
+    )
     p_nursery_joint.add_argument("--neural-lr", type=float, default=1e-3)
     p_nursery_joint.add_argument("--batch-size", type=int, default=32)
     p_nursery_joint.add_argument("--seed", type=int, default=0)
@@ -2111,6 +2243,53 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_joint.add_argument("--skip-data-quality-gate", action="store_true")
     p_nursery_joint.set_defaults(func=cmd_nursery_joint)
 
+    p_nursery_bench = nursery_sub.add_parser(
+        "backbone-benchmark",
+        help="issue #93: train the cortex once per temporal backbone (gru, dilated_conv, "
+             "transformer) on identical recordings and report the Phase 2 scoring gates "
+             "(model/copy-last, model/oracle, frozen-rollout) per horizon for each",
+    )
+    p_nursery_bench.add_argument("--record-dir", default="sessions")
+    p_nursery_bench.add_argument("--train-scenarios", nargs="+", default=["walk_forward", "turn_in_place"],
+                                 help="scenarios recorded and trained on (shared by every backbone)")
+    p_nursery_bench.add_argument("--eval-scenario", default="turn_in_place",
+                                 help="held-out-seed scenario each backbone is scored on; must be "
+                                      "one of --train-scenarios")
+    p_nursery_bench.add_argument("--backbones", nargs="+", default=["gru", "dilated_conv", "transformer"],
+                                 choices=["gru", "dilated_conv", "transformer"],
+                                 help="backbones to benchmark")
+    p_nursery_bench.add_argument("--baseline-backbone", default="gru",
+                                 choices=["gru", "dilated_conv", "transformer"],
+                                 help="backbone every other backbone's comparison is measured against")
+    p_nursery_bench.add_argument("--train-seeds", type=int, default=6)
+    p_nursery_bench.add_argument("--holdout-seeds", type=int, default=2)
+    p_nursery_bench.add_argument("--episode-ticks", type=int, default=400)
+    p_nursery_bench.add_argument("--world-size", type=int, default=48)
+    p_nursery_bench.add_argument("--backend", default=_default_nursery_backend(),
+                                 choices=sorted(MINECRAFT_BACKEND_NAMES))
+    p_nursery_bench.add_argument("--realtime", action="store_true")
+    p_nursery_bench.add_argument("--horizons", type=int, nargs="+", default=[1, 10, 100],
+                                 help="tick offsets to evaluate at (converted to recorded-frame "
+                                      "steps via the measured vision rate)")
+    p_nursery_bench.add_argument("--latent-width", type=int, default=32)
+    p_nursery_bench.add_argument("--hidden-dim", type=int, default=64)
+    p_nursery_bench.add_argument("--reconstruction-size", type=int, default=16)
+    p_nursery_bench.add_argument("--epochs", type=int, default=30)
+    p_nursery_bench.add_argument("--warmup-frames", type=int, default=3,
+                                 help="teacher-forced frames before each training rollout")
+    p_nursery_bench.add_argument("--rollout-frames", type=int, default=8,
+                                 help="closed-loop steps per training window (short on purpose)")
+    p_nursery_bench.add_argument("--context-length", type=int, default=8,
+                                 help="window size the dilated_conv/transformer backbones attend "
+                                      "over; ramped 1 -> this value via the context-length curriculum")
+    p_nursery_bench.add_argument("--neural-lr", type=float, default=1e-3)
+    p_nursery_bench.add_argument("--batch-size", type=int, default=32)
+    p_nursery_bench.add_argument("--seed", type=int, default=0)
+    p_nursery_bench.add_argument("--report", default=None,
+                                 help="path to save a JSON report of all metrics")
+    p_nursery_bench.add_argument("--skip-data-quality-gate", action="store_true")
+    p_nursery_bench.set_defaults(func=cmd_nursery_backbone_benchmark)
+
     p_replay = sub.add_parser("replay", help="re-simulate a session and verify determinism")
     p_replay.add_argument("--session", required=True)
     p_replay.add_argument("--episode", default=None)
@@ -2118,7 +2297,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_replay.add_argument("--reward-profile", default=None,
                           help="the reward profile the session was recorded with (required to "
                                "replay a session recorded with --reward-profile; must match by "
-                               "content -- see docs/reward_profiles.md)")
+                               "content -- see docs/history/reward_profiles.md)")
     p_replay.set_defaults(func=cmd_replay)
 
     p_view = sub.add_parser("view", help="inspect a recorded episode")
@@ -2132,6 +2311,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_dash.add_argument("--statistical", action="store_true",
                         help="append the statistical evaluation harness's mean +/- CI "
                              "report (issue #44) for the same (curriculum, policy) groups")
+    p_dash.add_argument("--name", default=None,
+                        help="issue #88: restrict to one organism name (sessions recorded "
+                             "before this field existed group as 'legacy')")
     p_dash.set_defaults(func=cmd_dashboard)
 
     p_review = sub.add_parser(
@@ -2150,12 +2332,48 @@ def build_parser() -> argparse.ArgumentParser:
                           help="number of most-recent episodes to show in detail")
     p_review.set_defaults(func=cmd_review)
 
+    p_trace = sub.add_parser(
+        "trace",
+        help="inspect run traces written by any other command "
+             "(phase timings, metric curves, config, git commit)",
+    )
+    trace_sub = p_trace.add_subparsers(dest="trace_command", required=True)
+
+    p_trace_list = trace_sub.add_parser("list", help="list traced runs, oldest first")
+    p_trace_list.set_defaults(func=cmd_trace_list)
+
+    p_trace_show = trace_sub.add_parser(
+        "show", help="show one run's phase tree, metrics, config and identity"
+    )
+    p_trace_show.add_argument("run", nargs="?", default=None,
+                              help="run id, run directory, or trace.jsonl path "
+                                   "(default: the latest run)")
+    p_trace_show.add_argument("--tail", type=int, default=0,
+                              help="also print the last N raw trace events")
+    p_trace_show.set_defaults(func=cmd_trace_show)
+
+    _add_observability_args_everywhere(parser)
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    args.func(args)
+
+    configure_logging(
+        getattr(args, "log_level", None),
+        log_file=getattr(args, "log_file", None),
+        log_format=getattr(args, "log_format", "human"),
+    )
+
+    name = _run_name(args)
+    with start_run(
+        name,
+        trace_dir=getattr(args, "trace_dir", None),
+        run_id=getattr(args, "run_id", None),
+        config=_trace_config(args),
+        enabled=_should_trace(args, name),
+    ):
+        args.func(args)
 
 
 if __name__ == "__main__":

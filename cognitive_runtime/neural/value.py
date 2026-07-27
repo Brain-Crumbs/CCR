@@ -1,6 +1,6 @@
 """Value-model contract (Phase A: interface only).
 
-:class:`ValueModel` is the critic half of step 5 in ``docs/online-learning.md``'s
+:class:`ValueModel` is the critic half of step 5 in ``docs/history/online-learning.md``'s
 neural upgrade path, providing the expected-return baseline an actor/critic
 policy needs alongside :class:`~cognitive_runtime.neural.policy.PolicyModel`.
 

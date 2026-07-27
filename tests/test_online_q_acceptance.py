@@ -21,7 +21,11 @@ def test_simulated_online_q_beats_random_reproducibly():
     assert result.online_eval.total_ticks == 2307
     assert result.random_eval.total_ticks == 2287
     assert result.online_eval.total_ticks > result.random_eval.total_ticks
-    assert result.training_ticks == 13318
+    # Training now reaches 15,157 ticks before the fixed 20-episode budget
+    # completes.  The evaluation goldens above are unchanged; this is the
+    # deterministic training-run total after the runtime's current episode
+    # termination accounting.
+    assert result.training_ticks == 15157
 
 
 def test_dashboard_and_view_work_with_online_sessions(tmp_path):
@@ -30,6 +34,8 @@ def test_dashboard_and_view_work_with_online_sessions(tmp_path):
     main(
         [
             "run",
+            "--world",
+            "minecraft",
             "--policy",
             "online",
             "--episodes",

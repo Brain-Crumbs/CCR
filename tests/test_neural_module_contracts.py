@@ -33,7 +33,7 @@ def test_core_runtime_and_scripted_cli_never_import_torch(tmp_path):
         "import cognitive_runtime.runtime.loop; "
         "import cognitive_runtime.runtime.replay; "
         "from cognitive_runtime.cli import main; "
-        f"main(['run', '--policy', 'scripted', '--episodes', '1', "
+        f"main(['run', '--world', 'minecraft', '--policy', 'scripted', '--episodes', '1', "
         f"'--episode-ticks', '20', '--world-size', '16', '--no-record']); "
         "assert 'torch' not in sys.modules, sorted(m for m in sys.modules if 'torch' in m)"
     )

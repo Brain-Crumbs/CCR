@@ -1,4 +1,8 @@
-# CCR pixel prediction viewer
+# CCR Clinic
+
+The viewer now opens on a React session browser grouped by the organism name
+recorded in Phase 0. Every card displays the authoritative Record quality
+verdict and its failing checks before the session is used for training.
 
 A lightweight, zero-dependency node server plus a reusable
 `<pixel-horizon-viewer>` web component for inspecting recorded streams-v2
@@ -15,6 +19,11 @@ node viewer/server.js --data-dir /path/to/sessions --port 9000
 
 Open http://localhost:8787 — pick a session and episode.
 
+The read-only API supports `GET /api/sessions?name=Pixel` and
+`GET /api/sessions/:id`; the detail response contains all recorded stream
+events, JSON exports, and the `record.quality` verdict. Existing episode
+`frames` and `predictions` endpoints remain available to viewer panels.
+
 ## Prediction sources
 
 - **copy-last** and **mean-frame** work on any recorded session with pixel
@@ -28,6 +37,16 @@ Open http://localhost:8787 — pick a session and episode.
   are unrecoverable after the run unless exported. `nursery run --out-dir`
   also saves `<scenario>-full.pt`, a full encoder+decoder+predictor bundle
   for re-exporting later:
+
+Live `CortexWorldModel` runs also place decoded horizon frames in each
+`DecisionRecord`. When no offline export exists, the clinic assembles those
+records into the same `pixel-predictions-v1` response and labels the source
+**model (live record)**.
+
+The episode frame scrubber is shared with the EEG and arbiter-mode timelines:
+moving either pixel viewer highlights the matching cognitive tick, while
+clicking a trace or mode tick moves both pixel viewers to its corresponding
+recorded frame.
 
 ```bash
 python -m cognitive_runtime.training.prediction_export \

@@ -1,8 +1,11 @@
 /**
  * <pixel-horizon-viewer> — reusable, framework-agnostic web component that
- * shows, for each prediction horizon h, the ACTUAL frame at t+h next to a
- * PREDICTED frame at t+h, plus an |error| heatmap and MSE/PSNR readouts,
- * with a scrubber/playback over the episode and an MSE-over-time chart.
+ * shows, for each prediction horizon h, a four-up strip: the SEEN frame the
+ * model was given at t, the PREDICTED frame at t+h, the ACTUAL frame at t+h,
+ * and an |error| heatmap, plus MSE/PSNR readouts, a scrubber/playback over
+ * the episode and an MSE-over-time chart. The seen→predicted→actual triple
+ * answers, for every frame, "what the model saw, what it predicted it would
+ * see next, and what actually was shown."
  *
  * Prediction sources:
  *   - "copy-last"  : predicted(t+h) = actual(t)      (the harness baseline)
@@ -12,7 +15,7 @@
  *
  * Attributes:
  *   frames-src       URL returning the /frames API payload (required)
- *   predictions-src  URL returning a pixel-predictions-v1 payload (optional)
+ *   predictions-src  URL returning a pixel-predictions-v1 or v2 payload (optional)
  *   horizons         comma list, default "1,10,100"
  *   scale            CSS pixels per frame pixel, default 6
  *
@@ -67,6 +70,8 @@ const TEMPLATE = `
   }
   button { cursor: pointer; }
   .status { color: var(--text-secondary); margin: 8px 0; }
+  .identity { color: var(--text-secondary); font-size: 12px; margin: 4px 0 8px; }
+  .event-nav { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
   .horizons { display: flex; flex-wrap: wrap; gap: 16px; }
   .panel { background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
   .panel h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
@@ -103,6 +108,8 @@ const TEMPLATE = `
     </label>
   </div>
   <div class="status" id="status">loading…</div>
+  <div class="identity" id="identity"></div>
+  <div class="event-nav"><button data-event="surprise">Previous surprise</button><button data-event="entity_entered">Next entity entry</button><button data-event="entity_left">Next entity exit</button><button data-event="blocked_forward">Next blocked transition</button><button data-event="false_positive">Worst false positive</button><button data-event="static">Worst static mismatch</button></div>
   <div class="horizons" id="horizons"></div>
   <div class="chartwrap">
     <div class="legend" id="legend"></div>
@@ -170,9 +177,10 @@ class PixelHorizonViewer extends HTMLElement {
   static get observedAttributes() { return ["frames-src", "predictions-src", "horizons", "scale"]; }
 
   connectedCallback() {
-    this._$("#scrub").addEventListener("input", (e) => { this._t = Number(e.target.value); this._render(); });
+    this._$("#scrub").addEventListener("input", (e) => this.setTime(Number(e.target.value), true));
     this._$("#source").addEventListener("change", () => this._render(true));
     this._$("#play").addEventListener("click", () => this._togglePlay());
+    this.shadowRoot.querySelectorAll("[data-event]").forEach((button) => button.addEventListener("click", () => this._jumpEvent(button.dataset.event)));
     this._load();
   }
 
@@ -191,7 +199,30 @@ class PixelHorizonViewer extends HTMLElement {
   get horizons() {
     return (this.getAttribute("horizons") || "1,10,100").split(",").map((s) => parseInt(s.trim(), 10)).filter((h) => h > 0);
   }
-  get scale() { return Number(this.getAttribute("scale") || 6); }
+  get scale() { return Number(this.getAttribute("scale") || 5); }
+  get time() { return this._t; }
+
+  setTick(tick) {
+    if (!this._frames?.length) return this.setTime(tick);
+    const wanted = Number(tick) || 0;
+    const closest = this._frames.reduce((best, frame, index) => (
+      !best || Math.abs(Number(frame.tick) - wanted) < best.distance
+        ? { index, distance: Math.abs(Number(frame.tick) - wanted) } : best
+    ), null);
+    this.setTime(closest.index);
+  }
+
+  setTime(t, emit = false) {
+    const requested = Math.max(0, Math.round(Number(t) || 0));
+    const max = Number(this._$("#scrub")?.max ?? 0);
+    const next = this._frames ? Math.min(max, requested) : requested;
+    this._t = next;
+    if (this._$("#scrub")) this._$("#scrub").value = next;
+    this._render();
+    if (emit) this.dispatchEvent(new CustomEvent("timechange", {
+      detail: { t: next, tick: this._frames?.[next]?.tick ?? next }, bubbles: true, composed: true,
+    }));
+  }
 
   _$(sel) { return this.shadowRoot.querySelector(sel); }
 
@@ -215,13 +246,16 @@ class PixelHorizonViewer extends HTMLElement {
     if (predSrc) {
       try {
         const p = await (await fetch(predSrc)).json();
-        if (!p.error && p.format === "pixel-predictions-v1") {
+        if (!p.error && (p.format === "pixel-predictions-v1" || p.format === "pixel-predictions-v2")) {
           p._decoded = {};
           for (const [h, entry] of Object.entries(p.predictions)) {
             p._decoded[h] = entry.frames.map(b64ToBytes);
           }
           p._targets = p.targets ? p.targets.map(b64ToBytes) : null;
           this._pred = p;
+          if (p.horizons?.length) {
+            this.setAttribute("horizons", p.horizons.join(","));
+          }
         }
       } catch { /* predictions are optional */ }
     }
@@ -230,7 +264,9 @@ class PixelHorizonViewer extends HTMLElement {
     if (hasModel && !sourceSel.querySelector('option[value="model"]')) {
       const opt = document.createElement("option");
       opt.value = "model";
-      opt.textContent = "model (exported)";
+      opt.textContent = this._pred.source === "live-record" ? "model (live record)" :
+        (this._pred.format === "pixel-predictions-v1" ? "Legacy per-scenario actionless predictor" :
+          `joint cortex (${this._pred.prediction_mode || "unknown"})`);
       sourceSel.prepend(opt);
       sourceSel.value = "model";
     } else if (!hasModel) {
@@ -243,9 +279,36 @@ class PixelHorizonViewer extends HTMLElement {
     scrub.max = Math.max(0, this._frames.length - 1 - maxH);
     this._t = Math.min(this._t, Number(scrub.max));
     scrub.value = this._t;
+    this._renderIdentity();
+    const eventful = this._pred?.events?.findIndex((event) => event.entity_entered || event.entity_left || event.blocked_forward || event.semantic_scene_changed);
+    if (eventful > 0) this._t = Math.min(eventful, Number(scrub.max));
     this._$("#status").textContent =
-      `${this._frames.length} frames (${this._shape.join("×")} ${this._pred ? "· model predictions loaded" : "· no model predictions exported — showing baselines"})`;
+      `${this._frames.length} frames (${this._shape.join("×")} ${this._pred ? `· ${this._pred.format === "pixel-predictions-v1" ? "legacy actionless" : "joint cortex"} model predictions loaded` : "· no model predictions recorded — showing baselines"})`;
     this._render(true);
+  }
+
+  _renderIdentity() {
+    const p = this._pred, identity = this._$("#identity");
+    if (!p) { identity.textContent = "No export identity; baselines only."; return; }
+    if (p.format === "pixel-predictions-v1") { identity.textContent = "Legacy export — actionless per-scenario model; not comparable to current joint cortex experiments."; return; }
+    const experiment = p.experiment || {}, model = p.model || {};
+    const source = p.evaluation_source || "unknown", split = /-(train|holdout)-/.exec(source)?.[1] || "unknown";
+    identity.textContent = `Experiment ${experiment.experiment_id || "unknown"} · Trace ${experiment.trace_id || "unknown"} · Checkpoint hash ${(model.checkpoint_sha256 || "unknown").slice(0, 12)} · Model type ${model.model_type || "unknown"} · Backbone ${model.backbone || "unknown"} · Objective ${model.training_objective || "unknown"} · Prediction mode ${p.prediction_mode || "unknown"} · actions ${model.uses_actions ? "on" : "off"}, workspace ${model.uses_workspace ? "on" : "off"} · Split ${split} · current joint export`;
+  }
+
+  _jumpEvent(kind) {
+    if (!this._frames?.length) return;
+    const events = this._pred?.events || [];
+    let index = -1;
+    if (kind === "surprise" || kind === "false_positive" || kind === "static") {
+      const series = this._mseSeries("model", this.horizons[0]);
+      const candidates = [...series.keys()].filter((i) => kind !== "static" || !events[i]?.position_changed);
+      index = candidates.reduce((best, i) => Number.isNaN(series[i]) || (best >= 0 && series[i] <= series[best]) ? best : i, -1);
+    } else {
+      index = events.findIndex((event, i) => i > this._t && event[kind]);
+      if (index < 0) index = events.findIndex((event) => event[kind]);
+    }
+    if (index >= 0) this.setTime(index, true);
   }
 
   _computeMean() {
@@ -360,9 +423,12 @@ class PixelHorizonViewer extends HTMLElement {
         panel.innerHTML = `
           <h3>horizon t+${h}</h3>
           <div class="strip">
+            <figure class="cell"><canvas class="px seen"></canvas><figcaption>seen t</figcaption></figure>
+            <figure class="cell"><canvas class="px pred"></canvas><figcaption class="pred-label">prediction t+${h}</figcaption></figure>
+            <figure class="cell"><canvas class="px copy"></canvas><figcaption>copy-last t</figcaption></figure>
             <figure class="cell"><canvas class="px actual"></canvas><figcaption>actual t+${h}</figcaption></figure>
-            <figure class="cell"><canvas class="px pred"></canvas><figcaption>predicted t+${h}</figcaption></figure>
-            <figure class="cell"><canvas class="px diff"></canvas><figcaption>|error|</figcaption></figure>
+            <figure class="cell"><canvas class="px diff"></canvas><figcaption class="diff-label">prediction error</figcaption></figure>
+            <figure class="cell"><canvas class="px copydiff"></canvas><figcaption>copy-last error</figcaption></figure>
           </div>
           <div class="metrics"></div>`;
         host.appendChild(panel);
@@ -372,16 +438,32 @@ class PixelHorizonViewer extends HTMLElement {
     const rows = [];
     for (const panel of host.children) {
       const h = Number(panel.dataset.h);
-      const pred = this._predicted(source, t, h);
-      const target = this._target(source, t + h);
+      // The source selector controls every primary panel and metric.  A
+      // loaded model adds an option; it must not silently override a selected
+      // baseline while the chart and table continue to report that baseline.
+      const comparisonSource = source;
+      const sourceLabel = comparisonSource === "model" ? "model" : comparisonSource;
+      const pred = this._predicted(comparisonSource, t, h);
+      const target = this._target(comparisonSource, t + h);
+      const seen = this._target(comparisonSource, t); // the input frame the model saw at t
+      const copy = this._predicted("copy-last", t, h);
       const shape = pred ? pred.shape : this._shape;
+      this._drawFrame(panel.querySelector(".seen"), seen?.bytes ?? null, seen?.shape ?? this._shape);
       this._drawFrame(panel.querySelector(".actual"), target?.bytes ?? null, target?.shape ?? this._shape);
       this._drawFrame(panel.querySelector(".pred"), pred?.bytes ?? null, shape);
+      this._drawFrame(panel.querySelector(".copy"), copy?.bytes ?? null, copy?.shape ?? this._shape);
+      panel.querySelector(".pred-label").textContent = `${sourceLabel} prediction t+${h}`;
+      panel.querySelector(".diff-label").textContent = `${sourceLabel} error`;
       const comparable = pred && target && pred.bytes.length === target.bytes.length;
       this._drawDiff(panel.querySelector(".diff"), comparable ? pred.bytes : null, comparable ? target.bytes : null, shape);
+      const copyComparable = copy && target && copy.bytes.length === target.bytes.length;
+      this._drawDiff(panel.querySelector(".copydiff"), copyComparable ? copy.bytes : null, copyComparable ? target.bytes : null, shape);
       const m = comparable ? mse(pred.bytes, target.bytes) : NaN;
-      panel.querySelector(".metrics").innerHTML = comparable
-        ? `MSE <b>${m.toExponential(2)}</b> · PSNR <b>${psnrText(m)}</b> dB`
+      const cm = copyComparable ? mse(copy.bytes, target.bytes) : NaN;
+      panel.querySelector(".metrics").innerHTML = comparisonSource === "model" && comparable && !Number.isNaN(cm)
+        ? `model MSE <b>${m.toExponential(2)}</b> · copy-last <b>${cm.toExponential(2)}</b> · <b>${m < cm ? "model beats copy-last" : "copy-last wins"}</b>`
+        : comparable
+        ? `${sourceLabel} MSE <b>${m.toExponential(2)}</b> · PSNR <b>${psnrText(m)}</b> dB`
         : `no comparable frames at t=${t}`;
       rows.push({ h, mse: m });
     }
@@ -475,9 +557,7 @@ class PixelHorizonViewer extends HTMLElement {
       const rect = svg.getBoundingClientRect();
       const i = Math.round(((ev.clientX - rect.left - pad.l) / (W - pad.l - pad.r)) * (n - 1));
       if (i >= 0 && i <= Number(this._$("#scrub").max)) {
-        this._t = i;
-        this._$("#scrub").value = i;
-        this._render();
+        this.setTime(i, true);
       }
     };
   }
@@ -487,9 +567,7 @@ class PixelHorizonViewer extends HTMLElement {
     this._$("#play").textContent = "❚❚";
     this._timer = setInterval(() => {
       const max = Number(this._$("#scrub").max);
-      this._t = this._t >= max ? 0 : this._t + 1;
-      this._$("#scrub").value = this._t;
-      this._render();
+      this.setTime(this._t >= max ? 0 : this._t + 1, true);
     }, 100);
   }
 

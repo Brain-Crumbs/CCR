@@ -1,6 +1,6 @@
 """World-model contract (Phase A: interface only).
 
-:class:`WorldModel` is the learned predictor ``docs/online-learning.md``
+:class:`WorldModel` is the learned predictor ``docs/history/online-learning.md``
 describes as step 4 of the neural upgrade path: given the fused agent state
 and the action taken, predict what happens next -- the next latent state,
 expected reward, terminal/death probability, a risk estimate, and the

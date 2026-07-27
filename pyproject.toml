@@ -13,7 +13,15 @@ license = { text = "MIT" }
 # through fusion, the binary frame store and the recorder, whether or not
 # torch (the neural extra) is installed.  PyYAML is core: reward profiles
 # (issue #41, --reward-profile) are the one place YAML is the primary format.
-dependencies = ["numpy>=1.23", "PyYAML>=6"]
+# namesgenerator is core: the organism's default name (issue #88,
+# RuntimeConfig.resolve_name) is generated from it; zero transitive deps.
+# crafter is core (issue #176): it's the CLI's default `--world` and the live
+# V2 nursery, so a base install must be able to run the documented default
+# `ccr run`/`ccr nursery run` path without an extra; its own deps (imageio,
+# numpy, opensimplex, pillow, ruamel.yaml) are all lightweight, pure-Python.
+# The legacy Minecraft survival economy needs none of this -- `--world
+# minecraft` never imports `programs.crafter`.
+dependencies = ["numpy>=1.23", "PyYAML>=6", "namesgenerator>=0.3", "crafter>=1.8,<2"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
@@ -27,7 +35,7 @@ neural = ["torch>=2"]
 ccr = "cognitive_runtime.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["cognitive_runtime*"]
+include = ["cognitive_runtime*", "brain*", "sleep*", "motor*", "development*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

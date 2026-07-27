@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from cognitive_runtime.core.streams import StreamSpec
 from cognitive_runtime.training.curriculum_runner import (
     CurriculumDefinition,
     CurriculumDefinitionError,
@@ -28,7 +29,7 @@ def _stage(name: str, **overrides) -> dict:
         "name": name,
         "world_config": dict(_BASE_WORLD),
         "train_episodes": 1,
-        "promotion": {"metric": "average_ticks", "threshold": 0.0, "sample_size": 1},
+        "gates": [{"metric": "average_ticks", "threshold": 0.0, "sample_size": 1}],
         "max_attempts": 1,
     }
     stage.update(overrides)
@@ -89,8 +90,8 @@ def test_load_curriculum_definition_toy_file():
     definition = load_curriculum_definition(TOY_CURRICULUM_PATH)
     assert definition.name == "toy-two-stage"
     assert [s.name for s in definition.stages] == ["flat-safe-toy", "night-survival-toy"]
-    assert definition.stages[0].promotion.metric == "average_ticks"
-    assert definition.stages[1].promotion.metric == "survival_rate"
+    assert definition.stages[0].gates[0].metric == "average_ticks"
+    assert definition.stages[1].gates[0].metric == "survival_rate"
 
 
 def test_load_curriculum_definition_rejects_bad_extension(tmp_path):
@@ -98,6 +99,194 @@ def test_load_curriculum_definition_rejects_bad_extension(tmp_path):
     bad.write_text("name: toy\nstages: []\n")
     with pytest.raises(CurriculumDefinitionError, match="unsupported extension"):
         load_curriculum_definition(str(bad))
+
+
+# --------------------------------------------------------------------------
+# Phase 7 (issue #104): staged-ontogeny stage fields (world/senses/
+# motor-freedom/losses/gates), generalised from `training/curriculum_runner.py`
+# into `development/` behind this module's shim.
+
+def test_stage_spec_requires_promotion_gates():
+    with pytest.raises(ValueError, match="at least one promotion gate"):
+        CurriculumStageSpec(name="missing-gates")
+
+
+def test_stage_spec_rejects_mixed_gate_sample_sizes():
+    with pytest.raises(ValueError, match="same sample_size"):
+        CurriculumStageSpec(
+            name="mixed-samples",
+            gates=(
+                PromotionCriteria(metric="average_ticks", sample_size=1),
+                PromotionCriteria(metric="survival_rate", sample_size=2),
+            ),
+        )
+
+
+def test_stage_spec_accepts_phase7_fields_and_validates():
+    stage = CurriculumStageSpec(
+        name="crawling",
+        world="crafter",
+        scenario="walk_forward",
+        senses=("vision", "proprioception"),
+        motor_freedom="overridden",
+        losses=("prediction", "action_conditioning"),
+        gates=(
+            PromotionCriteria(metric="cortex_beats_copy_last", threshold=1.0),
+            PromotionCriteria(metric="action_ablation_margin", threshold=0.1),
+        ),
+    )
+    assert stage.world == "crafter"
+    assert stage.scenario == "walk_forward"
+    assert stage.senses == ("vision", "proprioception")
+    assert stage.motor_freedom == "overridden"
+    assert stage.losses == ("prediction", "action_conditioning")
+    assert [g.metric for g in stage.gates] == ["cortex_beats_copy_last", "action_ablation_margin"]
+    assert stage.evaluation_sample_size == 3
+
+
+def test_stage_spec_rejects_unknown_world():
+    with pytest.raises(ValueError, match="unknown world"):
+        CurriculumStageSpec(name="s", world="atari")
+
+
+def test_stage_spec_rejects_unknown_motor_freedom():
+    with pytest.raises(ValueError, match="unknown motor_freedom"):
+        CurriculumStageSpec(name="s", motor_freedom="wandering")
+
+
+def test_stage_spec_rejects_duplicate_senses():
+    with pytest.raises(ValueError, match="duplicate senses"):
+        CurriculumStageSpec(name="s", senses=("vision", "vision"))
+
+
+def test_stage_spec_rejects_unknown_sense():
+    with pytest.raises(ValueError, match="unknown sense"):
+        CurriculumStageSpec(name="s", senses=("smell",))
+
+
+def test_stage_spec_rejects_duplicate_losses():
+    with pytest.raises(ValueError, match="duplicate losses"):
+        CurriculumStageSpec(name="s", losses=("prediction", "prediction"))
+
+
+# --------------------------------------------------------------------------
+# issue #135: a stage's declared `senses`/`losses` used to be pure labels --
+# `development.runner`/`development.ladder` never consulted them, so
+# changing a stage's world/senses/losses had no effect on the organism's
+# actual training run. `sense_stream_mask` is the fix's core primitive: the
+# per-stream weight overrides `development.runner._run_stage_episodes` feeds
+# `RuntimeConfig.sense_stream_weights`, which `runtime/loop.py` composes into
+# `TemporalFusion.fuse`'s existing `attention_weights` seam (issue #59) to
+# silence streams outside the declared senses without changing fusion width.
+
+def test_sense_stream_mask_empty_senses_silences_nothing():
+    from development.definitions import sense_stream_mask
+
+    catalog = [
+        StreamSpec("vision.frame.grid", "vision"),
+        StreamSpec("spatial.position", "spatial"),
+        StreamSpec("body.health", "body"),
+    ]
+    assert sense_stream_mask((), catalog) == {}
+
+
+def test_sense_stream_mask_silences_streams_outside_declared_senses():
+    from development.definitions import sense_stream_mask
+
+    catalog = [
+        StreamSpec("vision.frame.grid", "vision"),
+        StreamSpec("vision.frame.pixels", "vision"),
+        StreamSpec("spatial.position", "spatial"),
+        StreamSpec("spatial.facing", "spatial"),
+        StreamSpec("body.health", "body"),
+        StreamSpec("reward.scalar", "reward"),
+    ]
+    mask = sense_stream_mask(("vision",), catalog)
+    assert mask == {"spatial.position": 0.0, "spatial.facing": 0.0}
+
+
+def test_sense_stream_mask_leaves_body_and_reward_streams_untouched():
+    """Only the sense-governed modalities (vision/spatial) are ever masked --
+    body vitals and reward aren't part of either sense's vocabulary and stay
+    active no matter which senses a stage declares."""
+    from development.definitions import sense_stream_mask
+
+    catalog = [StreamSpec("body.health", "body"), StreamSpec("reward.scalar", "reward")]
+    assert sense_stream_mask(("vision",), catalog) == {}
+    assert sense_stream_mask(("vision", "proprioception"), catalog) == {}
+
+
+def test_sense_stream_mask_all_known_senses_declared_silences_nothing():
+    from development.definitions import sense_stream_mask
+
+    catalog = [StreamSpec("vision.frame.grid", "vision"), StreamSpec("spatial.position", "spatial")]
+    assert sense_stream_mask(("vision", "proprioception"), catalog) == {}
+
+
+def test_stage_spec_rejects_duplicate_gate_metrics():
+    with pytest.raises(ValueError, match="duplicate milestone gate metrics"):
+        CurriculumStageSpec(
+            name="s",
+            gates=(
+                PromotionCriteria(metric="average_ticks", threshold=1.0),
+                PromotionCriteria(metric="average_ticks", threshold=2.0),
+            ),
+        )
+
+
+def test_evaluate_gates_requires_all_gates_to_pass():
+    stage = CurriculumStageSpec(
+        name="crawling",
+        gates=(
+            PromotionCriteria(metric="cortex_beats_copy_last", threshold=1.0),
+            PromotionCriteria(metric="action_ablation_margin", threshold=0.1),
+        ),
+    )
+    all_pass = stage.evaluate_gates({"cortex_beats_copy_last": 1.5, "action_ablation_margin": 0.2})
+    assert all_pass == {"cortex_beats_copy_last": True, "action_ablation_margin": True}
+
+    one_fails = stage.evaluate_gates({"cortex_beats_copy_last": 1.5, "action_ablation_margin": 0.05})
+    assert one_fails == {"cortex_beats_copy_last": True, "action_ablation_margin": False}
+    assert not all(one_fails.values())
+
+
+def test_promotion_criteria_value_of_reads_a_metrics_mapping():
+    gate = PromotionCriteria(metric="forgetting_score", threshold=0.5)
+    assert gate.evaluate({"forgetting_score": 0.9}) is True
+    assert gate.evaluate({"forgetting_score": 0.1}) is False
+
+
+def test_promotion_criteria_value_of_raises_on_missing_metric():
+    gate = PromotionCriteria(metric="forgetting_score", threshold=0.5)
+    with pytest.raises(CurriculumDefinitionError, match="not present"):
+        gate.value_of({"some_other_metric": 1.0})
+
+
+def test_curriculum_definition_from_dict_parses_phase7_fields():
+    stage = _stage(
+        "gestation",
+        world="minecraft",
+        scenario="habituate",
+        senses=["vision", "proprioception"],
+        motor_freedom="frozen",
+        losses=["prediction"],
+        gates=[{"metric": "average_ticks", "threshold": 1.0, "sample_size": 1}],
+    )
+    definition = curriculum_definition_from_dict({"name": "ladder", "stages": [stage]})
+    spec = definition.stages[0]
+    assert spec.world == "minecraft"
+    assert spec.scenario == "habituate"
+    assert spec.senses == ("vision", "proprioception")
+    assert spec.motor_freedom == "frozen"
+    assert spec.losses == ("prediction",)
+    assert [g.metric for g in spec.gates] == ["average_ticks"]
+
+
+def test_single_promotion_shape_is_rejected():
+    stage = _stage("old-shape")
+    stage["promotion"] = stage.pop("gates")[0]
+    with pytest.raises(CurriculumDefinitionError, match="unknown stage field"):
+        curriculum_definition_from_dict({"name": "old", "stages": [stage]})
 
 
 # --------------------------------------------------------------------------
@@ -113,10 +302,44 @@ def _impossible_stage(name: str, **overrides) -> dict:
     """A stage whose promotion criterion can never be met, for hold tests."""
     stage = _stage(
         name,
-        promotion={"metric": "average_ticks", "threshold": 1_000_000.0, "sample_size": 1},
+        gates=[{"metric": "average_ticks", "threshold": 1_000_000.0, "sample_size": 1}],
     )
     stage.update(overrides)
     return stage
+
+
+def test_world_model_checkpoint_paths_recorded_once_they_exist(tmp_path):
+    """issue #134: a milestone gate could genuinely train and persist a
+    world model elsewhere with no trace of that in the ladder's own
+    checkpoint metadata at all -- ``world_model_checkpoint_paths`` lets the
+    organism's own checkpoint honestly report which ones now back it.
+
+    Deliberately a separate field from ``extra.actor_critic.has_world_model``
+    (PR #155 review): that flag means *this* checkpoint embeds an
+    ``MLPWorldModel`` -- conflating the two would make ``cli.py``/
+    ``sleep/async_trainer.py`` try to construct and load one that was never
+    actually saved here.
+    """
+    definition = load_curriculum_definition(TOY_CURRICULUM_PATH)
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+    world_model_path = tmp_path / "cortex.pt"
+
+    run_curriculum(
+        definition, checkpoint_path=checkpoint_path, record_dir=str(tmp_path / "sessions"),
+        world_model_checkpoint_paths=[str(world_model_path)],
+    )
+    meta = read_checkpoint_metadata(checkpoint_path)
+    assert meta["extra"]["ladder_world_model_checkpoints"] == []
+    assert meta["extra"]["actor_critic"]["has_world_model"] is False
+
+    world_model_path.write_bytes(b"stand-in for a real cortex checkpoint")
+    run_curriculum(
+        definition, checkpoint_path=checkpoint_path, record_dir=str(tmp_path / "sessions"),
+        world_model_checkpoint_paths=[str(world_model_path)], fresh=True,
+    )
+    meta = read_checkpoint_metadata(checkpoint_path)
+    assert meta["extra"]["ladder_world_model_checkpoints"] == [str(world_model_path)]
+    assert meta["extra"]["actor_critic"]["has_world_model"] is False
 
 
 def test_two_stage_toy_curriculum_promotes_through_both_stages(tmp_path):
@@ -215,7 +438,7 @@ def test_force_promote_overrides_unmet_metric(tmp_path):
     entry = result.state.history[0]
     assert entry["promoted"] is True
     assert entry["forced"] is True
-    assert entry["value"] < entry["threshold"]
+    assert entry["value"]["average_ticks"] < entry["threshold"]["average_ticks"]
 
 
 def test_stage_override_restarts_at_given_index(tmp_path):
@@ -236,3 +459,96 @@ def test_stage_override_out_of_range_raises(tmp_path):
     checkpoint_path = str(tmp_path / "curriculum.pt")
     with pytest.raises(ValueError, match="out of range"):
         run_curriculum(definition, checkpoint_path=checkpoint_path, record_dir=None, start_stage=5)
+
+
+# --------------------------------------------------------------------------
+# Phase 7 (issue #104): milestone-gated promotion, torch-gated (exercises
+# the real train/evaluate loop). Every gate declares the shared evaluation
+# sample size and all gates participate in the decision.
+
+def _gated_stage(name: str, gates, **overrides) -> dict:
+    stage = _stage(name)
+    stage["gates"] = gates
+    stage.update(overrides)
+    return stage
+
+
+def test_promotion_fires_only_when_every_milestone_gate_passes(tmp_path):
+    """"Not a single scalar": two gates on the same easy, mob-free world both
+    pass, so the stage promotes only after the whole milestone set passes."""
+    definition = curriculum_definition_from_dict({
+        "name": "multi-gate",
+        "stages": [_gated_stage("both-easy", gates=[
+            {"metric": "average_ticks", "threshold": 0.0, "sample_size": 1},
+            {"metric": "survival_rate", "threshold": 0.0, "sample_size": 1},
+        ])],
+    })
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+
+    result = run_curriculum(definition, checkpoint_path=checkpoint_path, record_dir=None)
+
+    assert result.status == "completed"
+    entry = result.state.history[0]
+    assert entry["metric"] == ["average_ticks", "survival_rate"]
+    assert entry["promoted"] is True
+    assert set(entry["value"]) == {"average_ticks", "survival_rate"}
+
+
+def test_a_failing_milestone_gate_holds_even_if_the_others_pass(tmp_path):
+    definition = curriculum_definition_from_dict({
+        "name": "multi-gate-holds",
+        "stages": [_gated_stage("one-impossible", gates=[
+            {"metric": "average_ticks", "threshold": 0.0, "sample_size": 1},
+            # survival_rate is a fraction in [0, 1]; > 1.0 can never pass.
+            {"metric": "survival_rate", "threshold": 1_000_000.0, "sample_size": 1},
+        ], max_attempts=1)],
+    })
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+
+    result = run_curriculum(definition, checkpoint_path=checkpoint_path, record_dir=None)
+
+    assert result.status == "held"
+    entry = result.state.history[0]
+    assert entry["promoted"] is False
+    assert entry["value"]["average_ticks"] >= entry["threshold"]["average_ticks"]
+    assert entry["value"]["survival_rate"] < entry["threshold"]["survival_rate"]
+
+
+def test_milestone_metrics_provider_supplies_phase2to6_metrics_to_gates(tmp_path):
+    """The seam issue #105's ladder wiring will use: a stage's gate can name
+    a Phase 2-6 milestone metric (not just the plain eval-episode ones), and
+    the runner asks a caller-supplied provider for it."""
+    definition = curriculum_definition_from_dict({
+        "name": "milestone-metric",
+        "stages": [_gated_stage("crawling", gates=[
+            {"metric": "cortex_beats_copy_last", "threshold": 1.0, "sample_size": 1},
+        ])],
+    })
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+
+    def milestone_metrics(stage, summary):
+        assert stage.name == "crawling"
+        return {"cortex_beats_copy_last": 1.5}
+
+    result = run_curriculum(
+        definition, checkpoint_path=checkpoint_path, record_dir=None,
+        milestone_metrics=milestone_metrics,
+    )
+
+    assert result.status == "completed"
+    assert result.state.history[0]["value"] == {"cortex_beats_copy_last": 1.5}
+
+
+def test_milestone_gate_without_a_metrics_provider_raises_a_clear_error(tmp_path):
+    """A gate referencing a milestone metric with no way to compute it is a
+    definition/wiring bug, not a hold -- it should fail loudly."""
+    definition = curriculum_definition_from_dict({
+        "name": "unwired-milestone",
+        "stages": [_gated_stage("crawling", gates=[
+            {"metric": "cortex_beats_copy_last", "threshold": 1.0, "sample_size": 1},
+        ])],
+    })
+    checkpoint_path = str(tmp_path / "curriculum.pt")
+
+    with pytest.raises(CurriculumDefinitionError, match="cortex_beats_copy_last"):
+        run_curriculum(definition, checkpoint_path=checkpoint_path, record_dir=None)

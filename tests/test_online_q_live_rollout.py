@@ -32,6 +32,8 @@ def test_remote_online_eval_smoke_does_not_train_and_records_nondeterministic_se
     main(
         [
             "run",
+            "--world",
+            "minecraft",
             "--backend",
             "remote",
             "--policy",
@@ -67,6 +69,8 @@ def test_remote_online_training_checkpoint_reloads_across_sessions(tmp_path, mon
 
     base_args = [
         "run",
+        "--world",
+        "minecraft",
         "--backend",
         "remote",
         "--policy",
@@ -95,6 +99,8 @@ def test_remote_dashboard_can_compare_online_random_and_scripted(tmp_path, monke
     _use_fake_remote(monkeypatch)
     checkpoint = tmp_path / "online-q.json"
     common = [
+        "--world",
+        "minecraft",
         "--backend",
         "remote",
         "--episodes",

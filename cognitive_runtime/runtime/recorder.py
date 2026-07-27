@@ -89,6 +89,21 @@ class DecisionRecord:
     # `None` on every other tick and for every session recorded before this
     # field existed.
     reflex: Optional[Dict[str, Any]] = None
+    #: The arbiter's three-mode switch (issue #95): `Arbiter.as_payload()`
+    #: (mode, the (surprise, pain) reading that drove it, and the surprise
+    #: calibrator's current calibration error), every tick; `None` for
+    #: every session recorded before this field existed.
+    arbiter_mode: Optional[Dict[str, Any]] = None
+    #: Full motor-stack efference record (issue #168):
+    #: ``MotorDecision.to_dict()`` carrying voluntary, reflex,
+    #: caregiver_override, and actuated for every tick the organism-motor
+    #: policy drives; ``None`` when the policy is not a
+    #: ``MotorFreedomPolicy`` or for sessions recorded before this field.
+    motor_decision: Optional[Dict[str, Any]] = None
+    #: Decoded multi-horizon frames produced by the live cortex on this tick.
+    #: The clinic aggregates these records into ``pixel-predictions-v1`` so a
+    #: live run is inspectable without a separate offline export.
+    live_prediction: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -164,6 +179,25 @@ class EpisodeSummary:
     #: this episode; 0 for `reflex_mode != "on"` and for every episode
     #: recorded before this field existed.
     reflex_activations: int = 0
+    #: The arbiter's mode timeline this episode (issue #95): mode name ->
+    #: ticks it was active. Empty for every episode recorded before this
+    #: field existed.
+    arbiter_mode_counts: Dict[str, int] = field(default_factory=dict)
+    #: The surprise calibrator's Expected Calibration Error at the end of
+    #: this episode (issue #95, task 4); `None` before enough observations
+    #: accumulated for a fit, and for every episode recorded before this
+    #: field existed.
+    surprise_calibration_error: Optional[float] = None
+    #: The hippocampus's episodic seed store size at the end of this episode
+    #: (issue #96) -- persists across episodes within a run, so this is a
+    #: running total, not a per-episode count. 0 for every episode recorded
+    #: before this field existed.
+    hippocampus_seeds: int = 0
+    #: Organism identity (issue #88): `RuntimeConfig.resolve_name()`'s
+    #: result for the run this episode belongs to; `None` for every episode
+    #: recorded before this field existed (dashboards group those as
+    #: "legacy").
+    name: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -16,6 +16,25 @@ Read in order:
    Dreams, the two motor paths, the World seam, and the Clinic front-end.
 3. [**02-implementation-plan.md**](02-implementation-plan.md) — the phased,
    milestone-gated path from today's `cognitive_runtime/` to the V2 organism.
+4. [**phases/**](phases/README.md) — the task-level breakdown: one actionable
+   implementation plan per phase (0–8), grounded in the current
+   `cognitive_runtime/` code, each with numbered tasks, tests, and its milestone
+   gate.
+
+For onboarding and presentation:
+
+5. [**03-onboarding-guide.md**](03-onboarding-guide.md) — a from-scratch mental
+   model of the system, repository tour, setup, workflows, current assembly
+   boundary, and explicit deferrals.
+6. [**04-contracts-and-data-flow.md**](04-contracts-and-data-flow.md) — the exact
+   Python, tensor, stream, disk, HTTP, checkpoint, development, and mineflayer
+   contracts, plus one complete action-to-training-target trace.
+7. [**05-presentation-runbook.md**](05-presentation-runbook.md) — a 75–90 minute
+   teaching sequence, live-demo script, slide outline, and presenter cautions.
+8. [**09-tracing-and-logging.md**](09-tracing-and-logging.md) — watching a
+   training run while it runs (progress logging with ETA) and reading it back
+   afterwards (`ccr trace show`: phase timings, loss curves, config, git
+   commit), plus how to instrument new code.
 
 **Design commitments** (the choices these docs are built on): re-architect +
 rename rather than rewrite; predict in latent space but always decode to the

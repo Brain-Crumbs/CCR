@@ -59,7 +59,7 @@ the old one.
   provenance are free: `walk_forward`, `object_permanence`, `approach_entity`, and
   a discrete-facing `turn` (Crafter's facing is a discrete flip, not the continuous
   rotation `turn_in_place` assumed — re-scope, don't port the optical-flow premise).
-- Bring the **data-quality gates** forward from `nursery-turn-in-place-analysis.md`
+- Bring the **data-quality gates** forward from `docs/history/nursery-turn-in-place-analysis.md`
   (pixel provenance, motion floor, completed-episode, yaw-sweep) as a reusable
   `record/quality.py`.
 
@@ -305,8 +305,9 @@ checkpoint across stages, which 5 and 6 must land first.
 ## What this plan deliberately defers
 
 - **Speaking / language** (developmental Stage 5) — after Foraging works.
-- **Hippocampal *retrieval*** (context-cued recall of a relevant past episode) —
-  Phase 4 builds the store and dreaming; cued retrieval is a follow-up.
+- **Hippocampal *retrieval*** (context-cued recall of a relevant past episode)
+  is implemented as a guarded follow-up to Phase 4: cosine kNN over fused
+  latent keys, surprise/provenance gating, and prepend-to-cortex context.
 - **Neural attention** and **learned neuromodulator scoring** — the deterministic
   versions ship first; learned successors stay gated until there's data to learn
   from (unchanged from the current roadmap's stance).

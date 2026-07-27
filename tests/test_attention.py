@@ -11,6 +11,7 @@ import sys
 import pytest
 
 from cognitive_runtime.core.attention import (
+    ACETYLCHOLINE_STREAM_ID,
     AttentionBudget,
     AttentionCoefficients,
     AttentionConfig,
@@ -118,6 +119,84 @@ def test_budget_never_exceeded():
     assert len(state.selected_streams) <= 2
     assert state.budget_used == pytest.approx(2.0)
     assert sum(state.weights.values()) <= 2.0 + 1e-9
+
+
+#: A moderate multi-stream salience spike (`internal.risk` fires alongside
+#: `body.health`/`reward.scalar`), scored under a budget generous enough
+#: (`max_streams=4`) that every stream in `_CATALOG` is a candidate --
+#: exactly where the acetylcholine sharpening tests below need to be able
+#: to observe streams *dropping out* rather than being pre-excluded by the
+#: budget's own top-K cap.
+_GENEROUS_BUDGET_CONFIG = AttentionConfig(budget=AttentionBudget(max_total_weight=4.0, max_streams=4))
+
+
+def _settled_spike_buffer(acetylcholine: float | None) -> TemporalBuffer:
+    buffer = TemporalBuffer()
+    t = 0.0
+    for i in range(20):
+        t += 0.05
+        _fill(buffer, t, i, health=20.0, reward=0.0, risk=0.05)
+    t += 0.05
+    if acetylcholine is not None:
+        buffer.append(
+            StreamEvent(ACETYLCHOLINE_STREAM_ID, "event", t, 21, {"value": acetylcholine})
+        )
+    _fill(buffer, t, 21, health=14.0, reward=-0.2, risk=0.3)
+    return buffer
+
+
+def test_acetylcholine_absent_defaults_to_quiescent_zero_no_behavior_change():
+    """No `internal.acetylcholine` stream published yet (e.g. an older
+    recorded session, or attention computed before the runtime's first
+    tick publishes one) must score exactly as if acetylcholine's
+    coefficient didn't exist -- `0.0`, not an error or a spurious
+    suppression."""
+    ctrl = AttentionController(_CATALOG, DEFAULT_STREAM_REGISTRY, mode="budgeted", config=_GENEROUS_BUDGET_CONFIG)
+    state = ctrl.compute(21, _settled_spike_buffer(None))
+    for reason in state.reasons.values():
+        assert reason.signal.acetylcholine == 0.0
+        assert reason.components["acetylcholine"] == 0.0
+
+
+def test_rising_acetylcholine_narrows_the_set_of_streams_the_budget_spends_on():
+    low = AttentionController(_CATALOG, DEFAULT_STREAM_REGISTRY, mode="budgeted", config=_GENEROUS_BUDGET_CONFIG)
+    high = AttentionController(_CATALOG, DEFAULT_STREAM_REGISTRY, mode="budgeted", config=_GENEROUS_BUDGET_CONFIG)
+
+    low_state = low.compute(21, _settled_spike_buffer(0.0))
+    high_state = high.compute(21, _settled_spike_buffer(0.9))
+
+    assert len(low_state.selected_streams) == 4  # every stream in _CATALOG clears the bar
+    assert len(high_state.selected_streams) < len(low_state.selected_streams)
+    # The same fixed budget (`max_total_weight=4.0`) is now spent across
+    # fewer streams: sharper, not just smaller.
+    assert high_state.budget_used == pytest.approx(low_state.budget_used)
+
+
+def test_rising_acetylcholine_concentrates_weight_on_the_top_stream_under_the_same_budget():
+    low = AttentionController(_CATALOG, DEFAULT_STREAM_REGISTRY, mode="budgeted", config=_GENEROUS_BUDGET_CONFIG)
+    high = AttentionController(_CATALOG, DEFAULT_STREAM_REGISTRY, mode="budgeted", config=_GENEROUS_BUDGET_CONFIG)
+
+    low_state = low.compute(21, _settled_spike_buffer(0.0))
+    high_state = high.compute(21, _settled_spike_buffer(0.9))
+
+    top_stream = max(low_state.weights, key=lambda sid: low_state.weights[sid])
+    low_share = low_state.weights[top_stream] / low_state.budget_used
+    high_share = high_state.weights[top_stream] / high_state.budget_used
+    assert high_share > low_share
+
+
+def test_acetylcholine_contributes_a_component_to_every_streams_score():
+    ctrl = AttentionController(
+        _CATALOG, DEFAULT_STREAM_REGISTRY, mode="budgeted",
+        config=AttentionConfig(
+            budget=AttentionBudget(max_total_weight=4.0, max_streams=4),
+            coefficients=AttentionCoefficients(acetylcholine=-1.0),
+        ),
+    )
+    state = ctrl.compute(21, _settled_spike_buffer(0.5))
+    for reason in state.reasons.values():
+        assert reason.signal.acetylcholine == pytest.approx(0.5)
+        assert reason.components["acetylcholine"] == pytest.approx(-0.5)
 
 
 def test_budget_forces_a_choice_among_more_streams_than_max_streams():

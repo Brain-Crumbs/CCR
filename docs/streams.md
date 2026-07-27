@@ -245,7 +245,7 @@ For those, `cognitive_runtime.training.statistical_evaluation` reports mean
 reward by tier, exploration coverage, world-model prediction error, death
 causes) and flags a regression only when a candidate checkpoint's interval no
 longer overlaps the baseline's on the worse side -- see
-[online-learning.md](online-learning.md)'s "Evaluation Gates" section.
+[history/online-learning.md](history/online-learning.md)'s "Evaluation Gates" section.
 
 ## Migration status
 

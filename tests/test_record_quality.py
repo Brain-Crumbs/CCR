@@ -1,0 +1,283 @@
+"""World-agnostic recording-quality gates (issue #90): ``record.quality``
+reads any Program's stream log the same way -- pixel provenance, motion
+floor, completed-episode, and a facing-sweep check that covers both
+continuous yaw (Minecraft) and discrete facing (Crafter). Exercises the
+gates directly (not through ``training.nursery``'s ``NurseryScenario``
+adapter) against a recording from each world, plus the green/amber/red
+verdict.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from cognitive_runtime.record.quality import (  # noqa: E402
+    EpisodeRecordingQuality,
+    audit_split_overlap,
+    validate_recording_quality,
+    validate_recordings,
+    verdict_for_session,
+)
+from cognitive_runtime.runtime.replay import list_episodes  # noqa: E402
+from cognitive_runtime.training.nursery import (  # noqa: E402
+    CRAFTER_SCENARIOS,
+    NURSERY_SCENARIOS,
+    NurseryConfig,
+    _record_scenario_episode,
+    measure_recording_quality,
+)
+
+
+def _record_minecraft_walk(tmp_path, session_id="mc-walk"):
+    cfg = NurseryConfig(episode_ticks=26, world_size=16)
+    return _record_scenario_episode(
+        str(tmp_path), session_id, 0, NURSERY_SCENARIOS["walk_forward"], cfg
+    )
+
+
+def _record_crafter_walk(tmp_path, session_id="crafter-walk"):
+    pytest.importorskip("crafter")
+    cfg = NurseryConfig(world="crafter", episode_ticks=40)
+    return _record_scenario_episode(
+        str(tmp_path), session_id, 0, CRAFTER_SCENARIOS["walk_forward_short"], cfg
+    )
+
+
+def _record_crafter_stationary(tmp_path, session_id="crafter-still"):
+    """Object_permanence's *player* never moves -- the motion-floor
+    ("barely moved") gate's Crafter case.
+
+    Note this is not a pixel-frozen recording: the scenario's scripted mob
+    walks in and out of view, so every frame differs. Use
+    ``_freeze_recorded_frames`` for the frozen-pixel gates.
+    """
+    pytest.importorskip("crafter")
+    cfg = NurseryConfig(world="crafter", episode_ticks=40)
+    return _record_scenario_episode(
+        str(tmp_path), session_id, 0, CRAFTER_SCENARIOS["object_permanence"], cfg
+    )
+
+
+def _freeze_recorded_frames(session_dir):
+    """Rewrite a recorded session so every pixel frame is byte-identical.
+
+    The frozen-pixel gate counts *distinct* frame content hashes, so this
+    constructs exactly the condition it exists to catch. Recording a
+    scenario and hoping it comes out static does not: no nursery scenario
+    is pixel-frozen (Crafter's ``object_permanence`` has a moving mob,
+    Minecraft's ``turn_in_place`` re-renders on every yaw change), which is
+    what made the earlier fixture stop reproducing the failure it asserted.
+    """
+    for episode_id in list_episodes(session_dir):
+        path = os.path.join(session_dir, f"{episode_id}.streams.jsonl")
+        with open(path, encoding="utf-8") as handle:
+            lines = [json.loads(line) for line in handle if line.strip()]
+        first_ref = next(
+            (line["frame_ref"] for line in lines if "frame_ref" in line), None
+        )
+        assert first_ref is not None, f"{path} records no pixel frames"
+        for line in lines:
+            if "frame_ref" in line:
+                line["frame_ref"] = first_ref
+        with open(path, "w", encoding="utf-8") as handle:
+            for line in lines:
+                handle.write(json.dumps(line) + "\n")
+    return session_dir
+
+
+# --------------------------------------------------------------------------- measurement
+
+
+def test_measure_recording_quality_reads_a_minecraft_recording(tmp_path):
+    session_dir = _record_minecraft_walk(tmp_path)
+    quality = measure_recording_quality(session_dir, list_episodes(session_dir)[0])
+    assert quality.n_frames > 0
+    assert quality.blocks_per_tick > 0.0
+    assert quality.pixel_sources == ["grid"]
+
+
+def test_measure_recording_quality_reads_a_crafter_recording(tmp_path):
+    session_dir = _record_crafter_walk(tmp_path)
+    quality = measure_recording_quality(session_dir, list_episodes(session_dir)[0])
+    assert quality.n_frames > 0
+    assert quality.blocks_per_tick > 0.0
+    assert quality.pixel_sources == ["crafter"]
+
+
+# ------------------------------------------------------------------- validate_recording_quality
+
+
+def test_validate_recording_quality_passes_a_healthy_recording_from_either_world(tmp_path):
+    mc = _record_minecraft_walk(tmp_path, "mc-clean")
+    crafter = _record_crafter_walk(tmp_path, "crafter-clean")
+    for session_dir in (mc, crafter):
+        quality = measure_recording_quality(session_dir, list_episodes(session_dir)[0])
+        issues = validate_recording_quality(
+            quality, name="walk", min_blocks_per_tick=0.005, min_unique_frame_fraction=0.05,
+        )
+        assert issues == [], (session_dir, issues)
+
+
+def test_validate_recording_quality_flags_a_frozen_recording_from_either_world(tmp_path):
+    mc_still = _record_scenario_episode(
+        str(tmp_path), "mc-still", 0, NURSERY_SCENARIOS["turn_in_place"],
+        NurseryConfig(episode_ticks=26, world_size=16),
+    )
+    crafter_still = _record_crafter_stationary(tmp_path)
+    for session_dir in (mc_still, crafter_still):
+        quality = measure_recording_quality(session_dir, list_episodes(session_dir)[0])
+        issues = validate_recording_quality(
+            quality, name="walk", min_blocks_per_tick=0.05,
+        )
+        assert any("barely moved" in issue for issue in issues), (session_dir, issues)
+
+
+def test_validate_recordings_checks_pixel_provenance_across_worlds(tmp_path):
+    crafter = _record_crafter_walk(tmp_path)
+    assert validate_recordings([crafter], name="walk", expected_pixel_source="crafter") == []
+    issues = validate_recordings([crafter], name="walk", expected_pixel_source="grid")
+    assert any("pixel source" in issue for issue in issues)
+
+
+# --------------------------------------------------------------------------- discrete facing
+
+
+def test_validate_recording_quality_flags_missing_unique_facings(tmp_path):
+    pytest.importorskip("crafter")
+    cfg = NurseryConfig(world="crafter", episode_ticks=40)
+    session_dir = _record_scenario_episode(
+        str(tmp_path), "crafter-turn", 0, CRAFTER_SCENARIOS["turn"], cfg
+    )
+    quality = measure_recording_quality(session_dir, list_episodes(session_dir)[0])
+    assert quality.unique_facings == 4
+    assert validate_recording_quality(quality, name="turn", min_unique_facings=4) == []
+    issues = validate_recording_quality(quality, name="turn", min_unique_facings=5)
+    assert any("unique facing" in issue for issue in issues)
+
+
+# --------------------------------------------------------------------------- verdict
+
+
+def test_verdict_for_session_is_green_for_a_healthy_recording(tmp_path):
+    session_dir = _record_crafter_walk(tmp_path)
+    verdict = verdict_for_session(
+        session_dir, name="walk", min_blocks_per_tick=0.01, min_unique_frame_fraction=0.05,
+    )
+    assert verdict.verdict == "green"
+    assert verdict.issues == []
+    assert verdict.warnings == []
+
+
+def test_verdict_for_session_is_red_for_a_frozen_recording(tmp_path):
+    session_dir = _record_crafter_stationary(tmp_path)
+    verdict = verdict_for_session(session_dir, name="walk", min_blocks_per_tick=0.05)
+    assert verdict.verdict == "red"
+    assert verdict.issues
+
+
+def test_world_agnostic_unique_frame_count_gate_rejects_frozen_pixels(tmp_path):
+    session_dir = _freeze_recorded_frames(_record_crafter_walk(tmp_path))
+    verdict = verdict_for_session(session_dir, min_unique_frames=2)
+    assert verdict.verdict == "red"
+    assert any("recording appears frozen" in issue for issue in verdict.issues)
+
+
+def test_world_agnostic_unique_frame_count_gate_passes_a_moving_recording(tmp_path):
+    """The other half of the gate: a recording whose frames actually change
+    must not trip it -- otherwise the test above would pass against a gate
+    that simply always fires."""
+    session_dir = _record_crafter_walk(tmp_path)
+    verdict = verdict_for_session(session_dir, min_unique_frames=2)
+    assert not any("recording appears frozen" in issue for issue in verdict.issues)
+
+
+def test_verdict_for_session_is_amber_when_provenance_predates_tracking(tmp_path):
+    session_dir = _record_crafter_walk(tmp_path)
+    episode_id = list_episodes(session_dir)[0]
+    summary_path = os.path.join(session_dir, f"{episode_id}.summary.json")
+    with open(summary_path, encoding="utf-8") as fh:
+        summary = json.load(fh)
+    summary["program_stats"].pop("pixel_sources", None)
+    with open(summary_path, "w", encoding="utf-8") as fh:
+        json.dump(summary, fh)
+
+    verdict = verdict_for_session(
+        session_dir, name="walk", min_blocks_per_tick=0.01, min_unique_frame_fraction=0.05,
+    )
+    assert verdict.verdict == "amber"
+    assert verdict.issues == []
+    assert any("provenance" in w for w in verdict.warnings)
+
+
+def test_verdict_for_session_is_amber_when_motion_is_close_to_the_floor(tmp_path):
+    session_dir = _record_crafter_walk(tmp_path)
+    quality = measure_recording_quality(session_dir, list_episodes(session_dir)[0])
+    # A floor just under the measured rate clears the hard gate but sits
+    # within AMBER_MARGIN of it.
+    close_floor = quality.blocks_per_tick / 1.2
+
+    verdict = verdict_for_session(session_dir, name="walk", min_blocks_per_tick=close_floor)
+    assert verdict.verdict == "amber"
+    assert any("motion" in w for w in verdict.warnings)
+
+
+def test_quality_gate_rejects_a_scene_whose_pixels_change_only_from_hud_animation():
+    """Issue #202: pixel-hash uniqueness alone is not proof of world motion
+    -- a scene can be 100% unique pixel frames (HUD flicker, render noise)
+    while the semantic grid -- the real world-motion signal -- never
+    changes. The unique-pixel-frame floor alone must not pass such a
+    recording; ``min_semantic_change_fraction`` catches what it misses."""
+    quality = EpisodeRecordingQuality(
+        session_dir="synthetic", episode_id="hud-animation",
+        n_frames=50, unique_frames=50,  # every pixel frame is unique...
+        net_displacement=0.0, duration_ticks=50,
+        semantic_frames=50, unique_semantic_frames=1,  # ...but the scene never changes
+        semantic_change_fraction=0.0,
+        moving_transition_fraction=0.0,
+    )
+    # The old-style gate (pixel uniqueness only) would wrongly pass this.
+    assert validate_recording_quality(
+        quality, name="turn", min_unique_frame_fraction=0.5,
+    ) == []
+    # The semantic-change floor correctly rejects it.
+    issues = validate_recording_quality(
+        quality, name="turn", min_unique_frame_fraction=0.5, min_semantic_change_fraction=0.1,
+    )
+    assert issues != []
+    assert any("semantic grid changed" in issue for issue in issues)
+
+
+def test_audit_split_overlap_is_clean_for_independently_recorded_episodes(tmp_path):
+    pytest.importorskip("crafter")
+    from cognitive_runtime.training.nursery import CRAFTER_SCENARIOS
+
+    cfg = NurseryConfig(world="crafter", episode_ticks=20)
+    scenario = CRAFTER_SCENARIOS["turn"]
+    train_dir = _record_scenario_episode(str(tmp_path), "turn-train", 0, scenario, cfg)
+    holdout_dir = _record_scenario_episode(str(tmp_path), "turn-holdout", 1000, scenario, cfg)
+
+    report = audit_split_overlap([train_dir], [holdout_dir])
+    assert report.duplicate_episode_pairs == []
+
+
+def test_audit_split_overlap_rejects_an_identical_holdout_episode(tmp_path):
+    """Issue #202's required test: holdout overlap validation rejects
+    identical episodes -- here, a holdout episode that is a byte-for-byte
+    copy of a training episode (e.g. an accidentally repeated seed)."""
+    pytest.importorskip("crafter")
+    from cognitive_runtime.training.nursery import CRAFTER_SCENARIOS
+
+    cfg = NurseryConfig(world="crafter", episode_ticks=20)
+    scenario = CRAFTER_SCENARIOS["turn"]
+    train_dir = _record_scenario_episode(str(tmp_path / "train"), "turn-train", 0, scenario, cfg)
+    # Same seed re-recorded under a "holdout" label -- byte-identical.
+    holdout_dir = _record_scenario_episode(str(tmp_path / "holdout"), "turn-holdout", 0, scenario, cfg)
+
+    report = audit_split_overlap([train_dir], [holdout_dir])
+    assert report.duplicate_episode_pairs
+    assert any("exactly matches" in issue for issue in report.issues)

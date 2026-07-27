@@ -34,7 +34,7 @@ from cognitive_runtime.core.hashing import canonical_json
 RECOMMENDED_TIERS: Tuple[str, ...] = ("survival", "capability", "quest", "shaping")
 
 #: Closed vocabulary of component "kind"s the engine knows how to evaluate.
-#: See `docs/reward_profiles.md` for the full semantics of each.
+#: See `docs/history/reward_profiles.md` for the historical semantics of each.
 KNOWN_KINDS = frozenset(
     {
         "tick",

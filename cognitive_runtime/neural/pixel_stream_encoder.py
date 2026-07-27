@@ -8,6 +8,7 @@ models and world models free to reuse the same encoder weights.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -19,6 +20,60 @@ from cognitive_runtime.neural.encoder import StreamEncoderModule
 
 PIXEL_STREAM_ID = "vision.frame.pixels"
 PIXEL_CHECKPOINT_KEY = "stream_encoder.vision_frame_pixels"
+
+
+@dataclass(frozen=True)
+class VisualEncoding:
+    """A compact temporal token together with its spatial visual evidence."""
+
+    token: torch.Tensor
+    spatial: torch.Tensor
+
+
+class SpatialVisualEncoder(nn.Module):
+    """Stride-eight visual encoder used by the spatial residual cortex.
+
+    This deliberately lives beside, rather than replaces, ``PixelStreamEncoder``:
+    the latter is a stable stream-module contract used by policy checkpoints.
+    """
+
+    architecture = "spatial_residual_v1"
+
+    def __init__(self, pixel_shape: Tuple[int, int, int], latent_width: int, spatial_width: int = 64):
+        super().__init__()
+        h, w, c = pixel_shape
+        if c != 3 or h < 1 or w < 1:
+            raise ValueError("spatial encoder requires non-empty RGB frames")
+        self.pixel_shape = tuple(pixel_shape)
+        self.latent_width = int(latent_width)
+        self.spatial_width = int(spatial_width)
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(64, self.spatial_width, 3, stride=2, padding=1), nn.ReLU(),
+        )
+        self.token = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(self.spatial_width, latent_width), nn.ReLU())
+
+    def encode(self, pixels: torch.Tensor) -> VisualEncoding:
+        if pixels.ndim != 4 or tuple(pixels.shape[1:]) != (3, *self.pixel_shape[:2]):
+            raise ValueError(f"pixels must be [B, 3, {self.pixel_shape[0]}, {self.pixel_shape[1]}]")
+        spatial = self.features(pixels)
+        return VisualEncoding(token=self.token(spatial), spatial=spatial)
+
+    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Token-only compatibility surface; use :meth:`encode` for layout."""
+        return self.encode(pixels).token
+
+    def encode_frame(self, frame: Any) -> torch.Tensor:
+        """Compatibility helper matching :class:`PixelStreamEncoder`.
+
+        Live cortex users historically obtain the single-frame token directly
+        from ``model.encoder``.  Spatial callers can still request the map
+        through :meth:`encode`; this helper deliberately returns only the
+        temporal token.
+        """
+        batch = pixels_to_chw(frame).unsqueeze(0).to(next(self.parameters()).device)
+        return self.forward(batch).squeeze(0)
 
 
 def pixels_to_chw(frame: Any) -> torch.Tensor:

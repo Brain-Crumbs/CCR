@@ -144,6 +144,7 @@ def save_world_model_checkpoint(
     model: MLPWorldModel,
     dataset: WorldModelDataset,
     stats: Dict[str, Any],
+    name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Save the trained world model in the unified checkpoint format."""
 
@@ -170,6 +171,7 @@ def save_world_model_checkpoint(
                 "prediction_error",
             ],
         },
+        name=name,
     )
     return manager.save(reason="world_model_training")
 
@@ -475,6 +477,7 @@ def save_multi_horizon_world_model_checkpoint(
     model: MultiHorizonMLPWorldModel,
     dataset: MultiHorizonWorldModelDataset,
     stats: Dict[str, Any],
+    name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Save the trained multi-horizon world model in the unified checkpoint
     format."""
@@ -502,6 +505,7 @@ def save_multi_horizon_world_model_checkpoint(
                 "prediction_error",
             ],
         },
+        name=name,
     )
     return manager.save(reason="multi_horizon_world_model_training")
 

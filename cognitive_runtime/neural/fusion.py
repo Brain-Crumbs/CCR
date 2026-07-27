@@ -3,7 +3,7 @@
 Where ``cognitive_runtime.core.streams.fusion.TemporalFusion`` deterministically
 concatenates each stream's fixed-width slice (with a spec's neutral value
 filling silent streams) into one versioned vector, :class:`LatentFusionModel`
-is the learned upgrade path ``docs/online-learning.md`` describes: a model
+is the learned upgrade path ``docs/history/online-learning.md`` describes: a model
 that consumes those same per-stream slices -- plus which streams were present
 this tick and how recently each last fired -- and produces one fused agent
 state.

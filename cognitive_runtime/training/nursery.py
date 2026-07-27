@@ -25,20 +25,36 @@ group nursery runs the same way they already group curriculum-preset runs
 from __future__ import annotations
 
 import json
-import math
+import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
+
+log = logging.getLogger("ccr.training.nursery")
 import torch.nn.functional as F
 
 from cognitive_runtime.core.action import NULL_ACTION, Action
 from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
+from cognitive_runtime.observability import span, trace_counter, trace_event, trace_metrics
 from cognitive_runtime.policies.constant_action import ConstantActionPolicy
 from cognitive_runtime.policies.null_policy import NullPolicy
 from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy
+from cognitive_runtime.programs.crafter.config import CrafterConfig, area_from_world_size
+from cognitive_runtime.programs.crafter.streams import FRAME_LEGEND
 from cognitive_runtime.programs.minecraft.adapter import BACKENDS, MinecraftSurvivalBox
+#: Re-exported for back-compat: this gate moved to ``record.quality`` (issue
+#: #90) so it can run world-agnostically; existing imports of
+#: ``EpisodeRecordingQuality``/``measure_recording_quality`` from here still
+#: work unchanged.
+from cognitive_runtime.record.quality import (  # noqa: F401
+    EpisodeRecordingQuality,
+    SplitOverlapReport,
+    audit_split_overlap,
+    measure_recording_quality,
+    validate_recordings,
+)
 from cognitive_runtime.runtime.config import RuntimeConfig
 from cognitive_runtime.runtime.loop import CognitiveRuntime
 from cognitive_runtime.runtime.replay import list_episodes
@@ -50,8 +66,13 @@ from cognitive_runtime.training.action_world_model import (
     ActionWorldModelConfig,
     build_action_sequence_dataset,
     evaluate_action_world_model,
+    evaluate_action_world_model_milestone,
     horizons_ticks_to_frames,
     linear_probe_yaw,
+    linear_probe_orientation,
+    representation_collapse_diagnostics,
+    load_action_world_model,
+    save_action_world_model,
     train_action_world_model,
 )
 from cognitive_runtime.training.ego_motion_canary import (
@@ -64,7 +85,17 @@ from cognitive_runtime.training.entity_persistence import (
     build_entity_persistence_dataset,
     train_entity_persistence_model,
 )
-from cognitive_runtime.training.prediction_export import export_session_predictions
+from cognitive_runtime.training.prediction_export import (
+    export_session_predictions,
+    load_full_visual_model,
+    save_full_visual_model,
+)
+from cognitive_runtime.training.statistical_evaluation import (
+    MetricComparison,
+    MetricStats,
+    cortex_horizon_statistics,
+    compare_cortex_horizon_statistics,
+)
 from cognitive_runtime.training.visual_representation import (
     VisualPretrainingConfig,
     VisualRepresentationModel,
@@ -92,6 +123,11 @@ class NurseryConfig:
     holdout_seeds: Sequence[int] = (1000, 1001)
     episode_ticks: int = 400
     world_size: int = 48
+    #: Which Program records the scenario (issue #90): ``"minecraft"`` looks
+    #: scenario names up in ``NURSERY_SCENARIOS``; ``"crafter"`` looks them
+    #: up in ``CRAFTER_SCENARIOS`` and ignores ``backend`` (Crafter has no
+    #: backend choice -- the ``crafter`` package *is* the backend).
+    world: str = "minecraft"
     backend: str = "simulated"
     realtime: bool = False
     horizons: Sequence[int] = (1, 10, 100)
@@ -120,6 +156,39 @@ class NurseryConfig:
     #: recorded an agent that was stuck against an obstacle for ~95% of its
     #: frames; this gate fails such sessions before any training happens.
     data_quality_gate: bool = True
+    #: Refuse to train when a recorded holdout episode is an exact or
+    #: near-exact duplicate of a recorded training episode (issue #202:
+    #: ``record.quality.audit_split_overlap``) -- a "held-out" evaluation
+    #: that leaky cannot support the generalization claim it exists to make.
+    #: Defaults off (unlike ``data_quality_gate``), because callers may use
+    #: deliberately repeated smoke-test recordings.  The bundled Crafter
+    #: scenarios retain seed-specific visual context and pass this gate at
+    #: the default threshold.
+    #:
+    #: Minecraft's simulated backend does not re-render
+    #:   ``vision.frame.pixels`` for a scripted non-player entity's own
+    #:   movement (only for the player's own position/facing changing), so
+    #:   ``object_permanence``/``approach_entity`` recordings there are
+    #:   pixel-frozen regardless of scripted parameter or seed -- a
+    #:   pre-existing rendering gap this issue's Crafter-focused fixes do
+    #:   not reach.
+    #: A custom scenario that intentionally erases its seeded background or
+    #: places exactly the same scripted path in every seed can still need a
+    #: looser, scenario-specific threshold; it must not use that as a way to
+    #: bless an otherwise invalid generalization split.
+    split_overlap_gate: bool = False
+    #: Diagnostic-only mode: evaluate each trained scenario on the exact
+    #: recorded sessions used for training.  This is an intentional
+    #: memorization/overfit canary, never a generalization result.  It
+    #: requires no zero-shot scenarios and bypasses the split-overlap gate
+    #: because the evaluation set is deliberately identical to the training
+    #: set.
+    overfit_evaluation: bool = False
+    #: Hard-fail threshold (fraction of index-aligned matching frames) for
+    #: ``split_overlap_gate`` -- see ``audit_split_overlap``'s docstring for
+    #: why this defaults looser than the <1% acceptance target: an exact
+    #: whole-episode duplicate always hard-fails regardless of this value.
+    max_corresponding_frame_fraction: float = 0.35
     #: Write ``predictions_<episode>.json`` (viewer "model" source) for every
     #: recorded session after training.  The nursery checkpoint persists only
     #: the pixel encoder, so predicted frames are unrecoverable later unless
@@ -132,6 +201,11 @@ class NurseryConfig:
     #: fallback instead.  ``None`` accepts either, but still refuses to mix
     #: sources within one training run.
     expected_pixel_source: Optional[str] = None
+    #: Organism identity (issue #88): threaded into every recorded episode's
+    #: `RuntimeConfig.name`, so its session metadata, prediction exports, and
+    #: the encoder checkpoint all carry it. ``None`` lets each recorded
+    #: episode resolve its own generated name (cosmetic only).
+    name: Optional[str] = None
 
 
 @dataclass
@@ -141,10 +215,14 @@ class ScenarioRecording:
     policy: Any
     program_config_extra: Dict[str, Any] = field(default_factory=dict)
     #: Optional one-shot world-scripting hook, run on the constructed
-    #: ``MinecraftSurvivalBox`` before the episode plays -- for scenarios
-    #: that need scripted entities/terrain beyond what a policy can express
-    #: (``object_permanence``, ``approach_entity``).
-    scene_setup: Optional[Callable[[MinecraftSurvivalBox], None]] = None
+    #: Program before the episode plays -- for scenarios that need scripted
+    #: entities/terrain beyond what a policy can express
+    #: (``object_permanence``, ``approach_entity``). Takes a
+    #: ``MinecraftSurvivalBox`` for scenarios registered in
+    #: ``NURSERY_SCENARIOS``, a ``CrafterWorld`` for ones in
+    #: ``CRAFTER_SCENARIOS`` -- never both, since each scenario is only ever
+    #: built for the world it's registered under.
+    scene_setup: Optional[Callable[[Any], None]] = None
     #: Overrides ``NurseryConfig.episode_ticks`` when a scenario needs a
     #: specific length (e.g. an occlusion cycle with fixed phase lengths).
     episode_ticks: Optional[int] = None
@@ -178,10 +256,43 @@ class NurseryScenario:
     #: expectation): ``turn_in_place`` requires at least one full revolution,
     #: otherwise there is no view-rotation regularity to learn.
     min_yaw_sweep_degrees: float = 0.0
+    #: Discrete-facing equivalent of ``min_yaw_sweep_degrees`` (0 = no
+    #: expectation): Crafter has no continuous view to rotate, so its
+    #: ``turn`` scenario instead requires visiting this many distinct facing
+    #: directions (``spatial.facing``; max 4 on a grid).
+    min_unique_facings: int = 0
     #: Nursery episodes are scripted micro-scenarios; one that terminated
     #: early (the first real turn_in_place train-0 was beaten to death by
     #: mobs at tick 167/400) is not the scenario it claims to be.
     require_completed: bool = True
+    #: Minimum fraction of frame-to-frame transitions where the agent's
+    #: forward-filled grid position actually changed (0.0 = no expectation;
+    #: issue #202). Unlike ``min_blocks_per_tick`` (net displacement over
+    #: the whole episode, diluted by a long stationary tail),
+    #: ``moving_transition_fraction`` looks at every transition, so it
+    #: still catches an agent that walked, then got stuck for the back half
+    #: of the episode.
+    min_moving_transition_fraction: float = 0.0
+    #: Minimum fraction of frame-to-frame transitions where the semantic
+    #: grid actually changed (0.0 = no expectation; issue #202). Pixel-hash
+    #: uniqueness alone cannot distinguish genuine world motion from a
+    #: static scene whose pixels merely animate (HUD flicker, render
+    #: noise); this floor requires the *semantic* scene to actually change.
+    min_semantic_change_fraction: float = 0.0
+    #: Upper bound (None = no expectation) on the longest run of
+    #: consecutive "position unchanged" transitions ending at the very last
+    #: frame -- an accidental long stationary tail (the agent walked into
+    #: an obstacle/boundary and idled for the rest of the episode), as
+    #: opposed to an intentional, explicitly bounded blocked phase
+    #: (``blocked_forward``'s few-tick collision hold, which this bound
+    #: comfortably covers).
+    max_longest_stationary_tail: Optional[int] = None
+    #: Upper bound (None = no expectation) on the longest "position
+    #: unchanged" run *anywhere* in the episode -- unlike
+    #: ``max_longest_stationary_tail``, this also catches a mid-episode
+    #: blocked phase that never actually unblocks (``blocked_forward``'s
+    #: recovery action failing to move the agent).
+    max_longest_stationary_run: Optional[int] = None
 
 
 @dataclass
@@ -218,6 +329,55 @@ class NurseryScenarioReport:
     #: frames do -- the collapse signature of the first real turn_in_place
     #: run.
     rollout_health: Dict[str, Any] = field(default_factory=dict)
+    #: The actual ``program_config`` used to construct the recording Program
+    #: (post ``world_size``->``area`` translation for Crafter) -- so a test
+    #: (or a human comparing runs) can assert the requested world size
+    #: actually took effect, without re-deriving it from ``config`` (issue
+    #: #202).
+    resolved_program_config: Dict[str, Any] = field(default_factory=dict)
+
+
+# --------------------------------------------------------------------------- explicit split parameters (issue #202)
+#
+# Scripted scenarios that derive a scene parameter (approach distance,
+# occlusion depth) from ``seed`` used to do it via a small modulus
+# (``6 + seed % 6``): with only 2-4 holdout seeds, a small modulus makes a
+# holdout seed land on the exact same parameter value as a training seed --
+# a holdout that silently repeats a training variant instead of testing a
+# new one. ``_split_parameter`` instead draws from an explicit, disjoint
+# tuple of values per split, indexed by the seed's position within its own
+# pool (``NurseryConfig.train_seeds``/``holdout_seeds``) -- so disjointness
+# is a property of the two tuples, not an accident of the moduli involved.
+
+
+def _seed_split_index(seed: int, cfg: NurseryConfig) -> Tuple[str, int]:
+    """Classify ``seed`` as belonging to ``cfg.train_seeds`` or
+    ``cfg.holdout_seeds`` and return its position within that pool."""
+    train_seeds = list(cfg.train_seeds)
+    holdout_seeds = list(cfg.holdout_seeds)
+    if seed in train_seeds:
+        return "train", train_seeds.index(seed)
+    if seed in holdout_seeds:
+        return "holdout", holdout_seeds.index(seed)
+    raise ValueError(
+        f"seed {seed} is neither a train nor a holdout seed in this NurseryConfig "
+        f"(train_seeds={cfg.train_seeds!r}, holdout_seeds={cfg.holdout_seeds!r})"
+    )
+
+
+def _split_parameter(
+    seed: int, cfg: NurseryConfig, train_values: Sequence[Any], holdout_values: Sequence[Any]
+) -> Any:
+    """Pick this seed's scripted scenario parameter from its split's
+    explicit value tuple, cycling by position within the pool if there are
+    more seeds than declared values. ``train_values``/``holdout_values``
+    must be disjoint (see ``tests/test_nursery.py``'s split-parameter
+    disjointness checks) -- that, not the seed arithmetic, is what makes a
+    holdout episode's scripted parameter always novel relative to training.
+    """
+    split, index = _seed_split_index(seed, cfg)
+    values = train_values if split == "train" else holdout_values
+    return values[index % len(values)]
 
 
 # --------------------------------------------------------------------------- scenario builders
@@ -245,12 +405,24 @@ def _day_night(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
     )
 
 
+#: Disjoint by construction (issue #202) -- see ``_split_parameter``.
+_APPROACH_ENTITY_TRAIN_DISTANCES = (6, 8, 10, 12)
+_APPROACH_ENTITY_HOLDOUT_DISTANCES = (7, 9, 11, 13)
+
+
 def _approach_entity(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
-    distance = 6 + (seed % 6)
+    distance = _split_parameter(
+        seed, cfg, _APPROACH_ENTITY_TRAIN_DISTANCES, _APPROACH_ENTITY_HOLDOUT_DISTANCES
+    )
 
     def scene_setup(program: MinecraftSurvivalBox) -> None:
         world = program._backend.world
-        world.reset(0)
+        # Regenerate the world from this episode's own seed (issue #202),
+        # not a hardcoded ``reset(0)`` -- freezing every seed to the exact
+        # same generated background world made train and holdout episodes
+        # share most of their approach-phase frames regardless of the
+        # (disjoint) scripted distance.
+        world.reset(seed)
         ax, az = int(world.x), int(world.z)
         _clear_terrain(world, ax, az, radius=distance + 4)
         _freeze_mobs(world, [{"id": 1, "x": ax, "z": az + distance, "hp": 10, "cooldown": 0}])
@@ -263,13 +435,23 @@ def _approach_entity(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
     )
 
 
+#: Disjoint by construction (issue #202) -- occlusion depth (offset past the
+#: wall) for the object-permanence excursion, per split.
+_OBJECT_PERMANENCE_TRAIN_OFFSETS = tuple(float(_WALL_OFFSET + 2 + d) for d in (0, 2, 4, 6))
+_OBJECT_PERMANENCE_HOLDOUT_OFFSETS = tuple(float(_WALL_OFFSET + 2 + d) for d in (1, 3, 5, 7))
+
+
 def _object_permanence(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
     phase_ticks = max(5, cfg.episode_ticks // 3)
-    offset = float(_WALL_OFFSET + 2 + (seed % 8))
+    offset = _split_parameter(
+        seed, cfg, _OBJECT_PERMANENCE_TRAIN_OFFSETS, _OBJECT_PERMANENCE_HOLDOUT_OFFSETS
+    )
 
     def scene_setup(program: MinecraftSurvivalBox) -> None:
         world = program._backend.world
-        world.reset(0)
+        # Regenerate the world from this episode's own seed (issue #202) --
+        # see ``_approach_entity``'s matching comment.
+        world.reset(seed)
         ax, az = int(world.x), int(world.z)
         _clear_terrain(world, ax, az, radius=int(offset) + 3)
         world.terrain[ax + _WALL_OFFSET][az] = "stone"
@@ -330,128 +512,515 @@ NURSERY_SCENARIOS: Dict[str, NurseryScenario] = {
 }
 
 
+# --------------------------------------------------------------------------- crafter scenario builders
+#
+# Crafter ports of walk_forward/turn/object_permanence/approach_entity
+# (issue #90), registered in the parallel ``CRAFTER_SCENARIOS`` below rather
+# than folded into ``NURSERY_SCENARIOS``: Crafter is a different Program
+# (``programs.crafter.adapter.CrafterWorld``), so its scene-setup hooks take
+# a ``CrafterWorld``, not a ``MinecraftSurvivalBox``.
+#
+# Crafter has no first-person view to rotate, so ``turn_in_place`` isn't
+# ported as-is (Crafter is 2-D top-down; see docs/v2/phases
+# /phase-1-nursery-world.md's "do not smuggle ego-motion back in").  Its
+# discrete analogue, ``turn``, boxes the agent in with stone on all four
+# sides and cycles the four directional actions -- every move is blocked,
+# so only the discrete ``facing`` changes (``crafter.objects.Player._move``
+# sets ``self.facing`` before checking collision, so a blocked move still
+# turns the agent).
+#
+# Crafter's renderer draws objects over terrain regardless of what's
+# underneath them (no line-of-sight occlusion), so ``object_permanence``
+# isn't ported via a literal wall either -- a mob standing on a "wall" tile
+# would still render on top of it.  Its real occlusion is the bounded
+# egocentric view (``CrafterConfig.grid_radius``): a scripted mob walks
+# out past the view radius, holds there, then walks back -- object
+# permanence via genuine limited perceptual range.  Because that relies on
+# view-radius geometry rather than Minecraft's ``vision.entities``/
+# ``EntityTracker`` semantics, Crafter's port does not report the
+# entity-persistence metric (``NurseryScenario.entity_persistence_metric``
+# stays ``False``); only the recording itself is ported here.
+
+
+def _crafter_env(program: Any) -> Any:
+    return program._env
+
+
+def _crafter_clear_terrain(world: Any, cx: int, cy: int, radius: int) -> None:
+    area = world.area
+    for x in range(max(0, cx - radius), min(area[0], cx + radius + 1)):
+        for y in range(max(0, cy - radius), min(area[1], cy + radius + 1)):
+            world[(x, y)] = "grass"
+
+
+def _crafter_clear_route(
+    world: Any, x: int, y: int, dx: int, dy: int, length: int, *, width: int = 1,
+) -> None:
+    """Clear only a narrow, deterministic route through a seeded world.
+
+    The earlier entity scenarios cleared a square whose radius grew with the
+    target distance.  That made a different Crafter seed visually irrelevant:
+    most of every train and holdout frame was the same synthetic grass field.
+    A route gives scripted actions and mobs reliable collision-free cells
+    while retaining the seed-specific terrain around them as useful context.
+    """
+    area = world.area
+    perpendicular_x, perpendicular_y = -dy, dx
+    for step in range(max(0, int(length)) + 1):
+        cx, cy = x + dx * step, y + dy * step
+        for offset in range(-width, width + 1):
+            px = cx + perpendicular_x * offset
+            py = cy + perpendicular_y * offset
+            if 0 <= px < area[0] and 0 <= py < area[1]:
+                world[(px, py)] = "grass"
+
+
+def _crafter_disable_neglect_and_spawn_balance(env: Any) -> None:
+    """Disable Crafter's own periodic spawn/despawn chunk balancing
+    (``Env._balance_chunk``, no Minecraft-style ``max_mobs=0`` knob exists)
+    and the player's own neglect-driven survival decay (hunger/thirst/energy
+    depletion and the health regen/degen it drives --
+    ``Player._update_life_stats``/``_degen_or_regen_health``). A short
+    scripted micro-scenario isn't testing "can the agent feed itself"; over
+    a few hundred ticks of pure ``MOVE_UP`` (issue #90's ``walk_forward``)
+    neglect alone starves the agent to death well before that, which isn't
+    the regularity these scenarios exist to capture. Orthogonal to whether
+    *other* creatures are removed or kept -- every crafter scenario wants
+    this, entity scenarios included."""
+    env._balance_chunk = lambda chunk, objs: None
+    env._player._update_life_stats = lambda: None
+    env._player._degen_or_regen_health = lambda: None
+
+
+def _crafter_remove_wildlife(env: Any) -> None:
+    """Remove every non-player creature from ``env`` outright (issue #202).
+
+    The previous approach only froze wildlife's ``update()`` to a no-op,
+    which stopped it moving but left it *rendering* in every frame --
+    world generation's incidental cow became a permanent feature of every
+    non-entity training episode instead of the absence it should have been.
+    Non-entity scenarios (``walk_forward_short``, ``blocked_forward``,
+    ``turn``) call this so their recorded semantic grid never contains a
+    creature id at all."""
+    _crafter_disable_neglect_and_spawn_balance(env)
+    world = env._world
+    for obj in list(world.objects):
+        if obj is not env._player:
+            world.remove(obj)
+
+
+def _crafter_freeze_scripted_entities(env: Any, keep: Sequence[Any] = ()) -> None:
+    """Remove every non-player creature except ``keep``, and freeze each
+    kept entity's own default AI (no-op ``update``) -- issue #202's entity
+    scenarios (``approach_entity``, ``object_permanence``) call this right
+    after creating their own scripted entity/entities so the only creature
+    left in the world is the one they asked for, nothing world generation
+    happened to spawn alongside it. Equivalent to removing existing
+    wildlife before adding the scripted entity (net result: player + kept
+    entities only), just expressed the other way around so both entity
+    scenarios can share one call. A caller whose entity needs to actually
+    move overrides the no-op afterward (``_crafter_script_mob_path``); one
+    that wants it frozen in place (``approach_entity``) leaves it as-is."""
+    _crafter_disable_neglect_and_spawn_balance(env)
+    world = env._world
+    keep_set = set(keep)
+    for obj in list(world.objects):
+        if obj is env._player or obj in keep_set:
+            continue
+        world.remove(obj)
+    for obj in keep_set:
+        obj.update = lambda: None
+
+
+def _crafter_clear_and_neutralize(env: Any) -> None:
+    """Shared body of ``_crafter_clear_walk_corridor``'s per-reset setup:
+    remove wildlife, then clear a 3-wide corridor of terrain in the
+    MOVE_UP direction (negative y) from the player to the top edge so the
+    agent doesn't get stuck on trees/stone. Width of 3 (player column +/- 1)
+    gives margin for the player's collision box without flattening the
+    whole world."""
+    _crafter_remove_wildlife(env)
+    px, py = int(env._player.pos[0]), int(env._player.pos[1])
+    world = env._world
+    area = world.area
+    for x in range(max(0, px - 1), min(area[0], px + 2)):
+        for y in range(0, py + 1):
+            world[(x, y)] = "grass"
+
+
+def _crafter_clear_walk_corridor(program: Any) -> None:
+    """Clear a corridor of terrain in the MOVE_UP direction (negative y) so
+    the walk_forward agent doesn't get stuck on trees/stone, and remove
+    wildlife. Registered as a post-reset hook (issue #202,
+    ``CrafterWorld.set_post_reset_hook``) rather than applied after calling
+    ``program.reset()``: each seed generates its own fresh world (this isn't
+    a frozen scenario), so the edit must land *before* that seed's reset
+    ever publishes its first frame -- applying it afterward left the
+    unedited world-generation state (incidental wildlife included) as the
+    episode's already-published first recorded frame."""
+    program.set_post_reset_hook(_crafter_clear_and_neutralize)
+
+
+def _crafter_box_in(env: Any) -> None:
+    """Wall the player in on all four sides with stone -- every MOVE_*
+    attempt is blocked, so only ``facing`` changes (issue #90's discrete
+    ``turn``)."""
+    _crafter_remove_wildlife(env)
+    x, y = int(env._player.pos[0]), int(env._player.pos[1])
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        env._world[(x + dx, y + dy)] = "stone"
+
+
+def _crafter_box_in_player(program: Any) -> None:
+    """Registered as a post-reset hook (issue #202) so each seed still
+    generates its own fresh surrounding world, boxed in on all four sides --
+    unlike the previous ``freeze_reset()`` approach, which pinned every
+    train *and* holdout episode to the exact same single generated world
+    (only the box itself, not the background, needs to be seed-invariant)."""
+    program.set_post_reset_hook(_crafter_box_in)
+
+
+def _crafter_script_mob_path(mob: Any, path: List[Tuple[int, int]]) -> None:
+    """Replace one Crafter object's per-tick ``update()`` with a scripted
+    position list -- ``path[i]`` is the mob's ``(x, y)`` at update call
+    index ``i``; holds its final position once the path is exhausted.
+    Skips (holds) a step whose target cell is occupied rather than raising
+    -- ``_crafter_freeze_wildlife`` should already prevent collisions, but
+    this stays robust to any it doesn't.  Same shape as
+    ``_install_scripted_mob_path`` below, adapted to ``crafter.World``'s
+    ``move``/``_obj_map``."""
+    import numpy as np
+
+    state = {"i": 0}
+
+    def scripted_update(self: Any) -> None:
+        i = min(state["i"], len(path) - 1)
+        state["i"] += 1
+        target = path[i]
+        if tuple(int(v) for v in self.pos) == target:
+            return
+        if self.world._obj_map[target] == 0:
+            self.world.move(self, np.array(target))
+
+    mob.update = scripted_update.__get__(mob)
+
+
+def _crafter_occlusion_distances(close: int, hidden: int, phase_ticks: int) -> List[int]:
+    """Distances (agent-relative, along one axis) for the three-phase
+    excursion: visible near -> ramps out past the view radius (occluded) ->
+    ramps back to visible near. Mirrors ``_occlusion_dz_sequence`` below."""
+    import numpy as np
+
+    outbound = np.linspace(close, hidden, phase_ticks).round().astype(int).tolist()
+    inbound = np.linspace(hidden, close, phase_ticks).round().astype(int).tolist()
+    return outbound + [hidden] * phase_ticks + inbound
+
+
+_CRAFTER_MOVE_UP = Action("MOVE_UP")
+_CRAFTER_MOVE_DOWN = Action("MOVE_DOWN")
+_CRAFTER_MOVE_LEFT = Action("MOVE_LEFT")
+_CRAFTER_MOVE_RIGHT = Action("MOVE_RIGHT")
+
+
+def _crafter_seeded_route(seed: int) -> Tuple[int, int, Action, Action]:
+    """Return one cardinal route, deterministically varied by episode seed."""
+    routes = (
+        (0, -1, _CRAFTER_MOVE_UP, _CRAFTER_MOVE_DOWN),
+        (1, 0, _CRAFTER_MOVE_RIGHT, _CRAFTER_MOVE_LEFT),
+        (0, 1, _CRAFTER_MOVE_DOWN, _CRAFTER_MOVE_UP),
+        (-1, 0, _CRAFTER_MOVE_LEFT, _CRAFTER_MOVE_RIGHT),
+    )
+    return routes[seed % len(routes)]
+
+
+def _crafter_alternating_policy(
+    forward: Action, backward: Action, forward_steps: int, episode_ticks: int,
+) -> ScriptedSequencePolicy:
+    """Keep an entity-approach recording dynamic without hitting its target."""
+    steps = max(1, int(forward_steps))
+    remaining = max(1, int(episode_ticks))
+    sequence: List[Tuple[Action, int]] = []
+    direction = forward
+    while remaining:
+        count = min(steps, remaining)
+        sequence.append((direction, count))
+        remaining -= count
+        direction = backward if direction == forward else forward
+    return ScriptedSequencePolicy(sequence)
+
+
+def _crafter_safe_corridor_length(world_size: int, margin: int = 2) -> int:
+    """Ticks a constant-``MOVE_UP`` walk can run before the player -- always
+    spawned at the exact world center (``crafter.Env.reset``) -- would reach
+    the world's top edge (``y=0``), minus a small safety margin. Bounds
+    ``walk_forward_short`` (issue #202) so it ends *before* the agent piles
+    up an accidental stationary tail against the boundary -- the bug the
+    original unbounded ``walk_forward`` had (a constant walk plateaus at the
+    edge/an obstacle and records a long stationary tail for the remainder
+    of the episode)."""
+    return max(1, world_size // 2 - margin)
+
+
+def _crafter_walk_forward_short(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    return ScenarioRecording(
+        policy=ConstantActionPolicy(_CRAFTER_MOVE_UP, seed=seed),
+        scene_setup=_crafter_clear_walk_corridor,
+        episode_ticks=min(cfg.episode_ticks, _crafter_safe_corridor_length(cfg.world_size)),
+    )
+
+
+#: ``blocked_forward``'s fixed phase lengths (issue #202): continuing to
+#: push into the wall for ``_BLOCKED_FORWARD_BLOCKED_HOLD`` ticks past
+#: collision is the explicitly bounded blocked phase (well within the
+#: "useful training data" 4-8 frame range the issue calls out, as opposed to
+#: an accidental 70-frame stationary tail); the final
+#: ``_BLOCKED_FORWARD_RECOVER_TICKS`` is the direction-change/recovery
+#: action. Collision distance itself is *not* fixed -- see
+#: ``_BLOCKED_FORWARD_TRAIN_COLLISION_DISTANCES`` below: the player always
+#: spawns at the exact world center regardless of seed, so a *fixed*
+#: distance made every train and holdout episode collide at the identical
+#: point and record byte-identical episodes.
+_BLOCKED_FORWARD_BLOCKED_HOLD = 6
+_BLOCKED_FORWARD_RECOVER_TICKS = 6
+#: Disjoint by construction (issue #202) -- see ``_split_parameter``.
+_BLOCKED_FORWARD_TRAIN_COLLISION_DISTANCES = (4, 6, 8, 10)
+_BLOCKED_FORWARD_HOLDOUT_COLLISION_DISTANCES = (5, 7, 9, 11)
+
+
+def _crafter_setup_blocked_corridor(
+    collision_distance: int, dx: int, dy: int, recovery_dx: int, recovery_dy: int, env: Any,
+) -> None:
+    _crafter_remove_wildlife(env)
+    x, y = int(env._player.pos[0]), int(env._player.pos[1])
+    # Retain the generated world around the route; only the forward lane and
+    # short recovery lane need editing for deterministic scripted behaviour.
+    _crafter_clear_route(env._world, x, y, dx, dy, collision_distance, width=1)
+    before_wall_x = x + dx * max(0, collision_distance - 1)
+    before_wall_y = y + dy * max(0, collision_distance - 1)
+    _crafter_clear_route(
+        env._world, before_wall_x, before_wall_y,
+        recovery_dx, recovery_dy, _BLOCKED_FORWARD_RECOVER_TICKS, width=1,
+    )
+    env._world[(x + dx * collision_distance, y + dy * collision_distance)] = "stone"
+
+
+def _crafter_blocked_forward(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    """Movement onset, continuation, and intentional collision (walking
+    ``MOVE_UP`` into a wall placed ``collision_distance`` tiles ahead), then
+    a bounded blocked phase (still pushing ``MOVE_UP``), then a direction
+    change / recovery action (``MOVE_LEFT`` into cleared space) -- issue
+    #202's motion-transition scenario, distinguishing a short, explicitly
+    labelled blocked phase (useful training data) from an accidental long
+    stationary tail (not). ``collision_distance`` is drawn from a
+    train/holdout-disjoint tuple, not fixed: the player always spawns at
+    the exact world center, so a fixed distance would make every episode
+    collide at the identical point and record byte-identical episodes
+    regardless of seed."""
+    collision_distance = _split_parameter(
+        seed, cfg,
+        _BLOCKED_FORWARD_TRAIN_COLLISION_DISTANCES, _BLOCKED_FORWARD_HOLDOUT_COLLISION_DISTANCES,
+    )
+    dx, dy, forward_action, recovery_action = _crafter_seeded_route(seed)
+
+    def scene_setup(program: Any) -> None:
+        # Registered as a post-reset hook (issue #202, mirrors
+        # ``_crafter_clear_walk_corridor``) so each seed's fresh world is
+        # edited before its first frame is ever published, not after.
+        program.set_post_reset_hook(
+            lambda env: _crafter_setup_blocked_corridor(
+                collision_distance, dx, dy, -dx, -dy, env,
+            )
+        )
+
+    policy = ScriptedSequencePolicy(
+        [
+            (forward_action, collision_distance + _BLOCKED_FORWARD_BLOCKED_HOLD),
+            (recovery_action, _BLOCKED_FORWARD_RECOVER_TICKS),
+        ]
+    )
+    episode_ticks = collision_distance + _BLOCKED_FORWARD_BLOCKED_HOLD + _BLOCKED_FORWARD_RECOVER_TICKS
+    return ScenarioRecording(policy=policy, scene_setup=scene_setup, episode_ticks=episode_ticks)
+
+
+def _crafter_turn(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    phase = max(1, cfg.episode_ticks // 4)
+    policy = ScriptedSequencePolicy(
+        [
+            (Action("MOVE_UP"), phase), (Action("MOVE_RIGHT"), phase),
+            (Action("MOVE_DOWN"), phase), (Action("MOVE_LEFT"), phase),
+        ]
+    )
+    return ScenarioRecording(policy=policy, scene_setup=_crafter_box_in_player)
+
+
+def _crafter_approach_entity(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    distance = _split_parameter(
+        seed, cfg, _APPROACH_ENTITY_TRAIN_DISTANCES, _APPROACH_ENTITY_HOLDOUT_DISTANCES
+    )
+    dx, dy, forward_action, backward_action = _crafter_seeded_route(seed)
+    lateral_offset = (seed // 4) % 3 - 1
+    # Stop two cells short of the cow, then retreat and repeat.  This keeps
+    # scale-change supervision while avoiding the long collision-induced
+    # stationary tail that previously dominated short approach recordings.
+    forward_steps = max(1, distance - 2)
+
+    def _setup_approach(env: Any) -> None:
+        import crafter as crafter_pkg
+
+        x, y = int(env._player.pos[0]), int(env._player.pos[1])
+        target = (x + dx * distance - dy * lateral_offset,
+                  y + dy * distance + dx * lateral_offset)
+        _crafter_clear_route(env._world, x, y, dx, dy, distance, width=1)
+        # The seed-specific world can place wildlife on the target cell.
+        # Clear those objects before adding our scripted cow; changing terrain
+        # alone does not clear Crafter's object-occupancy map.
+        _crafter_remove_wildlife(env)
+        cow = crafter_pkg.objects.Cow(env._world, target)
+        env._world.add(cow)
+        # Freeze the scripted cow in place; it is now the scenario's only
+        # non-player entity.
+        _crafter_freeze_scripted_entities(env, keep=[cow])
+
+    def scene_setup(program: Any) -> None:
+        # Registered as a post-reset hook (issue #202) so each seed's fresh
+        # world is edited before its first frame is ever published: applying
+        # the edit only after ``program.reset()`` returned left whatever
+        # wildlife world generation happened to spawn as the episode's
+        # already-published first recorded frame.
+        program.set_post_reset_hook(_setup_approach)
+
+    return ScenarioRecording(
+        policy=_crafter_alternating_policy(
+            forward_action, backward_action, forward_steps, cfg.episode_ticks,
+        ),
+        scene_setup=scene_setup,
+    )
+
+
+#: Disjoint by construction (issue #202) -- how many cells past the
+#: egocentric view radius the scripted mob walks before returning, per
+#: split (added to ``grid_radius + 3`` at use).
+_CRAFTER_OBJECT_PERMANENCE_TRAIN_HIDDEN_DELTAS = (0, 2, 4, 6)
+_CRAFTER_OBJECT_PERMANENCE_HOLDOUT_HIDDEN_DELTAS = (1, 3, 5, 7)
+
+
+def _crafter_object_permanence(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    phase_ticks = max(5, cfg.episode_ticks // 3)
+    close = 2
+    hidden_delta = _split_parameter(
+        seed, cfg,
+        _CRAFTER_OBJECT_PERMANENCE_TRAIN_HIDDEN_DELTAS,
+        _CRAFTER_OBJECT_PERMANENCE_HOLDOUT_HIDDEN_DELTAS,
+    )
+    hidden = CrafterConfig().grid_radius + 3 + hidden_delta
+    dx, dy, _forward_action, _backward_action = _crafter_seeded_route(seed)
+
+    def _setup_occlusion(env: Any) -> None:
+        import crafter as crafter_pkg
+
+        x, y = int(env._player.pos[0]), int(env._player.pos[1])
+        _crafter_clear_route(env._world, x, y, dx, dy, hidden, width=1)
+        # As above, remove a seed-generated object before claiming the
+        # scripted path's initial cell for the cow.
+        _crafter_remove_wildlife(env)
+        cow = crafter_pkg.objects.Cow(env._world, (x + dx * close, y + dy * close))
+        env._world.add(cow)
+        _crafter_freeze_scripted_entities(env, keep=[cow])
+        path = [
+            (x + dx * distance, y + dy * distance)
+            for distance in _crafter_occlusion_distances(close, hidden, phase_ticks)
+        ]
+        _crafter_script_mob_path(cow, path)
+
+    def scene_setup(program: Any) -> None:
+        # Registered as a post-reset hook (issue #202), like
+        # ``approach_entity``, rather than ``freeze_reset()``: freezing
+        # pinned every seed's object_permanence episode to the exact same
+        # generated background world (only the occlusion depth varied),
+        # which is exactly the "one generated world across all seeds" bug
+        # this issue calls out.
+        program.set_post_reset_hook(_setup_occlusion)
+
+    return ScenarioRecording(
+        policy=NullPolicy(),
+        scene_setup=scene_setup,
+        episode_ticks=phase_ticks * 3,
+    )
+
+
+CRAFTER_SCENARIOS: Dict[str, NurseryScenario] = {
+    "walk_forward_short": NurseryScenario(
+        "walk_forward_short",
+        "constant MOVE_UP over varied terrain seeds, bounded to end before the "
+        "player reaches the world boundary -- a short optical-flow canary "
+        "(issue #202; Crafter port of Minecraft's walk_forward, re-scoped "
+        "after the unbounded version was found to plateau at the boundary and "
+        "record a long accidental stationary tail).",
+        _crafter_walk_forward_short,
+        min_blocks_per_tick=0.01,
+        min_unique_frame_fraction=0.05,
+        # Bounded to the safe corridor length precisely so it should almost
+        # never collide; a handful of trailing stationary transitions would
+        # still be an early regression signal (an off-by-one in the corridor
+        # bound, or a seed with terrain the corridor-clear didn't cover).
+        min_moving_transition_fraction=0.5,
+        max_longest_stationary_tail=2,
+    ),
+    "blocked_forward": NurseryScenario(
+        "blocked_forward",
+        "movement onset, continuation and intentional collision with a fixed "
+        "wall, a bounded blocked phase, then a direction-change recovery -- "
+        "issue #202's motion-transition scenario: an explicitly labelled few-"
+        "tick blocked phase is useful training data, unlike an accidental "
+        "long stationary tail.",
+        _crafter_blocked_forward,
+        # Roughly a third of transitions are the forward approach + the
+        # recovery move; the rest is the deliberately bounded blocked hold.
+        min_moving_transition_fraction=0.2,
+        max_longest_stationary_run=_BLOCKED_FORWARD_BLOCKED_HOLD + 2,
+        # The recovery phase should move the agent almost immediately; a
+        # long trailing stationary run means the recovery action failed to
+        # actually unblock it.
+        max_longest_stationary_tail=2,
+    ),
+    "turn": NurseryScenario(
+        "turn",
+        "boxed in on all four sides, cycling the four directional actions -- "
+        "discrete facing changes with zero displacement (Crafter's re-scoped "
+        "port of turn_in_place: a discrete flip, not continuous rotation).",
+        _crafter_turn,
+        max_blocks_per_tick=0.0,
+        min_unique_facings=4,
+    ),
+    "object_permanence": NurseryScenario(
+        "object_permanence",
+        "a scripted mob walks out past the egocentric view radius and back -- "
+        "genuine limited perceptual range, not a synthetic occluder (Crafter "
+        "port; does not report the entity-persistence metric -- see module "
+        "docstring above).",
+        _crafter_object_permanence,
+    ),
+    "approach_entity": NurseryScenario(
+        "approach_entity",
+        "seed-varied approach and retreat around a frozen entity -- scale change with distance.",
+        _crafter_approach_entity,
+        # The approach route turns around before collision, so a short
+        # recording remains motion-rich rather than becoming a long blocked
+        # tail after reaching the cow.
+        min_blocks_per_tick=0.01,
+        min_moving_transition_fraction=0.6,
+        max_longest_stationary_tail=2,
+    ),
+}
+
+
 # --------------------------------------------------------------------------- data-quality gate
-
-
-@dataclass
-class EpisodeRecordingQuality:
-    """What the gate measures from one recorded episode's stream log."""
-
-    session_dir: str
-    episode_id: str
-    n_frames: int
-    unique_frames: int
-    net_displacement: float
-    duration_ticks: int
-    #: Furthest x/z distance from the episode's starting position -- catches
-    #: an agent that drifted away and back (net displacement ~0) just as
-    #: well as one that walked off.
-    max_displacement: float = 0.0
-    #: Total |wrapped yaw delta| over the episode, in degrees.
-    yaw_sweep_degrees: float = 0.0
-    #: ``summary.success`` -- False when the episode terminated early (death);
-    #: ``None`` for recordings whose summary predates the field or is absent.
-    completed: Optional[bool] = None
-    termination_reason: str = ""
-    #: Pixel provenance reported by the backend (``viewer``/``grid``), empty
-    #: for recordings that predate provenance tracking.
-    pixel_sources: List[str] = field(default_factory=list)
-
-    @property
-    def unique_frame_fraction(self) -> float:
-        return self.unique_frames / self.n_frames if self.n_frames else 0.0
-
-    @property
-    def blocks_per_tick(self) -> float:
-        return self.net_displacement / self.duration_ticks if self.duration_ticks else 0.0
-
-    @property
-    def max_blocks_per_tick(self) -> float:
-        return self.max_displacement / self.duration_ticks if self.duration_ticks else 0.0
-
-
-def _wrapped_degrees(delta: float) -> float:
-    return abs((delta + 180.0) % 360.0 - 180.0)
-
-
-def measure_recording_quality(session_dir: str, episode_id: str) -> EpisodeRecordingQuality:
-    """Scan one episode's stream log for the gate's signals: unique pixel
-    frames (via content-hash ``frame_ref``), x/z displacement (net and max),
-    yaw sweep, episode completion, and pixel provenance."""
-
-    first_pos: Optional[Tuple[float, float]] = None
-    last_pos: Optional[Tuple[float, float]] = None
-    max_displacement = 0.0
-    last_yaw: Optional[float] = None
-    yaw_sweep = 0.0
-    n_frames = 0
-    frame_refs: set = set()
-    streams_path = os.path.join(session_dir, f"{episode_id}.streams.jsonl")
-    with open(streams_path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            stream_id = record.get("stream_id")
-            if stream_id == "vision.frame.pixels":
-                n_frames += 1
-                ref = record.get("frame_ref") or record.get("hash")
-                if ref:
-                    frame_refs.add(ref)
-            elif stream_id == "spatial.position":
-                payload = record.get("payload") or {}
-                pos = (float(payload.get("x", 0.0)), float(payload.get("z", 0.0)))
-                if first_pos is None:
-                    first_pos = pos
-                else:
-                    max_displacement = max(
-                        max_displacement,
-                        math.hypot(pos[0] - first_pos[0], pos[1] - first_pos[1]),
-                    )
-                last_pos = pos
-            elif stream_id == "spatial.rotation":
-                payload = record.get("payload") or {}
-                yaw = payload.get("yaw")
-                if isinstance(yaw, (int, float)):
-                    if last_yaw is not None:
-                        yaw_sweep += _wrapped_degrees(float(yaw) - last_yaw)
-                    last_yaw = float(yaw)
-
-    displacement = (
-        math.hypot(last_pos[0] - first_pos[0], last_pos[1] - first_pos[1])
-        if first_pos is not None and last_pos is not None
-        else 0.0
-    )
-    duration_ticks = 0
-    completed: Optional[bool] = None
-    termination_reason = ""
-    pixel_sources: List[str] = []
-    summary_path = os.path.join(session_dir, f"{episode_id}.summary.json")
-    if os.path.exists(summary_path):
-        with open(summary_path, encoding="utf-8") as fh:
-            summary = json.load(fh)
-        duration_ticks = int(summary.get("duration_ticks", 0))
-        if "success" in summary:
-            completed = bool(summary["success"])
-        termination_reason = str(summary.get("termination_reason", ""))
-        program_stats = summary.get("program_stats") or {}
-        sources = program_stats.get("pixel_sources")
-        if isinstance(sources, list):
-            pixel_sources = [str(s) for s in sources]
-    return EpisodeRecordingQuality(
-        session_dir=session_dir,
-        episode_id=episode_id,
-        n_frames=n_frames,
-        unique_frames=len(frame_refs),
-        net_displacement=displacement,
-        duration_ticks=duration_ticks,
-        max_displacement=max_displacement,
-        yaw_sweep_degrees=yaw_sweep,
-        completed=completed,
-        termination_reason=termination_reason,
-        pixel_sources=pixel_sources,
-    )
+#
+# The gate itself moved to ``cognitive_runtime.record.quality`` (issue #90):
+# a world-agnostic module that reads any Program's stream log the same way.
+# ``EpisodeRecordingQuality``/``measure_recording_quality`` are re-exported
+# here unchanged for back-compat; ``validate_nursery_recordings`` adapts a
+# ``NurseryScenario``'s threshold fields to the generic gate.
 
 
 def _session_backend(session_dir: str) -> str:
@@ -476,6 +1045,8 @@ def validate_nursery_recordings(
 ) -> List[str]:
     """Check every recorded episode against the scenario's data-quality
     expectations; returns human-readable issue strings (empty = healthy).
+    Adapts ``NurseryScenario``'s threshold fields to the world-agnostic gate
+    in ``record.quality``.
 
     Exists because of the first real ``walk_forward`` run: recorded against
     the remote backend's persistent world, the agent was stuck against an
@@ -488,88 +1059,21 @@ def validate_nursery_recordings(
     checks displacement ceilings, yaw sweep, episode completion, and pixel
     provenance (no mixing, and matching ``expected_pixel_source`` when set).
     """
-    issues: List[str] = []
-    sources_seen: Dict[str, List[str]] = {}
-    for session_dir in session_dirs:
-        for episode_id in list_episodes(session_dir):
-            quality = measure_recording_quality(session_dir, episode_id)
-            where = f"{session_dir}/{episode_id}"
-            if quality.n_frames == 0:
-                issues.append(f"{where}: no pixel frames recorded (record_frames off?)")
-                continue
-            if (
-                scenario.min_unique_frame_fraction > 0.0
-                and quality.unique_frame_fraction < scenario.min_unique_frame_fraction
-            ):
-                issues.append(
-                    f"{where}: only {quality.unique_frames}/{quality.n_frames} unique pixel "
-                    f"frames ({quality.unique_frame_fraction:.1%} < "
-                    f"{scenario.min_unique_frame_fraction:.1%}) -- a near-static view has "
-                    f"no {scenario.name!r} signal to learn"
-                )
-            if (
-                scenario.min_blocks_per_tick > 0.0
-                and quality.duration_ticks > 0
-                and quality.blocks_per_tick < scenario.min_blocks_per_tick
-            ):
-                issues.append(
-                    f"{where}: net displacement {quality.net_displacement:.2f} blocks over "
-                    f"{quality.duration_ticks} ticks ({quality.blocks_per_tick:.4f}/tick < "
-                    f"{scenario.min_blocks_per_tick}/tick) -- the agent barely moved "
-                    f"(stuck against an obstacle?)"
-                )
-            if (
-                scenario.max_blocks_per_tick is not None
-                and quality.duration_ticks > 0
-                and quality.max_blocks_per_tick > scenario.max_blocks_per_tick
-            ):
-                issues.append(
-                    f"{where}: the agent strayed {quality.max_displacement:.2f} blocks from "
-                    f"its start ({quality.max_blocks_per_tick:.4f}/tick > "
-                    f"{scenario.max_blocks_per_tick}/tick) -- {scenario.name!r} expects a "
-                    "stationary agent (live-server knockback/water/mobs?)"
-                )
-            if (
-                scenario.min_yaw_sweep_degrees > 0.0
-                and quality.yaw_sweep_degrees < scenario.min_yaw_sweep_degrees
-            ):
-                issues.append(
-                    f"{where}: total yaw sweep {quality.yaw_sweep_degrees:.0f} degrees < "
-                    f"{scenario.min_yaw_sweep_degrees:.0f} -- {scenario.name!r} needs the "
-                    "view to actually rotate"
-                )
-            if scenario.require_completed and quality.completed is False:
-                issues.append(
-                    f"{where}: episode terminated early "
-                    f"({quality.termination_reason or 'unknown reason'}) -- a nursery "
-                    "recording that died mid-scenario is not the scenario it claims to be"
-                )
-            if quality.pixel_sources:
-                sources_seen[where] = sorted(set(quality.pixel_sources))
-                if len(sources_seen[where]) > 1:
-                    issues.append(
-                        f"{where}: mixed pixel sources within one episode "
-                        f"({sources_seen[where]}) -- the observation distribution changed "
-                        "mid-recording (viewer died and fell back to the grid?)"
-                    )
-                if (
-                    expected_pixel_source is not None
-                    and sources_seen[where] != [expected_pixel_source]
-                ):
-                    issues.append(
-                        f"{where}: pixel source {sources_seen[where]} != expected "
-                        f"{expected_pixel_source!r} -- the requested render path was not "
-                        "the one that produced these frames"
-                    )
-
-    distinct = {tuple(v) for v in sources_seen.values()}
-    if len(distinct) > 1:
-        issues.append(
-            "sessions mix pixel sources across episodes "
-            f"({sorted(sources_seen.items())}) -- do not train one model on frames from "
-            "different render paths"
-        )
-    return issues
+    return validate_recordings(
+        session_dirs,
+        name=scenario.name,
+        min_blocks_per_tick=scenario.min_blocks_per_tick,
+        min_unique_frame_fraction=scenario.min_unique_frame_fraction,
+        max_blocks_per_tick=scenario.max_blocks_per_tick,
+        min_yaw_sweep_degrees=scenario.min_yaw_sweep_degrees,
+        min_unique_facings=scenario.min_unique_facings,
+        require_completed=scenario.require_completed,
+        expected_pixel_source=expected_pixel_source,
+        min_moving_transition_fraction=scenario.min_moving_transition_fraction,
+        min_semantic_change_fraction=scenario.min_semantic_change_fraction,
+        max_longest_stationary_tail=scenario.max_longest_stationary_tail,
+        max_longest_stationary_run=scenario.max_longest_stationary_run,
+    )
 
 
 def _measured_ticks_per_frame(session_dirs: Sequence[str]) -> float:
@@ -589,6 +1093,282 @@ def _measured_ticks_per_frame(session_dirs: Sequence[str]) -> float:
     if len(values) % 2:
         return values[mid]
     return 0.5 * (values[mid - 1] + values[mid])
+
+
+# --------------------------------------------------------------------------- sample balance (issue #202)
+#
+# The joint training pool spans several scripted scenarios whose class
+# balance is an accident of how many ticks each scenario happens to record,
+# not a deliberate choice: the audit that produced this issue found 505/700
+# walk-forward transitions semantically unchanged and ~84% of joint frames
+# containing a visible cow. This section computes per-transition labels
+# (semantic change, coarse movement state, entity presence) straight from
+# the recorded stream logs and a balanced sampling weight from them --
+# reported in the run report (acceptance criterion: "the run report prints
+# per-scenario sample counts and event balance"), not silently folded into
+# training by duplicating frames ("prefer additional seeds and scenario
+# parameter variants" -- the issue is explicit that balance must not come
+# from exact-frame duplication).
+
+
+@dataclass
+class TransitionLabel:
+    """One frame-to-frame transition's sampling labels."""
+
+    scenario: str
+    semantic_changed: bool
+    #: "continuing" (position changed) / "turning" (facing changed, position
+    #: didn't) / "blocked" (neither changed).
+    movement_state: str
+    #: "absent" / "present" / "entering" / "leaving", based on whether any
+    #: cell classified ``"entity"`` in ``programs.crafter.streams.FRAME_LEGEND``
+    #: appears in the semantic grid (Crafter only -- worlds without a
+    #: semantic-grid stream report "absent" for every transition, a
+    #: documented simplification, not a claim that no entity exists).
+    entity_state: str
+
+
+def _session_is_crafter(session_dir: str) -> bool:
+    """Whether ``session_dir``'s recording came from ``CrafterWorld`` --
+    ``vision.frame.grid`` exists on Minecraft too, but with a completely
+    different (block-type) id vocabulary, so entity detection via
+    ``programs.crafter.streams.FRAME_LEGEND`` must not run against it."""
+    path = os.path.join(session_dir, "session.json")
+    if not os.path.exists(path):
+        return False
+    with open(path, encoding="utf-8") as fh:
+        metadata = json.load(fh)
+    return "crafter" in (metadata.get("program_tags") or [])
+
+
+def compute_scenario_transition_labels(
+    session_dir: str, episode_id: str, scenario: str
+) -> List[TransitionLabel]:
+    """Per-transition sampling labels for one recorded episode, read
+    straight from its stream log the same tick-grouped way
+    ``measure_recording_quality`` does. Entity presence is detected via
+    ``vision.frame.grid``'s semantic ids, so it is only meaningful for
+    Crafter recordings (see ``_session_is_crafter``); non-Crafter
+    transitions always report ``entity_state="absent"``, a documented
+    simplification rather than a claim that no entity exists."""
+    detect_entities = _session_is_crafter(session_dir)
+    position_at_frame: List[Optional[tuple]] = []
+    facing_at_frame: List[Optional[tuple]] = []
+    entity_present_at_frame: List[bool] = []
+    grid_key_at_frame: List[Optional[tuple]] = []
+    known_position: Optional[tuple] = None
+    known_facing: Optional[tuple] = None
+    known_entity_present = False
+    known_grid_key: Optional[tuple] = None
+
+    def flush_tick(records: List[Dict[str, Any]]) -> None:
+        nonlocal known_position, known_facing, known_entity_present, known_grid_key
+        has_pixel = False
+        for record in records:
+            stream_id = record.get("stream_id")
+            if stream_id == "vision.frame.pixels":
+                has_pixel = True
+            elif stream_id == "vision.frame.grid":
+                grid = record.get("payload")
+                if isinstance(grid, list):
+                    known_grid_key = tuple(tuple(row) for row in grid)
+                    if detect_entities:
+                        known_entity_present = any(
+                            FRAME_LEGEND.get(cell) == "entity" for row in grid for cell in row
+                        )
+            elif stream_id == "spatial.position":
+                payload = record.get("payload") or {}
+                known_position = (payload.get("x"), payload.get("z", payload.get("y")))
+            elif stream_id == "spatial.facing":
+                payload = record.get("payload") or {}
+                known_facing = (payload.get("x"), payload.get("y"))
+        if has_pixel:
+            position_at_frame.append(known_position)
+            facing_at_frame.append(known_facing)
+            entity_present_at_frame.append(known_entity_present)
+            grid_key_at_frame.append(known_grid_key)
+
+    streams_path = os.path.join(session_dir, f"{episode_id}.streams.jsonl")
+    tick_timestamp: Any = object()
+    tick_records: List[Dict[str, Any]] = []
+    with open(streams_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            timestamp = record.get("timestamp")
+            if tick_records and timestamp != tick_timestamp:
+                flush_tick(tick_records)
+                tick_records = []
+            tick_timestamp = timestamp
+            tick_records.append(record)
+    if tick_records:
+        flush_tick(tick_records)
+
+    labels: List[TransitionLabel] = []
+    for i in range(len(position_at_frame) - 1):
+        moved = (
+            position_at_frame[i] is not None
+            and position_at_frame[i + 1] is not None
+            and position_at_frame[i] != position_at_frame[i + 1]
+        )
+        turned = (
+            not moved
+            and facing_at_frame[i] is not None
+            and facing_at_frame[i + 1] is not None
+            and facing_at_frame[i] != facing_at_frame[i + 1]
+        )
+        movement_state = "continuing" if moved else ("turning" if turned else "blocked")
+
+        was_present, now_present = entity_present_at_frame[i], entity_present_at_frame[i + 1]
+        if was_present and now_present:
+            entity_state = "present"
+        elif was_present and not now_present:
+            entity_state = "leaving"
+        elif not was_present and now_present:
+            entity_state = "entering"
+        else:
+            entity_state = "absent"
+
+        grid_a, grid_b = grid_key_at_frame[i], grid_key_at_frame[i + 1]
+        semantic_changed = grid_a is not None and grid_b is not None and grid_a != grid_b
+
+        labels.append(
+            TransitionLabel(
+                scenario=scenario, semantic_changed=semantic_changed,
+                movement_state=movement_state, entity_state=entity_state,
+            )
+        )
+    return labels
+
+
+def summarize_sample_balance(
+    labels_by_scenario: Dict[str, Sequence[TransitionLabel]]
+) -> Dict[str, Any]:
+    """Per-scenario sample counts and event balance -- printed in the
+    nursery run report (issue #202's acceptance criterion)."""
+    summary: Dict[str, Any] = {}
+    for scenario, labels in labels_by_scenario.items():
+        total = len(labels)
+        summary[scenario] = {
+            "samples": total,
+            "semantic_changed_fraction": (
+                sum(1 for l in labels if l.semantic_changed) / total if total else 0.0
+            ),
+            "movement_state_counts": {
+                state: sum(1 for l in labels if l.movement_state == state)
+                for state in ("continuing", "blocked", "turning")
+            },
+            "entity_state_counts": {
+                state: sum(1 for l in labels if l.entity_state == state)
+                for state in ("absent", "present", "entering", "leaving")
+            },
+        }
+    return summary
+
+
+def log_sample_balance(summary: Dict[str, Any]) -> None:
+    """Print ``summarize_sample_balance``'s result -- the run report's
+    per-scenario sample counts and event balance."""
+    for scenario, stats in summary.items():
+        log.info(
+            "sample balance  scenario=%s  samples=%d  semantic_changed=%.1f%%  "
+            "movement=%s  entity=%s",
+            scenario, stats["samples"], 100.0 * stats["semantic_changed_fraction"],
+            stats["movement_state_counts"], stats["entity_state_counts"],
+        )
+
+
+def balanced_transition_weights(
+    labels: Sequence[TransitionLabel],
+    *,
+    max_stationary_fraction: float = 0.25,
+    entity_balance_target: float = 0.5,
+) -> List[float]:
+    """Per-transition sampling weight implementing the recommended starting
+    balance policy (issue #202): no more than ``max_stationary_fraction``
+    blocked/stationary transitions, ~``entity_balance_target``/
+    ``1 - entity_balance_target`` entity-present/-absent, oversample
+    entry/exit events, and weight every scenario equally regardless of how
+    many transitions it happens to contribute (sample scenarios uniformly
+    before sampling a transition).
+
+    Returns per-transition weights (not probabilities), suitable for a
+    weighted sampler (e.g. ``torch.utils.data.WeightedRandomSampler``) drawn
+    *without* replacement up to ``len(labels)`` or fewer -- this function
+    does not duplicate frames; achieving genuine balance beyond what a
+    reweighted draw can reach means recording additional seeds/scenario
+    parameter variants, not resampling exact duplicates.
+    """
+    n = len(labels)
+    if n == 0:
+        return []
+
+    #: Applied as a sequence of rebalancing passes, each targeting a
+    #: fraction of the *current* running total (not a fraction of the raw
+    #: transition count) -- composing stages this way means each stage's
+    #: guarantee holds regardless of what an earlier stage already did to
+    #: the weights, rather than every stage independently targeting the raw
+    #: count and the results only being correct when combined by luck.
+    weights: List[float] = [1.0] * n
+
+    #: Entry/exit events are individually rare; oversample them relative to
+    #: a flat entity-state split rather than splitting the "present" budget
+    #: with "entering"/"leaving" too -- a class this rare would otherwise be
+    #: swamped by the majority "absent"/"present" states.
+    entry_exit_bonus = 3.0
+    for i, label in enumerate(labels):
+        if label.entity_state in ("entering", "leaving"):
+            weights[i] *= entry_exit_bonus
+
+    # Entity present/absent balance: scale each class's current total to
+    # its target share of the (present + absent) total -- entering/leaving
+    # already got their own bonus above and sit outside this split.
+    present_idx = [i for i, l in enumerate(labels) if l.entity_state == "present"]
+    absent_idx = [i for i, l in enumerate(labels) if l.entity_state == "absent"]
+    for idx, target_fraction in ((present_idx, entity_balance_target),
+                                  (absent_idx, 1.0 - entity_balance_target)):
+        other_idx = (absent_idx if idx is present_idx else present_idx)
+        current = sum(weights[i] for i in idx)
+        other = sum(weights[i] for i in other_idx)
+        if current <= 0 or not other_idx:
+            continue
+        target_total = (target_fraction / (1.0 - target_fraction)) * other if target_fraction < 1.0 else current
+        scale = target_total / current
+        for i in idx:
+            weights[i] *= scale
+
+    # Stationary/blocked cap: scale the blocked class's current total down
+    # so it is at most `max_stationary_fraction` of the (blocked + other)
+    # total -- never scaled up, since being *under* the cap is fine.
+    blocked_idx = [i for i, l in enumerate(labels) if l.movement_state == "blocked"]
+    if blocked_idx:
+        blocked_total = sum(weights[i] for i in blocked_idx)
+        other_total = sum(weights) - blocked_total
+        if blocked_total > 0 and other_total > 0:
+            target_blocked_total = (
+                max_stationary_fraction / (1.0 - max_stationary_fraction)
+            ) * other_total
+            scale = min(1.0, target_blocked_total / blocked_total)
+            for i in blocked_idx:
+                weights[i] *= scale
+
+    # Scenario-uniform (final pass): rescale each scenario's current total
+    # to be equal, preserving every within-scenario ratio set above (every
+    # label in a scenario is divided by that same scenario's current total).
+    scenario_idx: Dict[str, List[int]] = {}
+    for i, label in enumerate(labels):
+        scenario_idx.setdefault(label.scenario, []).append(i)
+    n_scenarios = len(scenario_idx)
+    final_weights = [0.0] * n
+    for idx in scenario_idx.values():
+        total = sum(weights[i] for i in idx)
+        if total <= 0:
+            continue
+        for i in idx:
+            final_weights[i] = weights[i] / total / n_scenarios
+    return final_weights
 
 
 # --------------------------------------------------------------------------- recording
@@ -644,55 +1424,153 @@ def _occlusion_dz_sequence(offset: float, phase_ticks: int) -> List[float]:
     return [offset] * phase_ticks + [0.0] * phase_ticks + [-offset] * phase_ticks
 
 
+def _build_scenario_program(cfg: NurseryConfig, program_config: Dict[str, Any]) -> Any:
+    """Construct the Program a scenario records against (issue #90's
+    ``--world`` selector): ``MinecraftSurvivalBox`` (default, back-compat) or
+    ``CrafterWorld``. Mirrors ``cli.py``'s ``_build_program`` factory, minus
+    the stream/action-registry return value nursery recording doesn't need."""
+    if cfg.world == "crafter":
+        from cognitive_runtime.programs.crafter.adapter import CrafterWorld
+
+        return CrafterWorld(config=program_config)
+    return MinecraftSurvivalBox(config=program_config, backend=cfg.backend)
+
+
+def _scenario_program_config(
+    cfg: NurseryConfig, episode_ticks: int, extra: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Resolve one scenario recording's base ``program_config``, translating
+    ``NurseryConfig.world_size`` to whatever key the selected World actually
+    understands (issue #202): Minecraft's ``SurvivalBoxConfig`` has its own
+    ``world_size`` field, but Crafter has none -- ``CrafterConfig.from_dict``
+    silently drops it, so a Crafter program must instead receive ``area``
+    (see ``programs.crafter.config.area_from_world_size``). A notebook's
+    requested 128-unit world previously recorded, un-erroring, against
+    Crafter's default 64x64 ``area``."""
+    program_config: Dict[str, Any] = {"episode_ticks": episode_ticks}
+    if cfg.world == "crafter":
+        program_config["area"] = area_from_world_size(cfg.world_size)
+    else:
+        program_config["world_size"] = cfg.world_size
+    program_config.update(extra)
+    return program_config
+
+
 def _record_scenario_episode(
     record_dir: str, session_id: str, seed: int, scenario: NurseryScenario, cfg: NurseryConfig
 ) -> str:
-    recording = scenario.build(seed, cfg)
-    episode_ticks = recording.episode_ticks or cfg.episode_ticks
-    program_config: Dict[str, Any] = {"episode_ticks": episode_ticks, "world_size": cfg.world_size}
-    program_config.update(recording.program_config_extra)
-    runtime_config = RuntimeConfig(
-        episodes=1,
-        seed=seed,
-        max_ticks_per_episode=episode_ticks,
-        record_dir=record_dir,
-        session_id=session_id,
-        program_config=program_config,
-        realtime=cfg.realtime,
-        record_frames=True,
-        curriculum=f"nursery/{scenario.name}",
-    )
-    program = MinecraftSurvivalBox(config=program_config, backend=cfg.backend)
-    if recording.scene_setup is not None and cfg.backend == "simulated":
-        recording.scene_setup(program)
-    try:
-        CognitiveRuntime(program=program, policy=recording.policy, config=runtime_config).run()
-    finally:
-        program.close()
-    return os.path.join(record_dir, session_id)
+    with span("nursery.record.episode", session=session_id, scenario=scenario.name,
+              seed=seed, ticks=cfg.episode_ticks):
+        log.info("recording %s  seed=%d  ticks=%d", session_id, seed, cfg.episode_ticks)
+        recording = scenario.build(seed, cfg)
+        episode_ticks = recording.episode_ticks or cfg.episode_ticks
+        program_config = _scenario_program_config(
+            cfg, episode_ticks, recording.program_config_extra
+        )
+        runtime_config = RuntimeConfig(
+            episodes=1,
+            seed=seed,
+            max_ticks_per_episode=episode_ticks,
+            record_dir=record_dir,
+            session_id=session_id,
+            program_config=program_config,
+            realtime=cfg.realtime,
+            record_frames=True,
+            curriculum=f"nursery/{scenario.name}",
+            name=cfg.name,
+        )
+        program = _build_scenario_program(cfg, program_config)
+        # Crafter's scripted scenarios always run against the (only) live env;
+        # Minecraft's scene-setup only makes sense against the simulated
+        # backend's in-process world (a remote server has no scriptable world to
+        # reach into).
+        if recording.scene_setup is not None and (
+            cfg.world == "crafter" or cfg.backend == "simulated"
+        ):
+            recording.scene_setup(program)
+        try:
+            CognitiveRuntime(program=program, policy=recording.policy, config=runtime_config).run()
+        finally:
+            close = getattr(program, "close", None)
+            if callable(close):
+                close()
+        # Counted only once the episode is actually on disk: in a failed run
+        # -- the trace where this counter is most worth reading -- an
+        # increment before the runtime would overstate the usable recordings
+        # by the very episode that killed the run.
+        trace_counter("episodes_recorded")
+        return os.path.join(record_dir, session_id)
 
 
 # --------------------------------------------------------------------------- benchmark harness
+
+
+def _scenarios_for_world(world: str) -> Dict[str, NurseryScenario]:
+    """``--world`` selector (issue #90): which scenario registry a
+    ``NurseryConfig.world`` records against."""
+    if world == "minecraft":
+        return NURSERY_SCENARIOS
+    if world == "crafter":
+        return CRAFTER_SCENARIOS
+    raise ValueError(f"unknown nursery world {world!r}; choices: ['crafter', 'minecraft']")
+
+
+def _action_keys_for_world(world: str) -> List[str]:
+    """Return the selected World's complete, stable action vocabulary.
+
+    Stage recordings often exercise only a subset. Pinning checkpoints to
+    that incidental subset makes warm-starting across nursery/development
+    stages unsafe, so every dataset for a World uses the registry's full
+    ordered action space from the outset.
+    """
+    if world == "crafter":
+        from cognitive_runtime.programs.crafter.actions import ACTION_SPACE
+    elif world == "minecraft":
+        from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
+    else:
+        raise ValueError(f"unknown nursery world {world!r}; choices: ['crafter', 'minecraft']")
+    return [action.key() for action in ACTION_SPACE]
+
+
+def _semantic_classes_for_world(world: str) -> int:
+    """Number of grid ids available for semantic supervision in ``world``."""
+    return max(FRAME_LEGEND) + 1 if world == "crafter" else 0
 
 
 def run_nursery_scenario(
     record_dir: str,
     scenario_name: str,
     config: Optional[NurseryConfig] = None,
+    *,
+    cortex_checkpoint_path: Optional[str] = None,
 ) -> Tuple[VisualRepresentationModel, NurseryScenarioReport]:
     """Record train/holdout episodes for one nursery scenario, pretrain a
     pixel encoder+decoder+next-latent predictor on the train seeds only,
     then evaluate multi-horizon next-frame prediction on held-out seeds
     against copy-last-frame and mean-frame baselines. ``object_permanence``
-    additionally reports an entity-persistence metric."""
+    additionally reports an entity-persistence metric (Minecraft only --
+    Crafter's port doesn't set ``entity_persistence_metric``).
 
-    if scenario_name not in NURSERY_SCENARIOS:
-        raise ValueError(
-            f"unknown nursery scenario {scenario_name!r}; choices: {sorted(NURSERY_SCENARIOS)}"
-        )
-    scenario = NURSERY_SCENARIOS[scenario_name]
+    ``cortex_checkpoint_path`` (issue #134), when given, warm-starts
+    pretraining from that path's previously-saved
+    ``prediction_export.save_full_visual_model`` bundle (if it exists)
+    instead of a fresh random model, and saves the result back to it
+    afterward -- so a caller that reuses the same path across repeated
+    calls (e.g. one milestone-gate attempt per stage attempt) is actually
+    continuing to train *the same* model, not discarding it and measuring a
+    disposable one every time.
+    """
+
+    log.info("=== nursery scenario: %s ===", scenario_name)
     cfg = config or NurseryConfig()
-    if cfg.backend not in BACKENDS:
+    scenarios = _scenarios_for_world(cfg.world)
+    if scenario_name not in scenarios:
+        raise ValueError(
+            f"unknown nursery scenario {scenario_name!r} for --world {cfg.world!r}; "
+            f"choices: {sorted(scenarios)}"
+        )
+    scenario = scenarios[scenario_name]
+    if cfg.world == "minecraft" and cfg.backend not in BACKENDS:
         raise ValueError(f"unknown nursery backend {cfg.backend!r}; choices: {sorted(BACKENDS)}")
     if not cfg.horizons:
         raise ValueError("horizons must be non-empty")
@@ -701,14 +1579,21 @@ def run_nursery_scenario(
     if set(cfg.train_seeds) & set(cfg.holdout_seeds):
         raise ValueError("train_seeds and holdout_seeds must not overlap")
 
-    train_sessions = [
-        _record_scenario_episode(record_dir, f"nursery-{scenario_name}-train-{seed}", seed, scenario, cfg)
-        for seed in cfg.train_seeds
-    ]
-    holdout_sessions = [
-        _record_scenario_episode(record_dir, f"nursery-{scenario_name}-holdout-{seed}", seed, scenario, cfg)
-        for seed in cfg.holdout_seeds
-    ]
+    with span("nursery.record", scenario=scenario_name,
+              train_seeds=len(cfg.train_seeds), holdout_seeds=len(cfg.holdout_seeds)):
+        train_sessions = [
+            _record_scenario_episode(
+                record_dir, f"nursery-{scenario_name}-train-{seed}", seed, scenario, cfg
+            )
+            for seed in cfg.train_seeds
+        ]
+        holdout_sessions = [
+            _record_scenario_episode(
+                record_dir, f"nursery-{scenario_name}-holdout-{seed}", seed, scenario, cfg
+            )
+            for seed in cfg.holdout_seeds
+        ]
+    log.info("recorded %d train + %d holdout sessions", len(train_sessions), len(holdout_sessions))
 
     if cfg.data_quality_gate:
         issues = validate_nursery_recordings(
@@ -717,6 +1602,8 @@ def run_nursery_scenario(
             expected_pixel_source=cfg.expected_pixel_source,
         )
         if issues:
+            trace_event("nursery.quality_gate.failed",
+                        scenario=scenario_name, issues=issues)
             hint = (
                 " Hint: the remote backend plays on the server's persistent world -- "
                 "seeds do not vary terrain, sessions inherit the previous session's "
@@ -731,12 +1618,27 @@ def run_nursery_scenario(
                 "gate:\n  - " + "\n  - ".join(issues) + hint
             )
 
-    # config.horizons is declared in ticks; recorded vision may run below the
-    # tick rate (the first remote runs paced ~10 Hz against 20 Hz ticks, so
-    # "t+100" silently meant 200 ticks).  Convert via the measured rate so a
-    # horizon means the same amount of world time on every backend.
+    log.info("quality gate passed")
+
+    if cfg.split_overlap_gate:
+        overlap_report = audit_split_overlap(
+            train_sessions, holdout_sessions,
+            max_corresponding_frame_fraction=cfg.max_corresponding_frame_fraction,
+        )
+        if overlap_report.issues:
+            trace_event("nursery.split_overlap_gate.failed",
+                        scenario=scenario_name, issues=overlap_report.issues)
+            raise ValueError(
+                f"nursery scenario {scenario_name!r}: recorded holdout data leaks into "
+                "training:\n  - " + "\n  - ".join(overlap_report.issues)
+                + " (split_overlap_gate=False skips this check.)"
+            )
+        log.info("split-overlap gate passed")
+
     ticks_per_frame = _measured_ticks_per_frame(train_sessions + holdout_sessions)
     horizon_frames = horizons_ticks_to_frames(cfg.horizons, ticks_per_frame)
+    log.info("horizons (ticks): %s -> frames: %s  (%.2f ticks/frame)",
+             cfg.horizons, horizon_frames, ticks_per_frame)
 
     train_dataset = build_pixel_sequence_dataset(train_sessions, max_samples=cfg.max_train_samples)
     if len(train_dataset) == 0:
@@ -754,19 +1656,34 @@ def run_nursery_scenario(
         hidden_dim=cfg.hidden_dim,
         reconstruction_size=cfg.reconstruction_size,
     )
-    model, pretraining_stats = train_pixel_encoder_pretraining(train_dataset, visual_config)
+    initial_model = None
+    if cortex_checkpoint_path is not None and os.path.exists(cortex_checkpoint_path):
+        log.info("warm-starting from checkpoint %s", cortex_checkpoint_path)
+        initial_model = load_full_visual_model(cortex_checkpoint_path)
+    log.info("training pixel encoder  samples=%d  epochs=%d  lr=%s",
+             len(train_dataset), cfg.epochs, cfg.lr)
+    with span("nursery.train.pixel_encoder",
+              samples=len(train_dataset), epochs=cfg.epochs, lr=cfg.lr,
+              warm_start=initial_model is not None):
+        model, pretraining_stats = train_pixel_encoder_pretraining(
+            train_dataset, visual_config, initial_model=initial_model,
+        )
+    log.info("pixel encoder training complete")
 
     consistency_stats: Dict[str, List[float]] = {}
     if cfg.consistency_epochs > 0:
-        consistency_stats = train_horizon_consistency(
-            model,
-            train_sessions,
-            horizon_frames,
-            epochs=cfg.consistency_epochs,
-            lr=cfg.consistency_lr,
-            batch_size=cfg.batch_size,
-            seed=cfg.seed,
-        )
+        with span("nursery.train.horizon_consistency", epochs=cfg.consistency_epochs):
+            consistency_stats = train_horizon_consistency(
+                model,
+                train_sessions,
+                horizon_frames,
+                epochs=cfg.consistency_epochs,
+                lr=cfg.consistency_lr,
+                batch_size=cfg.batch_size,
+                seed=cfg.seed,
+            )
+    if cortex_checkpoint_path is not None:
+        save_full_visual_model(model, cortex_checkpoint_path)
 
     max_horizon = max(horizon_frames)
     for session_dir in holdout_sessions:
@@ -777,10 +1694,18 @@ def run_nursery_scenario(
                     f"({max_horizon} frames); increase episode_ticks"
                 )
 
-    horizon_metrics = evaluate_ego_motion_holdout(
-        model, holdout_sessions, horizon_frames, ssim_window=cfg.ssim_window
-    )
-    rollout_health = evaluate_rollout_health(model, holdout_sessions, horizon_frames)
+    log.info("evaluating on %d holdout sessions", len(holdout_sessions))
+    with span("nursery.evaluate", scenario=scenario_name, sessions=len(holdout_sessions)):
+        horizon_metrics = evaluate_ego_motion_holdout(
+            model, holdout_sessions, horizon_frames, ssim_window=cfg.ssim_window
+        )
+        rollout_health = evaluate_rollout_health(model, holdout_sessions, horizon_frames)
+    for h, metrics in horizon_metrics.items():
+        log.info("  t+%d: model_mse=%.4f  copy_last_mse=%.4f  beats=%s",
+                 h, metrics.get("model_mse", 0), metrics.get("copy_last_mse", 0),
+                 metrics.get("beats_copy_last", "?"))
+    _trace_horizon_metrics("scenario", scenario_name, {"horizons": horizon_metrics,
+                                                       "rollout_health": rollout_health})
 
     entity_persistence_stats: Optional[Dict[str, Any]] = None
     if scenario.entity_persistence_metric:
@@ -804,6 +1729,11 @@ def run_nursery_scenario(
             model, train_sessions + holdout_sessions, horizon_frames
         )
 
+    canonical_recording = scenario.build(cfg.train_seeds[0], cfg)
+    resolved_program_config = _scenario_program_config(
+        cfg, canonical_recording.episode_ticks or cfg.episode_ticks,
+        canonical_recording.program_config_extra,
+    )
     return model, NurseryScenarioReport(
         scenario=scenario_name,
         config=cfg,
@@ -818,6 +1748,7 @@ def run_nursery_scenario(
         horizon_frames=horizon_frames,
         ticks_per_frame=ticks_per_frame,
         rollout_health=rollout_health,
+        resolved_program_config=resolved_program_config,
     )
 
 
@@ -827,12 +1758,18 @@ def run_nursery_suite(
     config: Optional[NurseryConfig] = None,
 ) -> Dict[str, NurseryScenarioReport]:
     """``nursery run all``: run every named scenario (default: every
-    registered scenario) unattended, returning one report per scenario."""
+    scenario registered for ``config.world``) unattended, returning one
+    report per scenario."""
 
-    names = list(scenario_names) if scenario_names is not None else sorted(NURSERY_SCENARIOS)
+    cfg = config or NurseryConfig()
+    names = (
+        list(scenario_names)
+        if scenario_names is not None
+        else sorted(_scenarios_for_world(cfg.world))
+    )
     reports: Dict[str, NurseryScenarioReport] = {}
     for name in names:
-        _model, report = run_nursery_scenario(record_dir, name, config)
+        _model, report = run_nursery_scenario(record_dir, name, cfg)
         reports[name] = report
     return reports
 
@@ -843,7 +1780,7 @@ def run_nursery_suite(
 @dataclass
 class JointNurseryReport:
     """One action-conditioned world model trained across scenarios
-    (phase 3 of docs/nursery-turn-in-place-analysis.md)."""
+    (phase 3 of docs/history/nursery-turn-in-place-analysis.md)."""
 
     train_scenarios: List[str]
     holdout_scenarios: List[str]
@@ -851,8 +1788,13 @@ class JointNurseryReport:
     model_config: ActionWorldModelConfig
     #: scenario -> its recorded train-seed session dirs (training pool).
     train_sessions: Dict[str, List[str]] = field(default_factory=dict)
-    #: scenario -> its recorded holdout-seed session dirs (evaluation).
+    #: scenario -> its recorded evaluation session dirs.  In
+    #: ``overfit_evaluation`` mode these are intentionally the same paths as
+    #: ``train_sessions``.
     eval_sessions: Dict[str, List[str]] = field(default_factory=dict)
+    #: ``"held_out"`` for ordinary evaluation or ``"training_replay"`` for
+    #: the diagnostic memorization canary.
+    evaluation_mode: str = "held_out"
     training_stats: Dict[str, Any] = field(default_factory=dict)
     #: In-distribution generalization: per train scenario, evaluated on that
     #: scenario's held-out seeds ({"horizons": ..., "rollout_health": ...}).
@@ -862,8 +1804,57 @@ class JointNurseryReport:
     zero_shot_metrics: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     #: Does the representation linearly decode the agent's heading?
     yaw_probe: Dict[str, Any] = field(default_factory=dict)
+    #: Heading probe using yaw or Crafter's discrete facing stream.
+    orientation_probe: Dict[str, Any] = field(default_factory=dict)
+    #: Promotion-grade yaw + latent variance/effective-rank collapse gate.
+    representation_diagnostics: Dict[str, Any] = field(default_factory=dict)
     horizon_frames: List[int] = field(default_factory=list)
     ticks_per_frame: float = 1.0
+    #: Per-scenario sample counts and event balance over the training pool
+    #: (issue #202's acceptance criterion) -- see ``summarize_sample_balance``.
+    sample_balance: Dict[str, Any] = field(default_factory=dict)
+
+
+def _final_loss(training_stats: Dict[str, Any]) -> Optional[float]:
+    final = training_stats.get("final_total_loss")
+    if final is not None:
+        return float(final)
+    totals = (training_stats.get("loss_curves") or {}).get("total_loss") or []
+    return float(totals[-1]) if totals else None
+
+
+def _trace_horizon_metrics(split: str, scenario: str, metrics: Dict[str, Any]) -> None:
+    """Push one evaluation's per-horizon numbers into the trace as metric
+    series, so ``ccr trace show`` can answer "did it beat copy-last-frame?"
+    without re-reading the report JSON -- and so a run that dies during a
+    later scenario still has the earlier scenarios' verdicts on disk."""
+    # Keep direct and closed-loop metrics in disjoint trace namespaces.  The
+    # fallback preserves tracing for legacy single-mode reports.
+    mode_reports = (
+        (("direct", metrics["direct"]), ("rollout", metrics["rollout"]))
+        if "direct" in metrics and "rollout" in metrics
+        else ((metrics.get("prediction_mode", "rollout"), metrics),)
+    )
+    for mode, report in mode_reports:
+        for horizon, entry in (report.get("horizons") or {}).items():
+            trace_metrics(**{
+                f"eval/{split}/{scenario}/{mode}/t+{horizon}/model_mse": entry.get("model_mse"),
+                f"eval/{split}/{scenario}/{mode}/t+{horizon}/copy_last_mse": entry.get("copy_last_mse"),
+                f"eval/{split}/{scenario}/{mode}/t+{horizon}/beats_copy_last": float(bool(entry.get("beats_copy_last"))),
+            })
+    health = metrics.get("rollout_health") or {}
+    trace_event(
+        "nursery.evaluate.result", split=split, scenario=scenario,
+        primary_mode=metrics.get("primary_mode", metrics.get("prediction_mode", "rollout")), horizons={
+            str(h): {
+                "model_mse": e.get("model_mse"),
+                "copy_last_mse": e.get("copy_last_mse"),
+                "beats_copy_last": e.get("beats_copy_last"),
+            }
+            for h, e in (metrics.get("horizons") or {}).items()
+        },
+        frozen_rollout=health.get("frozen_rollout"),
+    )
 
 
 def run_nursery_joint(
@@ -877,7 +1868,8 @@ def run_nursery_joint(
     model on the train scenarios' train seeds, then evaluate:
 
     - per train scenario on its held-out seeds (in-distribution
-      generalization),
+      generalization), or, when ``config.overfit_evaluation`` is enabled,
+      on the exact training recordings as a memorization diagnostic,
     - per held-out scenario the model never saw (zero-shot generality --
       the metric that separates "memorized six scripted policies" from
       "learned how actions move the view"),
@@ -896,22 +1888,28 @@ def run_nursery_joint(
     if set(cfg.train_seeds) & set(cfg.holdout_seeds):
         raise ValueError("train_seeds and holdout_seeds must not overlap")
 
+    scenarios = _scenarios_for_world(cfg.world)
     holdout_names = list(holdout_scenarios)
     train_names = (
         list(train_scenarios)
         if train_scenarios is not None
-        else [n for n in sorted(NURSERY_SCENARIOS) if n not in holdout_names]
+        else [n for n in sorted(scenarios) if n not in holdout_names]
     )
     for name in list(train_names) + holdout_names:
-        if name not in NURSERY_SCENARIOS:
+        if name not in scenarios:
             raise ValueError(
-                f"unknown nursery scenario {name!r}; choices: {sorted(NURSERY_SCENARIOS)}"
+                f"unknown nursery scenario {name!r}; choices: {sorted(scenarios)}"
             )
     overlap = set(train_names) & set(holdout_names)
     if overlap:
         raise ValueError(f"scenarios cannot be both trained and held out: {sorted(overlap)}")
     if not train_names:
         raise ValueError("no training scenarios left after excluding holdouts")
+    if cfg.overfit_evaluation and holdout_names:
+        raise ValueError(
+            "overfit_evaluation requires no holdout_scenarios; it evaluates "
+            "the supplied train_scenarios on their exact training recordings"
+        )
 
     model_cfg = model_config or ActionWorldModelConfig(
         latent_width=cfg.latent_width,
@@ -921,93 +1919,232 @@ def run_nursery_joint(
         lr=cfg.lr,
         batch_size=cfg.batch_size,
         seed=cfg.seed,
+        horizons_ticks=tuple(cfg.horizons),
+    )
+    # The nursery configuration owns the advertised/evaluated tick horizons;
+    # rebuild supplied training configs to that same contract.
+    model_cfg = replace(
+        model_cfg,
+        horizons_ticks=tuple(cfg.horizons),
+        semantic_classes=(model_cfg.semantic_classes or _semantic_classes_for_world(cfg.world)),
+    )
+
+    log.info("=== nursery joint: train=%s  holdout=%s  world=%s ===",
+             train_names, holdout_names, cfg.world)
+    if cfg.overfit_evaluation:
+        log.warning(
+            "OVERFIT DIAGNOSTIC: evaluating exact training recordings; "
+            "metrics are not generalization results"
+        )
+    trace_event(
+        "nursery.joint.plan",
+        train_scenarios=train_names, holdout_scenarios=holdout_names, world=cfg.world,
+        train_seeds=list(cfg.train_seeds), holdout_seeds=list(cfg.holdout_seeds),
+        horizons=list(cfg.horizons), epochs=model_cfg.epochs, backbone=model_cfg.backbone,
+        training_objective=model_cfg.training_objective,
+        evaluation_mode="training_replay" if cfg.overfit_evaluation else "held_out",
     )
 
     train_sessions: Dict[str, List[str]] = {}
     eval_sessions: Dict[str, List[str]] = {}
-    for name in train_names:
-        scenario = NURSERY_SCENARIOS[name]
-        train_sessions[name] = [
-            _record_scenario_episode(
-                record_dir, f"nursery-{name}-train-{seed}", seed, scenario, cfg
-            )
-            for seed in cfg.train_seeds
-        ]
-        eval_sessions[name] = [
-            _record_scenario_episode(
-                record_dir, f"nursery-{name}-holdout-{seed}", seed, scenario, cfg
-            )
-            for seed in cfg.holdout_seeds
-        ]
-    for name in holdout_names:
-        scenario = NURSERY_SCENARIOS[name]
-        eval_sessions[name] = [
-            _record_scenario_episode(
-                record_dir, f"nursery-{name}-holdout-{seed}", seed, scenario, cfg
-            )
-            for seed in cfg.holdout_seeds
-        ]
+    with span("nursery.record",
+              scenarios=len(train_names) + len(holdout_names),
+              episodes=(len(train_names) * (len(cfg.train_seeds) + (
+                  0 if cfg.overfit_evaluation else len(cfg.holdout_seeds)
+              ))
+                        + len(holdout_names) * len(cfg.holdout_seeds))) as recording_span:
+        for name in train_names:
+            scenario = scenarios[name]
+            with span("nursery.record.scenario", scenario=name, split="train+holdout"):
+                train_sessions[name] = [
+                    _record_scenario_episode(
+                        record_dir, f"nursery-{name}-train-{seed}", seed, scenario, cfg
+                    )
+                    for seed in cfg.train_seeds
+                ]
+                eval_sessions[name] = (
+                    list(train_sessions[name])
+                    if cfg.overfit_evaluation
+                    else [
+                        _record_scenario_episode(
+                            record_dir, f"nursery-{name}-holdout-{seed}", seed, scenario, cfg
+                        )
+                        for seed in cfg.holdout_seeds
+                    ]
+                )
+        for name in holdout_names:
+            scenario = scenarios[name]
+            with span("nursery.record.scenario", scenario=name, split="zero-shot"):
+                eval_sessions[name] = [
+                    _record_scenario_episode(
+                        record_dir, f"nursery-{name}-holdout-{seed}", seed, scenario, cfg
+                    )
+                    for seed in cfg.holdout_seeds
+                ]
+        recording_span.set(
+            train_sessions=sum(len(v) for v in train_sessions.values()),
+            eval_sessions=sum(len(v) for v in eval_sessions.values()),
+        )
 
     if cfg.data_quality_gate:
-        issues: List[str] = []
-        for name in train_names:
-            issues += validate_nursery_recordings(
-                train_sessions[name] + eval_sessions[name],
-                NURSERY_SCENARIOS[name],
-                expected_pixel_source=cfg.expected_pixel_source,
+        with span("nursery.quality_gate") as gate_span:
+            issues: List[str] = []
+            for name in train_names:
+                sessions = train_sessions[name] if cfg.overfit_evaluation else (
+                    train_sessions[name] + eval_sessions[name]
+                )
+                issues += validate_nursery_recordings(
+                    sessions,
+                    scenarios[name],
+                    expected_pixel_source=cfg.expected_pixel_source,
+                )
+            for name in holdout_names:
+                issues += validate_nursery_recordings(
+                    eval_sessions[name],
+                    scenarios[name],
+                    expected_pixel_source=cfg.expected_pixel_source,
+                )
+            gate_span.set(issues=len(issues))
+            if issues:
+                # The gate's verdict belongs in the trace: a failed run whose
+                # only record is a traceback can't be compared against the
+                # run that passed.
+                trace_event("nursery.quality_gate.failed", issues=issues)
+                raise ValueError(
+                    "nursery joint run: recorded data fails the quality gate:\n  - "
+                    + "\n  - ".join(issues)
+                )
+            log.info("quality gate passed")
+
+    if cfg.split_overlap_gate and not cfg.overfit_evaluation:
+        with span("nursery.split_overlap_gate") as overlap_span:
+            # Pooled, not per-scenario (issue #202 review): the joint model
+            # trains on every train scenario's sessions at once, and
+            # zero-shot evaluation is exactly "did this model memorize
+            # *any* pooled training frame" -- checking each scenario only
+            # against its own holdout seeds would never audit a zero-shot
+            # scenario (`holdout_names`) at all, and would miss a holdout
+            # episode from one scenario duplicating another scenario's
+            # training data.
+            pooled_train_dirs = [d for name in train_names for d in train_sessions[name]]
+            pooled_eval_dirs = [d for dirs in eval_sessions.values() for d in dirs]
+            overlap_report = audit_split_overlap(
+                pooled_train_dirs, pooled_eval_dirs,
+                max_corresponding_frame_fraction=cfg.max_corresponding_frame_fraction,
             )
-        for name in holdout_names:
-            issues += validate_nursery_recordings(
-                eval_sessions[name],
-                NURSERY_SCENARIOS[name],
-                expected_pixel_source=cfg.expected_pixel_source,
-            )
-        if issues:
-            raise ValueError(
-                "nursery joint run: recorded data fails the quality gate:\n  - "
-                + "\n  - ".join(issues)
-            )
+            overlap_span.set(issues=len(overlap_report.issues))
+            if overlap_report.issues:
+                trace_event("nursery.split_overlap_gate.failed", issues=overlap_report.issues)
+                raise ValueError(
+                    "nursery joint run: recorded holdout data leaks into training:\n  - "
+                    + "\n  - ".join(overlap_report.issues)
+                )
+            log.info("split-overlap gate passed")
+    elif cfg.overfit_evaluation:
+        # The diagnostic intentionally evaluates identical session paths;
+        # running the normal leakage detector would reject the condition this
+        # mode exists to test.
+        trace_event("nursery.split_overlap_gate.skipped", reason="overfit_evaluation")
+        log.info("split-overlap gate skipped for overfit diagnostic")
 
     # Pin the vocabulary to the full action space (plus NULL): a held-out
     # scenario may issue actions no training scenario used, and zero-shot
     # evaluation must be able to encode them (their embeddings are simply
     # untrained).
-    from cognitive_runtime.training.features import ACTION_KEYS
-
-    vocabulary = list(ACTION_KEYS)
-    if NULL_ACTION.name not in vocabulary:
-        vocabulary.append(NULL_ACTION.name)
+    vocabulary = _action_keys_for_world(cfg.world)
 
     all_train_dirs = [d for name in train_names for d in train_sessions[name]]
-    dataset = build_action_sequence_dataset(all_train_dirs, action_keys=vocabulary)
-    if len(dataset) == 0:
-        raise ValueError("nursery joint run: no frame transitions in the training sessions")
-    ticks_per_frame = dataset.ticks_per_frame
-    horizon_frames = horizons_ticks_to_frames(cfg.horizons, ticks_per_frame)
+    with span("nursery.dataset", sessions=len(all_train_dirs)) as dataset_span:
+        dataset = build_action_sequence_dataset(all_train_dirs, action_keys=vocabulary)
+        if len(dataset) == 0:
+            raise ValueError("nursery joint run: no frame transitions in the training sessions")
+        ticks_per_frame = dataset.ticks_per_frame
+        horizon_frames = horizons_ticks_to_frames(cfg.horizons, ticks_per_frame)
+        dataset_span.set(
+            transitions=len(dataset), ticks_per_frame=ticks_per_frame,
+            horizon_frames=horizon_frames, action_vocabulary=len(vocabulary),
+        )
+    log.info("horizons (ticks): %s -> frames: %s  (%.2f ticks/frame)",
+             list(cfg.horizons), horizon_frames, ticks_per_frame)
 
-    model, training_stats = train_action_world_model(dataset, model_cfg)
+    with span("nursery.sample_balance"):
+        # Computed from `dataset.episodes` (not re-walked independently)
+        # so labels/weights are aligned 1:1 with what training actually
+        # consumes -- each episode's `session_dir`/`episode_id` names the
+        # same recorded episode `compute_scenario_transition_labels` reads.
+        session_to_scenario = {
+            session_dir: name for name in train_names for session_dir in train_sessions[name]
+        }
+        labels_by_episode: List[List[TransitionLabel]] = [
+            compute_scenario_transition_labels(
+                episode.session_dir, episode.episode_id, session_to_scenario[episode.session_dir]
+            )
+            for episode in dataset.episodes
+        ]
+        flat_labels = [label for episode_labels in labels_by_episode for label in episode_labels]
+        flat_weights = balanced_transition_weights(flat_labels)
+        transition_weights: List[List[float]] = []
+        cursor = 0
+        for episode_labels in labels_by_episode:
+            transition_weights.append(flat_weights[cursor : cursor + len(episode_labels)])
+            cursor += len(episode_labels)
+
+        labels_by_scenario: Dict[str, List[TransitionLabel]] = {}
+        for episode, episode_labels in zip(dataset.episodes, labels_by_episode):
+            scenario = session_to_scenario[episode.session_dir]
+            labels_by_scenario.setdefault(scenario, []).extend(episode_labels)
+        sample_balance = summarize_sample_balance(labels_by_scenario)
+        log_sample_balance(sample_balance)
+        trace_event("nursery.sample_balance", balance=sample_balance)
+
+    with span("nursery.train", epochs=model_cfg.epochs, backbone=model_cfg.backbone,
+              objective=model_cfg.training_objective) as train_span:
+        model, training_stats = train_action_world_model(
+            dataset, model_cfg, transition_weights=transition_weights,
+        )
+        training_stats["evaluation_mode"] = (
+            "training_replay" if cfg.overfit_evaluation else "held_out"
+        )
+        train_span.set(final_total_loss=_final_loss(training_stats))
 
     scenario_metrics: Dict[str, Dict[str, Any]] = {}
-    for name in train_names:
-        holdout_dataset = build_action_sequence_dataset(
-            eval_sessions[name], action_keys=model.action_keys
-        )
-        scenario_metrics[name] = evaluate_action_world_model(
-            model, holdout_dataset, horizon_frames, warmup_frames=model_cfg.warmup_frames
-        )
+    evaluation_split = "training_replay" if cfg.overfit_evaluation else "in_distribution"
+    with span(f"nursery.evaluate.{evaluation_split}", scenarios=len(train_names)):
+        for name in train_names:
+            with span("nursery.evaluate.scenario", scenario=name, split=evaluation_split):
+                holdout_dataset = build_action_sequence_dataset(
+                    eval_sessions[name], action_keys=model.action_keys
+                )
+                scenario_metrics[name] = evaluate_action_world_model_milestone(
+                    model, holdout_dataset, model.horizons_ticks,
+                    warmup_frames=model_cfg.warmup_frames,
+                )
+                _trace_horizon_metrics(evaluation_split, name, scenario_metrics[name])
     zero_shot_metrics: Dict[str, Dict[str, Any]] = {}
-    for name in holdout_names:
-        holdout_dataset = build_action_sequence_dataset(
-            eval_sessions[name], action_keys=model.action_keys
-        )
-        zero_shot_metrics[name] = evaluate_action_world_model(
-            model, holdout_dataset, horizon_frames, warmup_frames=model_cfg.warmup_frames
-        )
+    with span("nursery.evaluate.zero_shot", scenarios=len(holdout_names)):
+        for name in holdout_names:
+            with span("nursery.evaluate.scenario", scenario=name, split="zero_shot"):
+                holdout_dataset = build_action_sequence_dataset(
+                    eval_sessions[name], action_keys=model.action_keys
+                )
+                zero_shot_metrics[name] = evaluate_action_world_model_milestone(
+                    model, holdout_dataset, model.horizons_ticks,
+                    warmup_frames=model_cfg.warmup_frames,
+                )
+                _trace_horizon_metrics("zero_shot", name, zero_shot_metrics[name])
 
-    probe_dataset = build_action_sequence_dataset(
-        [d for dirs in eval_sessions.values() for d in dirs], action_keys=model.action_keys
-    )
-    yaw_probe = linear_probe_yaw(model, probe_dataset)
+    with span("nursery.probes"):
+        probe_dataset = build_action_sequence_dataset(
+            [d for dirs in eval_sessions.values() for d in dirs], action_keys=model.action_keys
+        )
+        yaw_probe = linear_probe_yaw(model, probe_dataset)
+        orientation_probe = linear_probe_orientation(model, probe_dataset)
+        representation_diagnostics = representation_collapse_diagnostics(
+            model, probe_dataset, config=model_cfg
+        )
+        trace_event("nursery.probes.result",
+                    yaw=yaw_probe, orientation=orientation_probe,
+                    representation=representation_diagnostics)
 
     return model, JointNurseryReport(
         train_scenarios=train_names,
@@ -1016,12 +2153,404 @@ def run_nursery_joint(
         model_config=model_cfg,
         train_sessions=train_sessions,
         eval_sessions=eval_sessions,
+        evaluation_mode="training_replay" if cfg.overfit_evaluation else "held_out",
         training_stats=training_stats,
         scenario_metrics=scenario_metrics,
         zero_shot_metrics=zero_shot_metrics,
         yaw_probe=yaw_probe,
+        orientation_probe=orientation_probe,
+        representation_diagnostics=representation_diagnostics,
         horizon_frames=horizon_frames,
         ticks_per_frame=ticks_per_frame,
+        sample_balance=sample_balance,
+    )
+
+
+# --------------------------------------------------------------------------- action-ablation (issue #92)
+
+
+@dataclass
+class ActionAblationReport:
+    """Milestone 2's action-ablation proof
+    (docs/v2/phases/phase-2-predictive-cortex.md): the same joint cortex,
+    trained twice on byte-identical recordings -- once seeing the real
+    ``motor.command`` stream, once with every action index overwritten by a
+    constant -- to show action-conditioning is load-bearing rather than
+    decorative. "A predictor that never sees its action can't tell 'kept
+    turning' from 'stopped'." """
+
+    train_scenarios: List[str]
+    eval_scenario: str
+    #: Full ``evaluate_action_world_model`` report for the model trained
+    #: with the real action stream.
+    with_actions_metrics: Dict[str, Any]
+    #: Same, for the model trained with actions withheld.
+    without_actions_metrics: Dict[str, Any]
+    #: Per-horizon mean +/- CI over held-out seeds for each model
+    #: (``statistical_evaluation.cortex_horizon_statistics``).
+    with_actions_stats: Dict[int, MetricStats]
+    without_actions_stats: Dict[int, MetricStats]
+    #: Per-horizon regression comparison, ablated-vs-baseline
+    #: (``statistical_evaluation.compare_cortex_horizon_statistics``).
+    comparisons: Dict[int, MetricComparison]
+    #: True when withholding actions raises ``eval_scenario``'s held-out
+    #: model MSE at every evaluated horizon -- the Milestone 2 assertion.
+    action_withholding_degrades: bool
+    #: Held-out representation gate for the promoted with-actions cortex.
+    representation_diagnostics: Dict[str, Any] = field(default_factory=dict)
+
+
+def run_action_ablation_eval(
+    record_dir: str,
+    train_scenarios: Sequence[str] = ("walk_forward", "turn_in_place"),
+    eval_scenario: str = "turn_in_place",
+    config: Optional[NurseryConfig] = None,
+    model_config: Optional[ActionWorldModelConfig] = None,
+    *,
+    cortex_checkpoint_path: Optional[str] = None,
+) -> ActionAblationReport:
+    """Train the joint cortex twice on identical recorded data -- with and
+    without the action stream reaching the model during training -- and
+    compare held-out ``eval_scenario`` performance.
+
+    Both runs share the same recordings, architecture, and training
+    hyperparameters (only ``ActionWorldModelConfig.withhold_actions``
+    differs), so a regression on ``eval_scenario`` when withheld is direct
+    evidence the baseline model actually uses its action input, not an
+    artifact of noise or a different random init. ``eval_scenario`` must be
+    one of ``train_scenarios`` -- the claim is "harder to predict the
+    scenario it trained on", not zero-shot generality.
+
+    ``cortex_checkpoint_path`` (issue #134), when given, warm-starts the
+    *with-actions* run from that path's previously-saved
+    :func:`~cognitive_runtime.training.action_world_model.save_action_world_model`
+    bundle (if it exists) and saves the result back to it afterward, so a
+    caller reusing the same path across calls actually keeps improving the
+    same cortex instead of measuring a fresh, disposable one every attempt.
+
+    The *without-actions* control warm-starts from (and saves to) its own
+    sibling path (``cortex_checkpoint_path + ".control"``) rather than the
+    with-actions path -- it must never see the with-actions run's weights or
+    actions, but it does need the *same accumulated training budget* across
+    repeated calls (PR #155 review): warm-starting only the with-actions run
+    would let it accumulate strictly more total training than a
+    freshly-initialized control every attempt, so ``action_ablation_margin``
+    could turn positive from more training alone rather than from access to
+    actions -- exactly the confound this ablation exists to rule out.
+    """
+    cfg = config or NurseryConfig()
+    log.info("=== action ablation eval  train=%s  eval=%s ===", list(train_scenarios), eval_scenario)
+    if eval_scenario not in train_scenarios:
+        raise ValueError(
+            f"eval_scenario {eval_scenario!r} must be one of the trained scenarios "
+            f"{list(train_scenarios)!r}: the ablation proves training-time action-"
+            "conditioning matters for a scenario the model trained on, not zero-shot "
+            "generality to one it never saw"
+        )
+    if set(cfg.train_seeds) & set(cfg.holdout_seeds):
+        raise ValueError("train_seeds and holdout_seeds must not overlap")
+
+    scenarios = _scenarios_for_world(cfg.world)
+    for name in train_scenarios:
+        if name not in scenarios:
+            raise ValueError(
+                f"unknown nursery scenario {name!r} for --world {cfg.world!r}; "
+                f"choices: {sorted(scenarios)}"
+            )
+
+    base_model_cfg = model_config or ActionWorldModelConfig(
+        latent_width=cfg.latent_width,
+        hidden_dim=cfg.hidden_dim,
+        reconstruction_size=cfg.reconstruction_size,
+        epochs=cfg.epochs,
+        lr=cfg.lr,
+        batch_size=cfg.batch_size,
+        seed=cfg.seed,
+        horizons_ticks=tuple(cfg.horizons),
+    )
+    base_model_cfg = replace(
+        base_model_cfg,
+        horizons_ticks=tuple(cfg.horizons),
+        semantic_classes=(base_model_cfg.semantic_classes or _semantic_classes_for_world(cfg.world)),
+    )
+
+    train_sessions: Dict[str, List[str]] = {}
+    eval_sessions: Dict[str, List[str]] = {}
+    for name in train_scenarios:
+        scenario = scenarios[name]
+        train_sessions[name] = [
+            _record_scenario_episode(record_dir, f"ablation-{name}-train-{seed}", seed, scenario, cfg)
+            for seed in cfg.train_seeds
+        ]
+        eval_sessions[name] = [
+            _record_scenario_episode(record_dir, f"ablation-{name}-holdout-{seed}", seed, scenario, cfg)
+            for seed in cfg.holdout_seeds
+        ]
+
+    if cfg.data_quality_gate:
+        issues: List[str] = []
+        for name in train_scenarios:
+            issues += validate_nursery_recordings(
+                train_sessions[name] + eval_sessions[name], scenarios[name],
+                expected_pixel_source=cfg.expected_pixel_source,
+            )
+        if issues:
+            raise ValueError(
+                "action-ablation eval: recorded data fails the quality gate:\n  - "
+                + "\n  - ".join(issues)
+            )
+
+    # Pin the vocabulary to the full action space (issue #91's joint-training
+    # convention) so both runs' models share one embedding table even though
+    # only one is trained to actually read it.
+    vocabulary = _action_keys_for_world(cfg.world)
+
+    all_train_dirs = [d for name in train_scenarios for d in train_sessions[name]]
+    dataset = build_action_sequence_dataset(all_train_dirs, action_keys=vocabulary)
+    if len(dataset) == 0:
+        raise ValueError("action-ablation eval: no frame transitions in the training sessions")
+    horizon_frames = horizons_ticks_to_frames(cfg.horizons, dataset.ticks_per_frame)
+
+    with_actions_cfg = replace(base_model_cfg, withhold_actions=False)
+    # The intentionally-deprived control must remain measurable even if its
+    # representation collapses; promotion gates the real with-actions model.
+    without_actions_cfg = replace(
+        base_model_cfg, withhold_actions=True, collapse_gate_enabled=False
+    )
+
+    without_actions_checkpoint_path = (
+        cortex_checkpoint_path + ".control" if cortex_checkpoint_path is not None else None
+    )
+
+    with_initial = None
+    if cortex_checkpoint_path is not None and os.path.exists(cortex_checkpoint_path):
+        with_initial, _ = load_action_world_model(cortex_checkpoint_path)
+    with span("ablation.train", arm="with_actions", epochs=with_actions_cfg.epochs):
+        model_with, stats_with = train_action_world_model(
+            dataset, with_actions_cfg, initial_model=with_initial,
+        )
+    if cortex_checkpoint_path is not None:
+        save_action_world_model(cortex_checkpoint_path, model_with, stats_with)
+
+    # The control warm-starts from its own sibling checkpoint (never the
+    # with-actions one) so it accumulates the *same* total training budget
+    # across repeated calls while still never seeing actions (see docstring).
+    without_initial = None
+    if without_actions_checkpoint_path is not None and os.path.exists(without_actions_checkpoint_path):
+        without_initial, _ = load_action_world_model(without_actions_checkpoint_path)
+    with span("ablation.train", arm="without_actions", epochs=without_actions_cfg.epochs):
+        model_without, stats_without = train_action_world_model(
+            dataset, without_actions_cfg, initial_model=without_initial,
+        )
+    if without_actions_checkpoint_path is not None:
+        save_action_world_model(without_actions_checkpoint_path, model_without, stats_without)
+
+    holdout_dataset = build_action_sequence_dataset(
+        eval_sessions[eval_scenario], action_keys=model_with.action_keys
+    )
+    with span("ablation.evaluate", scenario=eval_scenario):
+        with_actions_metrics = evaluate_action_world_model_milestone(
+            model_with, holdout_dataset, model_with.horizons_ticks,
+            warmup_frames=base_model_cfg.warmup_frames,
+        )
+        without_actions_metrics = evaluate_action_world_model_milestone(
+            model_without, holdout_dataset, model_without.horizons_ticks,
+            warmup_frames=base_model_cfg.warmup_frames,
+        )
+        _trace_horizon_metrics("ablation_with_actions", eval_scenario, with_actions_metrics)
+        _trace_horizon_metrics("ablation_without_actions", eval_scenario, without_actions_metrics)
+
+    with_actions_stats = cortex_horizon_statistics(with_actions_metrics["per_episode_model_mse"])
+    without_actions_stats = cortex_horizon_statistics(without_actions_metrics["per_episode_model_mse"])
+    comparisons = compare_cortex_horizon_statistics(with_actions_stats, without_actions_stats)
+
+    # Metrics are keyed by the holdout recording's frame offsets (or direct
+    # tick horizons), not the training dataset's sampling rate.  Derive the
+    # comparison domain from the returned reports so remote train/holdout
+    # recordings with different tick rates cannot mis-index this verdict.
+    evaluated_horizons = sorted(
+        set(with_actions_metrics["horizons"]) & set(without_actions_metrics["horizons"])
+    )
+    degrades = bool(evaluated_horizons) and all(
+        without_actions_metrics["horizons"][h]["model_mse"]
+        > with_actions_metrics["horizons"][h]["model_mse"]
+        for h in evaluated_horizons
+    )
+    representation_diagnostics = representation_collapse_diagnostics(
+        model_with, holdout_dataset, config=with_actions_cfg
+    )
+
+    log.info("ablation result  degrades_without_actions=%s", degrades)
+    trace_event("ablation.result", degrades_without_actions=degrades,
+                eval_scenario=eval_scenario, comparisons=comparisons)
+    return ActionAblationReport(
+        train_scenarios=list(train_scenarios),
+        eval_scenario=eval_scenario,
+        with_actions_metrics=with_actions_metrics,
+        without_actions_metrics=without_actions_metrics,
+        with_actions_stats=with_actions_stats,
+        without_actions_stats=without_actions_stats,
+        comparisons=comparisons,
+        action_withholding_degrades=degrades,
+        representation_diagnostics=representation_diagnostics,
+    )
+
+
+# --------------------------------------------------------------------------- backbone benchmark (issue #93)
+
+
+@dataclass
+class BackboneBenchmarkReport:
+    """A/B benchmark of the cortex's temporal backbones
+    (docs/v2/phases/phase-2-predictive-cortex.md task 5): the same
+    recordings, the same architecture and training budget otherwise, only
+    ``ActionWorldModelConfig.backbone`` differs -- so a difference in the
+    Phase 2 scoring gates (``model/copy-last``, ``model/oracle``,
+    frozen-rollout) is attributable to the backbone choice, not noise."""
+
+    train_scenarios: List[str]
+    eval_scenario: str
+    baseline_backbone: str
+    #: backbone name -> full ``evaluate_action_world_model`` report (the
+    #: Phase 2 scoring gates per horizon, plus rollout health).
+    metrics: Dict[str, Dict[str, Any]]
+    #: backbone name -> per-horizon mean +/- CI over held-out seeds.
+    stats: Dict[str, Dict[int, MetricStats]]
+    #: backbone name (excluding ``baseline_backbone``) -> per-horizon
+    #: regression comparison against the baseline backbone.
+    comparisons: Dict[str, Dict[int, MetricComparison]]
+    #: backbone name -> {horizon: beats_copy_last} (the Milestone 2 gate
+    #: each backbone must clear on its own to be a credible alternative).
+    beats_copy_last: Dict[str, Dict[int, bool]]
+
+
+def run_backbone_benchmark(
+    record_dir: str,
+    train_scenarios: Sequence[str] = ("walk_forward", "turn_in_place"),
+    eval_scenario: str = "turn_in_place",
+    backbones: Sequence[str] = ("gru", "dilated_conv", "transformer"),
+    baseline_backbone: str = "gru",
+    config: Optional[NurseryConfig] = None,
+    model_config: Optional[ActionWorldModelConfig] = None,
+) -> BackboneBenchmarkReport:
+    """Train the cortex once per backbone on identical recorded data and
+    compare held-out ``eval_scenario`` performance -- the "benchmark harness
+    reports GRU vs temporal-conv/transformer on the Phase 2 scoring gates"
+    exit criterion (issue #93).
+
+    Mirrors :func:`run_action_ablation_eval`'s shape (same recordings, same
+    dataset, only the varied field of ``ActionWorldModelConfig`` differs
+    across runs) so the two harnesses read the same way.
+    """
+    cfg = config or NurseryConfig()
+    log.info("=== backbone benchmark  backbones=%s  baseline=%s  eval=%s ===",
+             list(backbones), baseline_backbone, eval_scenario)
+    if eval_scenario not in train_scenarios:
+        raise ValueError(
+            f"eval_scenario {eval_scenario!r} must be one of the trained scenarios "
+            f"{list(train_scenarios)!r}"
+        )
+    if baseline_backbone not in backbones:
+        raise ValueError(
+            f"baseline_backbone {baseline_backbone!r} must be one of backbones {list(backbones)!r}"
+        )
+    if set(cfg.train_seeds) & set(cfg.holdout_seeds):
+        raise ValueError("train_seeds and holdout_seeds must not overlap")
+
+    scenarios = _scenarios_for_world(cfg.world)
+    for name in train_scenarios:
+        if name not in scenarios:
+            raise ValueError(
+                f"unknown nursery scenario {name!r} for --world {cfg.world!r}; "
+                f"choices: {sorted(scenarios)}"
+            )
+
+    base_model_cfg = model_config or ActionWorldModelConfig(
+        latent_width=cfg.latent_width,
+        hidden_dim=cfg.hidden_dim,
+        reconstruction_size=cfg.reconstruction_size,
+        epochs=cfg.epochs,
+        lr=cfg.lr,
+        batch_size=cfg.batch_size,
+        seed=cfg.seed,
+        horizons_ticks=tuple(cfg.horizons),
+    )
+    base_model_cfg = replace(
+        base_model_cfg,
+        horizons_ticks=tuple(cfg.horizons),
+        semantic_classes=(base_model_cfg.semantic_classes or _semantic_classes_for_world(cfg.world)),
+    )
+
+    train_sessions: Dict[str, List[str]] = {}
+    eval_sessions: Dict[str, List[str]] = {}
+    for name in train_scenarios:
+        scenario = scenarios[name]
+        train_sessions[name] = [
+            _record_scenario_episode(record_dir, f"backbone-bench-{name}-train-{seed}", seed, scenario, cfg)
+            for seed in cfg.train_seeds
+        ]
+        eval_sessions[name] = [
+            _record_scenario_episode(record_dir, f"backbone-bench-{name}-holdout-{seed}", seed, scenario, cfg)
+            for seed in cfg.holdout_seeds
+        ]
+
+    if cfg.data_quality_gate:
+        issues: List[str] = []
+        for name in train_scenarios:
+            issues += validate_nursery_recordings(
+                train_sessions[name] + eval_sessions[name], scenarios[name],
+                expected_pixel_source=cfg.expected_pixel_source,
+            )
+        if issues:
+            raise ValueError(
+                "backbone benchmark: recorded data fails the quality gate:\n  - "
+                + "\n  - ".join(issues)
+            )
+
+    vocabulary = _action_keys_for_world(cfg.world)
+
+    all_train_dirs = [d for name in train_scenarios for d in train_sessions[name]]
+    dataset = build_action_sequence_dataset(all_train_dirs, action_keys=vocabulary)
+    if len(dataset) == 0:
+        raise ValueError("backbone benchmark: no frame transitions in the training sessions")
+    horizon_frames = horizons_ticks_to_frames(cfg.horizons, dataset.ticks_per_frame)
+    holdout_dataset = build_action_sequence_dataset(
+        eval_sessions[eval_scenario], action_keys=vocabulary
+    )
+
+    metrics: Dict[str, Dict[str, Any]] = {}
+    stats: Dict[str, Dict[int, MetricStats]] = {}
+    beats_copy_last: Dict[str, Dict[int, bool]] = {}
+    for name in backbones:
+        with span("benchmark.backbone", backbone=name, epochs=base_model_cfg.epochs):
+            backbone_cfg = replace(base_model_cfg, backbone=name)
+            model, _train_stats = train_action_world_model(dataset, backbone_cfg)
+            report = evaluate_action_world_model(
+                model, holdout_dataset, horizon_frames,
+                warmup_frames=base_model_cfg.warmup_frames,
+            )
+            metrics[name] = report
+            stats[name] = cortex_horizon_statistics(report["per_episode_model_mse"])
+            beats_copy_last[name] = {
+                h: entry["beats_copy_last"] for h, entry in report["horizons"].items()
+            }
+            _trace_horizon_metrics(f"backbone/{name}", eval_scenario, report)
+        log.info("backbone %s  beats_copy_last=%s", name, beats_copy_last[name])
+
+    comparisons: Dict[str, Dict[int, MetricComparison]] = {
+        name: compare_cortex_horizon_statistics(stats[baseline_backbone], stats[name])
+        for name in backbones
+        if name != baseline_backbone
+    }
+
+    return BackboneBenchmarkReport(
+        train_scenarios=list(train_scenarios),
+        eval_scenario=eval_scenario,
+        baseline_backbone=baseline_backbone,
+        metrics=metrics,
+        stats=stats,
+        comparisons=comparisons,
+        beats_copy_last=beats_copy_last,
     )
 
 
@@ -1105,7 +2634,7 @@ def _ascii_thumbnail(frame: torch.Tensor, size: Tuple[int, int]) -> List[str]:
     one row per thumbnail pixel row."""
     th, tw = size
     gray = frame.mean(dim=0, keepdim=True).unsqueeze(0)  # 1, 1, H, W
-    thumb = F.adaptive_avg_pool2d(gray, output_size=(th, tw))[0, 0].clamp(0.0, 1.0)
+    thumb = F.adaptive_avg_pool2d(gray, output_size=(th, tw))[0, 0].nan_to_num(0.0).clamp(0.0, 1.0)
     ramp = _ASCII_RAMP
     last = len(ramp) - 1
     rows = []
@@ -1157,4 +2686,6 @@ def save_nursery_scenario_checkpoint(
         pixel_shape=model.pixel_shape,
         representation=f"nursery-{report.scenario}",
     )
-    return save_pixel_encoder_pretraining_checkpoint(path, model, dataset_stub, stats)
+    return save_pixel_encoder_pretraining_checkpoint(
+        path, model, dataset_stub, stats, name=report.config.name
+    )

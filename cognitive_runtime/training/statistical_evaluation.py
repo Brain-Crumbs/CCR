@@ -24,10 +24,16 @@ The confidence interval uses a normal approximation
 (``statistics.NormalDist``) rather than a t-distribution, to avoid adding a
 scipy dependency; with the episode counts these harnesses actually use
 (tens, not few), the approximation is adequate for regression flagging.
+
+``cortex_horizon_statistics``/``compare_cortex_horizon_statistics`` (issue
+#92) reuse the same ``_mean_ci``/``MetricStats``/``MetricComparison``
+machinery for the predictive cortex's per-horizon held-out MSE, the metric
+family ``action_world_model.evaluate_action_world_model`` reports.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import statistics
 from collections import Counter
@@ -41,6 +47,75 @@ from cognitive_runtime.training.evaluation import run_policy
 from cognitive_runtime.tools.metrics_dashboard import load_summaries
 
 DEFAULT_CONFIDENCE = 0.95
+
+EXPERIMENT_REPORT_FORMAT = "experiment-report-v1"
+
+
+def build_experiment_report(
+    *,
+    experiment: Dict[str, Any],
+    data_quality: Optional[Dict[str, Any]] = None,
+    split_overlap: Optional[Dict[str, Any]] = None,
+    training_stats: Optional[Dict[str, Any]] = None,
+    direct_metrics: Optional[Dict[str, Any]] = None,
+    rollout_metrics: Optional[Dict[str, Any]] = None,
+    checkpoint: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Create a self-contained, JSON-safe promotion artifact.
+
+    Conclusions are derived from the exact persisted metrics, so notebooks and
+    the clinic do not need hidden in-memory state to explain a verdict.
+    """
+    rollout_metrics = rollout_metrics or {}
+    training_stats = training_stats or {}
+    checkpoint = dict(checkpoint or {})
+    horizons = rollout_metrics.get("horizons", {})
+    reasons: list[str] = []
+    if not checkpoint.get("path") or not checkpoint.get("sha256"):
+        reasons.append("checkpoint identity requires path and sha256")
+    if training_stats.get("evaluation_mode") == "training_replay":
+        reasons.append("training-replay evaluation cannot support promotion")
+    for horizon, values in horizons.items():
+        if not values.get("beats_copy_last", False):
+            reasons.append(f"rollout t+{horizon} does not beat copy-last")
+    health = rollout_metrics.get("rollout_health", {})
+    if health.get("state") not in {None, "healthy", "not_evaluable"}:
+        reasons.append(f"rollout health is {health.get('state')}")
+    for horizon, values in (rollout_metrics.get("event_metrics") or {}).items():
+        entity = values.get("entity", {})
+        if entity.get("cow_false_positive_rate") is None:
+            reasons.append(f"t+{horizon} has no evaluable cow-absent samples")
+    return {
+        "format": EXPERIMENT_REPORT_FORMAT,
+        "experiment": dict(experiment),
+        "data_quality_summary": data_quality or {},
+        "split_overlap_summary": split_overlap or {},
+        "training_stats": training_stats,
+        "metrics": {"direct": direct_metrics or {}, "rollout": rollout_metrics},
+        "event_stratified_metrics": rollout_metrics.get("event_metrics", {}),
+        "checkpoint": checkpoint,
+        "promotion_verdict": {"promoted": not reasons, "reasons": reasons or ["all configured gates passed"]},
+    }
+
+
+def write_experiment_report(path: str, report: Dict[str, Any]) -> str:
+    """Persist an experiment report and validate its basic schema first."""
+    if report.get("format") != EXPERIMENT_REPORT_FORMAT:
+        raise ValueError(f"expected {EXPERIMENT_REPORT_FORMAT}, got {report.get('format')!r}")
+    if "checkpoint" not in report or "metrics" not in report:
+        raise ValueError("experiment report requires checkpoint and metrics")
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, sort_keys=True)
+    return path
+
+
+def load_experiment_report(path: str) -> Dict[str, Any]:
+    with open(path, encoding="utf-8") as handle:
+        report = json.load(handle)
+    if report.get("format") != EXPERIMENT_REPORT_FORMAT:
+        raise ValueError(f"not an {EXPERIMENT_REPORT_FORMAT} report")
+    return report
 
 
 # --------------------------------------------------------------- statistics
@@ -262,6 +337,65 @@ def compare_statistics(
 
 def flagged_regressions(comparisons: Sequence[MetricComparison]) -> List[MetricComparison]:
     return [c for c in comparisons if c.regressed]
+
+
+def metric_statistics(values: Sequence[float], confidence: float = DEFAULT_CONFIDENCE) -> MetricStats:
+    """Public entry point for ad-hoc metrics that don't fit
+    :class:`PolicyStatistics`'s fixed schema (e.g. the Phase 5 forgetting
+    metric, ``sleep.forgetting``) -- same mean +/- CI machinery as every
+    other metric family here."""
+    return _mean_ci(values, confidence)
+
+
+def compare_metric(
+    baseline: MetricStats, candidate: MetricStats, *, metric: str, higher_is_better: bool,
+) -> MetricComparison:
+    """Public :class:`MetricComparison` constructor for a metric outside the
+    ``compare_statistics``/``compare_cortex_horizon_statistics`` fixed
+    families -- same CI-overlap regression rule (see
+    :class:`MetricComparison`/:func:`_direction`)."""
+    return MetricComparison(
+        metric=metric, baseline=baseline, candidate=candidate,
+        higher_is_better=higher_is_better,
+        direction=_direction(baseline, candidate, higher_is_better),
+    )
+
+
+# ------------------------------------------------------------- cortex scoring
+
+
+def cortex_horizon_statistics(
+    per_episode_mse: Dict[int, Sequence[float]], confidence: float = DEFAULT_CONFIDENCE,
+) -> Dict[int, MetricStats]:
+    """Mean +/- CI over held-out episodes/seeds for each horizon's cortex
+    model MSE (issue #92) -- the per-horizon counterpart of
+    :func:`compute_statistics`, built on
+    ``action_world_model.evaluate_action_world_model``'s
+    ``per_episode_model_mse`` (one independent sample per held-out
+    episode/seed, not the many overlapping rollout-window samples pooled
+    into its ``horizons[h]["model_mse"]`` point estimate)."""
+    return {h: _mean_ci(values, confidence) for h, values in per_episode_mse.items()}
+
+
+def compare_cortex_horizon_statistics(
+    baseline: Dict[int, MetricStats], candidate: Dict[int, MetricStats],
+) -> Dict[int, MetricComparison]:
+    """Per-horizon regression check for cortex MSE (lower is better): a
+    ``candidate`` (e.g. an action-ablated model) whose CI sits entirely above
+    ``baseline``'s at some horizon is flagged "regressed" there -- the
+    action-ablation harness's "measurably hurts" claim, refereed the same
+    way whole-episode metrics are."""
+    common = sorted(set(baseline) & set(candidate))
+    return {
+        h: MetricComparison(
+            metric=f"horizon_{h}_model_mse",
+            baseline=baseline[h],
+            candidate=candidate[h],
+            higher_is_better=False,
+            direction=_direction(baseline[h], candidate[h], False),
+        )
+        for h in common
+    }
 
 
 # ------------------------------------------------------------------ running

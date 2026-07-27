@@ -6,6 +6,16 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+import namesgenerator
+
+
+def _generate_organism_name() -> str:
+    """A readable default organism name (issue #88) when none is configured
+    -- a run must always record a concrete name, never `None`. Docker-style
+    ``adjective-surname`` (e.g. ``vigorous-shannon``) via ``namesgenerator``;
+    purely cosmetic, never used to seed anything behavioural."""
+    return namesgenerator.get_random_name(sep="-")
+
 
 @dataclass
 class RuntimeConfig:
@@ -18,6 +28,17 @@ class RuntimeConfig:
     record_dir: str = "sessions"
     record_frames: bool = False        # frames are bulky; opt in (elided otherwise)
     session_id: Optional[str] = None
+    #: Organism identity (issue #88): cosmetic provenance only, threaded into
+    #: session ids, recorded metadata, checkpoints and export filenames --
+    #: never learning/recording semantics. `None` resolves once to a
+    #: generated slug (`resolve_name()`) so a run always records a concrete
+    #: name.
+    name: Optional[str] = None
+    #: Cache for the generated name so repeated calls to `resolve_name()`
+    #: within one run return the same value; not part of equality/repr.
+    _resolved_name: Optional[str] = field(
+        default=None, init=False, repr=False, compare=False
+    )
     memory_capacity: int = 512
     # Cognitive ticks can run slower than program ticks: the loop steps the
     # program this many times per cognitive tick (Phase 2, default 1).
@@ -59,6 +80,26 @@ class RuntimeConfig:
 
     #: Bulky frame streams elided from the log unless ``record_frames`` is set.
     FRAME_STREAMS = ("vision.frame.grid", "vision.frame.pixels")
+
+    #: Static per-stream weight overrides (issue #135), independent of the
+    #: dynamic ``AttentionController`` below: composed into (multiplied with)
+    #: whatever weights the controller produces this tick before either
+    #: reaches ``TemporalFusion.fuse``'s ``attention_weights`` -- a weight of
+    #: ``0.0`` silences a stream's contribution to the fused vector without
+    #: touching the fusion layout/width. ``None`` (default) leaves the
+    #: controller's own weights untouched. e.g. ``development/runner.py``
+    #: zeroes the streams outside a curriculum stage's declared ``senses``.
+    #: Only a genuine mask under the default fixed-fusion path
+    #: (``CognitiveRuntime.fusion``): ``--fusion learned``
+    #: (``cognitive_runtime.neural.live_fusion.LiveLearnedFusion``, issue
+    #: #57) never forwards ``attention_weights`` into the latents it builds
+    #: either -- pre-existing to this field, it only appends them as an
+    #: extra input feature the model may learn to use, so a silenced stream
+    #: still reaches (and still trains) the fusion MLP under that mode. No
+    #: caller combines the two today (``development/runner.py`` never
+    #: requests ``--fusion learned``); genuinely masking learned fusion too
+    #: is issue #59's gap to close, not this field's.
+    sense_stream_weights: Optional[Dict[str, float]] = None
 
     #: Attention ablation (issue #59): ``"off"`` gives every agent-input
     #: stream uniform weight ``1.0`` (the pre-#59 behavior, byte-identical
@@ -107,8 +148,17 @@ class RuntimeConfig:
                     excluded.append(stream_id)
         return excluded
 
+    def resolve_name(self) -> str:
+        """The organism's name, generating (and caching) one if unset -- a
+        run always records a concrete name, never `None`."""
+        if self.name:
+            return self.name
+        if self._resolved_name is None:
+            self._resolved_name = _generate_organism_name()
+        return self._resolved_name
+
     def resolved_session_id(self, policy_name: str) -> str:
         if self.session_id:
             return self.session_id
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        return f"{stamp}-{policy_name}"
+        return f"{self.resolve_name()}-{stamp}-{policy_name}"
