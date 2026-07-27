@@ -21,9 +21,13 @@ function qualityNode(quality) {
   return wrap;
 }
 
-export function episodeUrls(sessionId, episodeId) {
+export function episodeUrls(sessionId, episodeId, experimentId = null) {
   const base = `/api/sessions/${encodeURIComponent(sessionId)}/episodes/${encodeURIComponent(episodeId)}`;
-  return { frames: `${base}/frames`, predictions: `${base}/predictions` };
+  const predictions = `${base}/predictions`;
+  return {
+    frames: `${base}/frames`,
+    predictions: experimentId ? `${predictions}?experiment=${encodeURIComponent(experimentId)}` : predictions,
+  };
 }
 
 export function mountSessionBrowser(root, { loadSessions = () => fetch("/api/sessions").then((r) => {
@@ -37,11 +41,16 @@ export function mountSessionBrowser(root, { loadSessions = () => fetch("/api/ses
     const title = document.createElement("h2"); title.textContent = `${session.id} / ${episode}`;
     const stripTitle = document.createElement("h3"); stripTitle.textContent = "Predicted vs actual";
     const viewer = document.createElement("pixel-horizon-viewer");
-    const urls = episodeUrls(session.id, episode);
+    const selectedExperiment = filtersState.experiment === "__current__"
+      ? currentExperiment : filtersState.experiment;
+    const experimentId = session.experiments?.some((entry) => entry.id === selectedExperiment)
+      ? selectedExperiment : null;
+    const urls = episodeUrls(session.id, episode, experimentId);
     viewer.setAttribute("frames-src", urls.frames); viewer.setAttribute("predictions-src", urls.predictions);
     const dreamTitle = document.createElement("h3"); dreamTitle.textContent = "Dreamed vs actual";
     const dream = document.createElement("pixel-horizon-viewer");
-    dream.setAttribute("frames-src", urls.frames); dream.setAttribute("predictions-src", `${urls.predictions}?kind=dream`);
+    dream.setAttribute("frames-src", urls.frames);
+    dream.setAttribute("predictions-src", `${urls.predictions}${experimentId ? "&" : "?"}kind=dream`);
     const diagnostics = document.createElement("div"); diagnostics.className = "diagnostics"; diagnostics.textContent = "Loading diagnostic streams…";
     let diagnosticCursor = null;
     const syncTime = (source, t, tick) => {
@@ -70,6 +79,32 @@ export function mountSessionBrowser(root, { loadSessions = () => fetch("/api/ses
 
   function renderSessions(items) {
     root.replaceChildren();
+    const filters = document.createElement("div"); filters.className = "clinic-filters";
+    const allExperiments = [...new Set(items.flatMap((s) => s.experiments || []).map((e) => e.id))];
+    const addFilter = (label, key, values) => {
+      const wrap = document.createElement("label"); wrap.textContent = `${label} `;
+      const select = document.createElement("select"); select.dataset.filter = key;
+      for (const value of ["", ...values.filter(Boolean)]) { const opt = document.createElement("option"); opt.value = value; opt.textContent = value === "__current__" ? "current experiment only" : value || `all ${label.toLowerCase()}`; select.append(opt); }
+      select.addEventListener("change", () => { filtersState[key] = select.value; renderSessions(sessions); }); wrap.append(select); filters.append(wrap);
+    };
+    addFilter("Experiment", "experiment", ["__current__", ...allExperiments]);
+    addFilter("Scenario", "scenario", [...new Set(items.map((s) => s.scenario))]);
+    addFilter("Seed", "seed", [...new Set(items.map((s) => s.seed))]);
+    addFilter("Split", "split", ["train", "holdout"]);
+    addFilter("Entity event", "entity", ["yes"]);
+    addFilter("Motion", "motion", ["moving", "static", "blocked"]);
+    addFilter("Prediction", "mode", ["direct", "rollout"]);
+    for (const select of filters.querySelectorAll("select")) select.value = filtersState[select.dataset.filter] || "";
+    root.append(filters);
+    items = items.filter((s) =>
+      (!filtersState.experiment || (s.experiments || []).some((e) => e.id === filtersState.experiment || (filtersState.experiment === "__current__" && e.id === currentExperiment))) &&
+      (!filtersState.scenario || s.scenario === filtersState.scenario) &&
+      (!filtersState.seed || String(s.seed) === filtersState.seed) &&
+      (!filtersState.split || s.split === filtersState.split) &&
+      (!filtersState.entity || (s.experiments || []).some((e) => e.has_entity_event)) &&
+      (!filtersState.motion || (s.experiments || []).some((e) => filtersState.motion === "moving" ? e.has_moving : filtersState.motion === "static" ? e.has_static : e.has_blocked)) &&
+      (!filtersState.mode || (s.experiments || []).some((e) => e.prediction_mode === filtersState.mode))
+    );
     if (!items.length) { const empty = document.createElement("p"); empty.className = "empty"; empty.textContent = "No recorded sessions found."; root.append(empty); return; }
     const groups = Object.groupBy ? Object.groupBy(items, (s) => s.name || "legacy") : items.reduce((all, s) => { (all[s.name || "legacy"] ||= []).push(s); return all; }, {});
     const organisms = document.createElement("div"); organisms.className = "organisms";
@@ -92,9 +127,11 @@ export function mountSessionBrowser(root, { loadSessions = () => fetch("/api/ses
     root.append(organisms);
   }
 
-  let sessions = [];
+  let sessions = [], filtersState = {}, currentExperiment = null;
   loadSessions().then((loaded) => {
-    sessions = loaded; const match = location.hash.slice(1).split("/").map(decodeURIComponent);
+    sessions = loaded;
+    currentExperiment = sessions.flatMap((s) => s.experiments || []).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0]?.id || null;
+    const match = location.hash.slice(1).split("/").map(decodeURIComponent);
     const selected = sessions.find((s) => s.id === match[0] && s.episodes.includes(match[1]));
     if (selected) showEpisode(selected, match[1]); else renderSessions(sessions);
   }, (error) => { const alert = document.createElement("p"); alert.setAttribute("role", "alert"); alert.textContent = String(error); root.replaceChildren(alert); });

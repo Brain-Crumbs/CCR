@@ -72,8 +72,19 @@ test("browser links an episode to the locally served frame and prediction APIs",
     frames: "/api/sessions/pixel%20session/episodes/episode_00000/frames",
     predictions: "/api/sessions/pixel%20session/episodes/episode_00000/predictions",
   });
+  assert.equal(
+    episodeUrls("pixel session", "episode_00000", "joint cortex/42").predictions,
+    "/api/sessions/pixel%20session/episodes/episode_00000/predictions?experiment=joint%20cortex%2F42",
+  );
   assert.match(source, /createElement\("pixel-horizon-viewer"\)/);
   assert.match(source, /timechange/);
+  assert.match(source, /selectedExperiment/);
+});
+
+test("frame panels honor the source selected in the prediction control", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../public/pixel-horizon-viewer.js"), "utf8");
+  assert.match(source, /const comparisonSource = source;/);
+  assert.doesNotMatch(source, /const comparisonSource = this\._pred \? "model" : source;/);
 });
 
 test("prediction endpoint assembles forecasts recorded by a live cortex", async (t) => {
@@ -89,6 +100,23 @@ test("prediction endpoint assembles forecasts recorded by a live cortex", async 
   assert.equal(result.status, 200); assert.equal(result.body.source, "live-record");
   assert.deepEqual(result.body.predictions["1"].frames, ["prediction-0", "prediction-1"]);
   assert.deepEqual(result.body.targets, ["target-0", "target-1", "target-2"]);
+});
+
+test("prediction endpoint selects the requested experiment when exports coexist", async (t) => {
+  const root = fixture(), dir = path.join(root, "pixel-session");
+  fs.unlinkSync(path.join(dir, "Pixel-predictions_episode_00000.json"));
+  fs.writeFileSync(path.join(dir, "experiment-a-predictions_episode_00000.json"), JSON.stringify({
+    format: "pixel-predictions-v2", experiment: { experiment_id: "experiment-a" }, marker: "a",
+  }));
+  fs.writeFileSync(path.join(dir, "experiment-b-predictions_episode_00000.json"), JSON.stringify({
+    format: "pixel-predictions-v2", experiment: { experiment_id: "experiment-b" }, marker: "b",
+  }));
+  const server = createServer({ dataDir: root }); await new Promise((resolve) => server.listen(0, resolve)); t.after(() => server.close());
+  const base = "/api/sessions/pixel-session/episodes/episode_00000/predictions";
+  assert.equal((await get(server.address().port, base)).status, 409);
+  const selected = await get(server.address().port, `${base}?experiment=experiment-b`);
+  assert.equal(selected.status, 200);
+  assert.equal(selected.body.marker, "b");
 });
 
 test("frame endpoint maps ordered decision windows in one forward pass", async (t) => {

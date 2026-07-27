@@ -767,17 +767,12 @@ def audit_split_overlap(
       ``max_corresponding_frame_fraction``.
 
     The default threshold is looser than the acceptance target (<1% exact
-    corresponding-frame overlap) some scenarios should ultimately hit,
-    because a handful of scripted micro-scenarios (``approach_entity``,
-    ``object_permanence``) deliberately clear terrain to a flat, featureless
-    background before the scripted entity/wall ever enters view -- their
-    early frames are near-identical across every episode almost regardless
-    of seed, independent of world size, which is expected given the design
-    and not itself evidence of a leaked recording. The hard, unconditional
-    check -- an exact whole-episode duplicate -- is what actually catches a
+    corresponding-frame overlap) because two independently generated scenes
+    can still share a few static index-aligned frames.  The hard,
+    unconditional check -- an exact whole-episode duplicate -- catches a
     repeated seed or an accidentally un-varied scenario parameter; tighten
-    ``max_corresponding_frame_fraction`` per call for scenarios whose design
-    doesn't share a background this way.
+    ``max_corresponding_frame_fraction`` per call when an experiment needs a
+    stronger independence guarantee.
 
     A caller that wants to explicitly opt into an in-distribution duplicate
     (e.g. a deliberately repeated smoke-test episode) should filter

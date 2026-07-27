@@ -55,11 +55,16 @@ from cognitive_runtime.runtime.recorder import stream_event_from_log
 from cognitive_runtime.core.streams import TemporalBuffer, TemporalFusion
 from cognitive_runtime.core.streams.events import StreamSpec
 from cognitive_runtime.runtime.replay import load_session_metadata, require_streams_v2
+from cognitive_runtime.training.event_evaluation import (
+    COW_ID, evaluate_entity_predictions, extract_frame_event_labels, flattened_motion_metrics,
+    motion_stratified_metrics, rollout_health as classify_rollout_health,
+)
 
 PIXEL_STREAM = "vision.frame.pixels"
 MOTOR_STREAM = "motor.command"
 ROTATION_STREAM = "spatial.rotation"
 FACING_STREAM = "spatial.facing"
+POSITION_STREAM = "spatial.position"
 #: Recorded ground-truth stream for the cortex's terminal head (issue #169).
 #: Reward and risk targets instead come straight off the decision record
 #: (``reward_window_total``/``risk``) -- not the ``internal.*`` streams
@@ -103,6 +108,10 @@ class EpisodeActionFrames:
     #: Discrete grid facing ``(x, y)`` labels (Crafter).  The current value is
     #: forward-filled between delta-published facing events.
     facing: List[Optional[Tuple[float, float]]] = field(default_factory=list)
+    #: Agent grid position aligned to each frame when the spatial stream is
+    #: available.  Unlike semantic-grid equality this distinguishes a true
+    #: blocked movement attempt from an ordinary idle frame.
+    positions: List[Optional[Tuple[float, float]]] = field(default_factory=list)
     ticks: List[int] = field(default_factory=list)
     #: Per-frame supervision for the cortex's reward/terminal/risk heads
     #: (issue #169) -- ``reward_window_total`` off the decision record,
@@ -214,6 +223,19 @@ def _tick_facing(
     return None
 
 
+def _tick_position(
+    sensory_records: List[Dict[str, Any]],
+) -> Optional[Tuple[float, float]]:
+    for record in reversed(sensory_records):
+        if record.get("stream_id") != POSITION_STREAM:
+            continue
+        payload = record.get("payload") or {}
+        x, y = payload.get("x"), payload.get("y")
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            return float(x), float(y)
+    return None
+
+
 def _tick_terminal(sensory_records: List[Dict[str, Any]]) -> bool:
     return any(record.get("stream_id") == DEATH_STREAM for record in sensory_records)
 
@@ -268,6 +290,7 @@ def build_action_sequence_dataset(
                 #: below).
                 last_committed_action: Optional[str] = None
                 last_facing: Optional[Tuple[float, float]] = None
+                last_position: Optional[Tuple[float, float]] = None
                 last_semantic_grid: Optional[List[List[int]]] = None
                 for decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
                     workspace_buffer.extend([
@@ -291,6 +314,9 @@ def build_action_sequence_dataset(
                     facing = _tick_facing(sensory) or last_facing
                     if facing is not None:
                         last_facing = facing
+                    position = _tick_position(sensory) or last_position
+                    if position is not None:
+                        last_position = position
                     reward = float(decision.get("reward_window_total", 0.0))
                     terminal = _tick_terminal(sensory)
                     # Straight off the decision record (this tick's own
@@ -318,6 +344,7 @@ def build_action_sequence_dataset(
                         episode.frames.append(frame)
                         episode.yaw.append(yaw)
                         episode.facing.append(facing)
+                        episode.positions.append(position)
                         episode.ticks.append(tick)
                         episode.reward.append(reward)
                         episode.terminal.append(terminal)
@@ -362,6 +389,26 @@ def _torch():
     return torch, F
 
 
+def _model_device(model: Any):
+    """Return the device that owns a cortex's parameters."""
+    return next(model.parameters()).device
+
+
+def _resolve_training_device(requested: str):
+    """Choose the requested accelerator with a clear CPU-only fallback."""
+    torch, _F = _torch()
+    choice = requested.lower()
+    if choice == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(choice)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA was requested but is unavailable to this PyTorch interpreter; "
+            "install a CUDA-enabled torch wheel or use device='cpu'"
+        )
+    return device
+
+
 @dataclass
 class ActionWorldModelConfig:
     latent_width: int = 32
@@ -370,6 +417,21 @@ class ActionWorldModelConfig:
     reconstruction_size: int = 16
     visual_architecture: str = "spatial_residual_v1"
     change_mask_sparsity_weight: float = 0.01
+    #: Supervise the residual gate from the RGB difference between its
+    #: reference and target.  This is a training-only label -- it is never
+    #: supplied when decoding/evaluating a future frame.
+    change_mask_supervision_weight: float = 0.25
+    #: Pixels that changed from the residual reference receive this many
+    #: extra units of weight before the pixel loss is normalized.  Without
+    #: this, sparse Crafter motion makes copying the reference the MSE-optimal
+    #: local solution even on an overfit run.
+    motion_pixel_loss_weight: float = 4.0
+    #: Mean absolute RGB difference used to derive the binary change target.
+    change_mask_threshold: float = 0.02
+    #: Windowed rollouts train the recurrent transition.  This additional
+    #: term trains the configured direct horizon heads used by the direct
+    #: evaluator (notably T+4, whose separate head otherwise has no loss).
+    direct_horizon_loss_weight: float = 1.0
     scene_height: Optional[int] = None
     hud_loss_weight: float = 0.25
     semantic_loss_weight: float = 1.0
@@ -377,6 +439,10 @@ class ActionWorldModelConfig:
     epochs: int = 30
     lr: float = 1e-3
     batch_size: int = 32
+    #: ``"auto"`` selects CUDA when the active PyTorch build can see it,
+    #: otherwise CPU.  Explicit ``"cuda"`` turns a misconfigured CUDA
+    #: environment into an actionable error instead of a silent CPU run.
+    device: str = "auto"
     #: Teacher-forced frames before the training rollout starts -- enough
     #: history for the GRU to estimate motion (>= 2 to observe one delta).
     warmup_frames: int = 3
@@ -386,6 +452,15 @@ class ActionWorldModelConfig:
     #: Probability a rollout step feeds its own prediction instead of the
     #: observed latent (scheduled sampling).
     scheduled_sampling_p: float = 0.25
+    #: Low-weight RGB-only auxiliary that composes residuals on the model's
+    #: own previous frame.  The primary pixel objective remains teacher
+    #: forced so decoder error is never mislabeled as real scene motion.
+    closed_loop_pixel_loss_weight: float = 0.25
+    #: Directly anchor the recursively predicted latent trajectory to the
+    #: recorded future latents.  Unlike scheduled sampling at p=1, this is a
+    #: separate auxiliary and therefore does not replace the stable
+    #: teacher-forced one-step objective.
+    closed_loop_latent_loss_weight: float = 0.25
     #: ``"windowed_rollout"`` preserves the original short scheduled-
     #: sampling trainer; ``"autoregressive"`` trains every causal prefix
     #: and every configured direct horizon in one sequence pass (C1).
@@ -501,7 +576,7 @@ def build_action_world_model(
 # --------------------------------------------------------------------------- training
 
 
-def _episode_tensors(dataset: ActionSequenceDataset, reconstruction_shape):
+def _episode_tensors(dataset: ActionSequenceDataset, reconstruction_shape, *, device: Optional[Any] = None):
     torch, _F = _torch()
     from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
     from cognitive_runtime.training.visual_representation import reconstruction_target
@@ -509,8 +584,10 @@ def _episode_tensors(dataset: ActionSequenceDataset, reconstruction_shape):
     tensors = []
     for episode in dataset.episodes:
         pixels = torch.stack([pixels_to_chw(f) for f in episode.frames])
+        if device is not None:
+            pixels = pixels.to(device)
         targets = reconstruction_target(pixels, reconstruction_shape)
-        actions = torch.tensor(episode.actions, dtype=torch.long)
+        actions = torch.tensor(episode.actions, dtype=torch.long, device=device)
         tensors.append((episode, pixels, targets, actions))
     return tensors
 
@@ -536,6 +613,7 @@ def _episode_workspace_tensors(
 ) -> Dict[str, Any]:
     """Tensorize the bound workspace at every recorded visual frame."""
     torch, _F = _torch()
+    device = _model_device(model)
     if not getattr(model, "workspace_modalities", {}):
         return {}
     if model.workspace_layout_hash != dataset.workspace_layout_hash:
@@ -550,11 +628,14 @@ def _episode_workspace_tensors(
             f"{len(episode.workspace)}/{n_frames}"
         )
     result: Dict[str, Any] = {
-        "workspace": torch.tensor(episode.workspace, dtype=torch.float32),
+        "workspace": torch.tensor(episode.workspace, dtype=torch.float32, device=device),
     }
     if "efference" in model.workspace_modalities:
-        action_values = actions if actions is not None else torch.tensor(episode.actions, dtype=torch.long)
-        efference = torch.zeros(n_frames, len(model.action_keys), dtype=torch.float32)
+        action_values = actions if actions is not None else torch.tensor(
+            episode.actions, dtype=torch.long, device=device
+        )
+        action_values = action_values.to(device)
+        efference = torch.zeros(n_frames, len(model.action_keys), dtype=torch.float32, device=device)
         if action_values.numel():
             efference[:-1].scatter_(1, action_values.reshape(-1, 1), 1.0)
         result["efference"] = efference
@@ -572,25 +653,87 @@ def _workspace_loss(model: Any, predicted: Any, targets: Dict[str, Any]) -> Any:
 
 
 def _spatial_pixel_loss(model: Any, predicted: Any, reference: Any, target: Any, cfg: ActionWorldModelConfig,
-                        reference_spatial: Optional[Any] = None) -> Tuple[Any, Any, Dict[str, Any]]:
-    """Scene/HUD weighted residual loss and its mask regularizer."""
+                        reference_spatial: Optional[Any] = None,
+                        decoded: Optional[Dict[str, Any]] = None) -> Tuple[Any, Any, Dict[str, Any]]:
+    """Scene/HUD weighted residual loss, gate regularizer, and diagnostics.
+
+    The change target is derived solely from ``reference`` and ``target``
+    inside the training loss.  It tells the gate *where* RGB must depart from
+    the reference, while balanced BCE prevents sparse moving pixels from
+    being outvoted by the static background.  It is intentionally not an
+    input to the decoder, so evaluation still has no future-frame leak.
+    """
     torch, F = _torch()
     flat_reference = reference.reshape(-1, *reference.shape[-3:])
-    encoding = model.encode_visual(flat_reference) if reference_spatial is None else None
-    decoded = model.decode_prediction(
-        predicted.reshape(-1, predicted.shape[-1]),
-        reference_frame=flat_reference,
-        reference_spatial=(encoding.spatial if encoding is not None else reference_spatial.reshape(-1, *reference_spatial.shape[-3:])),
-    )
+    if decoded is None:
+        encoding = model.encode_visual(flat_reference) if reference_spatial is None else None
+        decoded = model.decode_prediction(
+            predicted.reshape(-1, predicted.shape[-1]),
+            reference_frame=flat_reference,
+            reference_spatial=(
+                encoding.spatial if encoding is not None
+                else reference_spatial.reshape(-1, *reference_spatial.shape[-3:])
+            ),
+        )
+    elif not {"vision", "change_mask", "residual_delta"}.issubset(decoded):
+        raise ValueError("decoded prediction must include vision, change_mask, and residual_delta")
     vision = decoded["vision"].reshape_as(target)
+    mask_shape = (*target.shape[:-3], 1, *target.shape[-2:])
+    predicted_mask = decoded["change_mask"].reshape(mask_shape)
+    residual_delta = decoded["residual_delta"].reshape_as(target)
+    # The encoder input can retain native recording resolution while the
+    # residual decoder supervises a smaller reconstruction target.  Compare
+    # against the same area-resized reference the decoder uses, not against
+    # the differently-sized encoder frame.
+    reference_for_target = reference
+    if tuple(reference.shape[-2:]) != tuple(target.shape[-2:]):
+        reference_for_target = F.interpolate(
+            flat_reference, size=target.shape[-2:], mode="area"
+        ).reshape(*reference.shape[:-3], reference.shape[-3], *target.shape[-2:])
+    target_delta = (target - reference_for_target).abs().mean(dim=-3, keepdim=True)
+    target_change = (target_delta >= cfg.change_mask_threshold).to(dtype=vision.dtype)
+    pixel_error = (vision - target).pow(2).mean(dim=-3, keepdim=True)
+
+    def _motion_weighted(error: Any, changed: Any) -> Any:
+        weights = 1.0 + cfg.motion_pixel_loss_weight * changed
+        # Normalize by the total weight, rather than by pixels, so the scale
+        # stays comparable across static and dynamic windows.
+        return (error * weights).sum() / weights.sum().clamp_min(1.0)
+
     scene_h = cfg.scene_height if cfg.scene_height is not None else vision.shape[-2]
     scene_h = max(0, min(int(scene_h), vision.shape[-2]))
-    scene = F.mse_loss(vision[..., :scene_h, :], target[..., :scene_h, :]) if scene_h else vision.new_zeros(())
-    hud = F.mse_loss(vision[..., scene_h:, :], target[..., scene_h:, :]) if scene_h < vision.shape[-2] else vision.new_zeros(())
-    return scene + cfg.hud_loss_weight * hud, decoded["change_mask"].mean(), decoded
+    scene = _motion_weighted(pixel_error[..., :scene_h, :], target_change[..., :scene_h, :]) if scene_h else vision.new_zeros(())
+    hud = _motion_weighted(pixel_error[..., scene_h:, :], target_change[..., scene_h:, :]) if scene_h < vision.shape[-2] else vision.new_zeros(())
+
+    positive = target_change.bool()
+    negative = ~positive
+    mask_terms = []
+    # Balance positives and negatives per batch/window.  Ordinary BCE makes
+    # an all-zero gate attractive whenever motion occupies few pixels.
+    if bool(positive.any()):
+        mask_terms.append(F.binary_cross_entropy(predicted_mask[positive], torch.ones_like(predicted_mask[positive])))
+    if bool(negative.any()):
+        mask_terms.append(F.binary_cross_entropy(predicted_mask[negative], torch.zeros_like(predicted_mask[negative])))
+    mask_supervision = torch.stack(mask_terms).mean() if mask_terms else vision.new_zeros(())
+    dynamic_error = pixel_error[positive].mean() if bool(positive.any()) else vision.new_zeros(())
+    static_error = pixel_error[negative].mean() if bool(negative.any()) else vision.new_zeros(())
+    # Attach scalar diagnostics to the existing decoded result so the
+    # internal function's long-standing three-value return contract remains
+    # intact for callers and tests.
+    decoded.update({
+        "mask_supervision_loss": mask_supervision,
+        "dynamic_pixel_loss": dynamic_error,
+        "static_pixel_loss": static_error,
+        "target_change_fraction": target_change.mean(),
+        "predicted_delta_magnitude": residual_delta.abs().mean(),
+        "predicted_change_mask_mean": predicted_mask.mean(),
+    })
+    return scene + cfg.hud_loss_weight * hud, predicted_mask.mean(), decoded
 
 
-def _episode_head_targets(episode: EpisodeActionFrames, n_frames: int) -> Tuple[Any, Any, Any, bool]:
+def _episode_head_targets(
+    episode: EpisodeActionFrames, n_frames: int, *, device: Optional[Any] = None,
+) -> Tuple[Any, Any, Any, bool]:
     """``(reward, terminal, risk, has_targets)`` for one episode, the first
     three aligned with :func:`_episode_tensors`' pixel/latent indexing
     (issue #169). ``has_targets`` is ``False`` when the episode predates
@@ -607,18 +750,20 @@ def _episode_head_targets(episode: EpisodeActionFrames, n_frames: int) -> Tuple[
 
     def _column(values: Sequence[Any]) -> Any:
         if len(values) == n_frames:
-            return torch.tensor([float(v) for v in values], dtype=torch.float32)
-        return torch.zeros(n_frames, dtype=torch.float32)
+            return torch.tensor([float(v) for v in values], dtype=torch.float32, device=device)
+        return torch.zeros(n_frames, dtype=torch.float32, device=device)
 
     return _column(episode.reward), _column(episode.terminal), _column(episode.risk), has_targets
 
 
-def _episode_semantic_targets(episode: EpisodeActionFrames, n_frames: int, classes: int) -> Optional[Any]:
+def _episode_semantic_targets(
+    episode: EpisodeActionFrames, n_frames: int, classes: int, *, device: Optional[Any] = None,
+) -> Optional[Any]:
     """Return aligned 9x9 class targets, or ``None`` for old recordings."""
     torch, F = _torch()
     if classes <= 0 or len(episode.semantic_grids) != n_frames or any(g is None for g in episode.semantic_grids):
         return None
-    grids = torch.tensor(episode.semantic_grids, dtype=torch.long)
+    grids = torch.tensor(episode.semantic_grids, dtype=torch.long, device=device)
     if grids.ndim != 3 or grids.min() < 0 or grids.max() >= classes:
         raise ValueError(f"semantic grids must contain ids in [0, {classes}), got shape {tuple(grids.shape)}")
     return F.interpolate(grids.unsqueeze(1).float(), size=(9, 9), mode="nearest").squeeze(1).long()
@@ -676,6 +821,8 @@ def _train_autoregressive_objective(
         "reward_loss": [], "terminal_loss": [], "risk_loss": [], "uncertainty_loss": [],
         "closed_loop_loss": [], "closed_loop_latent_loss": [],
         "closed_loop_pixel_loss": [], "workspace_loss": [], "semantic_loss": [],
+        "mask_supervision_loss": [], "dynamic_pixel_loss": [], "static_pixel_loss": [],
+        "predicted_delta_magnitude": [], "change_mask_mean": [], "target_change_fraction": [],
     }
     log.info("training cortex (autoregressive)  episodes=%d  epochs=%d  horizons=%s  backbone=%s",
              len(episodes), cfg.epochs, list(horizons_ticks), _backbone_name(model))
@@ -685,6 +832,7 @@ def _train_autoregressive_objective(
         horizon_frames=list(horizon_frames), backbone=_backbone_name(model),
         lr=cfg.lr, latent_width=cfg.latent_width, hidden_dim=cfg.hidden_dim,
         context_length=max_context, ema_target=target_encoder is not None,
+        device=str(_model_device(model)),
     )
     training_started = time.perf_counter()
     rollout_latent_weight = (
@@ -704,7 +852,7 @@ def _train_autoregressive_objective(
             _episode, pixels, targets, actions = episodes[episode_index]
             rewards, terminals, risks, has_targets = head_targets[episode_index]
             semantic_targets = _episode_semantic_targets(
-                _episode, pixels.shape[0], cfg.semantic_classes
+                _episode, pixels.shape[0], cfg.semantic_classes, device=pixels.device
             )
             if pixels.shape[0] <= min(horizon_frames):
                 continue
@@ -723,6 +871,12 @@ def _train_autoregressive_objective(
             latent_terms = []
             pixel_terms = []
             mask_terms = []
+            mask_supervision_terms = []
+            dynamic_pixel_terms = []
+            static_pixel_terms = []
+            delta_magnitude_terms = []
+            change_mask_terms = []
+            target_change_terms = []
             reward_terms = []
             terminal_terms = []
             risk_terms = []
@@ -744,12 +898,18 @@ def _train_autoregressive_objective(
                     F.normalize(prediction.latent, dim=-1) - F.normalize(target_latent, dim=-1)
                 ).pow(2).mean(dim=-1)
                 latent_terms.append(per_error.mean())
-                pixel_term, mask_term, _decoded = _spatial_pixel_loss(
+                pixel_term, mask_term, decoded = _spatial_pixel_loss(
                     model, prediction.latent, pixels[:positions].unsqueeze(0),
                     targets[horizon_frame:].unsqueeze(0), cfg,
                 )
                 pixel_terms.append(pixel_term)
                 mask_terms.append(mask_term)
+                mask_supervision_terms.append(decoded["mask_supervision_loss"])
+                dynamic_pixel_terms.append(decoded["dynamic_pixel_loss"])
+                static_pixel_terms.append(decoded["static_pixel_loss"])
+                delta_magnitude_terms.append(decoded["predicted_delta_magnitude"])
+                change_mask_terms.append(decoded["predicted_change_mask_mean"])
+                target_change_terms.append(decoded["target_change_fraction"])
                 if semantic_targets is not None:
                     assert prediction.semantic_logits is not None
                     semantic_terms.append(F.cross_entropy(
@@ -778,6 +938,12 @@ def _train_autoregressive_objective(
             latent_loss = _mean_or_zero(latent_terms)
             pixel_loss = _mean_or_zero(pixel_terms)
             mask_sparsity_loss = _mean_or_zero(mask_terms)
+            mask_supervision_loss = _mean_or_zero(mask_supervision_terms)
+            dynamic_pixel_loss = _mean_or_zero(dynamic_pixel_terms)
+            static_pixel_loss = _mean_or_zero(static_pixel_terms)
+            predicted_delta_magnitude = _mean_or_zero(delta_magnitude_terms)
+            change_mask_mean = _mean_or_zero(change_mask_terms)
+            target_change_fraction = _mean_or_zero(target_change_terms)
             semantic_loss = _mean_or_zero(semantic_terms)
             reward_loss = _mean_or_zero(reward_terms)
             terminal_loss = _mean_or_zero(terminal_terms)
@@ -820,7 +986,12 @@ def _train_autoregressive_objective(
                     rollout_pixel_terms.append(pixel_term)
                     use_prediction = float(torch.rand((), generator=generator)) < cfg.scheduled_sampling_p
                     latent_in = predicted if use_prediction else latents[:, index + 1]
-                    reference_frame = decoded["vision"] if use_prediction else targets[index + 1].unsqueeze(0)
+                    # Scheduled sampling applies to the transition's latent
+                    # input only.  The RGB residual must *always* compose on
+                    # its own prior frame: evaluation has no observed frame
+                    # after the first step, and mixing ground-truth visual
+                    # references here caused the T+4 residual to overshoot.
+                    reference_frame = decoded["vision"]
                     reference_spatial = model.encode_visual(F.interpolate(
                         reference_frame, size=model.pixel_shape[:2], mode="nearest"
                     )).spatial
@@ -840,6 +1011,7 @@ def _train_autoregressive_objective(
                 + cfg.uncertainty_loss_weight * uncertainty_loss
                 + workspace_loss
                 + cfg.change_mask_sparsity_weight * mask_sparsity_loss
+                + cfg.change_mask_supervision_weight * mask_supervision_loss
                 + cfg.semantic_loss_weight * semantic_loss
                 + closed_loop_loss
             )
@@ -858,6 +1030,12 @@ def _train_autoregressive_objective(
                 ("closed_loop_pixel_loss", closed_loop_pixel_loss),
                 ("workspace_loss", workspace_loss),
                 ("semantic_loss", semantic_loss),
+                ("mask_supervision_loss", mask_supervision_loss),
+                ("dynamic_pixel_loss", dynamic_pixel_loss),
+                ("static_pixel_loss", static_pixel_loss),
+                ("predicted_delta_magnitude", predicted_delta_magnitude),
+                ("change_mask_mean", change_mask_mean),
+                ("target_change_fraction", target_change_fraction),
             ):
                 epoch[key] += float(value.detach())
         for key in curves:
@@ -888,6 +1066,7 @@ def _train_autoregressive_objective(
         "action_keys": list(model.action_keys), "warmup_frames": cfg.warmup_frames,
         "rollout_frames": cfg.rollout_frames, "loss_curves": curves,
         "training_objective": "autoregressive",
+        "device": str(_model_device(model)),
         "autoregressive_horizons": list(horizon_frames),
         "autoregressive_horizons_ticks": list(horizons_ticks),
         "ticks_per_frame": ticks_per_frame,
@@ -970,6 +1149,16 @@ def train_action_world_model(
         raise ValueError(f"warmup_frames must be >= 1, got {cfg.warmup_frames}")
     if cfg.rollout_frames < 1:
         raise ValueError(f"rollout_frames must be >= 1, got {cfg.rollout_frames}")
+    if (cfg.change_mask_supervision_weight < 0 or cfg.motion_pixel_loss_weight < 0
+            or cfg.closed_loop_pixel_loss_weight < 0
+            or cfg.closed_loop_latent_loss_weight < 0):
+        raise ValueError("change-mask supervision and motion pixel weights must be non-negative")
+    if cfg.change_mask_threshold < 0:
+        raise ValueError(f"change_mask_threshold must be non-negative, got {cfg.change_mask_threshold}")
+    if cfg.direct_horizon_loss_weight < 0:
+        raise ValueError("direct_horizon_loss_weight must be non-negative")
+    if not isinstance(cfg.device, str):
+        raise ValueError(f"device must be a string such as 'auto', 'cuda', or 'cpu', got {cfg.device!r}")
     if cfg.ema_target_decay is not None and not 0.0 <= cfg.ema_target_decay < 1.0:
         raise ValueError(
             "ema_target_decay must be None or in [0, 1), got "
@@ -1012,6 +1201,9 @@ def train_action_world_model(
             workspace_modalities=expected_workspace_modalities,
             workspace_layout_hash=expected_workspace_layout,
         )
+    device = _resolve_training_device(cfg.device)
+    model.to(device)
+    log.info("cortex training device=%s (cuda_available=%s)", device, torch.cuda.is_available())
     # Evaluation must know which prediction surface was optimized.  It is
     # serialized in training_stats as well for a reloaded checkpoint.
     model.training_objective = cfg.training_objective
@@ -1021,6 +1213,13 @@ def train_action_world_model(
         "semantic_loss_weight": cfg.semantic_loss_weight,
         "semantic_classes": cfg.semantic_classes,
         "change_mask_sparsity_weight": cfg.change_mask_sparsity_weight,
+        "change_mask_supervision_weight": cfg.change_mask_supervision_weight,
+        "motion_pixel_loss_weight": cfg.motion_pixel_loss_weight,
+        "change_mask_threshold": cfg.change_mask_threshold,
+        "direct_horizon_loss_weight": cfg.direct_horizon_loss_weight,
+        "closed_loop_pixel_loss_weight": cfg.closed_loop_pixel_loss_weight,
+        "closed_loop_latent_loss_weight": cfg.closed_loop_latent_loss_weight,
+        "device": str(device),
     }
     target_encoder = None
     if cfg.ema_target_decay is not None:
@@ -1029,11 +1228,12 @@ def train_action_world_model(
         target_encoder = copy.deepcopy(model)
         target_encoder.requires_grad_(False)
         target_encoder.eval()
-    episodes = _episode_tensors(dataset, model.reconstruction_shape)
+    episodes = _episode_tensors(dataset, model.reconstruction_shape, device=device)
     #: Per-episode reward/terminal/risk targets (issue #169), aligned 1:1
     #: with ``episodes`` by index.
     head_targets = [
-        _episode_head_targets(episode, pixels.shape[0]) for episode, pixels, _t, _a in episodes
+        _episode_head_targets(episode, pixels.shape[0], device=device)
+        for episode, pixels, _t, _a in episodes
     ]
 
     max_context = getattr(model, "context_length_max", None)
@@ -1049,6 +1249,14 @@ def train_action_world_model(
         if cfg.collapse_gate_enabled and diagnostics["gate_evaluable"] and not diagnostics["passed"]:
             raise RepresentationCollapseError(diagnostics)
         return model, stats
+
+    # Workspace values are fixed recorded inputs.  Tensorizing their Python
+    # lists for every overlapping sampled window dominated CPU time and did
+    # no useful work; build each episode once and slice it below.
+    episode_workspaces = [
+        _episode_workspace_tensors(episode, dataset, model, actions=actions)
+        for episode, _pixels, _targets, actions in episodes
+    ]
 
     window = cfg.warmup_frames + cfg.rollout_frames
     starts: List[Tuple[int, int]] = []  # (episode index, start frame)
@@ -1088,6 +1296,17 @@ def train_action_world_model(
         "uncertainty_loss": [],
         "workspace_loss": [],
         "semantic_loss": [],
+        "mask_supervision_loss": [],
+        "dynamic_pixel_loss": [],
+        "static_pixel_loss": [],
+        "predicted_delta_magnitude": [],
+        "change_mask_mean": [],
+        "target_change_fraction": [],
+        "direct_pixel_loss": [],
+        "direct_latent_loss": [],
+        "direct_mask_supervision_loss": [],
+        "closed_loop_pixel_loss": [],
+        "closed_loop_latent_loss": [],
     }
 
     log.info("training cortex (windowed_rollout)  windows=%d  epochs=%d  backbone=%s",
@@ -1097,6 +1316,7 @@ def train_action_world_model(
         epochs=cfg.epochs, backbone=_backbone_name(model),
         lr=cfg.lr, batch_size=cfg.batch_size, latent_width=cfg.latent_width,
         hidden_dim=cfg.hidden_dim, context_length=max_context,
+        device=str(_model_device(model)),
     )
     training_started = time.perf_counter()
     model.train()
@@ -1142,7 +1362,7 @@ def train_action_world_model(
                 rewards_batch.append(rewards[t : t + window])
                 terminals_batch.append(terminals[t : t + window])
                 risks_batch.append(risks[t : t + window])
-                episode_workspace = _episode_workspace_tensors(_episode, dataset, model, actions=actions)
+                episode_workspace = episode_workspaces[e_idx]
                 for name, values in episode_workspace.items():
                     workspace_batch[name].append(values[t : t + window])
                 has_targets_batch.append(1.0 if has_targets else 0.0)
@@ -1157,7 +1377,7 @@ def train_action_world_model(
                 len(grids) == window and all(grid is not None for grid in grids)
                 for grids in semantic_batch
             ):
-                semantic_b = torch.tensor(semantic_batch, dtype=torch.long)
+                semantic_b = torch.tensor(semantic_batch, dtype=torch.long, device=frames_b.device)
                 semantic_b = F.interpolate(
                     semantic_b.reshape(-1, 1, *semantic_b.shape[-2:]).float(),
                     size=(9, 9), mode="nearest",
@@ -1172,7 +1392,7 @@ def train_action_world_model(
             #: truth -- only genuinely-supervised samples contribute to
             #: these three losses. Uncertainty is exempt: its target is the
             #: model's own realized latent error, always available.
-            has_targets_b = torch.tensor(has_targets_batch, dtype=torch.float32)
+            has_targets_b = torch.tensor(has_targets_batch, dtype=torch.float32, device=frames_b.device)
             n_supervised = float(has_targets_b.sum())
             if cfg.withhold_actions:
                 # Ablation: every action index becomes the same constant, so
@@ -1195,6 +1415,65 @@ def train_action_world_model(
                         flat_frames, flat_workspace
                     ).reshape(batch_n, window, -1)
 
+            # The direct evaluator uses per-horizon heads over this causal
+            # sequence.  Historically windowed_rollout only trained
+            # ``step``/``latent_head``, leaving T+4's multi-token head at its
+            # random initialization even though it was reported as a direct
+            # prediction metric.
+            direct_hidden = model.forward_sequence(latents[:, :-1], actions_b)
+            direct_pixel_loss = frames_b.new_zeros(())
+            direct_latent_loss = frames_b.new_zeros(())
+            direct_mask_supervision_loss = frames_b.new_zeros(())
+            if cfg.direct_horizon_loss_weight > 0:
+                for horizon_tick in model.horizons_ticks:
+                    horizon_frame = horizons_ticks_to_frames(
+                        (horizon_tick,), dataset.ticks_per_frame
+                    )[0]
+                    positions = window - horizon_frame
+                    if positions <= 0:
+                        continue
+                    direct_reference = frames_b[:, :positions]
+                    direct_encoding = model.encode_visual(
+                        direct_reference.reshape(-1, *direct_reference.shape[-3:])
+                    )
+                    direct_spatial = direct_encoding.spatial.reshape(
+                        batch_n, positions, *direct_encoding.spatial.shape[1:]
+                    )
+                    direct_prediction = model.sequence_prediction(
+                        direct_hidden[:, :positions], horizon_tick,
+                        reference_frame=direct_reference,
+                        reference_spatial=direct_spatial,
+                    )
+                    direct_pixel_term, _direct_mask_term, direct_decoded = _spatial_pixel_loss(
+                        model, direct_prediction.latent, direct_reference,
+                        targets_b[:, horizon_frame:], cfg,
+                        reference_spatial=direct_spatial,
+                        decoded={
+                            "vision": direct_prediction.decoded,
+                            "change_mask": direct_prediction.change_mask,
+                            "residual_delta": direct_prediction.residual_delta,
+                            **({"semantic_logits": direct_prediction.semantic_logits}
+                               if direct_prediction.semantic_logits is not None else {}),
+                        },
+                    )
+                    direct_pixel_loss = direct_pixel_loss + direct_pixel_term
+                    direct_mask_supervision_loss = (
+                        direct_mask_supervision_loss + direct_decoded["mask_supervision_loss"]
+                    )
+                    direct_target_latent = target_latents[:, horizon_frame:].detach()
+                    direct_latent_loss = direct_latent_loss + (
+                        F.normalize(direct_prediction.latent, dim=-1)
+                        - F.normalize(direct_target_latent, dim=-1)
+                    ).pow(2).mean()
+                n_direct_horizons = sum(
+                    1 for horizon_tick in model.horizons_ticks
+                    if window > horizons_ticks_to_frames((horizon_tick,), dataset.ticks_per_frame)[0]
+                )
+                if n_direct_horizons:
+                    direct_pixel_loss = direct_pixel_loss / n_direct_horizons
+                    direct_latent_loss = direct_latent_loss / n_direct_horizons
+                    direct_mask_supervision_loss = direct_mask_supervision_loss / n_direct_horizons
+
             hidden = model.initial_state(batch_n)
             # Teacher-forced warmup: observed latents drive the state.
             predicted = None
@@ -1203,6 +1482,12 @@ def train_action_world_model(
 
             pixel_loss = frames_b.new_zeros(())
             mask_sparsity_loss = frames_b.new_zeros(())
+            mask_supervision_loss = frames_b.new_zeros(())
+            dynamic_pixel_loss = frames_b.new_zeros(())
+            static_pixel_loss = frames_b.new_zeros(())
+            predicted_delta_magnitude = frames_b.new_zeros(())
+            change_mask_mean = frames_b.new_zeros(())
+            target_change_fraction = frames_b.new_zeros(())
             semantic_loss = frames_b.new_zeros(())
             latent_loss = frames_b.new_zeros(())
             reward_loss = frames_b.new_zeros(())
@@ -1210,6 +1495,8 @@ def train_action_world_model(
             risk_loss = frames_b.new_zeros(())
             uncertainty_loss = frames_b.new_zeros(())
             workspace_loss = frames_b.new_zeros(())
+            closed_loop_pixel_loss = frames_b.new_zeros(())
+            closed_loop_latent_loss = frames_b.new_zeros(())
             latent_in = latents[:, cfg.warmup_frames - 1]
             reference_frame = targets_b[:, cfg.warmup_frames - 1]
             reference_spatial = model.encode_visual(F.interpolate(
@@ -1232,6 +1519,12 @@ def train_action_world_model(
                 )
                 pixel_loss = pixel_loss + step_pixel_loss
                 mask_sparsity_loss = mask_sparsity_loss + step_mask_loss
+                mask_supervision_loss = mask_supervision_loss + decoded["mask_supervision_loss"]
+                dynamic_pixel_loss = dynamic_pixel_loss + decoded["dynamic_pixel_loss"]
+                static_pixel_loss = static_pixel_loss + decoded["static_pixel_loss"]
+                predicted_delta_magnitude = predicted_delta_magnitude + decoded["predicted_delta_magnitude"]
+                change_mask_mean = change_mask_mean + decoded["predicted_change_mask_mean"]
+                target_change_fraction = target_change_fraction + decoded["target_change_fraction"]
                 if semantic_b is not None:
                     visual = decoded
                     semantic_loss = semantic_loss + F.cross_entropy(
@@ -1264,16 +1557,60 @@ def train_action_world_model(
                 realized_latent_error = per_sample_latent_error.detach()
                 uncertainty_loss = uncertainty_loss + F.mse_loss(uncertainty_pred, realized_latent_error)
 
+                # This is the only RGB composition path that sees its own
+                # output as the next reference.  Keeping it separate and
+                # low-weight trains rollout recovery without turning its
+                # accumulated decoder error into the primary gate label.
+                if (cfg.closed_loop_pixel_loss_weight > 0
+                        or cfg.closed_loop_latent_loss_weight > 0):
+                    if step == 0:
+                        closed_predicted = predicted
+                        closed_hidden = hidden
+                        closed_loop_latent_loss = closed_loop_latent_loss + per_sample_latent_error.mean()
+                        if cfg.closed_loop_pixel_loss_weight > 0:
+                            closed_reference = decoded["vision"]
+                            closed_reference_spatial = model.encode_visual(F.interpolate(
+                                closed_reference, size=model.pixel_shape[:2], mode="nearest"
+                            )).spatial
+                            closed_loop_pixel_loss = closed_loop_pixel_loss + step_pixel_loss
+                    else:
+                        closed_predicted, closed_hidden = model.step(
+                            closed_predicted, actions_b[:, idx], closed_hidden
+                        )
+                        closed_loop_latent_loss = closed_loop_latent_loss + (
+                            F.normalize(closed_predicted, dim=1)
+                            - F.normalize(target_latents[:, idx + 1].detach(), dim=1)
+                        ).pow(2).mean()
+                        if cfg.closed_loop_pixel_loss_weight > 0:
+                            closed_pixel_term, _closed_mask_term, closed_decoded = _spatial_pixel_loss(
+                                model, closed_predicted, closed_reference,
+                                targets_b[:, idx + 1], cfg,
+                                reference_spatial=closed_reference_spatial,
+                            )
+                            closed_loop_pixel_loss = closed_loop_pixel_loss + closed_pixel_term
+                            closed_reference = closed_decoded["vision"]
+                            closed_reference_spatial = model.encode_visual(F.interpolate(
+                                closed_reference, size=model.pixel_shape[:2], mode="nearest"
+                            )).spatial
+
                 # Scheduled sampling: feed the prediction back in with
-                # probability p, else the observed latent.
+                # probability p, else the observed latent.  Its visual
+                # reference is teacher-forced for the primary loss; the
+                # separate auxiliary above owns closed-loop RGB composition.
                 use_prediction = float(torch.rand((), generator=generator)) < cfg.scheduled_sampling_p
                 latent_in = predicted if use_prediction else latents[:, idx + 1]
-                reference_frame = decoded["vision"] if use_prediction else targets_b[:, idx + 1]
+                reference_frame = targets_b[:, idx + 1]
                 reference_spatial = model.encode_visual(F.interpolate(
                     reference_frame, size=model.pixel_shape[:2], mode="nearest"
                 )).spatial
             pixel_loss = pixel_loss / cfg.rollout_frames
             mask_sparsity_loss = mask_sparsity_loss / cfg.rollout_frames
+            mask_supervision_loss = mask_supervision_loss / cfg.rollout_frames
+            dynamic_pixel_loss = dynamic_pixel_loss / cfg.rollout_frames
+            static_pixel_loss = static_pixel_loss / cfg.rollout_frames
+            predicted_delta_magnitude = predicted_delta_magnitude / cfg.rollout_frames
+            change_mask_mean = change_mask_mean / cfg.rollout_frames
+            target_change_fraction = target_change_fraction / cfg.rollout_frames
             semantic_loss = semantic_loss / cfg.rollout_frames
             latent_loss = latent_loss / cfg.rollout_frames
             reward_loss = reward_loss / cfg.rollout_frames
@@ -1281,6 +1618,8 @@ def train_action_world_model(
             risk_loss = risk_loss / cfg.rollout_frames
             uncertainty_loss = uncertainty_loss / cfg.rollout_frames
             workspace_loss = workspace_loss / cfg.rollout_frames
+            closed_loop_pixel_loss = closed_loop_pixel_loss / cfg.rollout_frames
+            closed_loop_latent_loss = closed_loop_latent_loss / cfg.rollout_frames
             total = (
                 cfg.pixel_loss_weight * pixel_loss
                 + cfg.latent_loss_weight * latent_loss
@@ -1290,7 +1629,14 @@ def train_action_world_model(
                 + cfg.uncertainty_loss_weight * uncertainty_loss
                 + workspace_loss
                 + cfg.change_mask_sparsity_weight * mask_sparsity_loss
+                + cfg.change_mask_supervision_weight * mask_supervision_loss
                 + cfg.semantic_loss_weight * semantic_loss
+                + cfg.closed_loop_pixel_loss_weight * closed_loop_pixel_loss
+                + cfg.closed_loop_latent_loss_weight * closed_loop_latent_loss
+                + cfg.direct_horizon_loss_weight * (
+                    direct_pixel_loss + direct_latent_loss
+                    + cfg.change_mask_supervision_weight * direct_mask_supervision_loss
+                )
             )
             total.backward()
             optimizer.step()
@@ -1307,6 +1653,17 @@ def train_action_world_model(
             epoch["uncertainty_loss"] += float(uncertainty_loss.detach()) * batch_n
             epoch["workspace_loss"] += float(workspace_loss.detach()) * batch_n
             epoch["semantic_loss"] += float(semantic_loss.detach()) * batch_n
+            epoch["mask_supervision_loss"] += float(mask_supervision_loss.detach()) * batch_n
+            epoch["dynamic_pixel_loss"] += float(dynamic_pixel_loss.detach()) * batch_n
+            epoch["static_pixel_loss"] += float(static_pixel_loss.detach()) * batch_n
+            epoch["predicted_delta_magnitude"] += float(predicted_delta_magnitude.detach()) * batch_n
+            epoch["change_mask_mean"] += float(change_mask_mean.detach()) * batch_n
+            epoch["target_change_fraction"] += float(target_change_fraction.detach()) * batch_n
+            epoch["direct_pixel_loss"] += float(direct_pixel_loss.detach()) * batch_n
+            epoch["direct_latent_loss"] += float(direct_latent_loss.detach()) * batch_n
+            epoch["direct_mask_supervision_loss"] += float(direct_mask_supervision_loss.detach()) * batch_n
+            epoch["closed_loop_pixel_loss"] += float(closed_loop_pixel_loss.detach()) * batch_n
+            epoch["closed_loop_latent_loss"] += float(closed_loop_latent_loss.detach()) * batch_n
         for key in curves:
             curves[key].append(round(epoch[key] / max(seen, 1), 6))
         _report_epoch(
@@ -1348,9 +1705,21 @@ def train_action_world_model(
         "final_risk_loss": curves["risk_loss"][-1],
         "final_uncertainty_loss": curves["uncertainty_loss"][-1],
         "final_workspace_loss": curves["workspace_loss"][-1],
+        "final_mask_supervision_loss": curves["mask_supervision_loss"][-1],
+        "final_dynamic_pixel_loss": curves["dynamic_pixel_loss"][-1],
+        "final_static_pixel_loss": curves["static_pixel_loss"][-1],
+        "final_predicted_delta_magnitude": curves["predicted_delta_magnitude"][-1],
+        "final_change_mask_mean": curves["change_mask_mean"][-1],
+        "final_target_change_fraction": curves["target_change_fraction"][-1],
+        "final_direct_pixel_loss": curves["direct_pixel_loss"][-1],
+        "final_direct_latent_loss": curves["direct_latent_loss"][-1],
+        "final_direct_mask_supervision_loss": curves["direct_mask_supervision_loss"][-1],
+        "final_closed_loop_pixel_loss": curves["closed_loop_pixel_loss"][-1],
+        "final_closed_loop_latent_loss": curves["closed_loop_latent_loss"][-1],
         "ema_target_enabled": target_encoder is not None,
         "ema_target_decay": cfg.ema_target_decay,
         "training_objective": "windowed_rollout",
+        "device": str(_model_device(model)),
     }
     diagnostics = representation_collapse_diagnostics(model, dataset, config=cfg)
     stats["representation_diagnostics"] = diagnostics
@@ -1407,16 +1776,26 @@ def evaluate_action_world_model_direct(
     per_episode_model_mse = {tick: [] for tick in ticks}
     prediction_dispersion: List[float] = []
     target_dispersion: List[float] = []
+    entity_labels = {tick: [] for tick in ticks}
+    entity_probabilities = {tick: [] for tick in ticks}
+    entity_cells = {tick: [] for tick in ticks}
+    strata = {tick: {name: [] for name in ("moving", "static", "blocked", "turning", "entity_entry", "entity_exit")}
+               for tick in ticks}
 
     was_training = model.training
     model.eval()
     with torch.no_grad():
-        for episode, pixels, targets, actions in _episode_tensors(dataset, model.reconstruction_shape):
+        for episode, pixels, targets, actions in _episode_tensors(
+            dataset, model.reconstruction_shape, device=_model_device(model)
+        ):
             n = pixels.shape[0]
             if n <= max_horizon + warmup_frames:
                 continue
             try:
-                remap = torch.tensor([action_index[dataset.action_keys[a]] for a in episode.actions], dtype=torch.long)
+                remap = torch.tensor(
+                    [action_index[dataset.action_keys[a]] for a in episode.actions],
+                    dtype=torch.long, device=pixels.device,
+                )
             except KeyError as exc:
                 raise ValueError(f"action {exc.args[0]!r} is outside the model vocabulary") from None
             workspace = _episode_workspace_tensors(episode, dataset, model, actions=remap)
@@ -1430,14 +1809,19 @@ def evaluate_action_world_model_direct(
             if max_starts_per_episode is not None:
                 starts = list(starts)[:max_starts_per_episode]
             episode_mse = {tick: [] for tick in ticks}
+            action_names = [dataset.action_keys[index] for index in episode.actions]
+            labels = extract_frame_event_labels(
+                episode.semantic_grids, positions=episode.positions, actions=action_names,
+            ) if len(episode.semantic_grids) == len(episode.frames) else []
             for t in starts:
                 decoded_by_tick = {}
                 for tick, frame in zip(ticks, frames):
                     prediction = model.sequence_prediction(hidden[:, t : t + 1], tick)
-                    decoded = model.decode_prediction(
+                    visual = model.decode_prediction(
                         prediction.latent[0], reference_frame=targets[t:t + 1],
                         reference_spatial=model.encode_visual(pixels[t:t + 1]).spatial,
-                    )["vision"][0]
+                    )
+                    decoded = visual["vision"][0]
                     decoded_by_tick[tick] = decoded
                     target = targets[t + frame]
                     mse = float(F.mse_loss(decoded, target))
@@ -1445,6 +1829,29 @@ def evaluate_action_world_model_direct(
                     episode_mse[tick].append(mse)
                     samples[tick]["copy_last"].append(float(F.mse_loss(targets[t], target)))
                     samples[tick]["mean_frame"].append(float(F.mse_loss(mean_frame, target)))
+                    event_label = labels[t + frame] if t + frame < len(labels) else None
+                    row = {
+                        "model_mse": mse, "copy_last_mse": float(F.mse_loss(targets[t], target)),
+                        "target_motion": float(F.mse_loss(targets[t], target)),
+                        "predicted_motion": float(F.mse_loss(decoded, targets[t])),
+                    }
+                    if visual.get("change_mask") is not None:
+                        row["change_mask_mean"] = float(visual["change_mask"].mean())
+                    if visual.get("residual_delta") is not None:
+                        row["predicted_delta_magnitude"] = float(visual["residual_delta"].abs().mean())
+                    if event_label is not None:
+                        strata[tick]["moving" if event_label.position_changed else "static"].append(row)
+                        if event_label.blocked_forward: strata[tick]["blocked"].append(row)
+                        if event_label.entity_entered: strata[tick]["entity_entry"].append(row)
+                        if event_label.entity_left: strata[tick]["entity_exit"].append(row)
+                        if t < len(episode.facing) and t + frame < len(episode.facing) and episode.facing[t] != episode.facing[t + frame]:
+                            strata[tick]["turning"].append(row)
+                        logits = visual.get("semantic_logits")
+                        if logits is not None and logits.shape[1] > COW_ID:
+                            probabilities = torch.softmax(logits[0], dim=0)[COW_ID]
+                            entity_labels[tick].append(event_label)
+                            entity_probabilities[tick].append(float(probabilities.max()))
+                            entity_cells[tick].append([(int(r), int(c)) for r, c in (probabilities >= .5).nonzero().tolist()])
                     if oracle_lag is not None and t + frame - oracle_lag >= 0:
                         samples[tick]["oracle"].append(float(F.mse_loss(targets[t + frame - oracle_lag], target)))
                     for name, by_horizon in workspace_samples.items():
@@ -1491,6 +1898,13 @@ def evaluate_action_world_model_direct(
         "workspace_modalities": workspace_report,
         "prediction_health": {"prediction_dispersion": _mean(prediction_dispersion) if prediction_dispersion else 0.0,
                               "target_dispersion": _mean(target_dispersion) if target_dispersion else 0.0},
+        "event_metrics": {
+            tick: (lambda motion: {
+                "entity": evaluate_entity_predictions(entity_labels[tick], entity_probabilities[tick], entity_cells[tick]),
+                "motion": motion, **flattened_motion_metrics(motion),
+            })(motion_stratified_metrics(strata[tick]))
+            for tick in ticks
+        },
         "per_episode_model_mse": per_episode_model_mse,
     }
 
@@ -1528,7 +1942,7 @@ def evaluate_action_world_model(
     log.info("evaluating cortex  horizons=%s  warmup=%d  episodes=%d",
              horizons_sorted, warmup_frames, len(dataset))
 
-    episodes = _episode_tensors(dataset, model.reconstruction_shape)
+    episodes = _episode_tensors(dataset, model.reconstruction_shape, device=_model_device(model))
     action_index = {name: i for i, name in enumerate(model.action_keys)}
     for name in dataset.action_keys:
         if name not in action_index:
@@ -1555,6 +1969,13 @@ def evaluate_action_world_model(
     per_episode_model_mse: Dict[int, List[float]] = {h: [] for h in horizons_sorted}
     prediction_dispersion: List[float] = []
     target_dispersion: List[float] = []
+    entity_labels: Dict[int, List[Any]] = {h: [] for h in horizons_sorted}
+    entity_probabilities: Dict[int, List[float]] = {h: [] for h in horizons_sorted}
+    entity_cells: Dict[int, List[List[Tuple[int, int]]]] = {h: [] for h in horizons_sorted}
+    strata: Dict[int, Dict[str, List[Dict[str, float]]]] = {
+        h: {name: [] for name in ("moving", "static", "blocked", "turning", "entity_entry", "entity_exit")}
+        for h in horizons_sorted
+    }
 
     was_training = model.training
     model.eval()
@@ -1566,7 +1987,7 @@ def evaluate_action_world_model(
             # Remap this episode's action indices into the model's vocabulary.
             remap = torch.tensor(
                 [action_index[dataset.action_keys[a]] for a in episode.actions],
-                dtype=torch.long,
+                dtype=torch.long, device=pixels.device,
             )
             workspace = _episode_workspace_tensors(episode, dataset, model, actions=remap)
             latents = model.encode_workspace(pixels, workspace)
@@ -1586,6 +2007,10 @@ def evaluate_action_world_model(
             if max_starts_per_episode is not None:
                 starts = list(starts)[:max_starts_per_episode]
             episode_model_mse: Dict[int, List[float]] = {h: [] for h in horizons_sorted}
+            action_names = [dataset.action_keys[index] for index in episode.actions]
+            labels = extract_frame_event_labels(
+                episode.semantic_grids, positions=episode.positions, actions=action_names,
+            ) if len(episode.semantic_grids) == len(episode.frames) else []
             for t in starts:
                 reference_encoding = model.encode_visual(pixels[t : t + 1])
                 rollout = model.forward_horizons(
@@ -1606,6 +2031,39 @@ def evaluate_action_world_model(
                     episode_model_mse[h].append(model_mse_sample)
                     samples[h]["copy_last"].append(float(F.mse_loss(targets[t], target)))
                     samples[h]["mean_frame"].append(float(F.mse_loss(mean_frame, target)))
+                    event_label = labels[t + h] if t + h < len(labels) else None
+                    change_mask = rollout[h].change_mask
+                    row = {
+                        "model_mse": model_mse_sample,
+                        "copy_last_mse": float(F.mse_loss(targets[t], target)),
+                        "target_motion": float(F.mse_loss(targets[t], target)),
+                        "predicted_motion": float(F.mse_loss(decoded, targets[t])),
+                    }
+                    if change_mask is not None:
+                        row["change_mask_mean"] = float(change_mask.mean())
+                    if rollout[h].residual_delta is not None:
+                        row["predicted_delta_magnitude"] = float(rollout[h].residual_delta.abs().mean())
+                    if event_label is not None:
+                        if event_label.position_changed:
+                            strata[h]["moving"].append(row)
+                        else:
+                            strata[h]["static"].append(row)
+                        if event_label.blocked_forward:
+                            strata[h]["blocked"].append(row)
+                        if event_label.entity_entered:
+                            strata[h]["entity_entry"].append(row)
+                        if event_label.entity_left:
+                            strata[h]["entity_exit"].append(row)
+                        if t < len(episode.facing) and t + h < len(episode.facing) and episode.facing[t] != episode.facing[t + h]:
+                            strata[h]["turning"].append(row)
+                        logits = rollout[h].semantic_logits
+                        if logits is not None and logits.shape[1] > COW_ID:
+                            probabilities = torch.softmax(logits.squeeze(0), dim=0)[COW_ID]
+                            entity_labels[h].append(event_label)
+                            entity_probabilities[h].append(float(probabilities.max()))
+                            entity_cells[h].append([
+                                (int(r), int(c)) for r, c in (probabilities >= .5).nonzero().tolist()
+                            ])
                     if oracle_lag is not None and t + h - oracle_lag >= 0:
                         samples[h]["oracle"].append(
                             float(F.mse_loss(targets[t + h - oracle_lag], target))
@@ -1660,13 +2118,7 @@ def evaluate_action_world_model(
 
     pred_disp = _mean(prediction_dispersion) if prediction_dispersion else 0.0
     tgt_disp = _mean(target_dispersion) if target_dispersion else 0.0
-    rollout_health = {
-        "prediction_dispersion": pred_disp,
-        "target_dispersion": tgt_disp,
-        # Predictions vary < 5% as much across horizons as reality does:
-        # the rollout is frozen (identical frames at t+10 and t+100).
-        "frozen_rollout": bool(tgt_disp > 1e-6 and pred_disp < 0.05 * tgt_disp),
-    }
+    rollout_health = classify_rollout_health(pred_disp, tgt_disp)
     workspace_report = {
         name: {
             h: {
@@ -1705,6 +2157,13 @@ def evaluate_action_world_model(
         "ticks_per_frame": dataset.ticks_per_frame,
         "workspace_modalities": workspace_report,
         "rollout_health": rollout_health,
+        "event_metrics": {
+            h: (lambda motion: {
+                "entity": evaluate_entity_predictions(entity_labels[h], entity_probabilities[h], entity_cells[h]),
+                "motion": motion, **flattened_motion_metrics(motion),
+            })(motion_stratified_metrics(strata[h]))
+            for h in horizons_sorted
+        },
         "per_episode_model_mse": per_episode_model_mse,
     }
 
@@ -1869,7 +2328,7 @@ def evaluate_cortex_heads(
         raise ValueError(f"horizons must be positive frame steps, got {horizons_frames!r}")
     max_horizon = horizons_sorted[-1]
 
-    episodes = _episode_tensors(dataset, model.reconstruction_shape)
+    episodes = _episode_tensors(dataset, model.reconstruction_shape, device=_model_device(model))
     action_index = {name: i for i, name in enumerate(model.action_keys)}
     for name in dataset.action_keys:
         if name not in action_index:
@@ -1897,12 +2356,14 @@ def evaluate_cortex_heads(
                 continue
             remap = torch.tensor(
                 [action_index[dataset.action_keys[a]] for a in episode.actions],
-                dtype=torch.long,
+                dtype=torch.long, device=pixels.device,
             )
             latents = model.encode_workspace(
                 pixels, _episode_workspace_tensors(episode, dataset, model, actions=remap)
             )
-            rewards, terminals, risks, _has_targets = _episode_head_targets(episode, n)
+            rewards, terminals, risks, _has_targets = _episode_head_targets(
+                episode, n, device=pixels.device
+            )
 
             hiddens = [model.initial_state(1)]
             hidden = hiddens[0]
@@ -1983,7 +2444,7 @@ def evaluate_static_holdout(model: Any, dataset: ActionSequenceDataset) -> Dict[
     fallback when the target is exactly equal to the reference).
     """
     torch, F = _torch()
-    episodes = _episode_tensors(dataset, model.reconstruction_shape)
+    episodes = _episode_tensors(dataset, model.reconstruction_shape, device=_model_device(model))
     model_mse: List[float] = []
     copy_mse: List[float] = []
     was_training = model.training
@@ -2115,7 +2576,7 @@ def _linear_probe_orientation(
     check)."""
     torch, _F = _torch()
 
-    episodes = _episode_tensors(dataset, model.reconstruction_shape)
+    episodes = _episode_tensors(dataset, model.reconstruction_shape, device=_model_device(model))
     action_index = {name: i for i, name in enumerate(model.action_keys)}
     latent_rows: List[Any] = []
     hidden_rows: List[Any] = []
@@ -2128,7 +2589,7 @@ def _linear_probe_orientation(
         for episode, pixels, _targets, _actions in episodes:
             remap = torch.tensor(
                 [action_index[dataset.action_keys[a]] for a in episode.actions],
-                dtype=torch.long,
+                dtype=torch.long, device=pixels.device,
             )
             latents = model.encode_workspace(
                 pixels, _episode_workspace_tensors(episode, dataset, model, actions=remap)
@@ -2147,7 +2608,7 @@ def _linear_probe_orientation(
                     latent_rows.append(latents[i])
                     hidden_rows.append(model.transition_backbone.readout(hidden).squeeze(0))
                     targets_rows.append(
-                        torch.tensor([math.sin(angle), math.cos(angle)])
+                        torch.tensor([math.sin(angle), math.cos(angle)], device=pixels.device)
                     )
                     source_rows.append(source or "unknown")
                 if i < len(episode.actions):
@@ -2207,7 +2668,7 @@ def latent_variance_rank(model: Any, dataset: ActionSequenceDataset) -> Dict[str
     when variance is distributed evenly across dimensions.
     """
     torch, _F = _torch()
-    episodes = _episode_tensors(dataset, model.reconstruction_shape)
+    episodes = _episode_tensors(dataset, model.reconstruction_shape, device=_model_device(model))
     was_training = model.training
     model.eval()
     rows = []
@@ -2304,9 +2765,11 @@ def representation_collapse_diagnostics(
 
 def _ridge_probe(x, y, l2: float = 1e-3) -> Dict[str, float]:
     torch, _F = _torch()
-    ones = torch.ones(x.shape[0], 1)
+    ones = torch.ones(x.shape[0], 1, device=x.device, dtype=x.dtype)
     design = torch.cat([x, ones], dim=1)
-    gram = design.T @ design + l2 * torch.eye(design.shape[1])
+    gram = design.T @ design + l2 * torch.eye(
+        design.shape[1], device=x.device, dtype=x.dtype
+    )
     weights = torch.linalg.solve(gram, design.T @ y)
     predicted = design @ weights
     residual = ((y - predicted) ** 2).sum()
@@ -2401,6 +2864,12 @@ def load_action_world_model(path: str, *, inspection_only: bool = False):
         visual_architecture=payload["visual_architecture"],
         semantic_classes=int(visual_config.get("semantic_classes", 0)),
         change_mask_sparsity_weight=float(visual_config.get("change_mask_sparsity_weight", 0.01)),
+        change_mask_supervision_weight=float(visual_config.get("change_mask_supervision_weight", 0.25)),
+        motion_pixel_loss_weight=float(visual_config.get("motion_pixel_loss_weight", 4.0)),
+        change_mask_threshold=float(visual_config.get("change_mask_threshold", 0.02)),
+        direct_horizon_loss_weight=float(visual_config.get("direct_horizon_loss_weight", 1.0)),
+        closed_loop_pixel_loss_weight=float(visual_config.get("closed_loop_pixel_loss_weight", 0.25)),
+        closed_loop_latent_loss_weight=float(visual_config.get("closed_loop_latent_loss_weight", 0.25)),
         scene_height=visual_config.get("scene_height"),
         hud_loss_weight=float(visual_config.get("hud_loss_weight", 0.25)),
         semantic_loss_weight=float(visual_config.get("semantic_loss_weight", 1.0)),

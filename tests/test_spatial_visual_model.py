@@ -66,6 +66,85 @@ def test_closed_loop_rollout_uses_its_previous_predicted_frame_as_reference(monk
     assert torch.equal(references[1], outputs[0])
 
 
+def test_dynamic_rollout_beats_copy_last_when_residuals_accumulate(monkeypatch):
+    """A tiny deterministic dynamic sequence guards the non-frozen contract.
+
+    The decoder below adds a fixed residual at each step.  Reusing the
+    initial observed frame at every horizon would emit 0.1 for both frames;
+    carrying the predicted reference emits 0.1 then 0.2, beating copy-last
+    at T+1 and T+2.  This remains fast and does not rely on optimizer luck.
+    """
+    model = PredictiveCortex(
+        (16, 16, 3), ["wait"],
+        PredictiveCortexConfig(latent_width=8, hidden_dim=12, reconstruction_size=16),
+    )
+    reference = torch.zeros(1, 3, 16, 16)
+    spatial = model.encode_visual(reference).spatial
+
+    def advancing_decode(latent, *, reference_frame, reference_spatial):
+        delta = torch.full_like(reference_frame, 0.1)
+        return {
+            "vision": torch.clamp(reference_frame + delta, 0, 1),
+            "change_mask": torch.ones_like(reference_frame[:, :1]),
+            "residual_delta": delta,
+        }
+
+    monkeypatch.setattr(model, "decode_prediction", advancing_decode)
+    rollout = model.forward_horizons(
+        torch.zeros(1, 8), torch.zeros(1, 2, dtype=torch.long), model.initial_state(1),
+        horizon_frames=[1, 2], reference_frame=reference, reference_spatial=spatial,
+    )
+    targets = {1: torch.full_like(reference[0], 0.1), 2: torch.full_like(reference[0], 0.2)}
+    for horizon, target in targets.items():
+        model_mse = torch.nn.functional.mse_loss(rollout[horizon].decoded[0], target)
+        copy_last_mse = torch.nn.functional.mse_loss(reference[0], target)
+        assert model_mse < copy_last_mse
+    assert not torch.allclose(rollout[1].decoded, rollout[2].decoded)
+    assert rollout[2].residual_delta is not None
+
+
+def test_spatial_loss_balances_dynamic_pixels_and_supervises_the_gate():
+    model = PredictiveCortex(
+        (8, 8, 3), ["wait"],
+        PredictiveCortexConfig(latent_width=4, reconstruction_size=8),
+    )
+    reference = torch.zeros(1, 3, 8, 8)
+    target = reference.clone()
+    target[:, :, 3:5, 3:5] = 1.0
+    loss, _mask, decoded = _spatial_pixel_loss(
+        model, torch.zeros(1, 4), reference, target,
+        ActionWorldModelConfig(change_mask_threshold=0.1, motion_pixel_loss_weight=4.0),
+    )
+    assert loss > 0
+    assert decoded["target_change_fraction"] == pytest.approx(4 / 64, abs=1e-6)
+    assert decoded["dynamic_pixel_loss"] > decoded["static_pixel_loss"]
+    assert decoded["mask_supervision_loss"] > 0
+
+
+def test_spatial_loss_reuses_an_existing_decoder_result(monkeypatch):
+    """The direct-head trainer must not decode each prediction twice."""
+    model = PredictiveCortex(
+        (8, 8, 3), ["wait"],
+        PredictiveCortexConfig(latent_width=4, reconstruction_size=8),
+    )
+    reference = torch.zeros(1, 3, 8, 8)
+    target = torch.ones_like(reference)
+    visual = model.decode_prediction(
+        torch.zeros(1, 4), reference_frame=reference,
+        reference_spatial=model.encode_visual(reference).spatial,
+    )
+
+    def unexpected_decode(*_args, **_kwargs):
+        raise AssertionError("loss unexpectedly decoded the direct prediction again")
+
+    monkeypatch.setattr(model, "decode_prediction", unexpected_decode)
+    loss, _mask, _decoded = _spatial_pixel_loss(
+        model, torch.zeros(1, 4), reference, target, ActionWorldModelConfig(),
+        decoded=visual,
+    )
+    assert loss > 0
+
+
 def test_legacy_global_pool_checkpoint_has_actionable_error(tmp_path):
     path = tmp_path / "legacy.pt"
     torch.save({"format": "action-world-model-v1"}, path)

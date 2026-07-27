@@ -176,7 +176,10 @@ def _session_name(session_dir: str) -> Optional[str]:
 def _b64_frame(chw: torch.Tensor) -> str:
     """``Tensor[C, H, W]`` in [0, 1] -> base64 of HWC uint8 bytes."""
     hwc = (chw.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).permute(1, 2, 0)
-    return base64.b64encode(hwc.contiguous().numpy().tobytes()).decode("ascii")
+    # Exports are JSON/NumPy artifacts, while a CUDA-trained cortex returns
+    # CUDA tensors.  Crossing to host memory belongs at this serialization
+    # boundary, not in the inference path.
+    return base64.b64encode(hwc.detach().cpu().contiguous().numpy().tobytes()).decode("ascii")
 
 
 def export_prediction_file(
@@ -204,7 +207,8 @@ def export_prediction_file(
             f"{session_dir}/{episode_id} has {len(frames)} frames, too short for horizon {max_horizon}"
         )
 
-    pixel_tensors = torch.stack([pixels_to_chw(f) for f in frames])
+    device = next(model.parameters()).device
+    pixel_tensors = torch.stack([pixels_to_chw(f) for f in frames]).to(device)
     targets = reconstruction_target(pixel_tensors, model.reconstruction_shape)
 
     was_training = model.training
@@ -288,6 +292,7 @@ def export_cortex_session_predictions(
     """
     from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
     from cognitive_runtime.training.action_world_model import _episode_workspace_tensors
+    from cognitive_runtime.training.event_evaluation import extract_frame_event_labels, labels_to_json
     from cognitive_runtime.training.visual_representation import reconstruction_target
 
     if prediction_mode not in {"direct", "rollout"}:
@@ -319,13 +324,19 @@ def export_cortex_session_predictions(
     frames = episode.frames
     if len(frames) <= horizons[-1]:
         raise ValueError(f"{session_dir}/{episode_id} is too short for horizon {horizons[-1]}")
-    pixels = torch.stack([pixels_to_chw(frame) for frame in frames])
+    device = next(model.parameters()).device
+    pixels = torch.stack([pixels_to_chw(frame) for frame in frames]).to(device)
     targets = reconstruction_target(pixels, model.reconstruction_shape)
     actions = torch.tensor(
-        [vocabulary[dataset.action_keys[index]] for index in episode.actions], dtype=torch.long
+        [vocabulary[dataset.action_keys[index]] for index in episode.actions],
+        dtype=torch.long, device=device,
     )
     # This performs the layout and per-modality checks for workspace-aware models.
     workspace = _episode_workspace_tensors(episode, dataset, model, actions=actions)
+    action_names = [dataset.action_keys[index] for index in episode.actions]
+    event_labels = extract_frame_event_labels(
+        episode.semantic_grids, positions=episode.positions, actions=action_names,
+    ) if len(episode.semantic_grids) == len(episode.frames) else []
 
     predictions: Dict[str, Any] = {str(h): {"frames": []} for h in horizons}
     was_training = model.training
@@ -378,6 +389,7 @@ def export_cortex_session_predictions(
         "training_sources": list(training_stats.get("training_sources", [])),
         "evaluation_source": f"{session_dir}/{episode_id}",
         "prediction_mode": prediction_mode,
+        "events": labels_to_json(event_labels),
         "horizons": horizons,
         "prediction_shape": list(model.reconstruction_shape),
         "n_frames": len(frames),

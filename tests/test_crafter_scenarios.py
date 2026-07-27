@@ -26,6 +26,7 @@ from cognitive_runtime.training.nursery import (  # noqa: E402
     run_nursery_scenario,
     validate_nursery_recordings,
 )
+from cognitive_runtime.training.action_world_model import ActionWorldModelConfig  # noqa: E402
 
 _COW_ID = next(i for i, n in SEMANTIC_LEGEND_NAMES.items() if n == "cow")
 _ENTITY_IDS = {
@@ -153,6 +154,21 @@ def test_object_permanence_player_is_stationary_while_mob_moves(tmp_path):
     assert quality.completed is True
 
 
+def test_approach_entity_stays_dynamic_after_nearing_the_cow(tmp_path):
+    """The entity approach must not spend most of a short episode blocked
+    against the cow; it approaches, retreats, and preserves useful motion
+    supervision throughout the configured recording length."""
+    scenario = CRAFTER_SCENARIOS["approach_entity"]
+    cfg = _crafter_config()
+    session_dir = _record_scenario_episode(
+        str(tmp_path), "crafter-approach-dynamic", 0, scenario, cfg
+    )
+    quality = measure_recording_quality(session_dir, list_episodes(session_dir)[0])
+
+    assert quality.moving_transition_fraction >= scenario.min_moving_transition_fraction
+    assert quality.longest_stationary_tail <= scenario.max_longest_stationary_tail
+
+
 @pytest.mark.parametrize("scenario_name", ["walk_forward_short", "blocked_forward", "turn"])
 def test_non_entity_scenarios_contain_no_cow_semantic_id(tmp_path, scenario_name):
     """Issue #202: wildlife must be *removed*, not merely frozen in place --
@@ -219,18 +235,11 @@ def test_run_nursery_scenario_reports_the_resolved_program_config(tmp_path):
     assert list(report.resolved_program_config["area"]) == [80, 80]
 
 
-@pytest.mark.parametrize("scenario_name", ["turn", "walk_forward_short"])
+@pytest.mark.parametrize("scenario_name", sorted(CRAFTER_SCENARIOS))
 def test_split_overlap_gate_passes_a_genuine_crafter_recording(tmp_path, scenario_name):
-    """Issue #202: scenarios with no deterministic convergence point (no
-    scripted entity/wall placed relative to the player's fixed spawn) leave
-    genuinely different, non-overlapping recordings per seed -- the gate
-    should be safe to enable outright for these at its default threshold.
-    (``approach_entity``/``object_permanence``/``blocked_forward`` all place
-    their scripted target relative to the player's spawn, which Crafter
-    always puts at the exact world center regardless of seed -- their early
-    approach frames legitimately share much of their background across
-    episodes by design, per ``NurseryConfig.split_overlap_gate``'s
-    docstring, and need a looser or scenario-specific threshold.)"""
+    """Every Crafter scenario retains enough seeded visual context for the
+    default train/holdout overlap gate to catch a real duplicated recording
+    without rejecting the intentionally scripted route or entity."""
     cfg = _crafter_config(
         train_seeds=(0, 1, 2), holdout_seeds=(1000, 1001),
         horizons=(1,), latent_width=16, hidden_dim=32, reconstruction_size=8,
@@ -239,6 +248,32 @@ def test_split_overlap_gate_passes_a_genuine_crafter_recording(tmp_path, scenari
     )
     _model, report = run_nursery_scenario(str(tmp_path), scenario_name, cfg)
     assert report.scenario == scenario_name
+
+
+def test_joint_overfit_evaluation_replays_exact_training_sessions(tmp_path):
+    """The overfit canary must not create a fake held-out recording: it
+    evaluates the exact paths that supplied training frames and labels the
+    result as a training replay."""
+    from cognitive_runtime.training.nursery import run_nursery_joint
+
+    cfg = _crafter_config(
+        train_seeds=(0, 1), holdout_seeds=(1000,), horizons=(1,),
+        split_overlap_gate=True, overfit_evaluation=True,
+    )
+    model_cfg = ActionWorldModelConfig(
+        latent_width=16, hidden_dim=32, reconstruction_size=8,
+        horizons_ticks=(1,), epochs=1, batch_size=16,
+        warmup_frames=2, rollout_frames=2,
+    )
+    _model, report = run_nursery_joint(
+        str(tmp_path), train_scenarios=("approach_entity",), holdout_scenarios=(),
+        config=cfg, model_config=model_cfg,
+    )
+
+    assert report.evaluation_mode == "training_replay"
+    assert report.eval_sessions["approach_entity"] == report.train_sessions["approach_entity"]
+    assert report.zero_shot_metrics == {}
+    assert report.training_stats["evaluation_mode"] == "training_replay"
 
 
 def test_run_nursery_scenario_end_to_end_against_crafter(tmp_path):
