@@ -2,6 +2,7 @@ from cognitive_runtime.training.event_evaluation import (
     FrameEventLabels, evaluate_entity_predictions, extract_frame_event_labels,
     motion_stratified_metrics, rollout_health,
 )
+from cognitive_runtime.programs.crafter.streams import SEMANTIC_CLASS_IDS
 from cognitive_runtime.training.statistical_evaluation import (
     build_experiment_report, load_experiment_report, write_experiment_report,
 )
@@ -9,7 +10,7 @@ from cognitive_runtime.training.statistical_evaluation import (
 
 def test_semantic_events_detect_cow_entry_exit_and_blocked_not_idle():
     empty = [[0, 0], [0, 0]]
-    cow = [[0, 14], [0, 0]]
+    cow = [[0, SEMANTIC_CLASS_IDS["entity"]], [0, 0]]
     labels = extract_frame_event_labels(
         [empty, cow, empty, empty], positions=[(1, 1)] * 4,
         actions=["MOVE_UP", "MOVE_UP", "MOVE_UP"],

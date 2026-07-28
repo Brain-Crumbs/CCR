@@ -64,7 +64,7 @@ test("session quality verdicts are memoized until a session file changes", () =>
   assert.equal(calls, 2);
 });
 
-test("browser links an episode to the locally served frame and prediction APIs", async () => {
+test("browser renders exactly one selected run's pixel-horizon viewer", async () => {
   const source = fs.readFileSync(path.join(__dirname, "../public/session-browser.js"), "utf8");
   const isolated = source.replace(/^import .*diagnostic-panels\.js.*$/m, "");
   const { episodeUrls } = await import(`data:text/javascript;base64,${Buffer.from(isolated).toString("base64")}`);
@@ -77,8 +77,59 @@ test("browser links an episode to the locally served frame and prediction APIs",
     "/api/sessions/pixel%20session/episodes/episode_00000/predictions?experiment=joint%20cortex%2F42",
   );
   assert.match(source, /createElement\("pixel-horizon-viewer"\)/);
-  assert.match(source, /timechange/);
-  assert.match(source, /selectedExperiment/);
+  assert.match(source, /run-picker/);
+  assert.match(source, /"Organism"/);
+  assert.match(source, /"Run"/);
+  assert.doesNotMatch(source, /Dreamed vs actual/);
+  assert.doesNotMatch(source, /mountDiagnostics/);
+});
+
+test("clinic mode joins a selected organism/run to its cached prediction sessions", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-runs-"));
+  const runsDir = path.join(root, "runs"), cacheDir = path.join(root, "episode_cache");
+  const runDir = path.join(runsDir, "Test", "run-1"), cached = path.join(cacheDir, "seed-20");
+  fs.mkdirSync(runDir, { recursive: true }); fs.mkdirSync(cached, { recursive: true });
+  fs.writeFileSync(path.join(runDir, "experiment.json"), JSON.stringify({ organism: "Test", experiment_id: "run-1" }));
+  fs.writeFileSync(path.join(cached, "session.json"), JSON.stringify({ name: "Test" }));
+  fs.writeFileSync(path.join(cached, "episode_00000.streams.jsonl"), "");
+  fs.writeFileSync(path.join(cached, "run-1-predictions_episode_00000.json"), JSON.stringify({
+    format: "pixel-predictions-v2", experiment: { experiment_id: "run-1" }, marker: "cached",
+  }));
+  const server = createServer({ runsDir, episodeCacheDir: cacheDir }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+  const port = server.address().port;
+  assert.deepEqual((await get(port, "/api/catalog")).body.runs, [{ organism: "Test", run: "run-1" }]);
+  const query = "?organism=Test&run=run-1";
+  const listed = await get(port, `/api/sessions${query}`);
+  assert.deepEqual(listed.body.sessions.map((session) => session.id), ["cache/seed-20"]);
+  const prediction = await get(port, `/api/sessions/cache%2Fseed-20/episodes/episode_00000/predictions${query}&experiment=run-1`);
+  assert.equal(prediction.body.marker, "cached");
+});
+
+test("clinic mode uses a run session index to include cached training recordings", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-index-"));
+  const runsDir = path.join(root, "runs"), cacheDir = path.join(root, "episode_cache");
+  const runDir = path.join(runsDir, "Test", "run-2"), cached = path.join(cacheDir, "seed-21");
+  fs.mkdirSync(runDir, { recursive: true }); fs.mkdirSync(cached, { recursive: true });
+  fs.writeFileSync(path.join(runDir, "experiment.json"), JSON.stringify({ organism: "Test", experiment_id: "run-2" }));
+  fs.writeFileSync(path.join(runDir, "clinic_sessions.json"), JSON.stringify({
+    format: "clinic-session-index-v1", sessions: [{ split: "train", scenario: "approach_entity", session_dir: cached }],
+  }));
+  fs.writeFileSync(path.join(cached, "session.json"), JSON.stringify({ name: "Test" }));
+  fs.writeFileSync(path.join(cached, "episode_00000.streams.jsonl"), "");
+  const server = createServer({ runsDir, episodeCacheDir: cacheDir }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+  const listed = await get(server.address().port, "/api/sessions?organism=Test&run=run-2");
+  assert.deepEqual(listed.body.sessions.map((session) => session.id), ["cache/seed-21"]);
+});
+
+test("service discovers sessions nested below the configured runs directory", async (t) => {
+  const root = fixture();
+  const outer = path.join(root, "Test", "run-1"); fs.mkdirSync(outer, { recursive: true });
+  fs.renameSync(path.join(root, "pixel-session"), path.join(outer, "pixel-session"));
+  const server = createServer({ dataDir: root }); await new Promise((resolve) => server.listen(0, resolve)); t.after(() => server.close());
+  const listed = await get(server.address().port, "/api/sessions");
+  assert.deepEqual(listed.body.sessions.map((session) => session.id), ["Test/run-1/pixel-session"]);
+  const detail = await get(server.address().port, "/api/sessions/Test%2Frun-1%2Fpixel-session");
+  assert.equal(detail.status, 200);
 });
 
 test("frame panels honor the source selected in the prediction control", () => {

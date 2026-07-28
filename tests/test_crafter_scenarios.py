@@ -15,7 +15,7 @@ import pytest
 pytest.importorskip("crafter")
 torch = pytest.importorskip("torch")
 
-from cognitive_runtime.programs.crafter.streams import SEMANTIC_LEGEND_NAMES  # noqa: E402
+from cognitive_runtime.programs.crafter.streams import SEMANTIC_CLASS_IDS  # noqa: E402
 from cognitive_runtime.runtime.replay import list_episodes  # noqa: E402
 from cognitive_runtime.training.nursery import (  # noqa: E402
     CRAFTER_SCENARIOS,
@@ -27,11 +27,9 @@ from cognitive_runtime.training.nursery import (  # noqa: E402
     validate_nursery_recordings,
 )
 from cognitive_runtime.training.action_world_model import ActionWorldModelConfig  # noqa: E402
+import cognitive_runtime.training.nursery as nursery_module  # noqa: E402
 
-_COW_ID = next(i for i, n in SEMANTIC_LEGEND_NAMES.items() if n == "cow")
-_ENTITY_IDS = {
-    i for i, n in SEMANTIC_LEGEND_NAMES.items() if n in ("cow", "zombie", "skeleton")
-}
+_ENTITY_ID = SEMANTIC_CLASS_IDS["entity"]
 
 
 def _crafter_config(**overrides) -> NurseryConfig:
@@ -67,6 +65,35 @@ def test_scenarios_for_world_selects_the_right_registry():
     assert _scenarios_for_world("minecraft") is NURSERY_SCENARIOS
     with pytest.raises(ValueError, match="unknown nursery world"):
         _scenarios_for_world("not-a-world")
+
+
+def test_episode_cache_reuses_a_compatible_scenario_seed(monkeypatch, tmp_path):
+    """Hyperparameter reruns must reuse recording data, not replay Crafter."""
+    calls = []
+
+    def fake_record(record_dir, session_id, seed, scenario, cfg, *, recording=None):
+        calls.append((record_dir, session_id, seed))
+        session_dir = os.path.join(record_dir, session_id)
+        os.makedirs(session_dir, exist_ok=True)
+        with open(os.path.join(session_dir, "session.json"), "w", encoding="utf-8") as fh:
+            json.dump({"session_id": session_id}, fh)
+        with open(os.path.join(session_dir, "episode_00000.decisions.jsonl"), "w", encoding="utf-8"):
+            pass
+        return session_dir
+
+    monkeypatch.setattr(nursery_module, "_record_scenario_episode", fake_record)
+    cfg = _crafter_config(episode_cache_dir=str(tmp_path / "episode-cache"))
+    scenario = CRAFTER_SCENARIOS["turn"]
+    first = nursery_module._record_or_reuse_scenario_episode(
+        str(tmp_path / "run-a"), "turn-train-0", 0, scenario, cfg,
+    )
+    second = nursery_module._record_or_reuse_scenario_episode(
+        str(tmp_path / "run-b"), "turn-train-0", 0, scenario, cfg,
+    )
+
+    assert first == second
+    assert len(calls) == 1
+    assert os.path.isfile(os.path.join(first, "nursery_cache.json"))
 
 
 @pytest.mark.parametrize("scenario_name", sorted(CRAFTER_SCENARIOS))
@@ -170,7 +197,7 @@ def test_approach_entity_stays_dynamic_after_nearing_the_cow(tmp_path):
 
 
 @pytest.mark.parametrize("scenario_name", ["walk_forward_short", "blocked_forward", "turn"])
-def test_non_entity_scenarios_contain_no_cow_semantic_id(tmp_path, scenario_name):
+def test_non_entity_scenarios_contain_no_entity_semantic_id(tmp_path, scenario_name):
     """Issue #202: wildlife must be *removed*, not merely frozen in place --
     a frozen-but-rendered cow was silently becoming a permanent training
     feature of scenarios that never asked for one."""
@@ -182,14 +209,12 @@ def test_non_entity_scenarios_contain_no_cow_semantic_id(tmp_path, scenario_name
         )
         episode_id = list_episodes(session_dir)[0]
         ids = _semantic_ids_seen(session_dir, episode_id)
-        assert not (ids & _ENTITY_IDS), (scenario_name, seed, ids)
+        assert _ENTITY_ID not in ids, (scenario_name, seed, ids)
 
 
 @pytest.mark.parametrize("scenario_name", ["approach_entity", "object_permanence"])
-def test_entity_scenarios_contain_only_the_scripted_entity_population(tmp_path, scenario_name):
-    """Issue #202: an entity scenario's recorded population must be exactly
-    its own scripted entity (one cow), nothing else world generation
-    happened to spawn alongside it."""
+def test_entity_scenarios_contain_the_scripted_entity_class(tmp_path, scenario_name):
+    """The compact recording exposes the action-relevant entity class only."""
     scenario = CRAFTER_SCENARIOS[scenario_name]
     cfg = _crafter_config(train_seeds=(0, 1, 2, 3), holdout_seeds=(1000,))
     for seed in (0, 1, 2, 3, 1000):
@@ -198,7 +223,7 @@ def test_entity_scenarios_contain_only_the_scripted_entity_population(tmp_path, 
         )
         episode_id = list_episodes(session_dir)[0]
         ids = _semantic_ids_seen(session_dir, episode_id)
-        assert ids & _ENTITY_IDS == {_COW_ID}, (scenario_name, seed, ids)
+        assert _ENTITY_ID in ids, (scenario_name, seed, ids)
 
 
 def test_crafter_scenarios_are_deterministic(tmp_path):

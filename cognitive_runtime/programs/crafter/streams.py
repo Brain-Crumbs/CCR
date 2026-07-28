@@ -18,12 +18,13 @@ from cognitive_runtime.core.streams.delta import DeltaPublisher
 from cognitive_runtime.core.streams.events import StreamEvent, StreamSpec
 from cognitive_runtime.core.streams.pacer import RatePacer
 
-#: Crafter's semantic material/object vocabulary: ``crafter.constants.materials``
-#: (ids 1..12, in declaration order) plus ``engine.SemanticView``'s tracked
-#: object types (ids 13..18); id 0 is void/out-of-bounds. Hardcoded (not
-#: imported) so this module -- and the generic vision-grid encoder it feeds
-#: -- stays importable without the optional ``crafter`` package installed;
-#: ``tests/test_crafter_world.py`` checks this against the live package.
+#: Crafter's *raw* semantic material/object vocabulary:
+#: ``crafter.constants.materials`` (ids 1..12, in declaration order) plus
+#: ``engine.SemanticView``'s tracked object types (ids 13..18); id 0 is
+#: void/out-of-bounds.  This is adapter metadata, not the vocabulary exposed
+#: to the world model.  It stays hardcoded so this module -- and the generic
+#: vision-grid encoder it feeds -- remains importable without ``crafter``.
+#: ``tests/test_crafter_world.py`` checks it against the live package.
 SEMANTIC_LEGEND_NAMES: Dict[int, str] = {
     0: "void", 1: "water", 2: "grass", 3: "stone", 4: "path", 5: "sand",
     6: "tree", 7: "lava", 8: "coal", 9: "iron", 10: "diamond",
@@ -31,7 +32,6 @@ SEMANTIC_LEGEND_NAMES: Dict[int, str] = {
     13: "player", 14: "cow", 15: "zombie", 16: "skeleton", 17: "arrow", 18: "plant",
 }
 
-_WALKABLE = {"grass", "path", "sand", "void"}
 _HAZARD = {"lava"}
 _RESOURCE = {"tree", "coal", "iron", "diamond", "plant"}
 _SOLID = {"stone", "table", "furnace"}
@@ -39,8 +39,15 @@ _HOSTILE = {"zombie", "skeleton", "arrow"}
 
 
 def _legend_class(name: str) -> str:
-    """Cell name -> generic class tag the ``GridVisionEncoder`` pools on
-    (issue #32's shared vocabulary): solid/water/resource/entity/agent/ground."""
+    """Raw Crafter material/object -> compact action-relevant class.
+
+    The world model should learn to act on geometry and affordances, not
+    memorize Crafter's renderer-level material ids.  These six categories
+    preserve the distinctions needed for local control: traversable space,
+    water, blocking/hazardous terrain, gatherable resources, entities, and the
+    agent.  Crafting recipes and item counts belong in body/inventory state,
+    not in the visual semantic target.
+    """
     if name == "player":
         return "agent"
     if name in _HOSTILE or name == "cow":
@@ -54,9 +61,27 @@ def _legend_class(name: str) -> str:
     return "ground"  # walkable terrain, or void: open, never blocks a view
 
 
-#: Frame cell id -> generic class tag, so the vision encoder stays generic.
-FRAME_LEGEND: Dict[int, str] = {
-    code: _legend_class(name) for code, name in SEMANTIC_LEGEND_NAMES.items()
+#: The compact vocabulary emitted in ``vision.frame.grid`` and supervised by
+#: the semantic decoder.  These ids are deliberately contiguous so they can
+#: be used directly as cross-entropy targets.
+SEMANTIC_CLASSES: Tuple[str, ...] = (
+    "ground", "water", "solid", "resource", "entity", "agent",
+)
+#: Bump whenever an existing compact id changes meaning.  Nursery recording
+#: caches use this to avoid training a new decoder against stale raw grids.
+SEMANTIC_VOCABULARY_VERSION = "crafter-action-semantics-v1"
+SEMANTIC_CLASS_IDS: Dict[str, int] = {
+    name: index for index, name in enumerate(SEMANTIC_CLASSES)
+}
+
+#: Frame cell id -> compact class tag.  Unlike ``SEMANTIC_LEGEND_NAMES``, this
+#: is the model vocabulary, not Crafter's raw simulator vocabulary.
+FRAME_LEGEND: Dict[int, str] = dict(enumerate(SEMANTIC_CLASSES))
+
+#: Raw Crafter semantic id -> compact model semantic id.
+RAW_TO_SEMANTIC_ID: Dict[int, int] = {
+    raw_id: SEMANTIC_CLASS_IDS[_legend_class(name)]
+    for raw_id, name in SEMANTIC_LEGEND_NAMES.items()
 }
 
 VISION_STREAM = "vision.frame.grid"
@@ -75,10 +100,13 @@ VITAL_RANGE = (0.0, 9.0)  # health/food/drink/energy scale
 def crop_semantic_grid(
     semantic: np.ndarray, position: Tuple[int, int], radius: int
 ) -> List[List[int]]:
-    """A ``(2*radius+1)`` square, egocentric crop of Crafter's full-world
-    semantic grid, clamped at the world edge (Crafter has no wraparound;
-    mirrors ``programs.minecraft.world.SimulatedWorld.render_frame``'s
-    clamped patch)."""
+    """Return a compact semantic crop centered on the player.
+
+    The crop is clamped at the world edge (Crafter has no wraparound).  Raw
+    simulator ids are converted at this boundary so recordings, the fused
+    grid encoder, and semantic-decoder targets all share the same small,
+    action-relevant vocabulary.
+    """
     x, y = position
     w, h = semantic.shape
     out: List[List[int]] = []
@@ -87,7 +115,11 @@ def crop_semantic_grid(
         for dy in range(-radius, radius + 1):
             cx = min(max(x + dx, 0), w - 1)
             cy = min(max(y + dy, 0), h - 1)
-            row.append(int(semantic[cx, cy]))
+            raw_id = int(semantic[cx, cy])
+            # Unknown values are treated as ground rather than creating an
+            # out-of-vocabulary target when a future Crafter release adds a
+            # decorative material.
+            row.append(RAW_TO_SEMANTIC_ID.get(raw_id, SEMANTIC_CLASS_IDS["ground"]))
         out.append(row)
     return out
 
@@ -108,8 +140,9 @@ def build_crafter_stream_specs(
     """
     grid_side = 2 * grid_radius + 1
     return [
-        StreamSpec(VISION_STREAM, "vision", "Egocentric local semantic-grid crop.",
-                   nominal_rate_hz=vision_hz, payload_schema=f"{grid_side}x{grid_side} int grid",
+        StreamSpec(VISION_STREAM, "vision", "Egocentric compact action-semantic grid crop.",
+                   nominal_rate_hz=vision_hz,
+                   payload_schema=f"{grid_side}x{grid_side} 6-class int grid",
                    legend=FRAME_LEGEND),
         StreamSpec(PIXEL_STREAM, "vision",
                    "RGB camera frame Crafter renders natively -- real pixel provenance, "

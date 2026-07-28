@@ -25,6 +25,7 @@ group nursery runs the same way they already group curriculum-preset runs
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 from dataclasses import dataclass, field, replace
@@ -42,7 +43,7 @@ from cognitive_runtime.policies.constant_action import ConstantActionPolicy
 from cognitive_runtime.policies.null_policy import NullPolicy
 from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy
 from cognitive_runtime.programs.crafter.config import CrafterConfig, area_from_world_size
-from cognitive_runtime.programs.crafter.streams import FRAME_LEGEND
+from cognitive_runtime.programs.crafter.streams import FRAME_LEGEND, SEMANTIC_VOCABULARY_VERSION
 from cognitive_runtime.programs.minecraft.adapter import BACKENDS, MinecraftSurvivalBox
 #: Re-exported for back-compat: this gate moved to ``record.quality`` (issue
 #: #90) so it can run world-agnostically; existing imports of
@@ -206,6 +207,11 @@ class NurseryConfig:
     #: the encoder checkpoint all carry it. ``None`` lets each recorded
     #: episode resolve its own generated name (cosmetic only).
     name: Optional[str] = None
+    #: Optional reusable session cache.  When set, nursery recordings are
+    #: keyed by their effective world/scenario/seed/program configuration and
+    #: reused across experiment directories.  Model/training hyperparameters
+    #: deliberately do not affect the key: they consume the same episodes.
+    episode_cache_dir: Optional[str] = None
 
 
 @dataclass
@@ -1457,12 +1463,13 @@ def _scenario_program_config(
 
 
 def _record_scenario_episode(
-    record_dir: str, session_id: str, seed: int, scenario: NurseryScenario, cfg: NurseryConfig
+    record_dir: str, session_id: str, seed: int, scenario: NurseryScenario, cfg: NurseryConfig,
+    *, recording: Optional[ScenarioRecording] = None,
 ) -> str:
     with span("nursery.record.episode", session=session_id, scenario=scenario.name,
               seed=seed, ticks=cfg.episode_ticks):
         log.info("recording %s  seed=%d  ticks=%d", session_id, seed, cfg.episode_ticks)
-        recording = scenario.build(seed, cfg)
+        recording = recording or scenario.build(seed, cfg)
         episode_ticks = recording.episode_ticks or cfg.episode_ticks
         program_config = _scenario_program_config(
             cfg, episode_ticks, recording.program_config_extra
@@ -1500,6 +1507,130 @@ def _record_scenario_episode(
         # by the very episode that killed the run.
         trace_counter("episodes_recorded")
         return os.path.join(record_dir, session_id)
+
+
+def _cached_episode_identity(
+    scenario: NurseryScenario, seed: int, cfg: NurseryConfig, recording: ScenarioRecording,
+) -> Dict[str, Any]:
+    """Stable identity for a reusable nursery recording.
+
+    Training knobs are intentionally absent: changing model width, epochs, or
+    loss weights must reuse the same recorded episode.  The effective program
+    config is included so changes such as Crafter area or scenario-specific
+    episode length safely produce a new cache entry.
+    """
+    episode_ticks = recording.episode_ticks or cfg.episode_ticks
+    return {
+        "format": "nursery-episode-cache-v1",
+        "world": cfg.world,
+        "backend": cfg.backend,
+        "scenario": scenario.name,
+        "seed": int(seed),
+        "episode_ticks": int(episode_ticks),
+        "program_config": _scenario_program_config(
+            cfg, episode_ticks, recording.program_config_extra,
+        ),
+        # Old Crafter recordings carry raw 19-class grids.  The vocabulary is
+        # part of recorded data identity, even though it is not a simulator
+        # knob, so a semantic-target change produces a fresh cache entry.
+        "semantic_vocabulary_version": (
+            SEMANTIC_VOCABULARY_VERSION if cfg.world == "crafter" else None
+        ),
+        "realtime": bool(cfg.realtime),
+    }
+
+
+def _record_or_reuse_scenario_episode(
+    record_dir: str, session_id: str, seed: int, scenario: NurseryScenario, cfg: NurseryConfig,
+) -> str:
+    """Reuse a verified compatible cached episode, or record it once.
+
+    Cached session directories are never copied into the experiment directory:
+    downstream dataset, quality, and split-audit code already operates on
+    arbitrary session paths.  This avoids duplicate frame files and makes a
+    cache hit genuinely skip the slow world simulation.
+    """
+    if not cfg.episode_cache_dir:
+        return _record_scenario_episode(record_dir, session_id, seed, scenario, cfg)
+
+    recording = scenario.build(seed, cfg)
+    identity = _cached_episode_identity(scenario, seed, cfg, recording)
+    # Round-trip through JSON before comparing/writing: program configs may
+    # contain tuples (e.g. Crafter's area) that serialize as lists.
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    identity = json.loads(encoded)
+    key = hashlib.sha256(encoded).hexdigest()[:20]
+    cache_session_dir = os.path.join(
+        os.path.abspath(cfg.episode_cache_dir), f"{scenario.name}-seed-{seed}-{key}",
+    )
+    manifest_path = os.path.join(cache_session_dir, "nursery_cache.json")
+
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, encoding="utf-8") as fh:
+                cached_identity = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid nursery episode cache manifest {manifest_path}: {exc}") from exc
+        if cached_identity != identity:
+            raise ValueError(
+                f"nursery episode cache identity mismatch at {cache_session_dir}; "
+                "use a fresh cache directory or remove the stale cache entry"
+            )
+        if not os.path.isfile(os.path.join(cache_session_dir, "session.json")) or not list_episodes(cache_session_dir):
+            raise ValueError(
+                f"nursery episode cache entry is incomplete: {cache_session_dir}; "
+                "remove it before recording again"
+            )
+        log.info("reusing cached nursery episode %s  seed=%d", scenario.name, seed)
+        trace_event("nursery.record.cache_hit", scenario=scenario.name, seed=seed,
+                    cache_session=cache_session_dir)
+        return cache_session_dir
+
+    if os.path.exists(cache_session_dir):
+        raise ValueError(
+            f"nursery episode cache entry is incomplete: {cache_session_dir}; "
+            "remove it before recording again"
+        )
+    os.makedirs(cache_session_dir, exist_ok=False)
+    # Record directly into the keyed session directory.  The manifest is
+    # written only after a successful recording, so an interrupted attempt
+    # cannot become a cache hit.
+    parent_dir, cache_session_id = os.path.split(cache_session_dir)
+    recorded_session = _record_scenario_episode(
+        parent_dir, cache_session_id, seed, scenario, cfg, recording=recording,
+    )
+    with open(manifest_path, "w", encoding="utf-8") as fh:
+        json.dump(identity, fh, indent=2, sort_keys=True)
+    trace_event("nursery.record.cache_store", scenario=scenario.name, seed=seed,
+                cache_session=recorded_session)
+    return recorded_session
+
+
+def _write_clinic_session_index(
+    record_dir: str,
+    train_sessions: Dict[str, List[str]],
+    eval_sessions: Dict[str, List[str]],
+) -> None:
+    """Bind an experiment run to the recordings it consumed.
+
+    Cache entries are deliberately shared across runs, so their directory
+    names cannot say which model used them.  The clinic reads this small,
+    run-local index to show the complete train/evaluation set for the selected
+    run, including recordings which do not have an exported prediction file.
+    """
+    entries = []
+    for split, groups in (("train", train_sessions), ("evaluation", eval_sessions)):
+        for scenario, sessions in groups.items():
+            for session_dir in sessions:
+                entries.append({
+                    "scenario": scenario,
+                    "split": split,
+                    "session_dir": os.path.abspath(session_dir),
+                })
+    os.makedirs(record_dir, exist_ok=True)
+    index_path = os.path.join(record_dir, "clinic_sessions.json")
+    with open(index_path, "w", encoding="utf-8") as fh:
+        json.dump({"format": "clinic-session-index-v1", "sessions": entries}, fh, indent=2)
 
 
 # --------------------------------------------------------------------------- benchmark harness
@@ -1957,7 +2088,7 @@ def run_nursery_joint(
             scenario = scenarios[name]
             with span("nursery.record.scenario", scenario=name, split="train+holdout"):
                 train_sessions[name] = [
-                    _record_scenario_episode(
+                    _record_or_reuse_scenario_episode(
                         record_dir, f"nursery-{name}-train-{seed}", seed, scenario, cfg
                     )
                     for seed in cfg.train_seeds
@@ -1966,7 +2097,7 @@ def run_nursery_joint(
                     list(train_sessions[name])
                     if cfg.overfit_evaluation
                     else [
-                        _record_scenario_episode(
+                        _record_or_reuse_scenario_episode(
                             record_dir, f"nursery-{name}-holdout-{seed}", seed, scenario, cfg
                         )
                         for seed in cfg.holdout_seeds
@@ -1976,7 +2107,7 @@ def run_nursery_joint(
             scenario = scenarios[name]
             with span("nursery.record.scenario", scenario=name, split="zero-shot"):
                 eval_sessions[name] = [
-                    _record_scenario_episode(
+                    _record_or_reuse_scenario_episode(
                         record_dir, f"nursery-{name}-holdout-{seed}", seed, scenario, cfg
                     )
                     for seed in cfg.holdout_seeds
@@ -1985,6 +2116,8 @@ def run_nursery_joint(
             train_sessions=sum(len(v) for v in train_sessions.values()),
             eval_sessions=sum(len(v) for v in eval_sessions.values()),
         )
+
+    _write_clinic_session_index(record_dir, train_sessions, eval_sessions)
 
     if cfg.data_quality_gate:
         with span("nursery.quality_gate") as gate_span:

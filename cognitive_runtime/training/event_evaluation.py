@@ -11,10 +11,13 @@ from math import hypot
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 try:  # Keep this small evaluation utility importable without Crafter.
-    from cognitive_runtime.programs.crafter.streams import SEMANTIC_LEGEND_NAMES
-    COW_ID = next(code for code, name in SEMANTIC_LEGEND_NAMES.items() if name == "cow")
+    from cognitive_runtime.programs.crafter.streams import SEMANTIC_CLASS_IDS
+    # The compact Crafter target no longer distinguishes animal species.  The
+    # historical metric names retain "cow" for report compatibility, but now
+    # score the action-relevant entity class.
+    COW_ID = SEMANTIC_CLASS_IDS["entity"]
 except ImportError:  # pragma: no cover - only for minimal installs
-    COW_ID = 14
+    COW_ID = 4
 
 MOVEMENT_ACTIONS = frozenset({"MOVE_UP", "MOVE_DOWN", "MOVE_LEFT", "MOVE_RIGHT", "MOVE_FORWARD", "MOVE_BACKWARD", "FORWARD", "BACKWARD"})
 

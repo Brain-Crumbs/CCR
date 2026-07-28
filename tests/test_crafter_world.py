@@ -17,6 +17,7 @@ from cognitive_runtime.programs.crafter.action_registry import CRAFTER_ACTION_RE
 from cognitive_runtime.programs.crafter.actions import ACTION_SPACE, CRAFTER_ACTIONS
 from cognitive_runtime.programs.crafter.adapter import CrafterWorld
 from cognitive_runtime.programs.crafter.stream_registry import CRAFTER_STREAM_REGISTRY
+from cognitive_runtime.programs.crafter.streams import SEMANTIC_CLASS_IDS
 
 FAST_CONFIG = {"episode_ticks": 200}
 
@@ -309,7 +310,7 @@ def test_post_reset_hook_edits_take_effect_before_the_reset_snapshot_publishes()
     # grid -- not just after a later reset.
     grid = grid_events[-1].payload
     radius = len(grid) // 2
-    assert grid[radius + 1][radius] == 3  # stone's semantic id
+    assert grid[radius + 1][radius] == SEMANTIC_CLASS_IDS["solid"]
 
 
 def test_post_reset_hook_is_reapplied_on_every_reset():

@@ -12,3 +12,4 @@ sessions/
 .venv/
 node_modules/
 package-lock.json
+**/episode_cache/

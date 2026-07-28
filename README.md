@@ -87,12 +87,11 @@ ccr nursery joint --record-dir runs/Pixel --out-dir models/Pixel --report result
 
 #### 4. Inspect results in the clinic
 
-The clinic is a browser-based viewer that shows dream strips (predicted vs
-actual frames at each horizon), neuromodulator timelines, and data-quality
-diagnostics.
+The clinic is a browser-based viewer for a selected run's Horizons pixel
+predictions.
 
 ```bash
-node viewer/server.js --data-dir runs/Pixel
+node viewer/server.js --data-dir notebooks/runs
 # open http://localhost:8787
 ```
 

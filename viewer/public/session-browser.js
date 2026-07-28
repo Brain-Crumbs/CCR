@@ -1,138 +1,86 @@
-/** Local, dependency-free session browser for the read-only clinic. */
+/** Local, dependency-free browser for one recorded pixel-prediction run. */
 
-import { mountDiagnostics } from "./diagnostic-panels.js";
-
-function qualityNode(quality) {
-  const wrap = document.createElement("div");
-  wrap.className = `quality quality--${quality.verdict}`;
-  const badge = document.createElement("span");
-  badge.className = "badge";
-  badge.setAttribute("aria-label", `${quality.verdict} data quality`);
-  badge.textContent = quality.verdict;
-  wrap.append(badge);
-  const details = [...(quality.issues || []), ...(quality.warnings || [])];
-  if (details.length) {
-    const list = document.createElement("ul"); list.className = "checks";
-    for (const detail of details) { const li = document.createElement("li"); li.textContent = detail; list.append(li); }
-    wrap.append(list);
-  } else {
-    const ok = document.createElement("span"); ok.className = "checks-ok"; ok.textContent = "All checks passed"; wrap.append(ok);
-  }
-  return wrap;
+function selectionQuery({ organism, run }) {
+  return `?organism=${encodeURIComponent(organism)}&run=${encodeURIComponent(run)}`;
 }
 
-export function episodeUrls(sessionId, episodeId, experimentId = null) {
+export function episodeUrls(sessionId, episodeId, experimentId = null, selection = null) {
   const base = `/api/sessions/${encodeURIComponent(sessionId)}/episodes/${encodeURIComponent(episodeId)}`;
-  const predictions = `${base}/predictions`;
-  return {
-    frames: `${base}/frames`,
-    predictions: experimentId ? `${predictions}?experiment=${encodeURIComponent(experimentId)}` : predictions,
-  };
+  const params = new URLSearchParams(selection || {});
+  if (experimentId) params.set("experiment", experimentId);
+  const suffix = params.size ? `?${[...params].map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`).join("&")}` : "";
+  return { frames: `${base}/frames${suffix}`, predictions: `${base}/predictions${suffix}` };
 }
 
-export function mountSessionBrowser(root, { loadSessions = () => fetch("/api/sessions").then((r) => {
+function picker(label, ariaLabel, values, selected, onChange) {
+  const control = document.createElement("label"); control.className = "run-picker"; control.textContent = `${label} `;
+  const select = document.createElement("select"); select.setAttribute("aria-label", ariaLabel);
+  for (const value of values) {
+    const option = document.createElement("option"); option.value = value; option.textContent = value;
+    option.selected = value === selected; select.append(option);
+  }
+  select.addEventListener("change", () => onChange(select.value)); control.append(select);
+  return control;
+}
+
+export function mountSessionBrowser(root, { loadCatalog = () => fetch("/api/catalog").then((r) => {
+  if (!r.ok) throw new Error(`Unable to load runs (${r.status})`);
+  return r.json();
+}), loadSessions = (organism, run) => fetch(`/api/sessions${selectionQuery({ organism, run })}`).then((r) => {
   if (!r.ok) throw new Error(`Unable to load sessions (${r.status})`);
   return r.json();
 }).then((x) => x.sessions) } = {}) {
-  async function showEpisode(session, episode) {
-    root.replaceChildren();
-    const back = document.createElement("button"); back.className = "back"; back.textContent = "← All sessions";
-    back.addEventListener("click", () => { location.hash = ""; renderSessions(sessions); });
-    const title = document.createElement("h2"); title.textContent = `${session.id} / ${episode}`;
-    const stripTitle = document.createElement("h3"); stripTitle.textContent = "Predicted vs actual";
-    const viewer = document.createElement("pixel-horizon-viewer");
-    const selectedExperiment = filtersState.experiment === "__current__"
-      ? currentExperiment : filtersState.experiment;
-    const experimentId = session.experiments?.some((entry) => entry.id === selectedExperiment)
-      ? selectedExperiment : null;
-    const urls = episodeUrls(session.id, episode, experimentId);
-    viewer.setAttribute("frames-src", urls.frames); viewer.setAttribute("predictions-src", urls.predictions);
-    const dreamTitle = document.createElement("h3"); dreamTitle.textContent = "Dreamed vs actual";
-    const dream = document.createElement("pixel-horizon-viewer");
-    dream.setAttribute("frames-src", urls.frames);
-    dream.setAttribute("predictions-src", `${urls.predictions}${experimentId ? "&" : "?"}kind=dream`);
-    const diagnostics = document.createElement("div"); diagnostics.className = "diagnostics"; diagnostics.textContent = "Loading diagnostic streams…";
-    let diagnosticCursor = null;
-    const syncTime = (source, t, tick) => {
-      if (source !== viewer) viewer.setTime(t);
-      if (source !== dream) dream.setTime(t);
-      diagnosticCursor?.setTime(tick);
-    };
-    const syncTick = (tick) => {
-      viewer.setTick(tick); dream.setTick(tick); diagnosticCursor?.setTime(tick);
-    };
-    viewer.addEventListener("timechange", (event) => syncTime(viewer, event.detail.t, event.detail.tick));
-    dream.addEventListener("timechange", (event) => syncTime(dream, event.detail.t, event.detail.tick));
-    root.append(back, title, stripTitle, viewer, dreamTitle, dream, diagnostics);
-    location.hash = `${encodeURIComponent(session.id)}/${encodeURIComponent(episode)}`;
-    try {
-      const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}`);
-      if (!response.ok) throw new Error(`Unable to load diagnostics (${response.status})`);
-      const detail = await response.json();
-      diagnosticCursor = mountDiagnostics(
-        diagnostics, detail.streams?.[episode] || [], detail.decisions?.[episode] || [], detail.session || session,
-        { onTimeChange: syncTick },
-      );
-      diagnosticCursor.setTime(viewer.time);
-    } catch (error) { diagnostics.textContent = String(error); diagnostics.setAttribute("role", "alert"); }
+  let catalog = null;
+
+  function renderEmpty(message) {
+    const empty = document.createElement("p"); empty.className = "empty"; empty.textContent = message; root.replaceChildren(empty);
   }
 
-  function renderSessions(items) {
+  function renderRun(organism, run, sessions, session, episode) {
     root.replaceChildren();
-    const filters = document.createElement("div"); filters.className = "clinic-filters";
-    const allExperiments = [...new Set(items.flatMap((s) => s.experiments || []).map((e) => e.id))];
-    const addFilter = (label, key, values) => {
-      const wrap = document.createElement("label"); wrap.textContent = `${label} `;
-      const select = document.createElement("select"); select.dataset.filter = key;
-      for (const value of ["", ...values.filter(Boolean)]) { const opt = document.createElement("option"); opt.value = value; opt.textContent = value === "__current__" ? "current experiment only" : value || `all ${label.toLowerCase()}`; select.append(opt); }
-      select.addEventListener("change", () => { filtersState[key] = select.value; renderSessions(sessions); }); wrap.append(select); filters.append(wrap);
-    };
-    addFilter("Experiment", "experiment", ["__current__", ...allExperiments]);
-    addFilter("Scenario", "scenario", [...new Set(items.map((s) => s.scenario))]);
-    addFilter("Seed", "seed", [...new Set(items.map((s) => s.seed))]);
-    addFilter("Split", "split", ["train", "holdout"]);
-    addFilter("Entity event", "entity", ["yes"]);
-    addFilter("Motion", "motion", ["moving", "static", "blocked"]);
-    addFilter("Prediction", "mode", ["direct", "rollout"]);
-    for (const select of filters.querySelectorAll("select")) select.value = filtersState[select.dataset.filter] || "";
-    root.append(filters);
-    items = items.filter((s) =>
-      (!filtersState.experiment || (s.experiments || []).some((e) => e.id === filtersState.experiment || (filtersState.experiment === "__current__" && e.id === currentExperiment))) &&
-      (!filtersState.scenario || s.scenario === filtersState.scenario) &&
-      (!filtersState.seed || String(s.seed) === filtersState.seed) &&
-      (!filtersState.split || s.split === filtersState.split) &&
-      (!filtersState.entity || (s.experiments || []).some((e) => e.has_entity_event)) &&
-      (!filtersState.motion || (s.experiments || []).some((e) => filtersState.motion === "moving" ? e.has_moving : filtersState.motion === "static" ? e.has_static : e.has_blocked)) &&
-      (!filtersState.mode || (s.experiments || []).some((e) => e.prediction_mode === filtersState.mode))
-    );
-    if (!items.length) { const empty = document.createElement("p"); empty.className = "empty"; empty.textContent = "No recorded sessions found."; root.append(empty); return; }
-    const groups = Object.groupBy ? Object.groupBy(items, (s) => s.name || "legacy") : items.reduce((all, s) => { (all[s.name || "legacy"] ||= []).push(s); return all; }, {});
-    const organisms = document.createElement("div"); organisms.className = "organisms";
-    for (const [name, grouped] of Object.entries(groups)) {
-      const section = document.createElement("section"); section.className = "organism";
-      const heading = document.createElement("h2"); heading.textContent = name;
-      const grid = document.createElement("div"); grid.className = "session-grid";
-      for (const session of grouped) {
-        const card = document.createElement("article"); card.className = "session";
-        const title = document.createElement("div"); title.className = "session-title";
-        const strong = document.createElement("strong"); strong.textContent = session.id;
-        const count = document.createElement("span"); count.textContent = `${session.episodes.length} episode${session.episodes.length === 1 ? "" : "s"}`;
-        title.append(strong, count); card.append(title, qualityNode(session.quality));
-        const episodes = document.createElement("div"); episodes.className = "episode-links";
-        for (const episode of session.episodes) { const open = document.createElement("button"); open.textContent = `View ${episode}`; open.addEventListener("click", () => showEpisode(session, episode)); episodes.append(open); }
-        card.append(episodes); grid.append(card);
-      }
-      section.append(heading, grid); organisms.append(section);
+    const organisms = catalog.organisms;
+    const organismControl = picker("Organism", "Organism", organisms, organism, (nextOrganism) => {
+      const nextRun = catalog.runs.find((entry) => entry.organism === nextOrganism)?.run;
+      if (nextRun) loadAndRender(nextOrganism, nextRun);
+    });
+    const runs = catalog.runs.filter((entry) => entry.organism === organism).map((entry) => entry.run);
+    const runControl = picker("Run", "Run", runs, run, (nextRun) => loadAndRender(organism, nextRun));
+
+    let recordingControl = null;
+    if (sessions.length > 1) {
+      recordingControl = picker("Recording", "Recording", sessions.map((item) => item.id), session.id, (id) => {
+        const next = sessions.find((item) => item.id === id);
+        if (next) renderRun(organism, run, sessions, next, next.episodes[0]);
+      });
     }
-    root.append(organisms);
+    let episodeControl = null;
+    if (session.episodes.length > 1) {
+      episodeControl = picker("Episode", "Episode", session.episodes, episode, (next) => renderRun(organism, run, sessions, session, next));
+    }
+
+    const title = document.createElement("h2"); title.textContent = "Horizons pixel prediction";
+    const subtitle = document.createElement("p"); subtitle.className = "run-name"; subtitle.textContent = `${organism} / ${run} / ${session.id}`;
+    const viewer = document.createElement("pixel-horizon-viewer");
+    const urls = episodeUrls(session.id, episode, run, { organism, run });
+    viewer.setAttribute("frames-src", urls.frames); viewer.setAttribute("predictions-src", urls.predictions);
+    root.append(organismControl, runControl, recordingControl, episodeControl, title, subtitle, viewer);
+    location.hash = `${encodeURIComponent(organism)}/${encodeURIComponent(run)}/${encodeURIComponent(session.id)}/${encodeURIComponent(episode)}`;
   }
 
-  let sessions = [], filtersState = {}, currentExperiment = null;
-  loadSessions().then((loaded) => {
-    sessions = loaded;
-    currentExperiment = sessions.flatMap((s) => s.experiments || []).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0]?.id || null;
+  function loadAndRender(organism, run) {
+    loadSessions(organism, run).then((sessions) => {
+      const match = location.hash.slice(1).split("/").map(decodeURIComponent);
+      const selected = sessions.find((session) => session.id === match[2] && session.episodes.includes(match[3])) || sessions[0];
+      if (selected) renderRun(organism, run, sessions, selected, match[3] || selected.episodes[0]);
+      else renderEmpty("No recordings are associated with this run yet.");
+    }, (error) => renderEmpty(String(error)));
+  }
+
+  loadCatalog().then((loaded) => {
+    catalog = loaded;
     const match = location.hash.slice(1).split("/").map(decodeURIComponent);
-    const selected = sessions.find((s) => s.id === match[0] && s.episodes.includes(match[1]));
-    if (selected) showEpisode(selected, match[1]); else renderSessions(sessions);
-  }, (error) => { const alert = document.createElement("p"); alert.setAttribute("role", "alert"); alert.textContent = String(error); root.replaceChildren(alert); });
+    const initial = loaded.runs.find((entry) => entry.organism === match[0] && entry.run === match[1]) || loaded.runs[0];
+    if (initial) loadAndRender(initial.organism, initial.run);
+    else renderEmpty("No experiment runs found.");
+  }, (error) => renderEmpty(String(error)));
 }

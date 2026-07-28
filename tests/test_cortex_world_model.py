@@ -23,6 +23,7 @@ from brain.hippocampus import Hippocampus, SeedTags  # noqa: E402
 from cognitive_runtime.core.action import Action  # noqa: E402
 from cognitive_runtime.core.memory import Memory  # noqa: E402
 from cognitive_runtime.core.perception import State  # noqa: E402
+from cognitive_runtime.core.world_model import Prediction  # noqa: E402
 from cognitive_runtime.core.streams.fusion import LatentState  # noqa: E402
 from cognitive_runtime.core.streams.events import StreamEvent  # noqa: E402
 from cognitive_runtime.neural.pixel_stream_encoder import PIXEL_STREAM_ID  # noqa: E402
@@ -137,6 +138,43 @@ def test_hidden_state_persists_across_ticks_and_resets_between_episodes():
     _push_frame(memory, _frame(rng), 3)
     first_of_next_episode = wm.predict(state, memory)
     assert first_of_next_episode.prediction_error is None
+
+
+def test_same_pixel_event_does_not_advance_the_recurrent_state_twice():
+    """A held vision frame is not another real world-model transition."""
+    wm = CortexWorldModel(_small_cortex(), action_keys=_ACTION_KEYS)
+    memory = Memory()
+    state = State(observation=None)
+
+    _push_frame(memory, _frame(np.random.default_rng(3)), 0)
+    first = wm.predict(state, memory)
+    hidden_after_first = copy.deepcopy(wm._hidden)
+    forecast_after_first = wm._predicted_latent.clone()
+    ticks_after_first = wm._tick
+
+    # No event arrived between cognitive ticks: latest() returns the same
+    # stream event, which must not create an imagined real transition.
+    repeated = wm.predict(state, memory)
+
+    assert repeated == Prediction()
+    assert wm._tick == ticks_after_first
+    assert torch.equal(wm._hidden, hidden_after_first)
+    assert torch.equal(wm._predicted_latent, forecast_after_first)
+    assert wm.live_prediction_record() is None
+    assert first.next_latent is not None
+
+
+@pytest.mark.parametrize(
+    "runtime_action_keys",
+    [
+        ["noop", "move_forward", "turn_right", "turn_left"],
+        ["noop", "move_forward", "turn_left"],
+        ["noop", "move_forward", "turn_left", "turn_right", "attack"],
+    ],
+)
+def test_runtime_action_vocabulary_must_match_cortex_checkpoint(runtime_action_keys):
+    with pytest.raises(ValueError, match="exactly match.*ordered vocabulary"):
+        CortexWorldModel(_small_cortex(), action_keys=runtime_action_keys)
 
 
 def test_reset_clears_retrieval_surprise_before_next_episode():

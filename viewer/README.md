@@ -1,8 +1,8 @@
 # CCR Clinic
 
-The viewer now opens on a React session browser grouped by the organism name
-recorded in Phase 0. Every card displays the authoritative Record quality
-verdict and its failing checks before the session is used for training.
+The viewer opens one recorded pixel-prediction run at a time. Select the
+organism and run from the dropdowns to inspect the recordings and horizon
+predictions associated with that experiment.
 
 A lightweight, zero-dependency node server plus a reusable
 `<pixel-horizon-viewer>` web component for inspecting recorded streams-v2
@@ -13,7 +13,7 @@ readouts, a scrubber/playback over the episode, and an MSE-over-time chart.
 ## Run
 
 ```bash
-node viewer/server.js                       # serves ./shared on :8787
+node viewer/server.js                       # serves runs plus episode_cache on :8787
 node viewer/server.js --data-dir /path/to/sessions --port 9000
 ```
 

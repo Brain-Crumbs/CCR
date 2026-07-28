@@ -93,11 +93,19 @@ class CortexWorldModel(CoreWorldModel):
         self.model.eval()
         self.checkpoint_path = checkpoint_path
 
-        keys = list(action_keys) if action_keys is not None else list(model.action_keys)
+        checkpoint_action_keys = list(model.action_keys)
+        keys = (
+            list(action_keys) if action_keys is not None else checkpoint_action_keys
+        )
         if not keys:
             raise ValueError(
                 "CortexWorldModel needs action_keys (the checkpoint carried none); "
                 "pass the program's ordered action space explicitly"
+            )
+        if checkpoint_action_keys and keys != checkpoint_action_keys:
+            raise ValueError(
+                "cortex action_keys must exactly match the checkpoint's ordered "
+                f"vocabulary; checkpoint={checkpoint_action_keys!r}, runtime={keys!r}"
             )
         self.action_keys = keys
         self._action_index = {key: i for i, key in enumerate(self.action_keys)}
@@ -130,6 +138,10 @@ class CortexWorldModel(CoreWorldModel):
         self._latent: Optional[torch.Tensor] = None
         self._pre_advance_hidden = None
         self._latest_live_prediction: Optional[dict[str, Any]] = None
+        # The vision stream can run slower than the cognitive loop.  Its
+        # sequence number identifies the last real observation that advanced
+        # the recurrent state, so the same frame is never consumed twice.
+        self._last_pixel_sequence: Optional[int] = None
 
         # Optional online-consolidation wiring (issue #175): a live
         # `sleep.cortex_consolidation.CortexConsolidator` feeding real
@@ -191,6 +203,7 @@ class CortexWorldModel(CoreWorldModel):
         self._retrieval_surprise = 0.0
         self._last_recalls = ()
         self._latest_live_prediction = None
+        self._last_pixel_sequence = None
 
     def live_prediction_record(self) -> Optional[dict[str, Any]]:
         """Return this tick's decoded live forecasts for the clinic Record."""
@@ -277,6 +290,12 @@ class CortexWorldModel(CoreWorldModel):
         if latest_pixels is None:
             # No pixel frame yet (first tick of an episode before the program
             # publishes): no learned signal, like the memoryless bridge.
+            self._latest_live_prediction = None
+            return Prediction()
+        if latest_pixels.sequence_number == self._last_pixel_sequence:
+            # Vision can be slower than the cognitive clock.  Do not turn a
+            # held frame into extra recurrent transitions or prediction-error
+            # measurements; this tick has no new learned signal.
             self._latest_live_prediction = None
             return Prediction()
 
@@ -382,6 +401,11 @@ class CortexWorldModel(CoreWorldModel):
             self._predicted_latent = first_latent
 
             reward, terminal_logit, risk, uncertainty = self.model.heads(first_hidden)
+
+        # Mark the frame consumed only after its complete cortex update
+        # succeeded, so a transient failure can still be retried on the next
+        # cognitive tick.
+        self._last_pixel_sequence = latest_pixels.sequence_number
 
         # Sleep-phase consolidation (issue #175): outside `no_grad` above --
         # `consolidate()` takes real gradient steps. Phasic/synchronous by

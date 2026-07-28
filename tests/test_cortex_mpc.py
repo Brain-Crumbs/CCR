@@ -29,10 +29,10 @@ from motor.reflexes import ReflexConfig, ReflexStack, Stimulus  # noqa: E402
 _ACTION_KEYS = ["noop", "move_forward", "turn_left", "turn_right"]
 
 
-def _small_cortex(pixel_shape=(8, 8, 3)) -> PredictiveCortex:
+def _small_cortex(pixel_shape=(8, 8, 3), horizons=(1,)) -> PredictiveCortex:
     torch.manual_seed(42)
     cfg = PredictiveCortexConfig(
-        latent_width=8, hidden_dim=16, reconstruction_size=8, horizons_ticks=(1,)
+        latent_width=8, hidden_dim=16, reconstruction_size=8, horizons_ticks=horizons
     )
     return PredictiveCortex(pixel_shape, _ACTION_KEYS, cfg)
 
@@ -55,10 +55,10 @@ def _frame(rng: np.random.Generator, shape=(8, 8, 3)) -> np.ndarray:
     return rng.integers(0, 256, size=shape, dtype=np.uint8)
 
 
-def _primed_cortex_wm():
+def _primed_cortex_wm(horizons=(1,)):
     """Return a CortexWorldModel whose internal state has been primed by
     one predict() call, so _latent and _pre_advance_hidden are populated."""
-    cortex = _small_cortex()
+    cortex = _small_cortex(horizons=horizons)
     wm = CortexWorldModel(cortex, action_keys=_ACTION_KEYS)
     memory = Memory()
     rng = np.random.default_rng(1)
@@ -88,6 +88,59 @@ def test_cortex_mpc_is_deterministic_across_calls():
     first = controller.choose(None, actions)
     second = controller.choose(None, actions)
     assert first == second
+
+
+def test_cortex_mpc_selects_a_setup_action_for_delayed_reward():
+    """Sequence search can choose an initially worse action whose planned
+    continuation has a larger return; a one-step scorer would pick ``short``.
+    """
+    class DelayedRewardModel:
+        horizons_ticks = (1, 2)
+
+        @staticmethod
+        def step(latent, action_idx, hidden):
+            del latent
+            # Encode each discrete action sequence as a base-10 number.
+            return hidden, hidden * 10 + action_idx.to(torch.float32).unsqueeze(1) + 1
+
+        @staticmethod
+        def heads(hidden):
+            code = hidden.squeeze(1)
+            reward = torch.where(
+                code == 1,
+                torch.full_like(code, 3.0),  # immediate reward for ``short``
+                torch.where(code == 21, torch.full_like(code, 10.0), torch.zeros_like(code)),
+            )
+            return reward, torch.zeros_like(code), torch.zeros_like(code), torch.zeros_like(code)
+
+    class DelayedRewardWorldModel:
+        model = DelayedRewardModel()
+        horizons = (1, 2)
+        _action_index = {"short": 0, "setup": 1}
+        _latent = torch.zeros(1, 1)
+        _pre_advance_hidden = torch.zeros(1, 1)
+
+    controller = build_cortex_mpc(
+        DelayedRewardWorldModel(),
+        planning_horizon=2,
+        beam_width=2,
+        novelty_weight=0.0,
+        risk_penalty=0.0,
+        terminal_penalty=0.0,
+    )
+    actions = [Action("short"), Action("setup")]
+
+    assert controller.choose(None, actions) == Action("setup")
+    assert controller.last_plan == ("setup", "short")
+
+
+def test_cortex_mpc_rolls_a_real_cortex_to_the_requested_horizon():
+    wm, _memory, _rng = _primed_cortex_wm(horizons=(1, 2))
+    controller = build_cortex_mpc(wm, planning_horizon=2)
+    actions = [Action(key) for key in _ACTION_KEYS]
+
+    assert controller.choose(None, actions) in actions
+    assert len(controller.last_plan) == 2
 
 
 def test_cortex_mpc_does_not_take_gradient_steps():
