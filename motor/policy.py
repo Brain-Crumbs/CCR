@@ -15,13 +15,33 @@ motor tick.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
-import torch
-import torch.nn.functional as F
+try:
+    import torch
+    import torch.nn.functional as F
+except ModuleNotFoundError as exc:
+    if exc.name != "torch":
+        raise
+    torch = None
+    F = None
 
 from cognitive_runtime.core.action import NULL_ACTION, Action
 from motor.voluntary import CallableController, VoluntaryController
+
+if TYPE_CHECKING:
+    import torch as torch_types
+
+
+def _require_torch() -> Any:
+    """Return Torch or explain why the neural controllers are unavailable."""
+    if torch is None:
+        raise ModuleNotFoundError(
+            "motor.policy's active-inference and imagination controllers require "
+            "the optional 'neural' dependency; install cognitive-runtime[neural]"
+        )
+    return torch
+
 
 # --------------------------------------------------------------------------
 # Active-inference decoding
@@ -47,6 +67,7 @@ def _encode_goal(cortex: Any, goal: Any) -> torch.Tensor:
     encoder's expected N x C x H x W layout and normalized before
     encoding. Stays on ``goal``'s own device/dtype throughout -- no forced
     CPU round-trip, so a CUDA-resident goal encodes on-device."""
+    torch = _require_torch()
     if not isinstance(goal, torch.Tensor):
         raise ValueError("active-inference goal must be a tensor (pixel frame or latent)")
     if goal.dim() == 0:
@@ -95,6 +116,8 @@ def build_active_inference_controller(
         if goal is None:
             raise ValueError("active-inference controller requires a preferred-state goal")
         target = _encode_goal(cortex, goal)
+        torch = _require_torch()
+        F = torch.nn.functional
         with torch.no_grad():
             surprise = []
             for action in actions:
@@ -112,7 +135,7 @@ def build_active_inference_controller(
 # --------------------------------------------------------------------------
 
 
-class ImaginationActor(torch.nn.Module):
+class ImaginationActor(torch.nn.Module if torch is not None else object):
     """A small actor/critic pair trained entirely on imagined (dreamed)
     rollouts through the frozen cortex -- Dreamer's "learn behaviour in
     latent imagination" applied to this cortex's ``rollout``/``heads``.
@@ -125,6 +148,7 @@ class ImaginationActor(torch.nn.Module):
     """
 
     def __init__(self, latent_width: int, n_actions: int, hidden_dim: int = 32) -> None:
+        torch = _require_torch()
         super().__init__()
         self.actor = torch.nn.Sequential(
             torch.nn.Linear(latent_width, hidden_dim),
@@ -141,6 +165,7 @@ class ImaginationActor(torch.nn.Module):
     def act(self, latent: torch.Tensor) -> int:
         """Deterministic (argmax) action choice -- the inference path used
         by :func:`build_imagination_controller`; never mutates weights."""
+        torch = _require_torch()
         with torch.no_grad():
             logits = self.actor(latent)
             action_logits = logits if logits.dim() == 1 else logits[0]
@@ -167,6 +192,8 @@ class ImaginationActor(torch.nn.Module):
         """
         if horizon <= 0:
             raise ValueError(f"horizon must be positive, got {horizon!r}")
+        torch = _require_torch()
+        F = torch.nn.functional
         latent = seed_latent
         state = hidden
         log_probs = []
