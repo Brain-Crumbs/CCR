@@ -18,14 +18,29 @@ import json
 import math
 from dataclasses import dataclass, field, fields
 from functools import cached_property
+from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, Tuple
+
+
+def _require_str_keys(mapping: Mapping[Any, Any]) -> None:
+    """Reject non-``str`` mapping keys instead of coercing them.
+
+    ``str(key)`` coercion is lossy: ``{1: "a", "1": "b"}`` and ``{"1": "b"}``
+    would otherwise canonicalize identically, letting two distinct contracts
+    collide on the same SHA-256 identity.
+    """
+    for key in mapping:
+        if not isinstance(key, str):
+            raise TypeError(
+                "mapping keys must be str for a stable contract identity; "
+                f"got {key!r} ({type(key).__name__})"
+            )
 
 
 def _canonicalize(value: Any) -> Any:
     """Recursively normalize ``value`` into JSON-safe, order-stable data.
 
-    Mappings become dicts keyed by ``str`` (later sorted by ``json.dumps``);
-    tuples and sets become lists so a tuple-vs-list field choice never
+    Tuples and sets become lists so a tuple-vs-list field choice never
     changes the hash; NaN/Inf floats are rejected rather than silently
     emitted as the non-standard, non-round-trippable ``NaN``/``Infinity``
     tokens ``json.dumps`` would otherwise produce.
@@ -35,7 +50,8 @@ def _canonicalize(value: Any) -> Any:
             raise ValueError(f"non-finite float is not canonicalizable: {value!r}")
         return value
     if isinstance(value, Mapping):
-        return {str(key): _canonicalize(val) for key, val in value.items()}
+        _require_str_keys(value)
+        return {key: _canonicalize(val) for key, val in value.items()}
     if isinstance(value, (list, tuple)):
         return [_canonicalize(item) for item in value]
     if isinstance(value, (set, frozenset)):
@@ -46,6 +62,27 @@ def _canonicalize(value: Any) -> Any:
     if isinstance(value, (str, int, bool)) or value is None:
         return value
     raise TypeError(f"cannot canonicalize value of type {type(value).__name__}: {value!r}")
+
+
+def _deep_freeze(value: Any) -> Any:
+    """Recursively convert mutable containers into immutable ones.
+
+    Contract fields often arrive as caller-owned dicts/lists (an optimizer
+    block, a policy dict, ``backbone_kwargs``). Without this, editing that
+    dict after construction would change ``to_dict()`` while a previously
+    cached ``.hash`` silently kept identifying the old contract -- exactly
+    the kind of mismatch this module exists to prevent. Applied once in
+    ``__post_init__``, so a contract's fields are immutable for its entire
+    lifetime, not just at hashing time.
+    """
+    if isinstance(value, Mapping):
+        _require_str_keys(value)
+        return MappingProxyType({key: _deep_freeze(val) for key, val in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_deep_freeze(item) for item in value)
+    return value
 
 
 def canonical_json(payload: Mapping[str, Any]) -> bytes:
@@ -70,13 +107,19 @@ def contract_hash(payload: Mapping[str, Any]) -> str:
 
 
 class _ContractMixin:
-    """Shared ``to_dict``/``hash`` behavior for the contract dataclasses.
+    """Shared ``to_dict``/``hash``/freezing behavior for the contracts.
 
     Not itself a dataclass -- each subclass supplies its own frozen
     ``@dataclass`` fields. ``cached_property`` writes directly into the
     instance ``__dict__`` rather than through ``__setattr__``, so caching
-    works even though the dataclasses are frozen.
+    works even though the dataclasses are frozen. dataclass-generated
+    ``__init__`` calls ``__post_init__`` (found via inheritance) after
+    setting every field, so this runs on every construction.
     """
+
+    def __post_init__(self) -> None:
+        for f in fields(self):  # type: ignore[arg-type]
+            object.__setattr__(self, f.name, _deep_freeze(getattr(self, f.name)))
 
     def to_dict(self) -> Dict[str, Any]:
         return {f.name: getattr(self, f.name) for f in fields(self)}  # type: ignore[arg-type]

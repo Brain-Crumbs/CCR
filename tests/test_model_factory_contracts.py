@@ -155,6 +155,31 @@ def test_unknown_field_is_a_construction_error():
         _make_architecture(unexpected_field=123)
 
 
+def test_mutating_caller_owned_dict_after_construction_does_not_change_the_contract():
+    optimizer = {"name": "adamw", "lr": 0.0003}
+    training = _make_training(optimizer=optimizer)
+    cached_hash = training.hash
+
+    optimizer["lr"] = 0.5  # mutate the caller's original dict, not the contract's
+
+    assert training.optimizer["lr"] == 0.0003
+    assert training.to_dict()["optimizer"]["lr"] == 0.0003
+    assert training.hash == cached_hash
+
+
+def test_contract_fields_reject_mutation_after_construction():
+    training = _make_training()
+    with pytest.raises(TypeError):
+        training.optimizer["lr"] = 0.5  # type: ignore[index]
+
+
+def test_non_string_mapping_keys_are_rejected_instead_of_silently_coerced():
+    with pytest.raises(TypeError):
+        _make_training(optimizer={1: "a", "1": "b"})
+    with pytest.raises(TypeError):
+        canonical_json({"x": {1: "a", "1": "b"}})
+
+
 def test_identical_contracts_built_in_different_field_orders_hash_identically():
     ordered = ArchitectureContract(
         pixel_shape=(3, 64, 64),
