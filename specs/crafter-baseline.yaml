@@ -1,0 +1,46 @@
+# Example Model Factory experiment template (epic #212 §8, issue #214).
+#
+# YAML is input convenience only; the canonical on-disk form is JSON,
+# produced by ExperimentSpec.resolve() + dump_canonical_json(). Load and
+# resolve this with:
+#
+#   from cognitive_runtime.training.model_factory import load_spec, resolve
+#   spec = resolve(load_spec("specs/crafter-baseline.yaml"))
+#
+format: model-factory-spec-v1
+organism: Crafter
+mode: fresh
+data:
+  corpus_id: crafter-generic-action-effects-v1
+  world: crafter
+  train_scenarios: [motor_babbling_open, motor_babbling_walls, approach_entity]
+  train_sessions: []
+  validation_sessions: []
+  test_sessions: []
+  expected_pixel_source: crafter
+  horizons_ticks: [1, 2, 3, 4]
+model:
+  backbone: transformer
+  latent_width: 128
+  hidden_dim: 256
+  action_embed_dim: 8
+  reconstruction_size: 64
+  context_length: 8
+  backbone_kwargs: {n_heads: 2, n_layers: 1}
+training:
+  objective: windowed_rollout
+  optimizer: {name: adamw, lr: 0.0003, weight_decay: 0.00001}
+  batch_size: 32
+  seed: 0
+  rollout_frames: 8
+  warmup_frames: 4
+  scheduled_sampling_p: 0.25
+  loss_weights: {pixel: 1.0, latent: 1.0, semantic: 1.0}
+  checkpoint_selection_policy: {metric: validation_loss, mode: min}
+  device: cpu
+  precision: fp32
+  determinism_policy: {deterministic: true, seed: 0}
+evaluation:
+  selection_metric: rollout.t+4.model_over_copy_last_mse
+  gates: [rollout_health, representation_collapse]
+  confidence: 0.95
