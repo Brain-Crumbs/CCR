@@ -125,23 +125,31 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -e ".[dev]"
 
-      # These four assert that learning actually converges, so they are worth
+      # These assert that learning actually converges, so they are worth
       # keeping on every PR -- just not in the critical path of the fast tier.
       #
-      # test_simulated_online_q_beats_random_reproducibly currently fails for
-      # TWO independent reasons, which is why this step is continue-on-error:
-      #   #241 — torch-free, it reaches `motor.cortex_mpc` through
-      #          `motor/__init__.py` at runtime (not at collection);
-      #   #244 — with torch, a stale golden: training_ticks 15157 -> 13318.
-      # Both must land before this step can become blocking. It is listed
-      # here rather than dropped so the fix is visible when it arrives.
-      - name: Acceptance tests
-        continue-on-error: true
+      # Deliberately split into a blocking step and an allowed-to-fail one.
+      # Folding all four into one continue-on-error step would leave these
+      # three unguarded: `core` deselects them and `neural` installs torch, so
+      # a regression that only manifests torch-free -- one of them acquiring a
+      # torch import, say -- would leave every job green.
+      - name: Acceptance tests (blocking)
         run: |
           python -m pytest tests -q --durations=10 \
             "tests/test_training.py::test_latent_bc_matches_or_beats_handcrafted_and_beats_random" \
             "tests/test_training.py::test_learned_policy_outperforms_random_baseline" \
-            "tests/test_training.py::test_bc_learns_to_imitate_scripted_policy" \
+            "tests/test_training.py::test_bc_learns_to_imitate_scripted_policy"
+
+      # This one fails today for TWO independent reasons:
+      #   #241 — torch-free, it reaches `motor.cortex_mpc` through
+      #          `motor/__init__.py` at runtime (not at collection);
+      #   #244 — with torch, a stale golden: training_ticks 15157 -> 13318.
+      # Both must land before it can become blocking. Kept here rather than
+      # dropped so the fix is visible when it arrives.
+      - name: Acceptance test with known failures (#241, #244)
+        continue-on-error: true
+        run: |
+          python -m pytest tests -q \
             "tests/test_online_q_acceptance.py::test_simulated_online_q_beats_random_reproducibly"
 
   # --------------------------------------------------------------- tier 3
@@ -195,12 +203,19 @@ jobs:
       # Artifact schema drift is silent data loss for a provenance system: an
       # older run simply stops being readable and nobody notices until they
       # need it. Golden fixtures + committed schemas make drift a red check.
+      #
+      # Run when EITHER directory exists, not both. The validator's whole job
+      # includes rejecting a schema with no fixture and a fixture with no
+      # schema -- requiring both directories would skip validation in exactly
+      # the orphan cases it exists to catch, letting the first one merge
+      # silently. It already handles a missing counterpart directory: an empty
+      # schema glob and an empty fixture glob each exit non-zero.
       - name: Validate artifact schemas against golden fixtures
         run: |
-          if [ -d .github/schemas ] && [ -d tests/fixtures/factory ]; then
+          if [ -d .github/schemas ] || [ -d tests/fixtures/factory ]; then
             python .github/scripts/validate_artifact_schemas.py
           else
-            echo "No schemas/fixtures yet — skipping (issue #242)."
+            echo "No schemas or fixtures yet — skipping (issue #242)."
           fi
 
   # --------------------------------------------------------------- tier 4
