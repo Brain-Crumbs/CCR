@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from dataclasses import asdict
+from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -88,6 +92,12 @@ def test_fresh_run_writes_versioned_manifest_set_and_initial_directories(tmp_pat
     for name, expected_format in formats.items():
         with (artifacts.directory / name).open(encoding="utf-8") as handle:
             assert json.load(handle)["format"] == expected_format
+    data_manifest = json.loads(artifacts.data_manifest_path.read_text(encoding="utf-8"))
+    assert data_manifest["sessions"] == {
+        "train": [{"session_id": "train-1", "sha256": "a"}],
+        "validation": [{"session_id": "validation-1", "sha256": "b"}],
+        "test": [{"session_id": "test-1", "sha256": "c"}],
+    }
     assert artifacts.checkpoints_dir.is_dir()
     assert artifacts.metrics_dir.is_dir()
 
@@ -108,6 +118,7 @@ def test_explicit_resume_validates_the_original_fresh_trial_without_rewriting_it
         tmp_path, spec, architecture, data, training, run_id="run-1", resume=True,
     )
     assert resumed.directory == first.directory
+    assert resumed.experiment == first.experiment
     assert resumed.execution_path.read_bytes() == execution_before
 
 
@@ -165,3 +176,66 @@ def test_report_contains_full_resolved_model_and_nursery_config():
     assert report["resolved_action_world_model_config"] == asdict(model)
     assert report["resolved_nursery_config"] == asdict(nursery)
     assert report["resolved_data_config"] == {"corpus_id": "corpus-1"}
+
+
+def test_report_accepts_nested_immutable_mappings():
+    data = MappingProxyType({"corpus_id": "corpus-1", "split": MappingProxyType({"seed": 7})})
+    report = build_experiment_report(
+        experiment={"experiment_id": "run-1"},
+        checkpoint={"path": "/models/run-1.pt", "sha256": "abc"},
+        rollout_metrics={"horizons": {1: {"beats_copy_last": True}}, "event_metrics": {}},
+        data_config=data,
+    )
+    assert report["resolved_data_config"] == {"corpus_id": "corpus-1", "split": {"seed": 7}}
+
+
+def test_artifact_allocation_imports_without_torch():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = """
+import sys
+
+class BlockTorch:
+    def find_spec(self, name, path=None, target=None):
+        if name == 'torch' or name.startswith('torch.'):
+            raise ImportError('torch is deliberately blocked')
+        return None
+
+sys.meta_path.insert(0, BlockTorch())
+from tempfile import TemporaryDirectory
+from cognitive_runtime.training.model_factory.artifacts import allocate_run_artifacts
+from cognitive_runtime.training.model_factory.contracts import ArchitectureContract, DataContract, TrainingContract
+from cognitive_runtime.training.model_factory.spec import resolve
+
+spec = resolve({
+    'organism': 'Crafter', 'mode': 'fresh',
+    'data': {'corpus_id': 'corpus-1', 'world': 'crafter'},
+    'training': {'optimizer': {'name': 'adamw', 'lr': 0.0003}},
+    'evaluation': {'selection_metric': 'rollout.t+4.model_over_copy_last_mse'},
+})
+architecture = ArchitectureContract(
+    pixel_shape=(3, 64, 64), rgb_preprocessing_version='v1', action_vocabulary=('NULL',),
+    workspace_modalities={}, workspace_layout_hash=None, latent_width=128, hidden_dim=256,
+    action_embed_dim=8, reconstruction_shape=(3, 64, 64), visual_architecture='spatial_residual_v1',
+    semantic_classes=0, horizons_ticks=(1, 2, 3, 4), direct_horizon_topology=(1, 2, 3, 4),
+    backbone='transformer', context_length=8,
+)
+data = DataContract(
+    world='crafter', backend='crafter', program_config={}, scenario_names=(), scenario_code_version='v1',
+    train_session_ids=(), train_session_hashes=(), validation_session_ids=(), validation_session_hashes=(),
+    test_session_ids=(), test_session_hashes=(), seed_assignments={}, pixel_provenance='crafter',
+    semantic_vocabulary_version='v1', preprocessing_version='v1', horizons_ticks=(1, 2, 3, 4),
+    ticks_per_frame=1.0,
+)
+with TemporaryDirectory() as root:
+    allocate_run_artifacts(root, spec, architecture, data, TrainingContract(**dict(spec.training)), run_id='run-1')
+print('OK')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "OK"

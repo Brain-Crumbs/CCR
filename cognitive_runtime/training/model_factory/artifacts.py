@@ -119,6 +119,35 @@ def _verify_or_write_resume(path: Path, payload: Mapping[str, Any]) -> None:
     atomic_write_json(path, expected)
 
 
+def _session_artifacts(session_ids: Any, session_hashes: Any, *, split: str) -> list[Dict[str, str]]:
+    """Pair every frozen session ID with its immutable content hash."""
+    if len(session_ids) != len(session_hashes):
+        raise ValueError(
+            f"data contract {split} session IDs and hashes have different lengths "
+            f"({len(session_ids)} != {len(session_hashes)})"
+        )
+    return [
+        {"session_id": str(session_id), "sha256": str(session_hash)}
+        for session_id, session_hash in zip(session_ids, session_hashes)
+    ]
+
+
+def _contract_session_manifest(data_contract: DataContract) -> Dict[str, Any]:
+    """Exact evidence identities required even before MF-A5 adds metadata."""
+    return {
+        "train": _session_artifacts(
+            data_contract.train_session_ids, data_contract.train_session_hashes, split="train"
+        ),
+        "validation": _session_artifacts(
+            data_contract.validation_session_ids, data_contract.validation_session_hashes,
+            split="validation",
+        ),
+        "test": _session_artifacts(
+            data_contract.test_session_ids, data_contract.test_session_hashes, split="test"
+        ),
+    }
+
+
 def execution_manifest(
     *,
     device: str,
@@ -233,6 +262,8 @@ def allocate_run_artifacts(
     data_payload = {
         "format": DATA_MANIFEST_FORMAT,
         "corpus_id": spec.data.get("corpus_id"),
+        "data_contract_hash": data_contract.hash,
+        "sessions": _contract_session_manifest(data_contract),
         "resolved_data": _jsonable(data_manifest if data_manifest is not None else spec.data),
     }
     execution_payload = execution_manifest(
@@ -255,6 +286,17 @@ def allocate_run_artifacts(
             # This is an upgrade of that bootstrap record, not a change to
             # its identity or timestamp.
             atomic_write_json(experiment_path, {"format": EXPERIMENT_IDENTITY_FORMAT, **saved_experiment})
+        try:
+            experiment = ExperimentIdentity(
+                experiment_id=saved_experiment["experiment_id"],
+                organism=saved_experiment["organism"],
+                trace_id=saved_experiment.get("trace_id"),
+                created_at=saved_experiment["created_at"],
+                git_commit=saved_experiment.get("git_commit"),
+                format=saved_experiment.get("format", EXPERIMENT_IDENTITY_FORMAT),
+            )
+        except KeyError as exc:
+            raise ValueError(f"invalid experiment identity manifest: {experiment_path}") from exc
     else:
         # ``experiment_directory`` atomically installed this versioned
         # identity manifest as part of reserving the fresh run ID.

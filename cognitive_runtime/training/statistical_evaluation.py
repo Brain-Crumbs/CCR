@@ -38,6 +38,7 @@ import os
 import statistics
 import dataclasses
 from collections import Counter
+from collections.abc import Mapping as ABCMapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -58,9 +59,23 @@ def _resolved_config(value: Optional[Any]) -> Dict[str, Any]:
         return {}
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return dataclasses.asdict(value)
-    if isinstance(value, dict):
-        return dict(value)
+    if isinstance(value, ABCMapping):
+        return _plain_mapping(value)
     raise TypeError("resolved configuration must be a dataclass or mapping")
+
+
+def _plain_mapping(value: ABCMapping[Any, Any]) -> Dict[str, Any]:
+    """Thaw nested immutable mappings without changing scalar/list values."""
+    def _thaw(item: Any) -> Any:
+        if isinstance(item, ABCMapping):
+            return _plain_mapping(item)
+        if isinstance(item, list):
+            return [_thaw(value) for value in item]
+        if isinstance(item, tuple):
+            return tuple(_thaw(value) for value in item)
+        return item
+
+    return {str(key): _thaw(item) for key, item in value.items()}
 
 
 def build_experiment_report(
