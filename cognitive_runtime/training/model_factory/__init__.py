@@ -10,6 +10,8 @@ description of one trial. See epic #212.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from cognitive_runtime.training.model_factory.contracts import (
     ArchitectureContract,
     DataContract,
@@ -50,6 +52,16 @@ from cognitive_runtime.training.model_factory.naming import (
     new_naming_seed,
     surname_sequence,
 )
+if TYPE_CHECKING:
+    from cognitive_runtime.training.model_factory.corpus import (
+        CORPUS_MANIFEST_FORMAT,
+        CORPUS_SPEC_FORMAT,
+        QUALITY_REPORT_FORMAT,
+        SPLIT_OVERLAP_REPORT_FORMAT,
+        ResolvedCorpus,
+        build_corpus,
+        resolve_corpus,
+    )
 
 __all__ = [
     "ArchitectureContract",
@@ -84,4 +96,31 @@ __all__ = [
     "load_display_name",
     "new_naming_seed",
     "surname_sequence",
+    "CORPUS_SPEC_FORMAT",
+    "CORPUS_MANIFEST_FORMAT",
+    "QUALITY_REPORT_FORMAT",
+    "SPLIT_OVERLAP_REPORT_FORMAT",
+    "ResolvedCorpus",
+    "build_corpus",
+    "resolve_corpus",
 ]
+
+
+_LAZY_CORPUS_EXPORTS = {
+    "CORPUS_SPEC_FORMAT",
+    "CORPUS_MANIFEST_FORMAT",
+    "QUALITY_REPORT_FORMAT",
+    "SPLIT_OVERLAP_REPORT_FORMAT",
+    "ResolvedCorpus",
+    "build_corpus",
+    "resolve_corpus",
+}
+
+
+def __getattr__(name: str):
+    """Keep the existing core-only Model Factory import boundary torch-free."""
+    if name in _LAZY_CORPUS_EXPORTS:
+        from cognitive_runtime.training.model_factory import corpus
+
+        return getattr(corpus, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
