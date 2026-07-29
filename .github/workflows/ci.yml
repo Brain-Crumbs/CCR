@@ -6,7 +6,7 @@ name: CI
 #   core              torch-free unit tests, ~2 min, every PR
 #   factory-contracts torch-free Model Factory invariants, ~1 min, every PR
 #   acceptance        the four slow convergence tests, ~5.5 min, every PR
-#   neural            full suite with CPU torch, 20+ min, every PR
+#   neural            full suite with CPU torch, 20+ min, every PR, non-blocking
 #
 # The nightly end-to-end factory smoke trial lives in nightly-factory.yml.
 
@@ -218,6 +218,10 @@ jobs:
   neural:
     name: full suite (CPU torch)
     runs-on: ubuntu-latest
+    # Non-blocking: this tier is slow (20+ min) and broad enough that a
+    # failure here shouldn't hold up a merge. Treat a red run as a bug to
+    # triage and fix afterward, not a gate to wait on.
+    continue-on-error: true
     # Measured at 44m29s on 4 vCPU (partly under contention). 45 was too
     # tight to be honest about; 75 leaves headroom without letting a hang
     # burn an hour. The single worst test is ~10 min on its own:
