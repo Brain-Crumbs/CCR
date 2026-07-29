@@ -179,6 +179,9 @@ DEFAULT_SPEC: Mapping[str, Any] = {
 }
 
 
+_MISSING = object()
+
+
 class SpecError(ValueError):
     """A malformed, ambiguous, or unresolvable ExperimentSpec."""
 
@@ -297,7 +300,9 @@ def _coerce(raw_value: str, reference: Any) -> Any:
         return float(raw_value)
     if isinstance(reference, (list, tuple)):
         return [_infer_scalar(item.strip()) for item in raw_value.split(",")]
-    if reference is None or isinstance(reference, str):
+    if isinstance(reference, str):
+        return raw_value
+    if reference is None:
         return _infer_scalar(raw_value)
     raise SpecError(
         f"cannot coerce override value for a field of type {type(reference).__name__}"
@@ -339,9 +344,14 @@ def apply_overrides(spec: Mapping[str, Any], overrides: Sequence[str]) -> Dict[s
 
         cursor = result
         for part in parts[:-1]:
-            existing = cursor.get(part)
-            if not isinstance(existing, Mapping):
+            existing = cursor.get(part, _MISSING)
+            if existing is _MISSING:
                 existing = {}
+            elif not isinstance(existing, Mapping):
+                raise SpecError(
+                    f"override path {dotted_path!r} traverses through "
+                    f"{part!r}, an existing non-mapping value ({existing!r})"
+                )
             cursor[part] = dict(existing)
             cursor = cursor[part]
 
@@ -456,8 +466,13 @@ def _validate_training(training: Mapping[str, Any]) -> None:
     rollout = training.get("rollout_frames", 0) or 0
     if rollout <= 0:
         raise SpecError("'training.rollout_frames' must be a positive integer")
-    if warmup < 0:
-        raise SpecError("'training.warmup_frames' must not be negative")
+    if warmup < 1:
+        # train_action_world_model() rejects warmup_frames < 1 unconditionally
+        # (cognitive_runtime/training/action_world_model.py), for both the
+        # windowed_rollout and autoregressive objectives -- a spec that
+        # resolves with warmup_frames=0 would pass validation here and then
+        # fail immediately at training.
+        raise SpecError("'training.warmup_frames' must be a positive integer (>= 1)")
 
     # This is exactly the required-field subset of TrainingContract's
     # non-defaulted fields; constructing one below is both the validation
@@ -504,12 +519,23 @@ def _validate_evolution(evolution: Optional[Mapping[str, Any]]) -> None:
     if evolution is None:
         return
     _check_unknown_keys("evolution", evolution, EVOLUTION_KEYS)
-    parents = evolution.get("configuration_parents") or ()
-    if len(parents) not in (0, 2):
-        raise SpecError(
-            "'evolution.configuration_parents' must name exactly two "
-            f"parents when present; got {len(parents)}"
-        )
+    parents = evolution.get("configuration_parents")
+    if parents is not None:
+        # A `str` is itself a `Sequence`, so it must be excluded explicitly --
+        # otherwise a two-character string like "ab" would pass a bare
+        # `len(parents) == 2` check without naming two actual parent run IDs.
+        if isinstance(parents, str) or not isinstance(parents, (list, tuple)):
+            raise SpecError(
+                "'evolution.configuration_parents' must be a list/tuple of "
+                f"parent run IDs; got {type(parents).__name__}"
+            )
+        if len(parents) not in (0, 2) or any(
+            not isinstance(parent, str) or not parent for parent in parents
+        ):
+            raise SpecError(
+                "'evolution.configuration_parents' must name exactly two "
+                f"non-empty parent run IDs when present; got {parents!r}"
+            )
     if parents and not evolution.get("weight_donor"):
         raise SpecError("'evolution.weight_donor' is required when 'configuration_parents' is set")
 

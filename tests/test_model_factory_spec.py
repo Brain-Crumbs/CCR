@@ -163,6 +163,23 @@ def test_apply_overrides_rejects_malformed_override():
         apply_overrides(_minimal_raw(), ["training.batch_size"])
 
 
+def test_apply_overrides_keeps_string_fields_as_strings():
+    raw = apply_overrides(_minimal_raw(), ["data.corpus_id=2026"])
+    assert raw["data"]["corpus_id"] == "2026"
+    assert isinstance(raw["data"]["corpus_id"], str)
+
+    raw = apply_overrides(_minimal_raw(), ["organism=true"])
+    assert raw["organism"] == "true"
+    assert isinstance(raw["organism"], str)
+
+
+def test_apply_overrides_rejects_traversal_through_an_existing_scalar():
+    raw = _minimal_raw()
+    raw["training"]["optimizer"]["lr"] = 0.0003
+    with pytest.raises(SpecError, match="lr"):
+        apply_overrides(raw, ["training.optimizer.lr.extra=7"])
+
+
 # --------------------------------------------------------------------- mode / parent validation
 
 
@@ -245,6 +262,18 @@ def test_unknown_nested_training_key_is_rejected():
     assert "optimizer" in str(excinfo.value)
 
 
+# --------------------------------------------------------------------- warmup_frames
+
+
+def test_zero_warmup_frames_is_rejected():
+    # train_action_world_model() rejects warmup_frames < 1 unconditionally, so
+    # a spec that resolves with 0 would pass here and then fail at training.
+    raw = _minimal_raw()
+    raw["training"]["warmup_frames"] = 0
+    with pytest.raises(SpecError, match="warmup_frames"):
+        resolve(raw)
+
+
 # --------------------------------------------------------------------- evaluation.selection_metric
 
 
@@ -319,6 +348,25 @@ def test_valid_evolution_block_is_accepted():
     }
     spec = resolve(raw)
     assert spec.evolution["weight_donor"] == "crafter-rollout-0021"
+
+
+def test_configuration_parents_as_a_two_character_string_is_rejected():
+    # len("ab") == 2, so a naive `len(parents) == 2` check would accept this
+    # even though it names zero actual parent run IDs.
+    raw = _minimal_raw()
+    raw["evolution"] = {"configuration_parents": "ab", "weight_donor": "crafter-rollout-0021"}
+    with pytest.raises(SpecError, match="configuration_parents"):
+        resolve(raw)
+
+
+def test_configuration_parents_as_a_two_key_mapping_is_rejected():
+    raw = _minimal_raw()
+    raw["evolution"] = {
+        "configuration_parents": {"a": "crafter-rollout-0018", "b": "crafter-rollout-0021"},
+        "weight_donor": "crafter-rollout-0021",
+    }
+    with pytest.raises(SpecError, match="configuration_parents"):
+        resolve(raw)
 
 
 # --------------------------------------------------------------------- training_contract_hash
