@@ -11,19 +11,35 @@ again, which avoids committing to an imagined open-loop trajectory.
 from __future__ import annotations
 
 import math
-from typing import Any, Optional, Sequence
-
-import torch
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 from cognitive_runtime.core.action import Action
-from cognitive_runtime.policies.cortex_world_model import CortexWorldModel
 from development.definitions import CurriculumStageSpec
 from motor.voluntary import VoluntaryController
+
+if TYPE_CHECKING:
+    import torch
+
+    from cognitive_runtime.policies.cortex_world_model import CortexWorldModel
+
+
+def _torch() -> Any:
+    """Import Torch only when cortex MPC is actually asked to plan."""
+    try:
+        import torch
+    except ModuleNotFoundError as exc:
+        if exc.name == "torch":
+            raise ModuleNotFoundError(
+                "cortex MPC requires the optional 'neural' dependency; "
+                "install cognitive-runtime[neural]"
+            ) from exc
+        raise
+    return torch
 
 
 def _repeat_state(state: Any, repeats: int) -> Any:
     """Repeat a temporal-backbone state along its batch dimension."""
-    if isinstance(state, torch.Tensor):
+    if isinstance(state, _torch().Tensor):
         return state.repeat_interleave(repeats, dim=0)
     if isinstance(state, tuple):
         return tuple(_repeat_state(part, repeats) for part in state)
@@ -34,7 +50,7 @@ def _repeat_state(state: Any, repeats: int) -> Any:
 
 def _select_state(state: Any, indices: torch.Tensor) -> Any:
     """Select temporal-backbone batch rows without mutating the live state."""
-    if isinstance(state, torch.Tensor):
+    if isinstance(state, _torch().Tensor):
         return state.index_select(0, indices)
     if isinstance(state, tuple):
         return tuple(_select_state(part, indices) for part in state)
@@ -92,6 +108,7 @@ class CortexMPCController:
     @staticmethod
     def _best_indices(scores: torch.Tensor, count: int) -> torch.Tensor:
         """Stable score ordering, preserving action-space order on ties."""
+        torch = _torch()
         values = scores.detach().cpu().tolist()
         ordered = sorted(
             range(len(values)),
@@ -112,6 +129,7 @@ class CortexMPCController:
         del state, goal  # Goal-conditioned scoring is a future extension.
         if not actions:
             raise ValueError("voluntary action space must not be empty")
+        torch = _torch()
 
         latent = self.cortex_wm._latent
         hidden = self.cortex_wm._pre_advance_hidden
