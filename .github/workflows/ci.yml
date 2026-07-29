@@ -6,7 +6,7 @@ name: CI
 #   core              torch-free unit tests, ~2 min, every PR
 #   factory-contracts torch-free Model Factory invariants, ~1 min, every PR
 #   acceptance        the four slow convergence tests, ~5.5 min, every PR
-#   neural            full suite with CPU torch, 20+ min, every PR, non-blocking
+#   neural            full suite with CPU torch, 20+ min, main/manual only
 #
 # The nightly end-to-end factory smoke trial lives in nightly-factory.yml.
 
@@ -16,6 +16,7 @@ on:
     paths-ignore: ['**.md', 'docs/**', 'notebooks/**']
   pull_request:
     paths-ignore: ['**.md', 'docs/**', 'notebooks/**']
+    
   workflow_dispatch:
 
 # A 20-minute tier must not queue behind superseded pushes.
@@ -217,6 +218,10 @@ jobs:
   # --------------------------------------------------------------- tier 4
   neural:
     name: full suite (CPU torch)
+    # Pull requests run the fast core and Model Factory contract lanes. The
+    # expensive compatibility/CPU-Torch sweep protects main and remains
+    # available on demand through workflow_dispatch.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # Non-blocking: this tier is slow (20+ min) and broad enough that a
     # failure here shouldn't hold up a merge. Treat a red run as a bug to
