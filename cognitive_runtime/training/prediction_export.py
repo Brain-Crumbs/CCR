@@ -46,17 +46,13 @@ import hashlib
 import json
 import os
 import subprocess
-from typing import Any, Dict, Literal, Mapping, Optional, Sequence
+import tempfile
+from typing import TYPE_CHECKING, Any, Dict, Literal, Mapping, Optional, Sequence
 
-import torch
+if TYPE_CHECKING:
+    import torch
 
-from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
-from cognitive_runtime.runtime.replay import list_episodes
-from cognitive_runtime.training.datasets import load_episode_pixel_frames
-from cognitive_runtime.training.visual_representation import (
-    VisualRepresentationModel,
-    reconstruction_target,
-)
+    from cognitive_runtime.training.visual_representation import VisualRepresentationModel
 
 FULL_MODEL_FORMAT = "visual-representation-full-v1"
 
@@ -70,6 +66,10 @@ class ExperimentIdentity:
     trace_id: Optional[str]
     created_at: str
     git_commit: Optional[str]
+    #: Version tag for the persisted identity manifest.  Kept on the
+    #: dataclass itself so every writer of ``experiment.json`` shares the
+    #: same schema, including the Model Factory artifact allocator.
+    format: str = "experiment-identity-v1"
 
     @classmethod
     def create(cls, experiment_id: str, organism: str, *, trace_id: Optional[str] = None) -> "ExperimentIdentity":
@@ -100,8 +100,29 @@ def experiment_directory(root: str, experiment: ExperimentIdentity, *, resume: b
     manifest_path = os.path.join(path, "experiment.json")
     if not os.path.exists(path):
         os.makedirs(path)
-        with open(manifest_path, "w", encoding="utf-8") as handle:
-            json.dump(dataclasses.asdict(experiment), handle, indent=2, sort_keys=True)
+        # The identity is the guard for every later resume.  A crash must not
+        # leave a syntactically partial JSON document that could be mistaken
+        # for a valid experiment, so stage it beside the final path and swap
+        # only after the complete document is flushed.
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path,
+                prefix=".experiment.json.", suffix=".tmp", delete=False,
+            ) as handle:
+                temporary_path = handle.name
+                json.dump(dataclasses.asdict(experiment), handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, manifest_path)
+        except BaseException:
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
+            raise
         return path
     if not resume:
         raise FileExistsError(
@@ -131,6 +152,8 @@ def checkpoint_sha256(path: str) -> str:
 def save_full_visual_model(model: VisualRepresentationModel, path: str) -> None:
     """Save encoder+decoder+next-predictor so predictions can be exported
     later (the nursery checkpoint keeps only the encoder)."""
+    import torch
+
     torch.save(
         {
             "format": FULL_MODEL_FORMAT,
@@ -145,6 +168,9 @@ def save_full_visual_model(model: VisualRepresentationModel, path: str) -> None:
 
 
 def load_full_visual_model(path: str) -> VisualRepresentationModel:
+    import torch
+    from cognitive_runtime.training.visual_representation import VisualRepresentationModel
+
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if payload.get("format") != FULL_MODEL_FORMAT:
         raise ValueError(
@@ -175,6 +201,8 @@ def _session_name(session_dir: str) -> Optional[str]:
 
 def _b64_frame(chw: torch.Tensor) -> str:
     """``Tensor[C, H, W]`` in [0, 1] -> base64 of HWC uint8 bytes."""
+    import torch
+
     hwc = (chw.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).permute(1, 2, 0)
     # Exports are JSON/NumPy artifacts, while a CUDA-trained cortex returns
     # CUDA tensors.  Crossing to host memory belongs at this serialization
@@ -196,6 +224,10 @@ def export_prediction_file(
     The filename is prefixed with the organism ``name`` (issue #88) --
     explicit if given, else read from the session's own recorded metadata,
     else left unprefixed for a legacy nameless session."""
+    import torch
+    from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
+    from cognitive_runtime.training.datasets import load_episode_pixel_frames
+    from cognitive_runtime.training.visual_representation import reconstruction_target
 
     horizons_sorted = sorted({int(h) for h in horizons if int(h) > 0})
     if not horizons_sorted:
@@ -258,6 +290,9 @@ def export_session_predictions(
     ``{f"{session_dir}/{episode_id}": prediction_file_path}``.  Episodes too
     short for the largest horizon are skipped rather than fatal -- a session
     can legitimately end early (death)."""
+    from cognitive_runtime.runtime.replay import list_episodes
+    from cognitive_runtime.training.datasets import load_episode_pixel_frames
+
     written: Dict[str, str] = {}
     max_horizon = max(int(h) for h in horizons)
     for session_dir in session_dirs:
@@ -290,6 +325,7 @@ def export_cortex_session_predictions(
     present in the checkpoint rather than silently exporting a pixel-only
     approximation of a joint model.
     """
+    import torch
     from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
     from cognitive_runtime.training.action_world_model import _episode_workspace_tensors
     from cognitive_runtime.training.event_evaluation import extract_frame_event_labels, labels_to_json

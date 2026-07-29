@@ -36,7 +36,9 @@ from __future__ import annotations
 import json
 import os
 import statistics
+import dataclasses
 from collections import Counter
+from collections.abc import Mapping as ABCMapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -51,6 +53,31 @@ DEFAULT_CONFIDENCE = 0.95
 EXPERIMENT_REPORT_FORMAT = "experiment-report-v1"
 
 
+def _resolved_config(value: Optional[Any]) -> Dict[str, Any]:
+    """Turn a resolved config dataclass/mapping into report-safe JSON data."""
+    if value is None:
+        return {}
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return dataclasses.asdict(value)
+    if isinstance(value, ABCMapping):
+        return _plain_mapping(value)
+    raise TypeError("resolved configuration must be a dataclass or mapping")
+
+
+def _plain_mapping(value: ABCMapping[Any, Any]) -> Dict[str, Any]:
+    """Thaw nested immutable mappings without changing scalar/list values."""
+    def _thaw(item: Any) -> Any:
+        if isinstance(item, ABCMapping):
+            return _plain_mapping(item)
+        if isinstance(item, list):
+            return [_thaw(value) for value in item]
+        if isinstance(item, tuple):
+            return tuple(_thaw(value) for value in item)
+        return item
+
+    return {str(key): _thaw(item) for key, item in value.items()}
+
+
 def build_experiment_report(
     *,
     experiment: Dict[str, Any],
@@ -60,6 +87,9 @@ def build_experiment_report(
     direct_metrics: Optional[Dict[str, Any]] = None,
     rollout_metrics: Optional[Dict[str, Any]] = None,
     checkpoint: Optional[Dict[str, Any]] = None,
+    action_world_model_config: Optional[Any] = None,
+    nursery_config: Optional[Any] = None,
+    data_config: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Create a self-contained, JSON-safe promotion artifact.
 
@@ -94,6 +124,12 @@ def build_experiment_report(
         "metrics": {"direct": direct_metrics or {}, "rollout": rollout_metrics},
         "event_stratified_metrics": rollout_metrics.get("event_metrics", {}),
         "checkpoint": checkpoint,
+        # These configs are resolved before training and are deliberately
+        # duplicated into the final report: inspecting a report must not
+        # require reconstructing notebook defaults or CLI flags.
+        "resolved_action_world_model_config": _resolved_config(action_world_model_config),
+        "resolved_nursery_config": _resolved_config(nursery_config),
+        "resolved_data_config": _resolved_config(data_config),
         "promotion_verdict": {"promoted": not reasons, "reasons": reasons or ["all configured gates passed"]},
     }
 
