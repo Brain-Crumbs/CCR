@@ -135,7 +135,7 @@ jobs:
       # torch import, say -- would leave every job green.
       - name: Acceptance tests (blocking)
         run: |
-          python -m pytest tests -q --durations=10 \
+          python -m pytest -q --durations=10 \
             "tests/test_training.py::test_latent_bc_matches_or_beats_handcrafted_and_beats_random" \
             "tests/test_training.py::test_learned_policy_outperforms_random_baseline" \
             "tests/test_training.py::test_bc_learns_to_imitate_scripted_policy"
@@ -149,7 +149,7 @@ jobs:
       - name: Acceptance test with known failures (#241, #244)
         continue-on-error: true
         run: |
-          python -m pytest tests -q \
+          python -m pytest -q \
             "tests/test_online_q_acceptance.py::test_simulated_online_q_beats_random_reproducibly"
 
   # --------------------------------------------------------------- tier 3
