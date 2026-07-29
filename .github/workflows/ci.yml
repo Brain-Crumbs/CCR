@@ -54,11 +54,17 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -e ".[dev]"
 
+      # `ccr nursery list` is deliberately NOT smoke-tested here: it exits 1
+      # without torch by design (cli.py:1112). The guard is graceful and
+      # intentional, so a core-only install genuinely cannot list scenarios.
+      # `ccr nursery --help` still exercises the nested subparser wiring
+      # because argparse renders help without dispatching to the command.
       - name: CLI smoke
         run: |
           python -c "import cognitive_runtime.cli"
           ccr --help > /dev/null
-          ccr nursery list > /dev/null
+          ccr nursery --help > /dev/null
+          ccr trace list > /dev/null
 
       # Regression guard for issue #241. `motor/__init__.py` currently imports
       # `motor.cortex_mpc`, which imports torch at module scope, so collection
