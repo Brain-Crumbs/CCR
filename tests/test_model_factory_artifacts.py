@@ -7,7 +7,6 @@ from dataclasses import asdict
 
 import pytest
 
-from cognitive_runtime.training.action_world_model import ActionWorldModelConfig
 from cognitive_runtime.training.model_factory.artifacts import (
     CONTRACTS_FORMAT,
     DATA_MANIFEST_FORMAT,
@@ -24,7 +23,6 @@ from cognitive_runtime.training.model_factory.contracts import (
     TrainingContract,
 )
 from cognitive_runtime.training.model_factory.spec import resolve
-from cognitive_runtime.training.nursery import NurseryConfig
 from cognitive_runtime.training.statistical_evaluation import build_experiment_report
 
 
@@ -150,6 +148,10 @@ def test_atomic_write_never_replaces_a_valid_manifest_when_interrupted(tmp_path)
 
 
 def test_report_contains_full_resolved_model_and_nursery_config():
+    pytest.importorskip("torch", reason="resolved neural configs require the neural extra")
+    from cognitive_runtime.training.action_world_model import ActionWorldModelConfig
+    from cognitive_runtime.training.nursery import NurseryConfig
+
     model = ActionWorldModelConfig(backbone_kwargs={"n_heads": 2}, context_length=12)
     nursery = NurseryConfig(world="crafter", expected_pixel_source="viewer")
     report = build_experiment_report(
