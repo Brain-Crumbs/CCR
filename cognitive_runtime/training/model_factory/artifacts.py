@@ -14,8 +14,10 @@ import os
 import platform
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Mapping, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, Mapping, Optional, Sequence, Union
 
 from cognitive_runtime.observability.trace import (
     _device_info,
@@ -124,6 +126,89 @@ def _verify_or_write_resume(path: Path, payload: Mapping[str, Any]) -> None:
             raise ValueError(f"resume manifest does not match requested immutable state: {path}")
         return
     atomic_write_json(path, expected)
+
+
+@contextmanager
+def _display_name_lock(organism_directory: Path) -> Iterator[None]:
+    """Serialize sibling-name reservation across factory processes.
+
+    A run directory is reserved atomically by ``experiment_directory``, but
+    the sibling scan that detects a cosmetic-name collision spans directories.
+    This small persistent lock serializes that scan and the corresponding
+    ``display_name.json`` write.  It is deliberately separate from run
+    identity and is never consulted for lineage or registry lookup.
+    """
+
+    lock_path = organism_directory / ".display_name.lock"
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write("0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _lineage_parent_run_ids(spec: ExperimentSpec) -> tuple[str, ...]:
+    """Return the authoritative naming-parent IDs encoded by the trial spec."""
+
+    configuration_parents = tuple((spec.evolution or {}).get("configuration_parents", ()))
+    if configuration_parents:
+        return tuple(str(run_id) for run_id in configuration_parents)
+    if spec.parent:
+        return (str(spec.parent["run_id"]),)
+    return ()
+
+
+def _resolve_naming_parents(
+    organism_directory: Path,
+    spec: ExperimentSpec,
+    supplied_parents: Sequence[DisplayNameParent],
+) -> tuple[DisplayNameParent, ...]:
+    """Load cosmetic parent records using the lineage's real run IDs."""
+
+    parent_run_ids = _lineage_parent_run_ids(spec)
+    if supplied_parents:
+        supplied_ids = tuple(parent.run_id for parent in supplied_parents)
+        if supplied_ids != parent_run_ids:
+            raise ValueError(
+                "naming_parents do not match the parent run IDs declared by ExperimentSpec"
+            )
+        return tuple(supplied_parents)
+
+    resolved = []
+    for run_id in parent_run_ids:
+        display_name_path = organism_directory / run_id / "display_name.json"
+        try:
+            assignment = load_display_name(display_name_path)
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"lineage parent {run_id!r} has no persisted display-name manifest: "
+                f"{display_name_path}"
+            ) from exc
+        resolved.append(DisplayNameParent(run_id=run_id, display_name=assignment.display_name))
+    return tuple(resolved)
 
 
 def _session_artifacts(session_ids: Any, session_hashes: Any, *, split: str) -> list[Dict[str, str]]:
@@ -318,26 +403,30 @@ def allocate_run_artifacts(
     if resuming and display_name_path.exists():
         display_name_assignment = load_display_name(display_name_path)
     else:
-        # Each run directory is an identity boundary.  Reading only sibling
-        # name manifests lets a cosmetic collision be resolved without using
-        # display names to locate, merge, or otherwise identify any run.
-        existing_names = set()
-        for sibling in directory.parent.iterdir():
-            if sibling == directory or not sibling.is_dir():
-                continue
-            sibling_display_name = sibling / "display_name.json"
-            if sibling_display_name.exists():
-                existing_names.add(load_display_name(sibling_display_name).display_name)
-        display_name_assignment = assign_display_name(
-            run_id=assigned_run_id,
-            naming_seed=new_naming_seed() if naming_seed is None else naming_seed,
-            parents=naming_parents,
-            existing_names=existing_names,
+        resolved_naming_parents = _resolve_naming_parents(
+            directory.parent, spec, naming_parents,
         )
-        if resuming:
-            _verify_or_write_resume(display_name_path, display_name_assignment.to_dict())
-        else:
-            _write_once(display_name_path, display_name_assignment.to_dict())
+        # Each run directory is an identity boundary.  The lock only guards
+        # collision reservation; display names still never locate, merge, or
+        # otherwise identify a run.
+        with _display_name_lock(directory.parent):
+            existing_names = set()
+            for sibling in directory.parent.iterdir():
+                if sibling == directory or not sibling.is_dir():
+                    continue
+                sibling_display_name = sibling / "display_name.json"
+                if sibling_display_name.exists():
+                    existing_names.add(load_display_name(sibling_display_name).display_name)
+            display_name_assignment = assign_display_name(
+                run_id=assigned_run_id,
+                naming_seed=new_naming_seed() if naming_seed is None else naming_seed,
+                parents=resolved_naming_parents,
+                existing_names=existing_names,
+            )
+            if resuming:
+                _verify_or_write_resume(display_name_path, display_name_assignment.to_dict())
+            else:
+                _write_once(display_name_path, display_name_assignment.to_dict())
 
     immutable_paths_and_payloads = (
         (directory / "trial_spec.json", spec_payload),

@@ -66,11 +66,15 @@ def surname_sequence(display_name: str) -> tuple[str, ...]:
 def _parent_surnames(parent: DisplayNameParent) -> tuple[str, ...]:
     """Read cosmetic surname parts without inheriting a collision suffix."""
 
-    surnames = surname_sequence(parent.display_name)
     collision_suffix = parent.run_id[-SHORT_RUN_ID_LENGTH:]
-    if len(surnames) > 1 and surnames[-1] == collision_suffix:
-        return surnames[:-1]
-    return surnames
+    # A run ID's trailing eight characters can themselves contain a hyphen
+    # (for example ``1-8fc9b9``).  Remove the serialized suffix before
+    # splitting the cosmetic name, rather than trying to match one token.
+    display_name = parent.display_name
+    serialized_suffix = f"-{collision_suffix}"
+    if display_name.endswith(serialized_suffix):
+        display_name = display_name[:-len(serialized_suffix)]
+    return surname_sequence(display_name)
 
 
 def _random_for_seed(naming_seed: Union[str, int]) -> random.Random:
