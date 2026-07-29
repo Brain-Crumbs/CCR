@@ -11,16 +11,55 @@ from __future__ import annotations
 import random
 import os
 import tempfile
+import json
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from cognitive_runtime.training.model_factory.contracts import contract_hash
 
 
 FORMAT = "action-world-model-factory-v1"
+HEADER_FORMAT = "model-factory-checkpoint-header-v1"
 _LEGACY_V2 = "action-world-model-v2"
 _LEGACY_V1 = "action-world-model-v1"
+
+_CONTINUATION_MODES = frozenset(("resume", "clone", "fine_tune"))
+
+
+@dataclass(frozen=True)
+class ContinuationMismatch:
+    """One incompatible contract field, suitable for human diagnostics."""
+
+    field: str
+    parent: Any
+    requested: Any
+
+
+@dataclass(frozen=True)
+class ContinuationDecision:
+    """The header-only result of a requested checkpoint continuation."""
+
+    approved: bool
+    mode: str
+    lineage_mode: Optional[str]
+    mismatches: Tuple[ContinuationMismatch, ...] = ()
+    message: str = ""
+
+    @property
+    def rejection(self) -> Optional[Dict[str, Any]]:
+        """Structured rejection data, or ``None`` when loading is approved."""
+
+        if self.approved:
+            return None
+        return {
+            "mode": self.mode,
+            "message": self.message,
+            "mismatches": [
+                {"field": item.field, "parent": item.parent, "requested": item.requested}
+                for item in self.mismatches
+            ],
+        }
 
 
 @dataclass
@@ -36,6 +75,7 @@ class FactoryCheckpoint:
     optimizer: Any = None
     scheduler: Any = None
     resumed: bool = False
+    continuation: Optional[ContinuationDecision] = None
 
     def __getitem__(self, key: str) -> Any:
         return self.payload[key]
@@ -78,6 +118,49 @@ def _saveable(value: Any) -> Any:
     return value
 
 
+def _jsonable(value: Any) -> Any:
+    """Make comparison/header values JSON-shaped without importing torch."""
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_jsonable(item) for item in value]
+    return value
+
+
+def factory_checkpoint_metadata_path(path: str) -> str:
+    """Return the JSON compatibility header path for a factory checkpoint."""
+    return f"{path}.json"
+
+
+def read_factory_checkpoint_metadata(path: str) -> Dict[str, Any]:
+    """Read the compatibility header without deserializing tensors."""
+    with open(factory_checkpoint_metadata_path(path), encoding="utf-8") as handle:
+        header = json.load(handle)
+    if not isinstance(header, dict) or header.get("format") != HEADER_FORMAT:
+        raise ValueError(f"invalid factory checkpoint compatibility header for {path!r}")
+    return header
+
+
+def _atomic_json_dump(path: str, payload: Mapping[str, Any]) -> None:
+    destination = Path(path)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(_jsonable(payload), handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def _architecture_payload(contract: Any) -> Dict[str, Any]:
     body = _plain(contract)
     embedded_hash = body.pop("hash", None)
@@ -98,6 +181,144 @@ def _data_contract_hash(contract_or_hash: Any) -> str:
     if not isinstance(value, str):
         raise TypeError("data_contract_hash must be a SHA-256 string or DataContract")
     return value
+
+
+def _normalise_architecture(contract: Any) -> Dict[str, Any]:
+    """Canonical header representation for an architecture contract."""
+    return _jsonable(_architecture_payload(contract))
+
+
+def _normalise_training(contract: Any) -> Dict[str, Any]:
+    return _jsonable(_contract_payload(contract))
+
+
+def _contract_value(contract: Mapping[str, Any], name: str) -> Any:
+    """Accept the public ``*_contract`` names and concise internal aliases."""
+    aliases = {
+        "architecture_contract": ("architecture_contract", "architecture"),
+        "data_contract_hash": ("data_contract_hash", "data"),
+        "training_contract": ("training_contract", "training"),
+    }
+    for key in aliases[name]:
+        if key in contract:
+            return contract[key]
+    return None
+
+
+def _normalise_continuation_contract(contract: Mapping[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, Mapping):
+        raise TypeError("continuation contracts must be mappings")
+    architecture = _contract_value(contract, "architecture_contract")
+    data = _contract_value(contract, "data_contract_hash")
+    training = _contract_value(contract, "training_contract")
+    return {
+        "architecture_contract": _normalise_architecture(architecture) if architecture is not None else None,
+        "data_contract_hash": _data_contract_hash(data) if data is not None else None,
+        "training_contract": _normalise_training(training) if training is not None else None,
+    }
+
+
+def _field_differences(parent: Any, requested: Any, prefix: str) -> Tuple[ContinuationMismatch, ...]:
+    """Return stable, leaf-level differences for nested JSON-shaped contracts."""
+    if isinstance(parent, Mapping) and isinstance(requested, Mapping):
+        differences = []
+        for key in sorted(set(parent) | set(requested)):
+            child = f"{prefix}.{key}" if prefix else str(key)
+            if key not in parent:
+                differences.append(ContinuationMismatch(child, "<missing>", requested[key]))
+            elif key not in requested:
+                differences.append(ContinuationMismatch(child, parent[key], "<missing>"))
+            else:
+                differences.extend(_field_differences(parent[key], requested[key], child))
+        return tuple(differences)
+    if parent != requested:
+        return (ContinuationMismatch(prefix, parent, requested),)
+    return ()
+
+
+def _render_rejection(mode: str, category: str, mismatches: Sequence[ContinuationMismatch]) -> str:
+    lines = [f"cannot {mode}: {category} contract differs"]
+    lines.extend(
+        f"  {item.field}: parent={item.parent!r} requested={item.requested!r}"
+        for item in mismatches
+    )
+    if mode == "resume":
+        lines.append("  hint: use mode=fine_tune to continue these weights under a new training contract")
+    elif mode == "clone" and category == "data":
+        lines.append("  hint: use mode=fine_tune to branch these weights onto different data")
+    return "\n".join(lines)
+
+
+def validate_continuation(
+    parent_contract: Mapping[str, Any],
+    requested_contract: Mapping[str, Any],
+    mode: str,
+) -> ContinuationDecision:
+    """Approve or reject a continuation using contracts only, never tensors.
+
+    ``resume`` must preserve every contract.  ``clone`` preserves model and
+    data identity but intentionally starts a new training procedure.
+    ``fine_tune`` preserves the architecture/input contract while allowing a
+    new data and training contract; it is always represented as a distinct
+    fine-tune lineage branch.
+    """
+    if mode not in _CONTINUATION_MODES:
+        raise ValueError(f"unsupported continuation mode {mode!r}")
+    parent = _normalise_continuation_contract(parent_contract)
+    requested = _normalise_continuation_contract(requested_contract)
+    required = {
+        "resume": ("architecture_contract", "data_contract_hash", "training_contract"),
+        "clone": ("architecture_contract", "data_contract_hash"),
+        "fine_tune": ("architecture_contract",),
+    }[mode]
+    category_labels = {
+        "architecture_contract": "architecture",
+        "data_contract_hash": "data",
+        "training_contract": "training",
+    }
+    for name in required:
+        if requested[name] is None:
+            mismatch = ContinuationMismatch(name, parent[name], "<missing>")
+            return ContinuationDecision(
+                False, mode, None, (mismatch,),
+                f"cannot {mode}: requested {category_labels[name]} contract is required",
+            )
+        if parent[name] is None:
+            mismatch = ContinuationMismatch(name, "<missing>", requested[name])
+            return ContinuationDecision(
+                False, mode, None, (mismatch,),
+                f"cannot {mode}: checkpoint is missing its {category_labels[name]} contract",
+            )
+        parent_value = parent[name]
+        requested_value = requested[name]
+        # ``hash`` is a derived summary of the architecture fields, not the
+        # operator-actionable source of incompatibility.  Compare it only via
+        # those fields so diagnostics name (for example) backbone_kwargs.
+        if name == "architecture_contract":
+            parent_value = dict(parent_value)
+            requested_value = dict(requested_value)
+            parent_value.pop("hash", None)
+            requested_value.pop("hash", None)
+        differences = _field_differences(
+            parent_value, requested_value, category_labels[name],
+        )
+        if differences:
+            return ContinuationDecision(
+                False, mode, None, differences,
+                _render_rejection(mode, category_labels[name], differences),
+            )
+    return ContinuationDecision(True, mode, mode, (), f"{mode} continuation approved")
+
+
+def _checkpoint_header(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "format": HEADER_FORMAT,
+        "checkpoint_format": FORMAT,
+        "architecture_contract": _normalise_architecture(payload["architecture_contract"]),
+        "data_contract_hash": payload["data_contract_hash"],
+        "training_contract": _normalise_training(payload["training_contract"]),
+        "parent_checkpoint_sha": payload.get("parent_checkpoint_sha"),
+    }
 
 
 def capture_rng_state() -> Dict[str, Any]:
@@ -244,6 +465,10 @@ def save_factory_checkpoint(
     try:
         torch.save(payload, temporary_path)
         os.replace(temporary_path, destination)
+        # This small, tensor-free header is the continuation guard.  It lets
+        # callers reject a requested resume/clone/fine-tune before torch.load
+        # can deserialize weights or a model constructor can reserve a device.
+        _atomic_json_dump(factory_checkpoint_metadata_path(path), _checkpoint_header(payload))
     except BaseException:
         try:
             os.unlink(temporary_path)
@@ -260,6 +485,7 @@ def load_factory_checkpoint(
     optimizer: Any = None,
     scheduler: Any = None,
     resume: bool = False,
+    mode: Optional[str] = None,
     map_location: str = "cpu",
     architecture_contract: Any = None,
     data_contract_hash: Any = None,
@@ -267,16 +493,52 @@ def load_factory_checkpoint(
 ) -> FactoryCheckpoint:
     """Load a factory checkpoint, or inspect/clone a legacy AWM checkpoint.
 
-    Passing ``resume=True`` requires exact expected architecture, data, and
-    training contracts before it restores optimizer, scheduler and RNG state. A
-    legacy v2 checkpoint has no such state, so it can only be inspected or
-    cloned and receives an explicit remediation error for resume attempts.
+    Explicit ``mode`` values validate the JSON compatibility header before
+    ``torch.load`` or model construction: ``resume`` requires all contracts,
+    ``clone`` requires architecture and data, and ``fine_tune`` requires the
+    architecture/input contract while recording a new training branch.
+
+    ``resume=True`` remains a compatibility spelling for ``mode='resume'``;
+    calls with neither option retain the pre-MF-B2 inspect/clone behavior.
+    A legacy v2 checkpoint has no resumable state, so it can only be inspected
+    or cloned and receives an explicit remediation error for resume attempts.
     """
+    if mode is not None and mode not in _CONTINUATION_MODES:
+        raise ValueError(f"unsupported continuation mode {mode!r}")
+    if mode is not None and resume and mode != "resume":
+        raise ValueError("resume=True conflicts with continuation mode " + repr(mode))
+    requested_mode = mode or ("resume" if resume else None)
+    continuation: Optional[ContinuationDecision] = None
+    if requested_mode is not None:
+        try:
+            header = read_factory_checkpoint_metadata(path)
+        except FileNotFoundError:
+            if mode is not None:
+                raise ValueError(
+                    "cannot safely validate continuation before loading weights: "
+                    f"factory checkpoint compatibility header is missing for {path!r}"
+                ) from None
+            # Legacy ``resume=True`` callers retain the historical error
+            # below after format inspection.  New explicit modes are always
+            # header-first and therefore never touch tensors on rejection.
+        else:
+            continuation = validate_continuation(
+                header,
+                {
+                    "architecture_contract": architecture_contract,
+                    "data_contract_hash": data_contract_hash,
+                    "training_contract": training_contract,
+                },
+                requested_mode,
+            )
+            if not continuation.approved:
+                raise ValueError(continuation.message)
+
     torch = _torch()
     payload = torch.load(path, map_location=map_location, weights_only=False)
     format_name = payload.get("format")
     if format_name in {_LEGACY_V1, _LEGACY_V2}:
-        if resume:
+        if requested_mode == "resume":
             raise ValueError(
                 f"{format_name} checkpoints cannot be resumed: they do not contain "
                 "optimizer, scheduler, or RNG state; load it for inspection or clone."
@@ -286,7 +548,7 @@ def load_factory_checkpoint(
         legacy_model, stats = load_action_world_model(path, inspection_only=format_name == _LEGACY_V1)
         return FactoryCheckpoint(
             payload={**payload, "training_stats": dict(stats), "legacy": True},
-            model=legacy_model,
+            model=legacy_model, continuation=continuation,
         )
     if format_name != FORMAT:
         raise ValueError(f"unsupported factory checkpoint format {format_name!r}")
@@ -294,7 +556,7 @@ def load_factory_checkpoint(
     stored_hash = architecture.pop("hash", None)
     if stored_hash != contract_hash(architecture):
         raise ValueError("factory checkpoint architecture_contract hash is invalid")
-    if resume:
+    if requested_mode == "resume" and continuation is None:
         missing = [
             name for name, value in (
                 ("architecture_contract", architecture_contract),
@@ -314,11 +576,11 @@ def load_factory_checkpoint(
         if _contract_payload(training_contract) != payload["training_contract"]:
             raise ValueError("cannot resume: training contract does not match checkpoint")
     restored_model = model or _build_model(payload["model_definition"])
-    restored_model.load_state_dict(payload["model_state_dict"])
+    _load_model_state(restored_model, payload["model_state_dict"])
     restored_model.training_objective = payload["training_contract"].get(
         "objective", "windowed_rollout"
     )
-    if resume:
+    if requested_mode == "resume":
         if optimizer is None:
             raise ValueError("resume requires an optimizer instance to restore")
         optimizer.load_state_dict(payload["optimizer_state_dict"])
@@ -329,5 +591,28 @@ def load_factory_checkpoint(
         restore_rng_state(payload["rng_state"])
     return FactoryCheckpoint(
         payload=payload, model=restored_model, optimizer=optimizer,
-        scheduler=scheduler, resumed=resume,
+        scheduler=scheduler, resumed=requested_mode == "resume", continuation=continuation,
     )
+
+
+def _load_model_state(model: Any, state_dict: Mapping[str, Any]) -> None:
+    """Load strictly, except for the two intentional historical migrations."""
+    incompatibility = model.load_state_dict(state_dict, strict=False)
+    allowed_missing = {
+        key for key in model.state_dict()
+        if key.startswith("multi_token_heads.")
+    }
+    allowed_unexpected = (
+        {"transition_backbone.position_embedding.weight"}
+        if getattr(model.config, "backbone", None) == "transformer"
+        else set()
+    )
+    missing = set(incompatibility.missing_keys) - allowed_missing
+    unexpected = set(incompatibility.unexpected_keys) - allowed_unexpected
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing keys: {sorted(missing)}")
+        if unexpected:
+            details.append(f"unexpected keys: {sorted(unexpected)}")
+        raise ValueError("incompatible factory checkpoint (" + "; ".join(details) + ")")
