@@ -52,6 +52,14 @@ from cognitive_runtime.training.model_factory.naming import (
     new_naming_seed,
     surname_sequence,
 )
+from cognitive_runtime.training.model_factory.checkpoint import (
+    FORMAT as FACTORY_CHECKPOINT_FORMAT,
+    FactoryCheckpoint,
+    capture_rng_state,
+    load_factory_checkpoint,
+    restore_rng_state,
+    save_factory_checkpoint,
+)
 if TYPE_CHECKING:
     from cognitive_runtime.training.model_factory.corpus import (
         CORPUS_MANIFEST_FORMAT,
@@ -96,6 +104,12 @@ __all__ = [
     "load_display_name",
     "new_naming_seed",
     "surname_sequence",
+    "FACTORY_CHECKPOINT_FORMAT",
+    "FactoryCheckpoint",
+    "capture_rng_state",
+    "restore_rng_state",
+    "save_factory_checkpoint",
+    "load_factory_checkpoint",
     "CORPUS_SPEC_FORMAT",
     "CORPUS_MANIFEST_FORMAT",
     "QUALITY_REPORT_FORMAT",
