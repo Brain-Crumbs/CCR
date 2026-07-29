@@ -41,6 +41,15 @@ from cognitive_runtime.training.model_factory.artifacts import (
     atomic_write_json,
     execution_manifest,
 )
+from cognitive_runtime.training.model_factory.naming import (
+    DISPLAY_NAME_FORMAT,
+    DisplayNameAssignment,
+    DisplayNameParent,
+    assign_display_name,
+    load_display_name,
+    new_naming_seed,
+    surname_sequence,
+)
 
 __all__ = [
     "ArchitectureContract",
@@ -68,4 +77,11 @@ __all__ = [
     "atomic_write_json",
     "execution_manifest",
     "allocate_run_artifacts",
+    "DISPLAY_NAME_FORMAT",
+    "DisplayNameAssignment",
+    "DisplayNameParent",
+    "assign_display_name",
+    "load_display_name",
+    "new_naming_seed",
+    "surname_sequence",
 ]
