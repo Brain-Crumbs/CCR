@@ -15,7 +15,7 @@ import platform
 import sys
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Mapping, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Mapping, Optional, Sequence, Union
 
 from cognitive_runtime.observability.trace import (
     _device_info,
@@ -30,6 +30,13 @@ from cognitive_runtime.training.model_factory.contracts import (
     TrainingContract,
 )
 from cognitive_runtime.training.model_factory.spec import DOCUMENT_FORMAT, ExperimentSpec
+from cognitive_runtime.training.model_factory.naming import (
+    DisplayNameAssignment,
+    DisplayNameParent,
+    assign_display_name,
+    load_display_name,
+    new_naming_seed,
+)
 
 if TYPE_CHECKING:
     from cognitive_runtime.training.prediction_export import ExperimentIdentity
@@ -195,6 +202,8 @@ class RunArtifacts:
     trial_spec_path: Path
     contracts_path: Path
     lineage_path: Path
+    display_name_path: Path
+    display_name: str
     execution_path: Path
     data_manifest_path: Path
     checkpoints_dir: Path
@@ -212,6 +221,8 @@ def allocate_run_artifacts(
     trace_id: Optional[str] = None,
     sibling_group: Optional[str] = None,
     data_manifest: Optional[Mapping[str, Any]] = None,
+    naming_seed: Optional[Union[str, int]] = None,
+    naming_parents: Sequence[DisplayNameParent] = (),
     resume: Optional[bool] = None,
 ) -> RunArtifacts:
     """Allocate a run directory and durably write its initial manifests.
@@ -273,6 +284,7 @@ def allocate_run_artifacts(
     )
 
     experiment_path = directory / "experiment.json"
+    display_name_path = directory / "display_name.json"
     if resuming:
         # ``experiment_directory`` already checked these authoritative fields.
         # Preserve the original timestamp and source identity rather than
@@ -302,6 +314,30 @@ def allocate_run_artifacts(
         # identity manifest as part of reserving the fresh run ID.
         if _load_json(experiment_path).get("format") != EXPERIMENT_IDENTITY_FORMAT:
             raise ValueError(f"new experiment identity manifest has an unexpected format: {experiment_path}")
+
+    if resuming and display_name_path.exists():
+        display_name_assignment = load_display_name(display_name_path)
+    else:
+        # Each run directory is an identity boundary.  Reading only sibling
+        # name manifests lets a cosmetic collision be resolved without using
+        # display names to locate, merge, or otherwise identify any run.
+        existing_names = set()
+        for sibling in directory.parent.iterdir():
+            if sibling == directory or not sibling.is_dir():
+                continue
+            sibling_display_name = sibling / "display_name.json"
+            if sibling_display_name.exists():
+                existing_names.add(load_display_name(sibling_display_name).display_name)
+        display_name_assignment = assign_display_name(
+            run_id=assigned_run_id,
+            naming_seed=new_naming_seed() if naming_seed is None else naming_seed,
+            parents=naming_parents,
+            existing_names=existing_names,
+        )
+        if resuming:
+            _verify_or_write_resume(display_name_path, display_name_assignment.to_dict())
+        else:
+            _write_once(display_name_path, display_name_assignment.to_dict())
 
     immutable_paths_and_payloads = (
         (directory / "trial_spec.json", spec_payload),
@@ -336,6 +372,8 @@ def allocate_run_artifacts(
         trial_spec_path=directory / "trial_spec.json",
         contracts_path=directory / "contracts.json",
         lineage_path=directory / "lineage.json",
+        display_name_path=display_name_path,
+        display_name=display_name_assignment.display_name,
         execution_path=execution_path,
         data_manifest_path=directory / "data_manifest.json",
         checkpoints_dir=checkpoints_dir,
