@@ -9,7 +9,10 @@ needed to continue an interrupted run exactly where it stopped.
 from __future__ import annotations
 
 import random
+import os
+import tempfile
 from dataclasses import asdict, dataclass, is_dataclass
+from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 from cognitive_runtime.training.model_factory.contracts import contract_hash
@@ -88,6 +91,13 @@ def _architecture_payload(contract: Any) -> Dict[str, Any]:
 
 def _contract_payload(contract: Any) -> Dict[str, Any]:
     return _plain(contract)
+
+
+def _data_contract_hash(contract_or_hash: Any) -> str:
+    value = getattr(contract_or_hash, "hash", contract_or_hash)
+    if not isinstance(value, str):
+        raise TypeError("data_contract_hash must be a SHA-256 string or DataContract")
+    return value
 
 
 def capture_rng_state() -> Dict[str, Any]:
@@ -209,9 +219,7 @@ def save_factory_checkpoint(
     progress = dict(trainer_state or {})
     for field in ("epoch", "global_step", "best_validation_metric"):
         progress.setdefault(field, None)
-    data_hash = getattr(data_contract_hash, "hash", data_contract_hash)
-    if not isinstance(data_hash, str):
-        raise TypeError("data_contract_hash must be a SHA-256 string or DataContract")
+    data_hash = _data_contract_hash(data_contract_hash)
     payload = {
         "format": FORMAT,
         "model_state_dict": model.state_dict(),
@@ -228,7 +236,20 @@ def save_factory_checkpoint(
         # resolved visual knob rather than relying on implicit defaults.
         "model_definition": _model_definition(model),
     }
-    torch.save(payload, path)
+    destination = Path(path)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent,
+    )
+    os.close(descriptor)
+    try:
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
     return payload
 
 
@@ -240,10 +261,14 @@ def load_factory_checkpoint(
     scheduler: Any = None,
     resume: bool = False,
     map_location: str = "cpu",
+    architecture_contract: Any = None,
+    data_contract_hash: Any = None,
+    training_contract: Any = None,
 ) -> FactoryCheckpoint:
     """Load a factory checkpoint, or inspect/clone a legacy AWM checkpoint.
 
-    Passing ``resume=True`` restores optimizer, scheduler and RNG state.  A
+    Passing ``resume=True`` requires exact expected architecture, data, and
+    training contracts before it restores optimizer, scheduler and RNG state. A
     legacy v2 checkpoint has no such state, so it can only be inspected or
     cloned and receives an explicit remediation error for resume attempts.
     """
@@ -269,8 +294,30 @@ def load_factory_checkpoint(
     stored_hash = architecture.pop("hash", None)
     if stored_hash != contract_hash(architecture):
         raise ValueError("factory checkpoint architecture_contract hash is invalid")
+    if resume:
+        missing = [
+            name for name, value in (
+                ("architecture_contract", architecture_contract),
+                ("data_contract_hash", data_contract_hash),
+                ("training_contract", training_contract),
+            ) if value is None
+        ]
+        if missing:
+            raise ValueError(
+                "resume requires expected " + ", ".join(missing)
+            )
+        expected_architecture = _architecture_payload(architecture_contract)
+        if expected_architecture != payload["architecture_contract"]:
+            raise ValueError("cannot resume: architecture contract does not match checkpoint")
+        if _data_contract_hash(data_contract_hash) != payload["data_contract_hash"]:
+            raise ValueError("cannot resume: data contract does not match checkpoint")
+        if _contract_payload(training_contract) != payload["training_contract"]:
+            raise ValueError("cannot resume: training contract does not match checkpoint")
     restored_model = model or _build_model(payload["model_definition"])
     restored_model.load_state_dict(payload["model_state_dict"])
+    restored_model.training_objective = payload["training_contract"].get(
+        "objective", "windowed_rollout"
+    )
     if resume:
         if optimizer is None:
             raise ValueError("resume requires an optimizer instance to restore")

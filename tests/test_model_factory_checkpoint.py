@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from dataclasses import replace
 
 import pytest
 
@@ -15,6 +16,7 @@ from cognitive_runtime.training.model_factory.checkpoint import (  # noqa: E402
     load_factory_checkpoint,
     save_factory_checkpoint,
 )
+from cognitive_runtime.training.model_factory import checkpoint as checkpoint_module  # noqa: E402
 from cognitive_runtime.training.model_factory.contracts import (  # noqa: E402
     ArchitectureContract,
     DataContract,
@@ -108,6 +110,8 @@ def test_factory_checkpoint_round_trips_every_resumable_state(tmp_path):
     loaded = load_factory_checkpoint(
         str(path), model=target, optimizer=target_optimizer,
         scheduler=target_scheduler, resume=True,
+        architecture_contract=architecture, data_contract_hash=data,
+        training_contract=training,
     )
 
     assert payload["format"] == FORMAT
@@ -139,6 +143,83 @@ def test_factory_clone_preserves_non_default_backbone_kwargs_and_action_embeddin
     assert clone.config.backbone_kwargs == {"n_heads": 2, "n_layers": 1}
     assert type(clone.transition_backbone) is type(model.transition_backbone)
     _assert_state_equal(model.state_dict(), clone.state_dict())
+
+
+def test_resume_rejects_any_changed_contract_before_restoring_state(tmp_path):
+    model = _model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    architecture, data, training = _contracts(model)
+    path = tmp_path / "factory.pt"
+    save_factory_checkpoint(
+        str(path), model, optimizer, architecture_contract=architecture,
+        data_contract_hash=data, training_contract=training,
+    )
+
+    changed_architecture_model = _model()
+    with pytest.raises(ValueError, match="data contract"):
+        load_factory_checkpoint(
+            str(path), model=changed_architecture_model,
+            optimizer=torch.optim.AdamW(changed_architecture_model.parameters()),
+            resume=True, architecture_contract=architecture,
+            data_contract_hash="different-data", training_contract=training,
+        )
+    changed_architecture_model = _model()
+    with pytest.raises(ValueError, match="architecture contract"):
+        load_factory_checkpoint(
+            str(path), model=changed_architecture_model,
+            optimizer=torch.optim.AdamW(changed_architecture_model.parameters()),
+            resume=True,
+            architecture_contract=replace(architecture, action_vocabulary=("LEFT", "NULL")),
+            data_contract_hash=data, training_contract=training,
+        )
+    changed_training_model = _model()
+    with pytest.raises(ValueError, match="training contract"):
+        load_factory_checkpoint(
+            str(path), model=changed_training_model,
+            optimizer=torch.optim.AdamW(changed_training_model.parameters()),
+            resume=True, architecture_contract=architecture, data_contract_hash=data,
+            training_contract=replace(training, seed=99),
+        )
+
+
+def test_factory_clone_restores_training_objective(tmp_path):
+    model = _model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    architecture, data, training = _contracts(model)
+    training = replace(training, objective="autoregressive")
+    path = tmp_path / "factory.pt"
+    save_factory_checkpoint(
+        str(path), model, optimizer, architecture_contract=architecture,
+        data_contract_hash=data, training_contract=training,
+    )
+
+    assert load_factory_checkpoint(str(path)).model.training_objective == "autoregressive"
+
+
+def test_factory_save_keeps_existing_checkpoint_when_serialization_fails(tmp_path, monkeypatch):
+    model = _model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    architecture, data, training = _contracts(model)
+    path = tmp_path / "factory.pt"
+    save_factory_checkpoint(
+        str(path), model, optimizer, architecture_contract=architecture,
+        data_contract_hash=data, training_contract=training,
+    )
+    original = path.read_bytes()
+    real_save = torch.save
+
+    def interrupted_save(payload, temporary_path):
+        real_save(payload, temporary_path)
+        raise OSError("simulated full filesystem")
+
+    monkeypatch.setattr(torch, "save", interrupted_save)
+    with pytest.raises(OSError, match="full filesystem"):
+        save_factory_checkpoint(
+            str(path), model, optimizer, architecture_contract=architecture,
+            data_contract_hash=data, training_contract=training,
+        )
+    assert path.read_bytes() == original
+    assert not list(tmp_path.glob(".factory.pt.*.tmp"))
 
 
 def test_legacy_v2_can_clone_but_cannot_resume(tmp_path):
