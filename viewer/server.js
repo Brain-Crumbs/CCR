@@ -134,6 +134,51 @@ function runCatalog(runsDir) {
   }).sort((a, b) => a.organism.localeCompare(b.organism) || b.run.localeCompare(a.run));
 }
 
+/** A deliberately small, stable slice of a run report for the clinic header. */
+function runSummary(entry) {
+  const experiment = readJSON(path.join(entry.dir, "experiment.json"), {});
+  const report = readJSON(path.join(entry.dir, "experiment_report.json"), {});
+  const training = report.training_stats || {};
+  const evaluation = report.metrics?.rollout || report.metrics?.direct || {};
+  const horizons = evaluation.horizons || {};
+  const horizon = Object.keys(horizons).map(Number).filter(Number.isFinite).sort((a, b) => a - b)[0];
+  const metric = Number.isFinite(horizon) ? horizons[String(horizon)] || {} : {};
+  const checkpoint = report.checkpoint || {};
+  const verdict = report.promotion_verdict || {};
+  return {
+    organism: entry.organism,
+    run: entry.run,
+    created_at: experiment.created_at || report.experiment?.created_at || null,
+    model: {
+      type: checkpoint.model_type || null,
+      checkpoint_sha256: checkpoint.sha256 || null,
+    },
+    training: {
+      objective: training.training_objective || null,
+      device: training.device || null,
+      epochs: training.epochs ?? null,
+      episodes: training.episodes ?? null,
+      samples: training.samples ?? null,
+      final_total_loss: training.final_total_loss ?? null,
+    },
+    evaluation: {
+      split: training.evaluation_mode || null,
+      prediction_mode: evaluation.prediction_mode || null,
+      horizon: Number.isFinite(horizon) ? horizon : null,
+      model_mse: metric.model_mse ?? null,
+      copy_last_mse: metric.copy_last_mse ?? null,
+      model_over_copy_last_mse: metric.model_over_copy_last_mse ?? null,
+      beats_copy_last: metric.beats_copy_last ?? null,
+      samples: metric.n_samples ?? null,
+      rollout_health: evaluation.rollout_health?.state || null,
+    },
+    promotion: {
+      promoted: typeof verdict.promoted === "boolean" ? verdict.promoted : null,
+      reasons: Array.isArray(verdict.reasons) ? verdict.reasons : [],
+    },
+  };
+}
+
 function exportedCacheSessions(cacheDir, experimentId) {
   if (!fs.existsSync(cacheDir)) return [];
   return sessionIdsBelow(cacheDir).flatMap((id) => {
@@ -281,6 +326,13 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null }
         organisms: [...new Set((clinic?.catalog() || []).map((entry) => entry.organism))],
         runs: (clinic?.catalog() || []).map(({ organism, run }) => ({ organism, run })),
       });
+      if (p.length === 2 && p[1] === "runs") {
+        if (!clinic) return sendJSON(res, 400, { error: "run summaries require clinic mode" });
+        const organism = url.searchParams.get("organism"), run = url.searchParams.get("run");
+        const entry = clinic.catalog().find((candidate) => candidate.organism === organism && candidate.run === run);
+        if (!entry) return sendJSON(res, 404, { error: "unknown organism or run" });
+        return sendJSON(res, 200, runSummary(entry));
+      }
       if (p.length === 2 && p[1] === "sessions") {
         const activeStore = selectedStore(url);
         if (!activeStore) return sendJSON(res, 400, { error: "select organism and run" });
@@ -335,4 +387,4 @@ if (require.main === module) {
   const args = parseArgs(process.argv);
   createServer(args).listen(args.port, () => console.log(`CCR clinic: http://localhost:${args.port}  (${args.dataDir ? `Record: ${args.dataDir}` : `Runs: ${args.runsDir}; cache: ${args.episodeCacheDir}`})`));
 }
-module.exports = { createServer, livePredictionsFromDecisions, makeStore, makeClinicStore };
+module.exports = { createServer, livePredictionsFromDecisions, makeStore, makeClinicStore, runSummary };

@@ -90,6 +90,12 @@ test("clinic mode joins a selected organism/run to its cached prediction session
   const runDir = path.join(runsDir, "Test", "run-1"), cached = path.join(cacheDir, "seed-20");
   fs.mkdirSync(runDir, { recursive: true }); fs.mkdirSync(cached, { recursive: true });
   fs.writeFileSync(path.join(runDir, "experiment.json"), JSON.stringify({ organism: "Test", experiment_id: "run-1" }));
+  fs.writeFileSync(path.join(runDir, "experiment_report.json"), JSON.stringify({
+    checkpoint: { model_type: "predictive_cortex", sha256: "abc123" },
+    training_stats: { training_objective: "windowed_rollout", epochs: 12, episodes: 3, samples: 48, final_total_loss: .2, evaluation_mode: "held_out" },
+    metrics: { rollout: { prediction_mode: "rollout", rollout_health: { state: "healthy" }, horizons: { 1: { model_mse: .1, copy_last_mse: .2, model_over_copy_last_mse: .5, beats_copy_last: true, n_samples: 8 } } } },
+    promotion_verdict: { promoted: true, reasons: [] },
+  }));
   fs.writeFileSync(path.join(cached, "session.json"), JSON.stringify({ name: "Test" }));
   fs.writeFileSync(path.join(cached, "episode_00000.streams.jsonl"), "");
   fs.writeFileSync(path.join(cached, "run-1-predictions_episode_00000.json"), JSON.stringify({
@@ -98,6 +104,12 @@ test("clinic mode joins a selected organism/run to its cached prediction session
   const server = createServer({ runsDir, episodeCacheDir: cacheDir }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
   const port = server.address().port;
   assert.deepEqual((await get(port, "/api/catalog")).body.runs, [{ organism: "Test", run: "run-1" }]);
+  const summary = await get(port, "/api/runs?organism=Test&run=run-1");
+  assert.equal(summary.status, 200);
+  assert.deepEqual(summary.body.model, { type: "predictive_cortex", checkpoint_sha256: "abc123" });
+  assert.equal(summary.body.training.final_total_loss, .2);
+  assert.equal(summary.body.evaluation.model_over_copy_last_mse, .5);
+  assert.equal(summary.body.promotion.promoted, true);
   const query = "?organism=Test&run=run-1";
   const listed = await get(port, `/api/sessions${query}`);
   assert.deepEqual(listed.body.sessions.map((session) => session.id), ["cache/seed-20"]);
