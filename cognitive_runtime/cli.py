@@ -1439,6 +1439,16 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
             direct_metrics={**(selected.get("direct") or {}), "by_scenario": {name: value.get("direct") for name, value in all_metrics.items()}},
             rollout_metrics={**(selected.get("rollout") or {}), "by_scenario": {name: value.get("rollout") for name, value in all_metrics.items()}},
             checkpoint=checkpoint,
+            action_world_model_config=model_config,
+            nursery_config=config,
+            data_config={
+                "train_scenarios": list(report.train_scenarios),
+                "holdout_scenarios": list(report.holdout_scenarios),
+                "train_sessions": report.train_sessions,
+                "evaluation_sessions": report.eval_sessions,
+                "horizon_frames": report.horizon_frames,
+                "ticks_per_frame": report.ticks_per_frame,
+            },
         )
         payload["joint_nursery"] = legacy_payload
         report_path = args.report or os.path.join(args.out_dir, "experiment_report.json")

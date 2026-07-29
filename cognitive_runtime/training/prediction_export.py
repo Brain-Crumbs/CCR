@@ -46,6 +46,7 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
 from typing import Any, Dict, Literal, Mapping, Optional, Sequence
 
 import torch
@@ -70,6 +71,10 @@ class ExperimentIdentity:
     trace_id: Optional[str]
     created_at: str
     git_commit: Optional[str]
+    #: Version tag for the persisted identity manifest.  Kept on the
+    #: dataclass itself so every writer of ``experiment.json`` shares the
+    #: same schema, including the Model Factory artifact allocator.
+    format: str = "experiment-identity-v1"
 
     @classmethod
     def create(cls, experiment_id: str, organism: str, *, trace_id: Optional[str] = None) -> "ExperimentIdentity":
@@ -100,8 +105,29 @@ def experiment_directory(root: str, experiment: ExperimentIdentity, *, resume: b
     manifest_path = os.path.join(path, "experiment.json")
     if not os.path.exists(path):
         os.makedirs(path)
-        with open(manifest_path, "w", encoding="utf-8") as handle:
-            json.dump(dataclasses.asdict(experiment), handle, indent=2, sort_keys=True)
+        # The identity is the guard for every later resume.  A crash must not
+        # leave a syntactically partial JSON document that could be mistaken
+        # for a valid experiment, so stage it beside the final path and swap
+        # only after the complete document is flushed.
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=path,
+                prefix=".experiment.json.", suffix=".tmp", delete=False,
+            ) as handle:
+                temporary_path = handle.name
+                json.dump(dataclasses.asdict(experiment), handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, manifest_path)
+        except BaseException:
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
+            raise
         return path
     if not resume:
         raise FileExistsError(
