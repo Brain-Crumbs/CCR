@@ -27,7 +27,9 @@ SPLIT_OVERLAP_REPORT_FORMAT = "model-factory-corpus-split-overlap-v1"
 # In-process convenience only.  The on-disk fallback in ``_corpus_directory``
 # keeps resolution usable by a later process when the conventional root is
 # used, while this permits callers to choose an explicit temporary root.
-_KNOWN_CORPORA: Dict[str, Path] = {}
+# Multiple roots may deliberately hold the same corpus ID, so an unqualified
+# ID is usable only when it identifies exactly one known directory.
+_KNOWN_CORPORA: Dict[str, set[Path]] = {}
 
 
 @dataclass
@@ -211,16 +213,15 @@ def _corpus_directory(corpus_id: str, *, root: str | Path | None = None, organis
     direct = Path(corpus_id)
     if direct.is_dir():
         return direct.resolve()
-    if corpus_id in _KNOWN_CORPORA:
-        return _KNOWN_CORPORA[corpus_id]
     base = Path(root) if root is not None else Path("corpora")
     if organism is not None:
         return (base / organism / corpus_id).resolve()
     if len(direct.parts) > 1:
         return (base / direct).resolve()
-    candidates = [path for path in base.glob(f"*/{corpus_id}") if path.is_dir()]
+    candidates = set(_KNOWN_CORPORA.get(corpus_id, set()))
+    candidates.update(path.resolve() for path in base.glob(f"*/{corpus_id}") if path.is_dir())
     if len(candidates) == 1:
-        return candidates[0].resolve()
+        return candidates.pop()
     if not candidates:
         raise FileNotFoundError(f"corpus {corpus_id!r} was not found under {base}")
     raise ValueError(f"corpus id {corpus_id!r} is ambiguous under {base}; use organism/corpus_id")
@@ -267,6 +268,7 @@ def _write_split_lists(directory: Path, sessions: Mapping[str, Sequence[Mapping[
 
 def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapping[str, Any]]]) -> DataContract:
     generator = spec["generator"]
+    quality_policy = spec["quality_policy"]
     all_entries = [entry for split in ("train", "validation", "test") for entry in sessions[split]]
     return DataContract(
         world=str(generator["world"]),
@@ -281,7 +283,10 @@ def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapp
         test_session_ids=tuple(str(entry["session_id"]) for entry in sessions["test"]),
         test_session_hashes=tuple(str(entry["sha256"]) for entry in sessions["test"]),
         seed_assignments={str(entry["session_id"]): int(entry["seed"]) for entry in all_entries},
-        pixel_provenance=str(generator.get("expected_pixel_source") or "unspecified"),
+        pixel_provenance=str(
+            quality_policy.get("expected_pixel_source", generator.get("expected_pixel_source"))
+            or "unspecified"
+        ),
         semantic_vocabulary_version=(
             _nursery_module().SEMANTIC_VOCABULARY_VERSION
             if generator["world"] == "crafter" else "none"
@@ -289,7 +294,7 @@ def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapp
         preprocessing_version=str(spec["preprocessing_version"]),
         horizons_ticks=tuple(int(value) for value in generator["horizons"]),
         ticks_per_frame=1.0,
-        quality_policy=spec["quality_policy"],
+        quality_policy=quality_policy,
         split_overlap_policy=spec["split_overlap_policy"],
     )
 
@@ -311,6 +316,32 @@ def _check_split_sets(sessions: Mapping[str, Sequence[Mapping[str, Any]]]) -> li
     return issues
 
 
+def _verify_manifest_sessions(
+    corpus_id: str, sessions: Any, data_contract: DataContract,
+) -> Mapping[str, Sequence[Mapping[str, Any]]]:
+    """Ensure the consumable session list is exactly the contracted evidence."""
+    if not isinstance(sessions, Mapping) or set(sessions) != {"train", "validation", "test"}:
+        raise ValueError(f"corpus {corpus_id!r} manifest must contain exactly train, validation, and test sessions")
+    contract_splits = {
+        "train": (data_contract.train_session_ids, data_contract.train_session_hashes),
+        "validation": (data_contract.validation_session_ids, data_contract.validation_session_hashes),
+        "test": (data_contract.test_session_ids, data_contract.test_session_hashes),
+    }
+    for split, (contract_ids, contract_hashes) in contract_splits.items():
+        entries = sessions[split]
+        if not isinstance(entries, list) or not all(isinstance(entry, Mapping) for entry in entries):
+            raise ValueError(f"corpus {corpus_id!r} manifest {split!r} sessions are invalid")
+        manifest_pairs = tuple(
+            (str(entry.get("session_id")), str(entry.get("sha256"))) for entry in entries
+        )
+        contract_pairs = tuple(zip(map(str, contract_ids), map(str, contract_hashes)))
+        if manifest_pairs != contract_pairs:
+            raise ValueError(
+                f"corpus {corpus_id!r} manifest {split!r} sessions do not match its data contract"
+            )
+    return sessions
+
+
 def build_corpus(spec: Mapping[str, Any]) -> ResolvedCorpus:
     """Record/reuse all requested episodes, gate them, then freeze their hashes.
 
@@ -328,7 +359,7 @@ def build_corpus(spec: Mapping[str, Any]) -> ResolvedCorpus:
     frozen_spec = _corpus_spec_payload(spec, cfg, splits)
     directory = (Path(spec.get("root", "corpora")) / str(spec["organism"]) / str(spec["corpus_id"])).resolve()
     directory.mkdir(parents=True, exist_ok=True)
-    _KNOWN_CORPORA[str(spec["corpus_id"])] = directory
+    _KNOWN_CORPORA.setdefault(str(spec["corpus_id"]), set()).add(directory)
     spec_path = directory / "corpus_spec.json"
     if spec_path.exists():
         with spec_path.open(encoding="utf-8") as handle:
@@ -337,6 +368,13 @@ def build_corpus(spec: Mapping[str, Any]) -> ResolvedCorpus:
             raise ValueError(
                 f"corpus id {spec['corpus_id']!r} already has a different generator declaration; "
                 "choose a new corpus_id"
+            )
+        if (directory / "corpus_manifest.json").is_file():
+            # The content manifest is the corpus identity.  A second build
+            # of the same declaration must never re-record a remote or
+            # non-deterministic episode and replace those frozen bytes.
+            return resolve_corpus(
+                str(spec["corpus_id"]), root=spec.get("root"), organism=str(spec["organism"]),
             )
     else:
         atomic_write_json(spec_path, frozen_spec)
@@ -366,7 +404,11 @@ def build_corpus(spec: Mapping[str, Any]) -> ResolvedCorpus:
                 })
             if frozen_spec["quality_policy"].get("enabled", True):
                 quality_issues.extend(validate_nursery_recordings(
-                    paths, scenario, expected_pixel_source=cfg.expected_pixel_source,
+                    paths,
+                    scenario,
+                    expected_pixel_source=frozen_spec["quality_policy"].get(
+                        "expected_pixel_source", cfg.expected_pixel_source,
+                    ),
                 ))
 
     set_issues = _check_split_sets(sessions)
@@ -442,7 +484,14 @@ def resolve_corpus(
         manifest = json.load(handle)
     if manifest.get("format") != CORPUS_MANIFEST_FORMAT:
         raise ValueError(f"not a {CORPUS_MANIFEST_FORMAT} manifest: {manifest_path}")
-    for split, entries in manifest.get("sessions", {}).items():
+    try:
+        data_contract = DataContract(**manifest["data_contract"])
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"corpus {corpus_id!r} has an invalid data contract") from exc
+    if data_contract.hash != manifest.get("data_contract_hash"):
+        raise ValueError(f"corpus {corpus_id!r} data contract hash does not match its frozen manifest")
+    sessions = _verify_manifest_sessions(corpus_id, manifest.get("sessions"), data_contract)
+    for split, entries in sessions.items():
         for entry in entries:
             session_id = entry.get("session_id", "?")
             session_path = Path(entry.get("session_path", ""))
@@ -456,12 +505,6 @@ def resolve_corpus(
                     f"corpus {corpus_id!r} session {session_id!r} content hash changed "
                     f"(expected {entry.get('sha256')}, got {actual})"
                 )
-    try:
-        data_contract = DataContract(**manifest["data_contract"])
-    except (KeyError, TypeError) as exc:
-        raise ValueError(f"corpus {corpus_id!r} has an invalid data contract") from exc
-    if data_contract.hash != manifest.get("data_contract_hash"):
-        raise ValueError(f"corpus {corpus_id!r} data contract hash does not match its frozen manifest")
     return ResolvedCorpus(str(manifest.get("corpus_id", corpus_id)), directory, manifest, data_contract)
 
 

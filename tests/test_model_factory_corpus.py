@@ -79,6 +79,37 @@ def test_build_freezes_stable_cached_content_and_disjoint_splits(tmp_path, monke
     assert (first.directory / "quality_report.json").is_file()
 
 
+def test_rebuilding_a_completed_corpus_resolves_without_recording(tmp_path, monkeypatch):
+    _install_fake_nursery(monkeypatch, tmp_path / "episode-cache")
+    spec = _spec(tmp_path)
+    first = corpus_module.build_corpus(spec)
+
+    def unexpected_record(*args, **kwargs):
+        pytest.fail("a completed corpus must not record replacement episodes")
+
+    monkeypatch.setattr(corpus_module, "_record_or_reuse_scenario_episode", unexpected_record)
+    second = corpus_module.build_corpus(spec)
+
+    assert second.manifest == first.manifest
+
+
+def test_quality_gate_uses_the_declared_pixel_provenance_policy(tmp_path, monkeypatch):
+    _install_fake_nursery(monkeypatch, tmp_path / "episode-cache")
+    expected_sources = []
+
+    def validate(_paths, _scenario, *, expected_pixel_source=None):
+        expected_sources.append(expected_pixel_source)
+        return []
+
+    monkeypatch.setattr(corpus_module, "validate_nursery_recordings", validate)
+    spec = _spec(tmp_path)
+    spec["quality_policy"] = {"enabled": True, "expected_pixel_source": "viewer"}
+    corpus = corpus_module.build_corpus(spec)
+
+    assert expected_sources == ["viewer", "viewer", "viewer"]
+    assert corpus.data_contract.pixel_provenance == "viewer"
+
+
 def test_resolve_refuses_a_missing_frozen_session_and_names_it(tmp_path, monkeypatch):
     _install_fake_nursery(monkeypatch, tmp_path / "episode-cache")
     corpus = corpus_module.build_corpus(_spec(tmp_path))
@@ -98,6 +129,18 @@ def test_resolve_refuses_changed_content_without_recording_a_replacement(tmp_pat
     (session / "episode_00000.decisions.jsonl").write_text('{"edited": true}\n', encoding="utf-8")
 
     with pytest.raises(ValueError, match=r"frozen-v1.*synthetic-validation-2.*content hash changed"):
+        corpus_module.resolve_corpus("frozen-v1", root=tmp_path / "corpora", organism="test-organism")
+
+
+def test_resolve_requires_manifest_sessions_to_match_the_data_contract(tmp_path, monkeypatch):
+    _install_fake_nursery(monkeypatch, tmp_path / "episode-cache")
+    corpus = corpus_module.build_corpus(_spec(tmp_path))
+    manifest_path = corpus.directory / "corpus_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sessions"]["test"] = []
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"test.*sessions do not match its data contract"):
         corpus_module.resolve_corpus("frozen-v1", root=tmp_path / "corpora", organism="test-organism")
 
 
@@ -122,6 +165,21 @@ def test_data_contract_hash_tracks_declared_content_not_corpus_location(tmp_path
 
     assert first.data_contract_hash == same.data_contract_hash
     assert changed.data_contract_hash != first.data_contract_hash
+
+
+def test_explicit_corpus_root_wins_over_an_in_process_duplicate_id(tmp_path, monkeypatch):
+    _install_fake_nursery(monkeypatch, tmp_path / "episode-cache")
+    first_spec = _spec(tmp_path / "first-root")
+    first = corpus_module.build_corpus(first_spec)
+    second_spec = _spec(tmp_path / "second-root")
+    second = corpus_module.build_corpus(second_spec)
+
+    resolved = corpus_module.resolve_corpus(
+        "frozen-v1", root=tmp_path / "first-root" / "corpora", organism="test-organism",
+    )
+
+    assert resolved.directory == first.directory
+    assert resolved.directory != second.directory
 
 
 def test_corpus_module_imports_without_torch():
