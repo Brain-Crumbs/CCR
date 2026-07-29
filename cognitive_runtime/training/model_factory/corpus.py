@@ -14,20 +14,11 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from cognitive_runtime.record.quality import SplitOverlapReport, audit_split_overlap
 from cognitive_runtime.training.model_factory.artifacts import atomic_write_json
 from cognitive_runtime.training.model_factory.contracts import DataContract, contract_hash
-from cognitive_runtime.training.nursery import (
-    SEMANTIC_VOCABULARY_VERSION,
-    NurseryConfig,
-    _record_or_reuse_scenario_episode,
-    _scenarios_for_world,
-    validate_nursery_recordings,
-)
-
-
 CORPUS_SPEC_FORMAT = "model-factory-corpus-spec-v1"
 CORPUS_MANIFEST_FORMAT = "model-factory-corpus-manifest-v1"
 QUALITY_REPORT_FORMAT = "model-factory-corpus-quality-v1"
@@ -37,6 +28,74 @@ SPLIT_OVERLAP_REPORT_FORMAT = "model-factory-corpus-split-overlap-v1"
 # keeps resolution usable by a later process when the conventional root is
 # used, while this permits callers to choose an explicit temporary root.
 _KNOWN_CORPORA: Dict[str, Path] = {}
+
+
+@dataclass
+class CorpusNurseryConfig:
+    """Recording-relevant NurseryConfig shape that does not import torch.
+
+    It intentionally mirrors :class:`training.nursery.NurseryConfig`.  The
+    nursery recorder accesses this configuration structurally, so this keeps
+    corpus manifest inspection and synthetic corpus tests available in the
+    core-only install while preserving the recording configuration passed to
+    a real nursery build.
+    """
+
+    train_seeds: Sequence[int] = (0, 1, 2, 3)
+    holdout_seeds: Sequence[int] = (1000, 1001)
+    episode_ticks: int = 400
+    world_size: int = 48
+    # Model Factory's default evidence source is the deterministic Crafter
+    # nursery.  Minecraft remains available when a corpus spec requests it,
+    # but must never be selected merely by omitting generator fields.
+    world: str = "crafter"
+    backend: str = "crafter"
+    realtime: bool = False
+    horizons: Sequence[int] = (1, 10, 100)
+    latent_width: int = 32
+    hidden_dim: int = 64
+    reconstruction_size: int = 16
+    epochs: int = 15
+    lr: float = 1e-3
+    batch_size: int = 32
+    seed: int = 0
+    max_train_samples: Optional[int] = None
+    ssim_window: int = 3
+    consistency_epochs: int = 15
+    consistency_lr: float = 1e-3
+    entity_persistence_epochs: int = 30
+    data_quality_gate: bool = True
+    split_overlap_gate: bool = False
+    overfit_evaluation: bool = False
+    max_corresponding_frame_fraction: float = 0.35
+    export_predictions: bool = True
+    expected_pixel_source: Optional[str] = None
+    name: Optional[str] = None
+    episode_cache_dir: Optional[str] = None
+
+
+def _nursery_module():
+    """Import the recording implementation only when a corpus is built.
+
+    ``nursery`` owns the optional neural training path and imports torch.
+    Corpus manifests themselves remain inspectable in Model Factory's
+    core-only environment, where torch is deliberately unavailable.
+    """
+    from cognitive_runtime.training import nursery
+
+    return nursery
+
+
+def _record_or_reuse_scenario_episode(*args: Any, **kwargs: Any) -> str:
+    return _nursery_module()._record_or_reuse_scenario_episode(*args, **kwargs)
+
+
+def _scenarios_for_world(world: str) -> Mapping[str, Any]:
+    return _nursery_module()._scenarios_for_world(world)
+
+
+def validate_nursery_recordings(*args: Any, **kwargs: Any) -> list[str]:
+    return _nursery_module().validate_nursery_recordings(*args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -66,20 +125,25 @@ def _ordinary(value: Any) -> Any:
     return value
 
 
-def _config_from_spec(spec: Mapping[str, Any]) -> NurseryConfig:
+def _config_from_spec(spec: Mapping[str, Any]) -> CorpusNurseryConfig:
     supplied = spec.get("generator", spec.get("nursery_config", {}))
-    if isinstance(supplied, NurseryConfig):
+    if isinstance(supplied, CorpusNurseryConfig):
         return supplied
+    # Accept a caller-provided NurseryConfig without importing its
+    # torch-dependent defining module here.  Both config classes have the
+    # same public field shape and the recorder treats them structurally.
+    if dataclasses.is_dataclass(supplied) and not isinstance(supplied, type):
+        return CorpusNurseryConfig(**_ordinary(supplied))
     if not isinstance(supplied, Mapping):
         raise TypeError("corpus spec generator must be a mapping or NurseryConfig")
-    allowed = {field.name for field in dataclasses.fields(NurseryConfig)}
+    allowed = {field.name for field in dataclasses.fields(CorpusNurseryConfig)}
     unknown = set(supplied) - allowed
     if unknown:
         raise ValueError(f"unknown NurseryConfig fields in corpus generator: {sorted(unknown)!r}")
-    return NurseryConfig(**dict(supplied))
+    return CorpusNurseryConfig(**dict(supplied))
 
 
-def _split_assignments(spec: Mapping[str, Any], cfg: NurseryConfig) -> Dict[str, Dict[str, tuple[int, ...]]]:
+def _split_assignments(spec: Mapping[str, Any], cfg: CorpusNurseryConfig) -> Dict[str, Dict[str, tuple[int, ...]]]:
     """Normalize the explicit ``split -> scenario -> seeds`` corpus plan.
 
     ``splits`` is deliberately explicit so a future change cannot silently
@@ -119,7 +183,7 @@ def _split_assignments(spec: Mapping[str, Any], cfg: NurseryConfig) -> Dict[str,
     return result
 
 
-def _corpus_spec_payload(spec: Mapping[str, Any], cfg: NurseryConfig, splits: Mapping[str, Any]) -> Dict[str, Any]:
+def _corpus_spec_payload(spec: Mapping[str, Any], cfg: CorpusNurseryConfig, splits: Mapping[str, Any]) -> Dict[str, Any]:
     """The immutable declaration, excluding where the corpus happens to live."""
     generator = _ordinary(cfg)
     # The episode cache is an implementation location, not a content input.
@@ -218,7 +282,10 @@ def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapp
         test_session_hashes=tuple(str(entry["sha256"]) for entry in sessions["test"]),
         seed_assignments={str(entry["session_id"]): int(entry["seed"]) for entry in all_entries},
         pixel_provenance=str(generator.get("expected_pixel_source") or "unspecified"),
-        semantic_vocabulary_version=(SEMANTIC_VOCABULARY_VERSION if generator["world"] == "crafter" else "none"),
+        semantic_vocabulary_version=(
+            _nursery_module().SEMANTIC_VOCABULARY_VERSION
+            if generator["world"] == "crafter" else "none"
+        ),
         preprocessing_version=str(spec["preprocessing_version"]),
         horizons_ticks=tuple(int(value) for value in generator["horizons"]),
         ticks_per_frame=1.0,

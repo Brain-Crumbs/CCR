@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import cognitive_runtime.training.model_factory.corpus as corpus_module
-from cognitive_runtime.training.nursery import NurseryScenario
 
 
-def _fake_scenario() -> NurseryScenario:
-    return NurseryScenario("synthetic", "test-only corpus scenario", lambda seed, cfg: None)
+def _fake_scenario() -> SimpleNamespace:
+    return SimpleNamespace(name="synthetic")
 
 
 def _install_fake_nursery(monkeypatch, cache: Path) -> None:
@@ -53,6 +55,13 @@ def _spec(tmp_path: Path, corpus_id: str = "frozen-v1") -> dict:
             "test": {"synthetic": [3]},
         },
     }
+
+
+def test_default_generator_targets_crafter():
+    config = corpus_module._config_from_spec({"generator": {}})
+
+    assert config.world == "crafter"
+    assert config.backend == "crafter"
 
 
 def test_build_freezes_stable_cached_content_and_disjoint_splits(tmp_path, monkeypatch):
@@ -113,3 +122,26 @@ def test_data_contract_hash_tracks_declared_content_not_corpus_location(tmp_path
 
     assert first.data_contract_hash == same.data_contract_hash
     assert changed.data_contract_hash != first.data_contract_hash
+
+
+def test_corpus_module_imports_without_torch():
+    repo_root = Path(__file__).resolve().parents[1]
+    script = """
+import sys
+from importlib.abc import MetaPathFinder
+
+class BlockTorch(MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == 'torch' or name.startswith('torch.'):
+            raise ModuleNotFoundError("No module named 'torch'")
+        return None
+
+sys.meta_path.insert(0, BlockTorch())
+import cognitive_runtime.training.model_factory.corpus  # noqa: F401
+print('OK')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=repo_root, capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "OK"
