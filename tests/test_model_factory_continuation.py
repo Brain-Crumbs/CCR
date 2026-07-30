@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +13,7 @@ torch = pytest.importorskip("torch")
 from brain.cortex.predictive import PredictiveCortex, PredictiveCortexConfig  # noqa: E402
 from cognitive_runtime.training.model_factory import checkpoint as checkpoint_module  # noqa: E402
 from cognitive_runtime.training.model_factory.checkpoint import (  # noqa: E402
+    factory_checkpoint_metadata_path,
     load_factory_checkpoint,
     save_factory_checkpoint,
     validate_continuation,
@@ -120,6 +122,55 @@ def test_resume_training_mismatch_is_rejected_before_any_tensor_load(tmp_path, m
     assert attempted_tensor_load is False
 
 
+def test_stale_header_digest_rejects_an_overwritten_checkpoint_before_tensor_load(tmp_path, monkeypatch):
+    path = tmp_path / "factory.pt"
+    model, architecture, data, training = _save(path)
+    header_path = factory_checkpoint_metadata_path(str(path))
+    stale_header = Path(header_path).read_text(encoding="utf-8")
+    save_factory_checkpoint(
+        str(path), model, torch.optim.AdamW(model.parameters(), lr=0.01),
+        architecture_contract=architecture, data_contract_hash=data,
+        training_contract=replace(training, seed=99),
+    )
+    Path(header_path).write_text(stale_header, encoding="utf-8")
+
+    def tensor_load_spy(*args, **kwargs):
+        raise AssertionError("torch.load must not be reached")
+
+    monkeypatch.setattr(torch, "load", tensor_load_spy)
+    with pytest.raises(ValueError, match="bytes do not match"):
+        load_factory_checkpoint(
+            str(path), mode="resume", architecture_contract=architecture,
+            data_contract_hash=data, training_contract=training,
+        )
+
+
+def test_payload_generation_mismatch_rejects_before_model_or_state_restoration(tmp_path, monkeypatch):
+    path = tmp_path / "factory.pt"
+    model, architecture, data, training = _save(path)
+    header_path = factory_checkpoint_metadata_path(str(path))
+    stale_header = json.loads(Path(header_path).read_text(encoding="utf-8"))
+    save_factory_checkpoint(
+        str(path), model, torch.optim.AdamW(model.parameters(), lr=0.01),
+        architecture_contract=architecture, data_contract_hash=data,
+        training_contract=replace(training, seed=99),
+    )
+    # Simulate a writer replacing the payload after the reader has checked the
+    # header digest.  Updating only the digest leaves the old generation ID.
+    stale_header["checkpoint_sha256"] = checkpoint_module._checkpoint_sha256(str(path))
+    Path(header_path).write_text(json.dumps(stale_header), encoding="utf-8")
+
+    monkeypatch.setattr(
+        checkpoint_module, "_build_model",
+        lambda definition: (_ for _ in ()).throw(AssertionError("model must not be built")),
+    )
+    with pytest.raises(ValueError, match="header identity"):
+        load_factory_checkpoint(
+            str(path), mode="resume", architecture_contract=architecture,
+            data_contract_hash=data, training_contract=training,
+        )
+
+
 def test_changed_data_requires_fine_tune_and_records_fine_tune_lineage(tmp_path):
     path = tmp_path / "factory.pt"
     _model, architecture, data, training = _save(path)
@@ -169,6 +220,10 @@ def test_factory_loader_preserves_only_the_two_intentional_state_dict_exemptions
         del payload["model_state_dict"][key]
     payload["model_state_dict"]["transition_backbone.position_embedding.weight"] = torch.zeros(1)
     torch.save(payload, path)
+    header_path = Path(factory_checkpoint_metadata_path(str(path)))
+    header = json.loads(header_path.read_text(encoding="utf-8"))
+    header["checkpoint_sha256"] = checkpoint_module._checkpoint_sha256(str(path))
+    header_path.write_text(json.dumps(header), encoding="utf-8")
 
     loaded = load_factory_checkpoint(
         str(path), mode="clone", architecture_contract=architecture, data_contract_hash=data,
@@ -177,6 +232,8 @@ def test_factory_loader_preserves_only_the_two_intentional_state_dict_exemptions
 
     payload["model_state_dict"]["unexpected.weight"] = torch.zeros(1)
     torch.save(payload, path)
+    header["checkpoint_sha256"] = checkpoint_module._checkpoint_sha256(str(path))
+    header_path.write_text(json.dumps(header), encoding="utf-8")
     with pytest.raises(ValueError, match="unexpected.weight"):
         load_factory_checkpoint(
             str(path), mode="clone", architecture_contract=architecture, data_contract_hash=data,

@@ -12,6 +12,8 @@ import random
 import os
 import tempfile
 import json
+import hashlib
+import uuid
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
@@ -159,6 +161,15 @@ def _atomic_json_dump(path: str, payload: Mapping[str, Any]) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def _checkpoint_sha256(path: str) -> str:
+    """Hash raw checkpoint bytes without deserializing tensors."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _architecture_payload(contract: Any) -> Dict[str, Any]:
@@ -310,15 +321,37 @@ def validate_continuation(
     return ContinuationDecision(True, mode, mode, (), f"{mode} continuation approved")
 
 
-def _checkpoint_header(payload: Mapping[str, Any]) -> Dict[str, Any]:
-    return {
+def _checkpoint_header(payload: Mapping[str, Any], *, checkpoint_sha256: Optional[str] = None) -> Dict[str, Any]:
+    header = {
         "format": HEADER_FORMAT,
         "checkpoint_format": FORMAT,
+        "checkpoint_id": payload["checkpoint_id"],
         "architecture_contract": _normalise_architecture(payload["architecture_contract"]),
         "data_contract_hash": payload["data_contract_hash"],
         "training_contract": _normalise_training(payload["training_contract"]),
         "parent_checkpoint_sha": payload.get("parent_checkpoint_sha"),
     }
+    if checkpoint_sha256 is not None:
+        header["checkpoint_sha256"] = checkpoint_sha256
+    return header
+
+
+def _verify_header_binding(header: Mapping[str, Any], payload: Mapping[str, Any]) -> None:
+    """Ensure the already-validated header describes this loaded payload."""
+    if header.get("checkpoint_format") != payload.get("format"):
+        raise ValueError("factory checkpoint payload does not match its compatibility header format")
+    if header.get("checkpoint_id") != payload.get("checkpoint_id"):
+        raise ValueError(
+            "factory checkpoint payload does not match its compatibility header identity; "
+            "retry after the checkpoint writer has finished"
+        )
+    payload_header = _checkpoint_header(payload)
+    for field in ("architecture_contract", "data_contract_hash", "training_contract"):
+        if header.get(field) != payload_header[field]:
+            raise ValueError(
+                "factory checkpoint payload contracts do not match its compatibility header; "
+                "retry after the checkpoint writer has finished"
+            )
 
 
 def capture_rng_state() -> Dict[str, Any]:
@@ -443,6 +476,10 @@ def save_factory_checkpoint(
     data_hash = _data_contract_hash(data_contract_hash)
     payload = {
         "format": FORMAT,
+        # The sidecar repeats this generation ID.  A loader verifies it after
+        # deserializing the payload so an interrupted overwrite cannot pair
+        # new weights with an older approved header.
+        "checkpoint_id": uuid.uuid4().hex,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
@@ -468,7 +505,10 @@ def save_factory_checkpoint(
         # This small, tensor-free header is the continuation guard.  It lets
         # callers reject a requested resume/clone/fine-tune before torch.load
         # can deserialize weights or a model constructor can reserve a device.
-        _atomic_json_dump(factory_checkpoint_metadata_path(path), _checkpoint_header(payload))
+        _atomic_json_dump(
+            factory_checkpoint_metadata_path(path),
+            _checkpoint_header(payload, checkpoint_sha256=_checkpoint_sha256(path)),
+        )
     except BaseException:
         try:
             os.unlink(temporary_path)
@@ -509,6 +549,7 @@ def load_factory_checkpoint(
         raise ValueError("resume=True conflicts with continuation mode " + repr(mode))
     requested_mode = mode or ("resume" if resume else None)
     continuation: Optional[ContinuationDecision] = None
+    header: Optional[Dict[str, Any]] = None
     if requested_mode is not None:
         try:
             header = read_factory_checkpoint_metadata(path)
@@ -522,6 +563,18 @@ def load_factory_checkpoint(
             # below after format inspection.  New explicit modes are always
             # header-first and therefore never touch tensors on rejection.
         else:
+            expected_digest = header.get("checkpoint_sha256")
+            if not isinstance(expected_digest, str) or not header.get("checkpoint_id"):
+                if mode is not None:
+                    raise ValueError(
+                        "cannot safely validate continuation before loading weights: "
+                        "factory checkpoint compatibility header lacks payload binding"
+                    )
+            elif _checkpoint_sha256(path) != expected_digest:
+                raise ValueError(
+                    "factory checkpoint bytes do not match their compatibility header; "
+                    "retry after the checkpoint writer has finished"
+                )
             continuation = validate_continuation(
                 header,
                 {
@@ -552,6 +605,24 @@ def load_factory_checkpoint(
         )
     if format_name != FORMAT:
         raise ValueError(f"unsupported factory checkpoint format {format_name!r}")
+    if continuation is not None:
+        # Hashing the file before torch.load catches an already-stale sidecar.
+        # This second check closes the overwrite race between that hash and
+        # torch.load, before model/optimizer/RNG state can be restored.
+        assert header is not None
+        _verify_header_binding(header, payload)
+        payload_decision = validate_continuation(
+            payload,
+            {
+                "architecture_contract": architecture_contract,
+                "data_contract_hash": data_contract_hash,
+                "training_contract": training_contract,
+            },
+            requested_mode,
+        )
+        if not payload_decision.approved:
+            raise ValueError(payload_decision.message)
+        continuation = payload_decision
     architecture = dict(payload["architecture_contract"])
     stored_hash = architecture.pop("hash", None)
     if stored_hash != contract_hash(architecture):
