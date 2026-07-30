@@ -85,6 +85,15 @@ def test_too_few_pairs_is_explicitly_not_evaluable_with_reason():
     assert report.permutation_interval is None
 
 
+def test_episode_ids_that_collide_as_json_object_keys_are_rejected():
+    with pytest.raises(ValueError, match=r"collide once serialized as JSON object keys"):
+        compare_paired_episodes(
+            {1: 1.0, "1": 2.0, "two": 3.0},
+            {1: 1.5, "1": 2.5, "two": 3.5},
+            minimum_episode_count=3,
+        )
+
+
 def test_ratio_is_never_reported_without_the_raw_candidate_and_baseline_errors():
     report = compare_paired_episodes(
         {"episode-a": 2.0, "episode-b": 1.0, "episode-c": 3.0},

@@ -9,6 +9,7 @@ comparison report can be produced wherever a validation result is available.
 
 from __future__ import annotations
 
+import json
 import math
 import random
 import statistics
@@ -210,6 +211,21 @@ def _episode_mapping(
     return dict(zip(episode_ids, errors))
 
 
+def _json_object_key(episode_id: Hashable) -> str:
+    """The JSON object-key string ``episode_id`` round-trips to.
+
+    JSON object keys are always strings: ``json.dumps`` coerces int, float,
+    bool, and ``None`` keys to their JSON key spelling (e.g. ``1 -> "1"``),
+    so IDs that differ only in Python type can collide once a report is
+    serialized (``1`` and ``"1"`` both become ``"1"``).
+    """
+    try:
+        (key,) = json.loads(json.dumps({episode_id: None}))
+    except TypeError as exc:
+        raise ValueError(f"episode id {episode_id!r} cannot be used as a JSON object key") from exc
+    return key
+
+
 def _validated_pairs(
     candidate: Mapping[Hashable, float], baseline: Mapping[Hashable, float],
 ) -> Tuple[Tuple[Hashable, ...], Tuple[float, ...], Tuple[float, ...]]:
@@ -226,6 +242,15 @@ def _validated_pairs(
     # still valid, hashable ID types remain deterministic without requiring
     # them to be mutually orderable.
     episode_ids = tuple(sorted(candidate_ids, key=repr))
+    json_keys: Dict[str, Hashable] = {}
+    for episode_id in episode_ids:
+        json_key = _json_object_key(episode_id)
+        if json_key in json_keys:
+            raise ValueError(
+                "episode ids collide once serialized as JSON object keys: "
+                f"{json_keys[json_key]!r} and {episode_id!r} both become {json_key!r}"
+            )
+        json_keys[json_key] = episode_id
     candidate_values = tuple(float(candidate[episode_id]) for episode_id in episode_ids)
     baseline_values = tuple(float(baseline[episode_id]) for episode_id in episode_ids)
     if any(not math.isfinite(value) for value in candidate_values + baseline_values):
