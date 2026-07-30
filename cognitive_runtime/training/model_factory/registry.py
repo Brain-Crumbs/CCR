@@ -69,6 +69,21 @@ class LineageCycleError(RegistryError):
     recursing forever."""
 
 
+class TestBudgetExhaustedError(RegistryError):
+    """Raised by :func:`record_test_use` when a caller-supplied ``max_uses``
+    cap is already spent for ``run_id`` (epic §10.3's sealed-test-use
+    budget)."""
+
+    def __init__(self, run_id: str, max_uses: int, current_uses: int) -> None:
+        self.run_id = run_id
+        self.max_uses = max_uses
+        self.current_uses = current_uses
+        super().__init__(
+            f"sealed-test-use budget exhausted for run {run_id!r}: "
+            f"{current_uses} of {max_uses} action(s) already recorded; refusing this test action"
+        )
+
+
 def _now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -381,6 +396,7 @@ def record_test_use(
     objective: str,
     run_id: str,
     reason: Optional[str] = None,
+    max_uses: Optional[int] = None,
     now: Callable[[], str] = _now_iso,
 ) -> ChampionEntry:
     """Charge one sealed-test-set use against ``run_id``'s recorded ledger
@@ -390,8 +406,18 @@ def record_test_use(
     ``run_id`` must already be a population member of the named slot --
     test uses are attributed to an evaluated candidate, never an unrelated
     identifier.
+
+    ``max_uses``, when supplied, caps this run_id's ledger. The cap check
+    and the increment happen inside the same locked critical section as the
+    read, so two callers racing to charge the final remaining use can never
+    both observe the pre-increment count and both succeed -- exactly the
+    check-then-act race a budget this small (epic §10.3) cannot tolerate.
+    Raises :class:`TestBudgetExhaustedError` (without writing) once the cap
+    is already spent.
     """
     _validate_slot_key(family, tier, objective)
+    if max_uses is not None and max_uses <= 0:
+        raise RegistryError("max_uses must be positive when supplied")
 
     path = registry_path(root)
     with _locked(_lock_path_for(path)):
@@ -403,13 +429,17 @@ def record_test_use(
             )
         rebuilt: List[ChampionEntry] = []
         updated: Optional[ChampionEntry] = None
+        found = False
         for member in (ChampionEntry.from_dict(item) for item in slot_payload.get("population", [])):
             if member.run_id == run_id:
+                found = True
+                if max_uses is not None and member.test_uses >= max_uses:
+                    raise TestBudgetExhaustedError(run_id, max_uses, member.test_uses)
                 updated = dataclasses.replace(member, test_uses=member.test_uses + 1)
                 rebuilt.append(updated)
             else:
                 rebuilt.append(member)
-        if updated is None:
+        if not found:
             raise RegistryError(
                 f"run_id {run_id!r} is not a population member of "
                 f"family={family!r} tier={tier!r} objective={objective!r}"
@@ -423,6 +453,7 @@ def record_test_use(
         }]
         _set_slot_payload(document, family, tier, objective, slot_payload)
         atomic_write_json(path, document)
+        assert updated is not None
         return updated
 
 
@@ -558,6 +589,7 @@ __all__ = [
     "DECISION_TEST_USE",
     "RegistryError",
     "LineageCycleError",
+    "TestBudgetExhaustedError",
     "ChampionEntry",
     "RegistrySlot",
     "LineageNode",

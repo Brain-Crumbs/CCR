@@ -120,6 +120,7 @@ def _base_kwargs(**overrides):
     a time to isolate exactly one gate's failure."""
     kwargs = dict(
         policy=PromotionPolicy(minimum_practical_margin=0.1),
+        candidate_run_id="candidate",
         experiment_report=_experiment_report(),
         data_quality=_data_quality(),
         split_overlap=_split_overlap(),
@@ -450,6 +451,22 @@ def test_non_durable_promotion_ignores_test_confirmation_entirely():
     assert gate.passed and not gate.applicable
 
 
+def test_durable_promotion_rejects_a_confirmation_earned_by_a_different_candidate():
+    """A sealed-test confirmation is bound to the run it was performed for --
+    reusing candidate A's passing confirmation to durably promote candidate
+    B must fail, not silently pass through."""
+    confirmation_for_a = TestConfirmation(
+        run_id="candidate-a", performed=True, passed=True, test_uses_after=1, max_sealed_test_uses=3,
+    )
+    verdict = evaluate_promotion(**_base_kwargs(
+        candidate_run_id="candidate-b", durable=True, test_confirmation=confirmation_for_a,
+    ))
+    assert not verdict.promoted
+    gate = _gate(verdict, "durable_test_confirmation")
+    assert not gate.passed
+    assert "candidate-a" in gate.reason and "candidate-b" in gate.reason
+
+
 # --------------------------------------------------------------------- PromotionPolicy validation
 
 
@@ -546,6 +563,84 @@ def test_sealed_test_budget_exhausted_error_names_the_run_and_counts(tmp_path):
     assert excinfo.value.run_id == "candidate"
     assert excinfo.value.max_sealed_test_uses == 1
     assert excinfo.value.current_uses == 1
+
+
+_SEALED_TEST_WORKER_SCRIPT = """
+import sys, os, time, json
+sys.path.insert(0, {path!r})
+from cognitive_runtime.training.model_factory.promotion import (
+    PromotionPolicy, SealedTestBudgetExhaustedError, perform_sealed_test_action,
+)
+
+ready_file = {ready_file!r}
+go_file = {go_file!r}
+out_file = {out_file!r}
+
+with open(ready_file, "w") as handle:
+    handle.write("ready")
+deadline = time.monotonic() + 30.0
+while not os.path.exists(go_file):
+    if time.monotonic() > deadline:
+        raise SystemExit("timed out waiting for go file")
+
+policy = PromotionPolicy(minimum_practical_margin=0.1, max_sealed_test_uses={max_uses!r})
+result = {{}}
+try:
+    confirmation = perform_sealed_test_action(
+        {root!r}, family="f", tier="fast", objective="obj", run_id="candidate",
+        passed=True, policy=policy,
+    )
+    result["ok"] = True
+    result["test_uses_after"] = confirmation.test_uses_after
+except SealedTestBudgetExhaustedError as exc:
+    result["ok"] = False
+    result["error"] = str(exc)
+with open(out_file, "w") as handle:
+    json.dump(result, handle)
+"""
+
+
+def test_perform_sealed_test_action_serializes_two_racing_workers_at_the_cap_boundary(tmp_path):
+    """AC: exhausting the sealed-test budget refuses the *next* action. Two
+    processes racing for the one remaining slot must never both succeed --
+    the check-then-act must be atomic under the registry's lock, not a
+    separate read here followed by a separate locked write."""
+    _promote_population_member(tmp_path, "candidate")
+    repo_root = str(__import__("pathlib").Path(__file__).resolve().parents[1])
+    max_uses = 1
+
+    procs, outcomes = [], []
+    for label in ("a", "b"):
+        ready_file = tmp_path / f"ready-{label}"
+        go_file = tmp_path / "go"
+        out_file = tmp_path / f"out-{label}.json"
+        script = _SEALED_TEST_WORKER_SCRIPT.format(
+            path=repo_root, root=str(tmp_path), max_uses=max_uses,
+            ready_file=str(ready_file), go_file=str(go_file), out_file=str(out_file),
+        )
+        proc = subprocess.Popen([sys.executable, "-c", script])
+        procs.append(proc)
+        outcomes.append((ready_file, out_file))
+
+    deadline = __import__("time").monotonic() + 30.0
+    for ready_file, _out_file in outcomes:
+        while not ready_file.exists():
+            assert __import__("time").monotonic() < deadline
+            __import__("time").sleep(0.01)
+    (tmp_path / "go").write_text("go", encoding="utf-8")
+
+    for proc in procs:
+        assert proc.wait(timeout=30) == 0
+
+    results = [json.loads(out_file.read_text(encoding="utf-8")) for _, out_file in outcomes]
+    successes = [r for r in results if r["ok"]]
+    failures = [r for r in results if not r["ok"]]
+    assert len(successes) == 1, results
+    assert len(failures) == 1, results
+    assert successes[0]["test_uses_after"] == max_uses
+
+    members = {entry.run_id: entry for entry in population(tmp_path, family="f", tier="fast", objective="obj")}
+    assert members["candidate"].test_uses == max_uses
 
 
 # --------------------------------------------------------------------- end-to-end: perform then confirm durable

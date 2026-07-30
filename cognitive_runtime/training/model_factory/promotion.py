@@ -72,8 +72,7 @@ from typing import Any, Mapping, Optional, Sequence, Tuple, Union
 from cognitive_runtime.training.model_factory.registry import (
     DECISION_HOLD,
     DECISION_PROMOTE,
-    ChampionEntry,
-    population,
+    TestBudgetExhaustedError,
     record_test_use,
 )
 
@@ -444,7 +443,7 @@ def _safety_metrics_gate(safety_metrics: Sequence[SafetyMetricObservation]) -> G
 
 
 def _durable_test_confirmation_gate(
-    durable: bool, test_confirmation: Optional[TestConfirmation],
+    durable: bool, test_confirmation: Optional[TestConfirmation], candidate_run_id: str,
 ) -> GateResult:
     if not durable:
         return GateResult(
@@ -455,6 +454,12 @@ def _durable_test_confirmation_gate(
         return GateResult(
             "durable_test_confirmation", False,
             "a durable champion requires a confirmed final sealed-test action (MF-C5) which was not supplied",
+        )
+    if test_confirmation.run_id != candidate_run_id:
+        return GateResult(
+            "durable_test_confirmation", False,
+            f"final sealed-test action confirmed run_id={test_confirmation.run_id!r}, not the candidate "
+            f"being evaluated (run_id={candidate_run_id!r}); a confirmation may not be reused across candidates",
         )
     if not (test_confirmation.performed and test_confirmation.passed):
         return GateResult(
@@ -473,6 +478,7 @@ def _durable_test_confirmation_gate(
 def evaluate_promotion(
     *,
     policy: PromotionPolicy,
+    candidate_run_id: str,
     experiment_report: Mapping[str, Any],
     data_quality: Mapping[str, Any],
     split_overlap: Mapping[str, Any],
@@ -485,6 +491,11 @@ def evaluate_promotion(
 ) -> PromotionVerdict:
     """Gate one candidate against all seven conditions, returning a
     structured :class:`PromotionVerdict`.
+
+    ``candidate_run_id`` is the run actually being evaluated. Gate 7 checks
+    it against ``test_confirmation.run_id``: a sealed-test confirmation
+    earned by one candidate must never be reusable to durably promote a
+    different one.
 
     ``experiment_report`` is the artifact
     ``cognitive_runtime.training.statistical_evaluation.build_experiment_report``
@@ -530,7 +541,7 @@ def evaluate_promotion(
             comparison, has_champion=has_champion, minimum_practical_margin=policy.minimum_practical_margin,
         ),
         _safety_metrics_gate(safety_metrics),
-        _durable_test_confirmation_gate(durable, test_confirmation),
+        _durable_test_confirmation_gate(durable, test_confirmation, candidate_run_id),
     )
     failing_reasons = tuple(gate.reason for gate in gates if not gate.passed)
     decision = DECISION_HOLD if failing_reasons else DECISION_PROMOTE
@@ -554,26 +565,27 @@ def perform_sealed_test_action(
     """Charge one sealed-test-set action against ``run_id``'s ledger.
 
     Refuses (:class:`SealedTestBudgetExhaustedError`) once ``policy``'s
-    ``max_sealed_test_uses`` is already spent for this run, *before*
-    touching the registry -- an exhausted budget never records a further
-    use. Every accepted action is recorded via
-    :func:`cognitive_runtime.training.model_factory.registry.record_test_use`,
-    which requires ``run_id`` to already be a population member of the
-    named slot: a test action confirms an already-evaluated candidate,
-    never an unrelated identifier.
+    ``max_sealed_test_uses`` is already spent for this run. The cap check
+    and the increment happen inside
+    :func:`cognitive_runtime.training.model_factory.registry.record_test_use`'s
+    single locked critical section (not a separate read here followed by a
+    separate locked write), so two callers racing to charge the last
+    remaining use can never both observe the pre-increment count and both
+    succeed. ``run_id`` must already be a population member of the named
+    slot: a test action confirms an already-evaluated candidate, never an
+    unrelated identifier.
 
     This is the *only* sanctioned way to query the sealed test split in the
     Model Factory (epic §10.3): routine search and population updates must
     never call it, only an explicit final-test decision (MF-C5) may.
     """
-    existing = population(root, family=family, tier=tier, objective=objective)
-    current: Optional[ChampionEntry] = next(
-        (member for member in existing if member.run_id == run_id), None,
-    )
-    current_uses = current.test_uses if current is not None else 0
-    if current_uses >= policy.max_sealed_test_uses:
-        raise SealedTestBudgetExhaustedError(run_id, policy.max_sealed_test_uses, current_uses)
-    updated = record_test_use(root, family=family, tier=tier, objective=objective, run_id=run_id, reason=reason)
+    try:
+        updated = record_test_use(
+            root, family=family, tier=tier, objective=objective, run_id=run_id,
+            reason=reason, max_uses=policy.max_sealed_test_uses,
+        )
+    except TestBudgetExhaustedError as exc:
+        raise SealedTestBudgetExhaustedError(exc.run_id, exc.max_uses, exc.current_uses) from exc
     return TestConfirmation(
         run_id=run_id, performed=True, passed=passed, test_uses_after=updated.test_uses,
         max_sealed_test_uses=policy.max_sealed_test_uses, reason=reason,
