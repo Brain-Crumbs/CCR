@@ -436,6 +436,12 @@ class TrainerResumeState:
     checkpoint contract's ``trainer_state`` (MF-B1); ``rng_state`` is the
     :func:`capture_trainer_rng_state` snapshot -- the four global streams
     plus the trainer's own window/scheduled-sampling generator.
+    ``target_encoder_state_dict`` is the EMA target encoder's weights
+    (``ActionWorldModelConfig.ema_target_decay``), when enabled: an
+    uninterrupted run's EMA copy holds the Polyak-averaged history of every
+    preceding step and generally differs from the online model, so it must
+    be restored explicitly rather than rebuilt as a fresh copy of the
+    resumed online weights.
     """
 
     epoch: int
@@ -443,6 +449,7 @@ class TrainerResumeState:
     optimizer_state_dict: Dict[str, Any]
     rng_state: Dict[str, Any]
     best_validation_metric: Optional[float] = None
+    target_encoder_state_dict: Optional[Dict[str, Any]] = None
 
 
 @dataclass

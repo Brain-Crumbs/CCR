@@ -1180,19 +1180,26 @@ def train_action_world_model(
     today's behavior exactly: a fresh ``torch.manual_seed(cfg.seed)`` and a
     freshly seeded window/scheduled-sampling generator.
 
+    ``validation_fn``, when given, is called with the model (in eval mode)
+    at the end of *every* epoch regardless of cadence or ``on_checkpoint``;
+    its return value is tracked as the declared selection metric
+    (``checkpoint_selection_mode``, ``"min"`` or ``"max"``), so
+    ``stats["resume_state"].best_validation_metric`` reflects it even if no
+    persistence callback is configured. ``best-validation.pt`` must follow
+    this metric, never the training loss.
+
     ``checkpoint_cadence_epochs`` and ``on_checkpoint`` implement the
     periodic-checkpoint cadence hook: every time training completes an
     epoch count that lands on the declared cadence
     (``cognitive_runtime.training.model_factory.checkpoint.checkpoint_due``),
-    ``on_checkpoint(state, is_best=...)`` is called with a
-    :class:`TrainerResumeState` snapshot so a caller can persist it (for
-    example via ``save_factory_checkpoint``). ``validation_fn``, when given,
-    is called with the model (in eval mode) at the end of every epoch; its
-    return value is tracked as the declared selection metric
-    (``checkpoint_selection_mode``, ``"min"`` or ``"max"``) so
-    ``on_checkpoint`` also fires -- with ``is_best=True`` -- whenever it
-    improves, independent of cadence. ``best-validation.pt`` must reflect
-    this metric, never the training loss. The final ``stats["resume_state"]``
+    or ``validation_fn`` reports a new best, ``on_checkpoint(model, state,
+    is_best=...)`` is called with the live model -- already holding that
+    epoch's trained weights -- and a :class:`TrainerResumeState` snapshot,
+    so a caller can persist both (for example via
+    ``save_factory_checkpoint``). A fresh call builds ``model`` inside this
+    function and does not return it until every epoch finishes, so passing
+    it explicitly here is the only way a caller can reach epoch-specific
+    weights for a periodic checkpoint. The final ``stats["resume_state"]``
     is always populated regardless of these arguments, so the base
     stop-and-continue primitive (train N epochs, then resume for the rest)
     works without configuring cadence or validation at all.
@@ -1232,10 +1239,14 @@ def train_action_world_model(
         raise ValueError(
             f"checkpoint_selection_mode must be 'min' or 'max', got {checkpoint_selection_mode!r}"
         )
-    if resume_state is not None and resume_state.epoch > cfg.epochs:
+    if resume_state is not None and resume_state.epoch >= cfg.epochs:
+        # Reject explicitly rather than entering an epoch loop that runs
+        # zero iterations: empty loss curves would otherwise raise a
+        # confusing IndexError deep in the final stats assembly instead of
+        # a clear, actionable error at the call boundary.
         raise ValueError(
-            f"resume_state.epoch ({resume_state.epoch}) exceeds cfg.epochs ({cfg.epochs}); "
-            "raise cfg.epochs to train past the checkpointed epoch"
+            f"resume_state.epoch ({resume_state.epoch}) has already reached or passed "
+            f"cfg.epochs ({cfg.epochs}); raise cfg.epochs to train additional epochs"
         )
     if resume_state is None:
         # Fresh start: unchanged from pre-#220 behavior. A resumed call
@@ -1303,6 +1314,12 @@ def train_action_world_model(
         target_encoder = copy.deepcopy(model)
         target_encoder.requires_grad_(False)
         target_encoder.eval()
+        if resume_state is not None and resume_state.target_encoder_state_dict is not None:
+            # An uninterrupted run's EMA copy holds the Polyak-averaged
+            # history of every preceding step, not merely the current online
+            # model -- restore that exact history rather than resetting the
+            # slow target back to a deepcopy of the just-resumed weights.
+            target_encoder.load_state_dict(resume_state.target_encoder_state_dict)
     episodes = _episode_tensors(dataset, model.reconstruction_shape, device=device)
     #: Per-episode reward/terminal/risk targets (issue #169), aligned 1:1
     #: with ``episodes`` by index.
@@ -1322,11 +1339,16 @@ def train_action_world_model(
     def _checkpoint_step(epochs_completed: int, step: int, step_optimizer: Any) -> None:
         """Cadence hook (issue #220): periodic + best-validation checkpoints.
 
-        Left a no-op unless the caller opts in via ``on_checkpoint``, so a
-        default call pays no extra cost and consumes no extra RNG draws.
+        Validation (when ``validation_fn`` is given) always runs at the end
+        of every epoch, independent of whether a persistence callback is
+        installed -- otherwise ``stats["resume_state"].best_validation_metric``
+        would silently stay ``None`` for a caller that only wants the
+        tracked metric, not disk writes. ``on_checkpoint`` receives the live
+        ``model`` explicitly: for a fresh call (no ``initial_model``) the
+        model is built inside this function and not returned until every
+        epoch finishes, so without this a caller has no way to reach the
+        epoch-specific weights a periodic checkpoint must persist.
         """
-        if on_checkpoint is None:
-            return
         is_best = False
         if validation_fn is not None:
             was_training = model.training
@@ -1335,14 +1357,20 @@ def train_action_world_model(
                 is_best = best_tracker.offer(float(validation_fn(model)))
             finally:
                 model.train(was_training)
+        if on_checkpoint is None:
+            return
         if not is_best and not checkpoint_due(epochs_completed, checkpoint_cadence_epochs):
             return
         on_checkpoint(
+            model,
             TrainerResumeState(
                 epoch=epochs_completed, global_step=step,
                 optimizer_state_dict=step_optimizer.state_dict(),
                 rng_state=capture_trainer_rng_state(generator),
                 best_validation_metric=best_tracker.best,
+                target_encoder_state_dict=(
+                    target_encoder.state_dict() if target_encoder is not None else None
+                ),
             ),
             is_best=is_best,
         )
@@ -1360,6 +1388,9 @@ def train_action_world_model(
             optimizer_state_dict=optimizer.state_dict(),
             rng_state=capture_trainer_rng_state(generator),
             best_validation_metric=best_tracker.best,
+            target_encoder_state_dict=(
+                target_encoder.state_dict() if target_encoder is not None else None
+            ),
         )
         diagnostics = representation_collapse_diagnostics(model, dataset, config=cfg)
         stats["representation_diagnostics"] = diagnostics
@@ -1852,6 +1883,9 @@ def train_action_world_model(
         optimizer_state_dict=optimizer.state_dict(),
         rng_state=capture_trainer_rng_state(generator),
         best_validation_metric=best_tracker.best,
+        target_encoder_state_dict=(
+            target_encoder.state_dict() if target_encoder is not None else None
+        ),
     )
     diagnostics = representation_collapse_diagnostics(model, dataset, config=cfg)
     stats["representation_diagnostics"] = diagnostics

@@ -180,9 +180,24 @@ def test_resume_rejects_a_checkpoint_epoch_past_the_configured_budget():
     _model, stats = train_action_world_model(
         dataset, _cfg(epochs=3, training_objective="windowed_rollout"),
     )
-    with pytest.raises(ValueError, match="exceeds cfg.epochs"):
+    with pytest.raises(ValueError, match="already reached or passed"):
         train_action_world_model(
             dataset, _cfg(epochs=2, training_objective="windowed_rollout"),
+            resume_state=stats["resume_state"],
+        )
+
+
+def test_resume_rejects_an_already_complete_checkpoint_instead_of_crashing():
+    """A checkpoint saved exactly at the epoch budget (e.g. the last
+    periodic save before a job recorded completion) must fail clearly, not
+    raise IndexError deep inside empty loss-curve bookkeeping."""
+    dataset = _dataset()
+    _model, stats = train_action_world_model(
+        dataset, _cfg(epochs=3, training_objective="windowed_rollout"),
+    )
+    with pytest.raises(ValueError, match="already reached or passed"):
+        train_action_world_model(
+            dataset, _cfg(epochs=3, training_objective="windowed_rollout"),
             resume_state=stats["resume_state"],
         )
 
@@ -267,8 +282,21 @@ def test_checkpoint_cadence_and_best_validation_fire_independently(tmp_path):
 
     saved = {}
 
-    def on_checkpoint(state, *, is_best):
-        saved[state.epoch] = (state, is_best)
+    def on_checkpoint(step_model, state, *, is_best):
+        # The hook receives the live model explicitly (issue #253 review):
+        # for a fresh call it is built inside train_action_world_model and
+        # not returned until every epoch finishes, so this is the only way
+        # a caller can reach the epoch-specific weights to persist.
+        architecture, data, training = _contracts_for(step_model)
+        path = tmp_path / f"checkpoint-epoch-{state.epoch}.pt"
+        save_factory_checkpoint(
+            str(path), step_model, torch.optim.Adam(step_model.parameters()), None,
+            {"epoch": state.epoch, "global_step": state.global_step,
+             "best_validation_metric": state.best_validation_metric},
+            architecture_contract=architecture, data_contract_hash=data,
+            training_contract=training,
+        )
+        saved[state.epoch] = (state, is_best, path, architecture, data, training)
 
     model, stats = train_action_world_model(
         dataset, _cfg(epochs=6, training_objective="windowed_rollout"),
@@ -288,16 +316,11 @@ def test_checkpoint_cadence_and_best_validation_fire_independently(tmp_path):
     assert stats["resume_state"].best_validation_metric == 3.0
     assert len(calls) == 6
 
-    architecture, data, training = _contracts_for(model)
-    for epoch, (state, _is_best) in saved.items():
-        path = tmp_path / f"checkpoint-epoch-{epoch}.pt"
-        save_factory_checkpoint(
-            str(path), model, torch.optim.Adam(model.parameters()), None,
-            {"epoch": state.epoch, "global_step": state.global_step,
-             "best_validation_metric": state.best_validation_metric},
-            architecture_contract=architecture, data_contract_hash=data,
-            training_contract=training,
-        )
+    # Each snapshot is independently loadable and genuinely holds *that*
+    # epoch's weights -- not the run's final weights mislabeled under every
+    # earlier epoch (the regression this test guards against).
+    loaded_weights = {}
+    for epoch, (state, _is_best, path, architecture, data, training) in saved.items():
         loaded = load_factory_checkpoint(
             str(path), model=type(model)(model.pixel_shape, model.action_keys, model.config),
             optimizer=torch.optim.Adam(model.parameters()), resume=True,
@@ -306,3 +329,49 @@ def test_checkpoint_cadence_and_best_validation_fire_independently(tmp_path):
         )
         assert loaded.resumed is True
         assert loaded.trainer_state["epoch"] == epoch
+        loaded_weights[epoch] = {k: v.clone() for k, v in loaded.model.state_dict().items()}
+    any_key = next(iter(loaded_weights[1]))
+    assert not torch.equal(loaded_weights[1][any_key], loaded_weights[6][any_key])
+
+
+def test_validation_runs_every_epoch_without_a_checkpoint_callback():
+    """``validation_fn`` must run even when the caller only wants the
+    tracked best metric and never configures ``on_checkpoint``."""
+    dataset = _dataset()
+    readings = [5.0, 3.0, 4.0]
+    calls = []
+
+    def validation_fn(model):
+        calls.append(len(calls))
+        return readings[len(calls) - 1]
+
+    _model, stats = train_action_world_model(
+        dataset, _cfg(epochs=3, training_objective="windowed_rollout"),
+        validation_fn=validation_fn,
+    )
+
+    assert len(calls) == 3
+    assert stats["resume_state"].best_validation_metric == 3.0
+
+
+def test_resume_matches_uninterrupted_training_with_ema_target():
+    """The EMA target encoder is a second, separately-evolving model whose
+    Polyak-averaged history must be restored explicitly at resume, not
+    rebuilt as a fresh copy of the just-resumed online weights."""
+    dataset = _dataset()
+    cfg_kwargs = dict(training_objective="windowed_rollout", ema_target_decay=0.9)
+
+    model_full, stats_full = train_action_world_model(dataset, _cfg(epochs=6, **cfg_kwargs))
+
+    model_first, stats_first = train_action_world_model(dataset, _cfg(epochs=3, **cfg_kwargs))
+    model_resumed, stats_resumed = train_action_world_model(
+        dataset, _cfg(epochs=6, **cfg_kwargs),
+        initial_model=model_first, resume_state=stats_first["resume_state"],
+    )
+
+    _assert_state_dict_equal(model_full.state_dict(), model_resumed.state_dict())
+    assert (
+        stats_full["loss_curves"]["total_loss"][3:6]
+        == stats_resumed["loss_curves"]["total_loss"]
+    )
+    assert stats_first["resume_state"].target_encoder_state_dict is not None
