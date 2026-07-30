@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import os
 import sys
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Dict, Mapping, Optional, Tuple
 
 if TYPE_CHECKING:
     # Issue #176: the CLI's default --world is now "crafter", and the
@@ -1736,6 +1738,530 @@ def cmd_trace_show(args: argparse.Namespace) -> None:
     print(format_trace_summary(manifest, events, tail=args.tail))
 
 
+# --------------------------------------------------------------------------- model factory (ccr factory ...)
+#
+# issue #228 (MF-C6, epic #212 §20): a thin dispatcher over
+# cognitive_runtime.training.model_factory's runner/registry/promotion/
+# corpus/confirmation modules -- argument parsing plus one call into the
+# domain layer, no orchestration logic here. Every Model Factory submodule
+# except the actual neural trainer stays torch-free at import time (each
+# defers its own `import torch` to the function that needs it), so most
+# factory commands only require the neural extra at the point they actually
+# touch a checkpoint or train -- `ccr factory --help` and `ccr factory show`
+# work in a core-only install.
+
+_FACTORY_RUNS_ROOT_DEFAULT = "runs"
+_FACTORY_CORPORA_ROOT_DEFAULT = "corpora"
+
+
+def _factory_run_directory(root: str, run_id: str, organism: Optional[str] = None) -> Path:
+    """Locate ``<root>/<organism>/<run_id>``, searching every organism under
+    ``root`` when ``organism`` is not given (mirrors
+    ``model_factory.corpus._corpus_directory``'s own ambiguity handling)."""
+    root_path = Path(root)
+    if organism:
+        directory = root_path / organism / run_id
+        if not directory.is_dir():
+            sys.exit(f"no run {run_id!r} for organism {organism!r} under {root!r}")
+        return directory
+    candidates = sorted(path for path in root_path.glob(f"*/{run_id}") if path.is_dir())
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        sys.exit(f"run {run_id!r} was not found under {root!r}")
+    organisms = ", ".join(sorted(candidate.parent.name for candidate in candidates))
+    sys.exit(f"run id {run_id!r} is ambiguous under {root!r} (organisms: {organisms}); pass --organism")
+
+
+def _factory_latest_run_directory(root: str) -> Path:
+    """The most recently allocated run directory under ``root``, for the
+    commands that default to inspecting "the latest run" when none is
+    named."""
+    root_path = Path(root)
+    candidates = sorted(
+        root_path.glob("*/*/experiment.json"), key=lambda path: path.stat().st_mtime,
+    )
+    if not candidates:
+        sys.exit(f"no Model Factory runs found under {root!r}")
+    return candidates[-1].parent
+
+
+def _factory_resolve_run(args: argparse.Namespace) -> Path:
+    root = args.root
+    run_id = getattr(args, "run", None)
+    if run_id:
+        return _factory_run_directory(root, run_id, getattr(args, "organism", None))
+    return _factory_latest_run_directory(root)
+
+
+def _factory_load_validation(directory: Path) -> Tuple[Dict[str, Any], float]:
+    """Load one run's ``metrics/validation.json`` plus its data contract's
+    ``ticks_per_frame``, restoring the ``rollout``/``direct``/
+    ``per_episode_model_mse`` horizon keys from JSON's string coercion back
+    to ``int`` so the payload matches the shape
+    ``runner._resolve_selection_metric`` expects."""
+    with (directory / "metrics" / "validation.json").open(encoding="utf-8") as handle:
+        payload: Dict[str, Any] = json.load(handle)
+    with (directory / "contracts.json").open(encoding="utf-8") as handle:
+        contracts = json.load(handle)
+    ticks_per_frame = float(contracts["data_contract"]["ticks_per_frame"])
+    for report_name in ("rollout", "direct"):
+        report = payload.get(report_name)
+        if not isinstance(report, dict):
+            continue
+        if isinstance(report.get("horizons"), dict):
+            report["horizons"] = {int(key): value for key, value in report["horizons"].items()}
+        if isinstance(report.get("per_episode_model_mse"), dict):
+            report["per_episode_model_mse"] = {
+                int(key): value for key, value in report["per_episode_model_mse"].items()
+            }
+    per_episode = payload.get("per_episode_model_mse")
+    if isinstance(per_episode, dict):
+        payload["per_episode_model_mse"] = {int(key): value for key, value in per_episode.items()}
+    return payload, ticks_per_frame
+
+
+def _factory_slot_defaults(run_directory: Path, trial_spec: Mapping[str, Any]) -> Tuple[str, Optional[str]]:
+    """``(family, tier)`` defaults so ``ccr factory promote <run>``/
+    ``ccr factory test <run>`` work with no extra flags, matching the epic
+    proposal's own terse workflow examples: family defaults to the run's
+    organism, tier to whatever ``build_budget_report`` recorded for it."""
+    family = str(trial_spec["organism"])
+    tier: Optional[str] = None
+    budget_report_path = run_directory / "metrics" / "budget_report.json"
+    if budget_report_path.is_file():
+        with budget_report_path.open(encoding="utf-8") as handle:
+            tier = json.load(handle).get("tier")
+    return family, tier
+
+
+def _print_trial_result(result: Any) -> None:
+    print(f"run_id: {result.run_id}")
+    print(f"display_name: {result.display_name}")
+    print(f"mode: {result.mode}")
+    print(f"state: {result.state}")
+    print(f"directory: {result.directory}")
+    print(f"architecture_hash: {result.architecture_hash}")
+    print(f"data_contract_hash: {result.data_contract_hash}")
+    print(f"training_contract_hash: {result.training_contract_hash}")
+    print(f"checkpoint: {result.checkpoint_path} (sha256={result.checkpoint_sha256})")
+    if result.comparison is not None:
+        print(
+            f"comparison: decision={result.comparison.get('decision')} "
+            f"mean_delta={result.comparison.get('mean_delta')}"
+        )
+
+
+def cmd_factory_baseline(args: argparse.Namespace) -> None:
+    """``ccr factory baseline <spec>`` (issue #228, epic #212 §20 workflow
+    step 1): resolve an experiment spec and launch one fresh/clone/resume/
+    fine_tune trial through ``run_trial``, establishing a fully recorded,
+    immutable run with a unique run ID."""
+    from cognitive_runtime.training.model_factory.spec import SpecError, apply_overrides, load_spec, resolve
+
+    raw = load_spec(args.spec)
+    if args.set:
+        raw = apply_overrides(raw, args.set)
+    try:
+        resolved = resolve(raw)
+    except SpecError as exc:
+        sys.exit(f"invalid spec: {exc}")
+
+    try:
+        from cognitive_runtime.training.model_factory.runner import run_trial
+
+        result = run_trial(
+            resolved, root=args.root, corpus_root=args.corpus_root, naming_seed=args.naming_seed,
+        )
+    except ImportError as exc:
+        sys.exit(f"'ccr factory baseline' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+    _print_trial_result(result)
+
+
+def cmd_factory_clone(args: argparse.Namespace) -> None:
+    """``ccr factory clone <run> --set path=value`` (issue #228): build a
+    clone/fine_tune child spec from an existing run's persisted
+    ``trial_spec.json``, apply dotted-path ``--set`` overrides, and launch it
+    as a new controlled sibling via ``run_trial``.
+
+    An unknown dotted path (a typo'd field, or one nested a level too deep)
+    is rejected by the same ``resolve()``/``validate()`` machinery every
+    other spec goes through: :class:`SpecError` already names the nearest
+    valid field via ``difflib``, so this command does not duplicate that
+    logic -- it only lets the error surface.
+    """
+    from cognitive_runtime.training.model_factory.checkpoint import read_factory_checkpoint_metadata
+    from cognitive_runtime.training.model_factory.spec import SpecError, apply_overrides, resolve
+
+    parent_directory = _factory_run_directory(args.root, args.run, args.organism)
+    with (parent_directory / "trial_spec.json").open(encoding="utf-8") as handle:
+        parent_spec = json.load(handle)
+
+    checkpoint_path = parent_directory / "checkpoints" / args.checkpoint
+    try:
+        checkpoint_meta = read_factory_checkpoint_metadata(str(checkpoint_path))
+    except OSError as exc:
+        sys.exit(f"cannot read parent checkpoint metadata at {checkpoint_path}: {exc}")
+
+    child_doc = {
+        "organism": parent_spec["organism"],
+        "mode": args.mode,
+        "data": parent_spec["data"],
+        "model": parent_spec["model"],
+        "training": parent_spec["training"],
+        "evaluation": parent_spec["evaluation"],
+        "parent": {
+            "run_id": args.run,
+            "checkpoint": args.checkpoint,
+            "sha256": checkpoint_meta.get("checkpoint_sha256"),
+        },
+    }
+    if args.set:
+        child_doc = apply_overrides(child_doc, args.set)
+
+    try:
+        resolved = resolve(child_doc)
+    except SpecError as exc:
+        sys.exit(f"invalid clone: {exc}")
+
+    try:
+        from cognitive_runtime.training.model_factory.runner import run_trial
+
+        result = run_trial(
+            resolved, root=args.root, corpus_root=args.corpus_root, naming_seed=args.naming_seed,
+        )
+    except ImportError as exc:
+        sys.exit(f"'ccr factory clone' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+    _print_trial_result(result)
+
+
+def cmd_factory_compare(args: argparse.Namespace) -> None:
+    """``ccr factory compare <run> <run> [<run> ...]`` (issue #228): pair
+    every candidate's frozen validation evidence against the first named run
+    (the baseline) with the same paired bootstrap/permutation rule (MF-C1)
+    promotion itself uses. Read-only: no trial is launched, nothing is
+    written."""
+    from cognitive_runtime.training.model_factory.comparison import compare_paired_episodes
+    from cognitive_runtime.training.model_factory.runner import _resolve_selection_metric
+
+    baseline_id, *candidate_ids = args.runs
+    if not candidate_ids:
+        sys.exit("ccr factory compare needs a baseline run and at least one candidate run")
+
+    def series_for(run_id: str) -> Tuple[str, Dict[str, float]]:
+        directory = _factory_run_directory(args.root, run_id, args.organism)
+        payload, ticks_per_frame = _factory_load_validation(directory)
+        selection_metric = payload["selection_metric"]
+        _, per_episode = _resolve_selection_metric(payload, selection_metric, ticks_per_frame)
+        return selection_metric, dict(zip(payload["episode_ids"], per_episode))
+
+    baseline_metric, baseline_series = series_for(baseline_id)
+    print(f"baseline: {baseline_id} (selection_metric={baseline_metric})")
+    for candidate_id in candidate_ids:
+        candidate_metric, candidate_series = series_for(candidate_id)
+        if candidate_metric != baseline_metric:
+            sys.exit(
+                f"cannot compare {candidate_id!r} (selection_metric={candidate_metric!r}) against "
+                f"{baseline_id!r} (selection_metric={baseline_metric!r}): selection metrics differ"
+            )
+        # minimum_episode_count=1 matches runner._build_comparison's own override of
+        # compare_paired_episodes's default (5): whether a handful of paired episodes is
+        # *statistically* enough to trust is a promotion-policy question, not a reason for
+        # this read-only command to contradict the comparison persisted for the same runs.
+        comparison = compare_paired_episodes(
+            candidate_series, baseline_series, primary_metric=baseline_metric, minimum_episode_count=1,
+        )
+        decision = (
+            "candidate_improves"
+            if comparison.status == "evaluable" and comparison.mean_delta is not None and comparison.mean_delta < 0
+            else "hold"
+        )
+        detail = "" if comparison.status == "evaluable" else f" ({comparison.reason})"
+        print(
+            f"{candidate_id}: status={comparison.status} mean_delta={comparison.mean_delta} "
+            f"win_rate={comparison.win_rate} decision={decision}{detail}"
+        )
+
+
+def cmd_factory_promote(args: argparse.Namespace) -> None:
+    """``ccr factory promote <run>`` (issue #228): gate a run against
+    ``promotion.evaluate_promotion``'s seven promotion conditions (data
+    quality, split overlap, rollout health, primary-metric margin, safety,
+    training-time budget, and -- with ``--durable`` -- sealed-test
+    confirmation), then record it as a champion-population member of one
+    ``(family, tier, objective)`` registry slot only if every gate passes.
+    A candidate that fails any gate is refused and recorded as a hold
+    instead, exactly like the workflow's own "promote only if gates pass"
+    (``--hold`` records an evaluated-but-not-promoted decision directly,
+    skipping gate evaluation). ``--family``/``--tier``/``--objective``
+    default from the run's own organism, recorded budget tier, and declared
+    selection metric."""
+    from cognitive_runtime.training.model_factory.checkpoint import read_factory_checkpoint_metadata
+    from cognitive_runtime.training.model_factory.corpus import resolve_corpus
+    from cognitive_runtime.training.model_factory.promotion import (
+        PromotionPolicy,
+        TestConfirmation,
+        evaluate_promotion,
+    )
+    from cognitive_runtime.training.model_factory.registry import RegistryError, hold, leading_champion, promote
+    from cognitive_runtime.training.model_factory.runner import _resolve_selection_metric
+
+    run_directory = _factory_run_directory(args.root, args.run, args.organism)
+    with (run_directory / "trial_spec.json").open(encoding="utf-8") as handle:
+        trial_spec = json.load(handle)
+
+    default_family, default_tier = _factory_slot_defaults(run_directory, trial_spec)
+    family = args.family or default_family
+    tier = args.tier or default_tier
+    objective = args.objective or trial_spec["evaluation"]["selection_metric"]
+    if not tier:
+        sys.exit(
+            "ccr factory promote: no --tier given and none could be inferred from "
+            "metrics/budget_report.json; pass --tier explicitly"
+        )
+
+    registry_root = run_directory.parent
+
+    if args.hold:
+        try:
+            slot = hold(registry_root, family=family, tier=tier, objective=objective,
+                        run_id=args.run, reason=args.reason)
+        except RegistryError as exc:
+            sys.exit(f"promotion refused: {exc}")
+        print(f"family={family} tier={tier} objective={objective}")
+        print(f"leading_champion: {slot.leading_champion}")
+        print(f"population: {[entry.run_id for entry in slot.population]}")
+        return
+
+    experiment_report_path = run_directory / "experiment_report.json"
+    if not experiment_report_path.is_file():
+        sys.exit(
+            f"ccr factory promote: no experiment_report.json for {args.run!r}; "
+            "the run is not gate-evaluable"
+        )
+    with experiment_report_path.open(encoding="utf-8") as handle:
+        experiment_report = json.load(handle)
+
+    corpus = resolve_corpus(
+        trial_spec["data"]["corpus_id"], root=args.corpus_root, organism=trial_spec["organism"],
+    )
+    with (corpus.directory / "quality_report.json").open(encoding="utf-8") as handle:
+        data_quality = json.load(handle)
+    with (corpus.directory / "split_overlap_report.json").open(encoding="utf-8") as handle:
+        split_overlap = json.load(handle)
+
+    comparison = None
+    comparison_path = run_directory / "metrics" / "comparison.json"
+    if comparison_path.is_file():
+        with comparison_path.open(encoding="utf-8") as handle:
+            comparison = json.load(handle)
+
+    has_champion = leading_champion(registry_root, family=family, tier=tier, objective=objective) is not None
+
+    test_confirmation = None
+    if args.durable:
+        test_metrics_path = run_directory / "metrics" / "test.json"
+        if not test_metrics_path.is_file():
+            sys.exit(
+                f"ccr factory promote --durable: no metrics/test.json for {args.run!r}; "
+                "run 'ccr factory test' first"
+            )
+        with test_metrics_path.open(encoding="utf-8") as handle:
+            test_payload = json.load(handle)
+        test_confirmation = TestConfirmation(
+            run_id=test_payload["run_id"], performed=True, passed=test_payload["passed"],
+            test_uses_after=test_payload["test_uses_after"],
+            max_sealed_test_uses=test_payload["max_sealed_test_uses"], reason=test_payload.get("reason"),
+        )
+
+    policy = PromotionPolicy(minimum_practical_margin=args.minimum_practical_margin)
+    verdict = evaluate_promotion(
+        policy=policy, candidate_run_id=args.run, experiment_report=experiment_report,
+        data_quality=data_quality, split_overlap=split_overlap, has_champion=has_champion,
+        comparison=comparison, durable=args.durable, test_confirmation=test_confirmation,
+    )
+    for gate in verdict.gates:
+        status = "PASS" if gate.passed else ("N/A" if not gate.applicable else "FAIL")
+        print(f"[{status}] {gate.name}: {gate.reason}")
+
+    if not verdict.promoted:
+        gate_reason = "; ".join(verdict.reasons)
+        hold_reason = f"{args.reason}; {gate_reason}" if args.reason else gate_reason
+        try:
+            hold(registry_root, family=family, tier=tier, objective=objective, run_id=args.run, reason=hold_reason)
+        except RegistryError:
+            pass  # best-effort audit trail; the refusal below is what matters
+        sys.exit(f"promotion refused (gates failed): {gate_reason}")
+
+    try:
+        checkpoint_path = run_directory / "checkpoints" / "best-validation.pt"
+        checkpoint_meta = read_factory_checkpoint_metadata(str(checkpoint_path))
+        validation_payload, ticks_per_frame = _factory_load_validation(run_directory)
+        metric_value, _ = _resolve_selection_metric(validation_payload, objective, ticks_per_frame)
+        slot = promote(
+            registry_root, family=family, tier=tier, objective=objective, run_id=args.run,
+            checkpoint_path=checkpoint_path, checkpoint_sha256=checkpoint_meta.get("checkpoint_sha256"),
+            metrics={"selection_metric": objective, "selection_metric_value": metric_value},
+            as_leading=not args.no_as_leading, reason=args.reason,
+        )
+    except RegistryError as exc:
+        sys.exit(f"promotion refused: {exc}")
+
+    print(f"family={family} tier={tier} objective={objective}")
+    print(f"leading_champion: {slot.leading_champion}")
+    print(f"population: {[entry.run_id for entry in slot.population]}")
+
+
+def cmd_factory_show(args: argparse.Namespace) -> None:
+    """``ccr factory show [run]`` (issue #228, default: the latest run):
+    print the run's complete effective config, all three contract hashes,
+    its display name, and its completion status -- epic #212 success
+    criterion 5. Reads only persisted JSON manifests, so this works with
+    torch not installed."""
+    from cognitive_runtime.training.model_factory.naming import load_display_name
+    from cognitive_runtime.training.model_factory.state import load_state, state_path
+
+    directory = _factory_resolve_run(args)
+    run_id = directory.name
+    organism = directory.parent.name
+
+    with (directory / "trial_spec.json").open(encoding="utf-8") as handle:
+        trial_spec = json.load(handle)
+    with (directory / "contracts.json").open(encoding="utf-8") as handle:
+        contracts = json.load(handle)
+    display_name = load_display_name(directory / "display_name.json").display_name
+    state_file = state_path(directory)
+    completion_status = load_state(state_file).state if state_file.exists() else "unknown"
+
+    print(f"run_id: {run_id}")
+    print(f"organism: {organism}")
+    print(f"display_name: {display_name}")
+    print(f"mode: {trial_spec.get('mode')}")
+    print(f"completion_status: {completion_status}")
+    print(f"architecture_hash: {contracts['architecture_hash']}")
+    print(f"data_contract_hash: {contracts['data_contract_hash']}")
+    print(f"training_contract_hash: {contracts['training_contract_hash']}")
+
+    validation_path = directory / "metrics" / "validation.json"
+    if validation_path.is_file():
+        with validation_path.open(encoding="utf-8") as handle:
+            print(f"selection_metric: {json.load(handle).get('selection_metric')}")
+    comparison_path = directory / "metrics" / "comparison.json"
+    if comparison_path.is_file():
+        with comparison_path.open(encoding="utf-8") as handle:
+            print(f"comparison decision: {json.load(handle).get('decision')}")
+
+    print("resolved spec (complete effective config):")
+    print(json.dumps(trial_spec, indent=2, sort_keys=True))
+
+
+def _print_lineage_node(node: Any, *, indent: int) -> None:
+    prefix = "  " * indent
+    print(f"{prefix}{node.run_id} (mode={node.mode})")
+    if node.parent_run_id:
+        print(f"{prefix}  parent: {node.parent_run_id}")
+    if node.configuration_parents:
+        print(f"{prefix}  configuration_parents: {', '.join(node.configuration_parents)}")
+    if node.weight_donor:
+        print(f"{prefix}  weight_donor: {node.weight_donor}")
+
+
+def cmd_factory_lineage(args: argparse.Namespace) -> None:
+    """``ccr factory lineage [run]`` (issue #228, default: the latest run):
+    render the ancestor chain walked from ``lineage.json`` -- both
+    configuration parents and the weight donor for a bred child. Reads only
+    persisted JSON manifests, so this works with torch not installed."""
+    from cognitive_runtime.training.model_factory.registry import RegistryError, lineage_graph
+
+    directory = _factory_resolve_run(args)
+    run_id = directory.name
+    organism_directory = directory.parent
+
+    try:
+        graph = lineage_graph(organism_directory, run_id)
+    except RegistryError as exc:
+        sys.exit(str(exc))
+
+    print(f"lineage for {run_id} (organism={organism_directory.name}):")
+    _print_lineage_node(graph.nodes[run_id], indent=0)
+    for ancestor_id in graph.ancestor_ids:
+        _print_lineage_node(graph.nodes[ancestor_id], indent=1)
+
+
+def cmd_factory_corpus_build(args: argparse.Namespace) -> None:
+    """``ccr factory corpus build <spec>`` (issue #228): record/reuse every
+    declared episode, run the corpus's quality and split-overlap gates, and
+    freeze its session hashes via ``build_corpus``."""
+    from cognitive_runtime.training.model_factory.spec import load_spec
+
+    raw = load_spec(args.spec)
+    raw.setdefault("root", args.root)
+
+    try:
+        from cognitive_runtime.training.model_factory.corpus import build_corpus
+
+        corpus = build_corpus(raw)
+    except ImportError as exc:
+        sys.exit(f"'ccr factory corpus build' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+
+    sessions = corpus.manifest.get("sessions", {})
+    print(f"corpus_id: {corpus.corpus_id}")
+    print(f"directory: {corpus.directory}")
+    print(f"data_contract_hash: {corpus.data_contract_hash}")
+    for split in ("train", "validation", "test"):
+        print(f"{split}: {len(sessions.get(split, []))} sessions")
+
+
+def cmd_factory_test(args: argparse.Namespace) -> None:
+    """``ccr factory test <run>`` (issue #228, MF-C5): the sealed-test final
+    action -- evaluate a candidate already confirmed across seeds against the
+    sealed test split exactly once, charging its sealed-test-use budget."""
+    run_directory = _factory_run_directory(args.root, args.run, args.organism)
+    organism = run_directory.parent.name
+    with (run_directory / "trial_spec.json").open(encoding="utf-8") as handle:
+        trial_spec = json.load(handle)
+
+    default_family, default_tier = _factory_slot_defaults(run_directory, trial_spec)
+    family = args.family or default_family
+    tier = args.tier or default_tier
+    objective = args.objective or trial_spec["evaluation"]["selection_metric"]
+    if not tier:
+        sys.exit(
+            "ccr factory test: no --tier given and none could be inferred from "
+            "metrics/budget_report.json; pass --tier explicitly"
+        )
+
+    try:
+        from cognitive_runtime.training.model_factory.confirmation import ConfirmationError, final_test
+        from cognitive_runtime.training.model_factory.promotion import (
+            PromotionPolicy,
+            SealedTestBudgetExhaustedError,
+        )
+
+        policy = PromotionPolicy(
+            minimum_practical_margin=args.minimum_practical_margin,
+            max_sealed_test_uses=args.max_sealed_test_uses,
+        )
+        result = final_test(
+            args.run, organism=organism, family=family, tier=tier, objective=objective,
+            policy=policy, root=args.root, corpus_root=args.corpus_root, reason=args.reason,
+        )
+    except ImportError as exc:
+        sys.exit(f"'ccr factory test' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+    except (ConfirmationError, SealedTestBudgetExhaustedError) as exc:
+        sys.exit(str(exc))
+
+    print(f"run_id: {result.run_id}")
+    print(f"passed: {result.passed}")
+    print(f"reason: {result.reason}")
+    print(f"selection_metric: {result.selection_metric} = {result.selection_metric_value}")
+    print(
+        f"sealed_test_uses: {result.test_confirmation.test_uses_after}/"
+        f"{result.test_confirmation.max_sealed_test_uses}"
+    )
+    print(f"metrics: {result.test_metrics_path}")
+
+
 # --------------------------------------------------------------------------- observability wiring
 
 
@@ -1779,7 +2305,7 @@ def _run_name(args: argparse.Namespace) -> str:
     """``nursery joint`` -> ``nursery.joint``: the trace's name and the stem
     of its generated run id."""
     parts = [args.command]
-    for attr in ("nursery_command", "trace_command"):
+    for attr in ("nursery_command", "trace_command", "factory_command", "factory_corpus_command"):
         value = getattr(args, attr, None)
         if value:
             parts.append(str(value))
@@ -1792,7 +2318,10 @@ def _run_name(args: argparse.Namespace) -> str:
 #: Read-only inspection commands.  They produce no result worth reproducing
 #: and get run often, so tracing them would bury the actual training runs in
 #: ``ccr trace list``.
-_UNTRACED_COMMANDS = frozenset({"trace", "view", "dashboard", "review", "nursery.list"})
+_UNTRACED_COMMANDS = frozenset({
+    "trace", "view", "dashboard", "review", "nursery.list",
+    "factory.show", "factory.lineage", "factory.compare",
+})
 
 
 def _should_trace(args: argparse.Namespace, name: str) -> bool:
@@ -2361,6 +2890,164 @@ def build_parser() -> argparse.ArgumentParser:
     p_trace_show.add_argument("--tail", type=int, default=0,
                               help="also print the last N raw trace events")
     p_trace_show.set_defaults(func=cmd_trace_show)
+
+    p_factory = sub.add_parser(
+        "factory",
+        help="issue #228 (Model Factory, epic #212): baseline/clone/compare/promote "
+             "reproducible checkpoint lineage, plus lineage/config inspection and the "
+             "sealed final-test action",
+    )
+    factory_sub = p_factory.add_subparsers(dest="factory_command", required=True)
+
+    p_factory_baseline = factory_sub.add_parser(
+        "baseline", help="resolve a spec and launch one fresh/clone/resume/fine_tune trial"
+    )
+    p_factory_baseline.add_argument("spec", help="experiment spec file (.yaml/.yml/.json)")
+    p_factory_baseline.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                    help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_baseline.add_argument("--corpus-root", default=None,
+                                    help=f"corpora root directory (default: {_FACTORY_CORPORA_ROOT_DEFAULT!r})")
+    p_factory_baseline.add_argument("--set", action="append", metavar="dotted.path=value", default=None,
+                                    help="override a resolved spec field before launching, e.g. "
+                                         "--set training.batch_size=64 (repeatable)")
+    p_factory_baseline.add_argument("--naming-seed", default=None,
+                                    help="seed the run's cosmetic display name deterministically "
+                                         "(default: a fresh random seed)")
+    p_factory_baseline.set_defaults(func=cmd_factory_baseline)
+
+    p_factory_clone = factory_sub.add_parser(
+        "clone", help="build a clone/fine_tune child spec from an existing run and launch it"
+    )
+    p_factory_clone.add_argument("run", help="parent run id to clone from")
+    p_factory_clone.add_argument("--set", action="append", metavar="dotted.path=value", default=None,
+                                 help="override the parent's resolved spec field, e.g. "
+                                      "--set training.loss_weights.closed_loop_pixel=0.125 (repeatable)")
+    p_factory_clone.add_argument("--mode", choices=["clone", "fine_tune"], default="clone",
+                                 help="child trial mode (default: clone)")
+    p_factory_clone.add_argument("--checkpoint", default="best-validation.pt",
+                                 help="parent checkpoint file name under its checkpoints/ directory "
+                                      "(default: best-validation.pt)")
+    p_factory_clone.add_argument("--organism", default=None,
+                                 help="parent run's organism, only needed if the run id is "
+                                      "ambiguous across organisms under --root")
+    p_factory_clone.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                 help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_clone.add_argument("--corpus-root", default=None,
+                                 help=f"corpora root directory (default: {_FACTORY_CORPORA_ROOT_DEFAULT!r})")
+    p_factory_clone.add_argument("--naming-seed", default=None,
+                                 help="seed the child's cosmetic display name deterministically")
+    p_factory_clone.set_defaults(func=cmd_factory_clone)
+
+    p_factory_compare = factory_sub.add_parser(
+        "compare", help="pair each candidate's validation evidence against a baseline run (MF-C1)"
+    )
+    p_factory_compare.add_argument("runs", nargs="+", metavar="run",
+                                   help="baseline run id, followed by one or more candidate run ids")
+    p_factory_compare.add_argument("--organism", default=None,
+                                   help="organism shared by every named run, only needed if a run id "
+                                        "is ambiguous across organisms under --root")
+    p_factory_compare.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                   help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_compare.set_defaults(func=cmd_factory_compare)
+
+    p_factory_promote = factory_sub.add_parser(
+        "promote", help="gate a run against evaluate_promotion and, if every gate passes, record it "
+                        "as a champion-population member of one registry slot"
+    )
+    p_factory_promote.add_argument("run", help="run id to promote")
+    p_factory_promote.add_argument("--family", default=None,
+                                   help="registry slot family (default: the run's organism)")
+    p_factory_promote.add_argument("--tier", default=None,
+                                   help="registry slot budget tier, e.g. fast/scale "
+                                        "(default: this run's recorded budget_report.json tier)")
+    p_factory_promote.add_argument("--objective", default=None,
+                                   help="registry slot objective (default: the run's declared "
+                                        "evaluation.selection_metric)")
+    p_factory_promote.add_argument("--hold", action="store_true",
+                                   help="record an evaluated-but-not-promoted decision directly, "
+                                        "skipping gate evaluation")
+    p_factory_promote.add_argument("--no-as-leading", action="store_true",
+                                   help="add to the champion population without becoming the slot's "
+                                        "new leading champion")
+    p_factory_promote.add_argument("--durable", action="store_true",
+                                   help="also require the durable_test_confirmation gate: a prior "
+                                        "'ccr factory test' pass recorded in metrics/test.json")
+    p_factory_promote.add_argument("--minimum-practical-margin", type=float, default=0.0,
+                                   help="required primary-metric improvement magnitude (default: 0.0)")
+    p_factory_promote.add_argument("--reason", default=None, help="free-form audit note")
+    p_factory_promote.add_argument("--organism", default=None,
+                                   help="run's organism, only needed if the run id is ambiguous "
+                                        "across organisms under --root")
+    p_factory_promote.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                   help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_promote.add_argument("--corpus-root", default=None,
+                                   help=f"corpora root directory, for the data-quality/split-overlap "
+                                        f"gates (default: {_FACTORY_CORPORA_ROOT_DEFAULT!r})")
+    p_factory_promote.set_defaults(func=cmd_factory_promote)
+
+    p_factory_show = factory_sub.add_parser(
+        "show", help="print one run's complete effective config, contract hashes, display name, "
+                     "and completion status"
+    )
+    p_factory_show.add_argument("run", nargs="?", default=None,
+                                help="run id (default: the latest run under --root)")
+    p_factory_show.add_argument("--organism", default=None,
+                                help="run's organism, only needed if the run id is ambiguous "
+                                     "across organisms under --root")
+    p_factory_show.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_show.set_defaults(func=cmd_factory_show)
+
+    p_factory_lineage = factory_sub.add_parser(
+        "lineage", help="render one run's ancestor graph (configuration parents + weight donor)"
+    )
+    p_factory_lineage.add_argument("run", nargs="?", default=None,
+                                   help="run id (default: the latest run under --root)")
+    p_factory_lineage.add_argument("--organism", default=None,
+                                   help="run's organism, only needed if the run id is ambiguous "
+                                        "across organisms under --root")
+    p_factory_lineage.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                   help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_lineage.set_defaults(func=cmd_factory_lineage)
+
+    p_factory_corpus = factory_sub.add_parser("corpus", help="build/inspect frozen nursery corpora")
+    factory_corpus_sub = p_factory_corpus.add_subparsers(dest="factory_corpus_command", required=True)
+
+    p_factory_corpus_build = factory_corpus_sub.add_parser(
+        "build", help="record/reuse every declared episode, gate it, and freeze its session hashes"
+    )
+    p_factory_corpus_build.add_argument("spec", help="corpus spec file (.yaml/.yml/.json)")
+    p_factory_corpus_build.add_argument("--root", default=_FACTORY_CORPORA_ROOT_DEFAULT,
+                                        help=f"corpora root directory (default: "
+                                             f"{_FACTORY_CORPORA_ROOT_DEFAULT!r})")
+    p_factory_corpus_build.set_defaults(func=cmd_factory_corpus_build)
+
+    p_factory_test = factory_sub.add_parser(
+        "test", help="the sealed-test final action (MF-C5): evaluate a seed-confirmed candidate "
+                     "against the sealed test split exactly once"
+    )
+    p_factory_test.add_argument("run", help="run id to sealed-test")
+    p_factory_test.add_argument("--family", default=None,
+                                help="registry slot family (default: the run's organism)")
+    p_factory_test.add_argument("--tier", default=None,
+                                help="registry slot budget tier (default: this run's recorded "
+                                     "budget_report.json tier)")
+    p_factory_test.add_argument("--objective", default=None,
+                                help="registry slot objective (default: the run's declared "
+                                     "evaluation.selection_metric)")
+    p_factory_test.add_argument("--minimum-practical-margin", type=float, default=0.0,
+                                help="required primary-metric improvement magnitude (default: 0.0)")
+    p_factory_test.add_argument("--max-sealed-test-uses", type=int, default=3,
+                                help="sealed-test-use budget cap for this run (default: 3)")
+    p_factory_test.add_argument("--reason", default=None, help="free-form audit note")
+    p_factory_test.add_argument("--organism", default=None,
+                                help="run's organism, only needed if the run id is ambiguous "
+                                     "across organisms under --root")
+    p_factory_test.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_test.add_argument("--corpus-root", default=None,
+                                help=f"corpora root directory (default: {_FACTORY_CORPORA_ROOT_DEFAULT!r})")
+    p_factory_test.set_defaults(func=cmd_factory_test)
 
     _add_observability_args_everywhere(parser)
     return parser
