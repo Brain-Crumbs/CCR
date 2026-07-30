@@ -105,6 +105,8 @@ def build_experiment_report(
         reasons.append("checkpoint identity requires path and sha256")
     if training_stats.get("evaluation_mode") == "training_replay":
         reasons.append("training-replay evaluation cannot support promotion")
+    if training_stats.get("completion_status") == "budget_exceeded":
+        reasons.append("budget_exceeded trial cannot support promotion")
     for horizon, values in horizons.items():
         if not values.get("beats_copy_last", False):
             reasons.append(f"rollout t+{horizon} does not beat copy-last")
