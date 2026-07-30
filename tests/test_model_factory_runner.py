@@ -12,6 +12,7 @@ import dataclasses
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -227,6 +228,13 @@ def test_resume_continues_an_interrupted_run_to_completion(tmp_path, corpus):
     )
     state_module.create_state(state_path(artifacts.directory), artifacts.run_id, heartbeat_timeout_seconds=300.0)
     state_module.transition(state_path(artifacts.directory), state_module.STATE_RUNNING)
+    # A stale heartbeat, not merely an active state, is what actually marks
+    # a worker as gone: run_trial's resume path now requires this too, so a
+    # live worker's own resume attempt can't race a second one against it.
+    state_module.write_heartbeat(
+        state_module.heartbeat_path(artifacts.directory), run_id=artifacts.run_id,
+        clock=lambda: time.time() - 10_000,
+    )
 
     partial_cfg = dataclasses.replace(cfg, epochs=1)
     trained_model, stats = awm.train_action_world_model(train_dataset, partial_cfg, initial_model=model)
@@ -258,6 +266,99 @@ def test_resume_continues_an_interrupted_run_to_completion(tmp_path, corpus):
     assert result.run_id == interrupted_run_id
     assert result.state == "completed"
     assert result.training_stats["completion_status"] == "completed"
+
+
+def test_resume_never_regresses_a_better_pre_crash_best_checkpoint(tmp_path, corpus):
+    """Codex review (PR #258): seeding a fresh BestValidationTracker on
+    resume made the first post-resume validation always count as "the
+    best," silently overwriting a genuinely better pre-crash checkpoint.
+    An unbeatable pre-crash metric must survive resuming."""
+    from cognitive_runtime.training.model_factory import (
+        artifacts as artifacts_module,
+        checkpoint as checkpoint_module,
+        contracts as contracts_module,
+        spec as spec_module,
+        state as state_module,
+    )
+    from cognitive_runtime.training import action_world_model as awm
+    from cognitive_runtime.training import nursery as nursery_module
+    from cognitive_runtime.training.model_factory.runner import (
+        _action_world_model_config,
+        _architecture_contract,
+    )
+
+    raw = _spec_dict(corpus.corpus_id, training_overrides={"epoch_budget": 3, "checkpoint_cadence_epochs": 1})
+    resolved = spec_module.resolve(raw)
+    vocabulary = nursery_module._action_keys_for_world(resolved.data["world"])
+    train_paths = [entry["session_path"] for entry in corpus.manifest["sessions"]["train"]]
+    train_dataset = awm.build_action_sequence_dataset(train_paths, action_keys=vocabulary)
+    cfg = _action_world_model_config(resolved)
+    expected_workspace_modalities = awm._workspace_modalities(train_dataset, cfg.workspace_enabled)
+    expected_workspace_layout = train_dataset.workspace_layout_hash if expected_workspace_modalities else None
+    model = awm.build_action_world_model(
+        train_dataset.pixel_shape, train_dataset.action_keys, cfg,
+        workspace_modalities=expected_workspace_modalities, workspace_layout_hash=expected_workspace_layout,
+    )
+    architecture_contract = _architecture_contract(model)
+    training_contract = contracts_module.TrainingContract(**dict(resolved.training))
+
+    runs_root = tmp_path / "runs"
+    interrupted_run_id = "interrupted-run-unbeatable-best"
+    artifacts = artifacts_module.allocate_run_artifacts(
+        str(runs_root), resolved, architecture_contract, corpus.data_contract, training_contract,
+        run_id=interrupted_run_id,
+    )
+    state_module.create_state(state_path(artifacts.directory), artifacts.run_id, heartbeat_timeout_seconds=300.0)
+    state_module.transition(state_path(artifacts.directory), state_module.STATE_RUNNING)
+    state_module.write_heartbeat(
+        state_module.heartbeat_path(artifacts.directory), run_id=artifacts.run_id,
+        clock=lambda: time.time() - 10_000,
+    )
+
+    partial_cfg = dataclasses.replace(cfg, epochs=1)
+    trained_model, stats = awm.train_action_world_model(train_dataset, partial_cfg, initial_model=model)
+    resume_state = stats["resume_state"]
+    optimizer = torch.optim.Adam(trained_model.parameters(), lr=cfg.lr)
+    optimizer.load_state_dict(resume_state.optimizer_state_dict)
+    # A real per-episode MSE can never beat this: any post-resume chunk
+    # must leave the pre-crash best-validation.pt exactly as it is now.
+    unbeatable_metric = -1000.0
+    trainer_state = {
+        "epoch": resume_state.epoch, "global_step": resume_state.global_step,
+        "best_validation_metric": unbeatable_metric,
+    }
+    checkpoint_module.save_factory_checkpoint(
+        str(artifacts.checkpoints_dir / "last.pt"), trained_model, optimizer,
+        trainer_state=trainer_state,
+        architecture_contract=architecture_contract, data_contract_hash=corpus.data_contract,
+        training_contract=training_contract, rng_state=resume_state.rng_state,
+    )
+    checkpoint_module.save_factory_checkpoint(
+        str(artifacts.checkpoints_dir / "best-validation.pt"), trained_model, optimizer,
+        trainer_state=trainer_state,
+        architecture_contract=architecture_contract, data_contract_hash=corpus.data_contract,
+        training_contract=training_contract, rng_state=resume_state.rng_state,
+    )
+    pre_resume_best_sha = checkpoint_module.read_factory_checkpoint_metadata(
+        str(artifacts.checkpoints_dir / "best-validation.pt")
+    )["checkpoint_sha256"]
+
+    resume_sha = checkpoint_module.read_factory_checkpoint_metadata(
+        str(artifacts.checkpoints_dir / "last.pt")
+    )["checkpoint_sha256"]
+    resume_spec_doc = dict(raw)
+    resume_spec_doc["mode"] = "resume"
+    resume_spec_doc["parent"] = {"run_id": interrupted_run_id, "checkpoint": "last.pt", "sha256": resume_sha}
+
+    result = _run(resume_spec_doc, tmp_path)
+
+    assert result.state == "completed"
+    post_resume_best_sha = checkpoint_module.read_factory_checkpoint_metadata(
+        str(artifacts.checkpoints_dir / "best-validation.pt")
+    )["checkpoint_sha256"]
+    assert post_resume_best_sha == pre_resume_best_sha
+    assert result.checkpoint_sha256 == pre_resume_best_sha
+    assert result.evaluation is not None
 
 
 def test_routine_trial_never_writes_metrics_test_json(tmp_path, corpus):

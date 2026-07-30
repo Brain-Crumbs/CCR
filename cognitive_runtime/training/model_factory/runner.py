@@ -81,6 +81,7 @@ from cognitive_runtime.training.model_factory.state import (
     STATE_RUNNING,
     create_state,
     heartbeat_path,
+    is_stale,
     load_state,
     release_devices,
     reserve_devices,
@@ -531,7 +532,9 @@ def run_trial(
                 optimizer_state_dict=loaded.payload["optimizer_state_dict"],
                 rng_state=loaded.payload["rng_state"],
                 best_validation_metric=trainer_state.get("best_validation_metric"),
-                target_encoder_state_dict=loaded.payload.get("target_encoder_state_dict"),
+                # See the matching comment where this is saved: it lives
+                # inside trainer_state, not as a top-level payload field.
+                target_encoder_state_dict=trainer_state.get("target_encoder_state_dict"),
             )
 
     if resolved_spec.mode == "resume":
@@ -561,6 +564,20 @@ def run_trial(
             raise ValueError(
                 f"cannot resume run {artifacts.run_id!r}: trial state is "
                 f"{existing_state.state!r}, not an active (interrupted) run"
+            )
+        # An active state alone does not distinguish an interrupted worker
+        # from one that is still training: a fresh heartbeat means the
+        # original worker is (or very recently was) alive, and racing it
+        # with a second resumed worker would let both write the same
+        # checkpoints/state concurrently. Only a heartbeat that has actually
+        # exceeded its declared watchdog timeout is a legitimate resume
+        # target (mirrors what recover_stale_worker checks before failing
+        # a run, just without writing that failed transition itself).
+        if not is_stale(existing_state, trial_heartbeat_path):
+            raise ValueError(
+                f"cannot resume run {artifacts.run_id!r}: its heartbeat is still current, "
+                "so the original worker may still be running; wait for its watchdog "
+                "timeout (or fail it explicitly via recover_stale_worker) before resuming"
             )
     else:
         create_state(trial_state_path, artifacts.run_id, heartbeat_timeout_seconds=resolved_heartbeat_timeout)
@@ -592,13 +609,21 @@ def run_trial(
                 max_training_seconds=max_training_seconds, total_epochs=total_epochs,
                 checkpoint_cadence_epochs=cadence,
             )
-            best_tracker = BestValidationTracker(mode="min")
+            # Seed the tracker with the pre-crash best (if any): otherwise a
+            # resumed run's first post-resume validation always counts as
+            # "the best" regardless of the actual metric, silently
+            # overwriting a genuinely better pre-crash checkpoint.
+            best_tracker = BestValidationTracker(
+                mode="min",
+                best=resume_state.best_validation_metric if resume_state is not None else None,
+            )
             trial_started = time.monotonic()
             completion_status = STATUS_COMPLETED
             best_eval: Optional[Dict[str, Any]] = None
             last_stats: Dict[str, Any] = {}
 
             while epoch < total_epochs:
+                chunk_start_epoch = epoch
                 next_epoch = min(epoch + chunk_size, total_epochs)
                 chunk_cfg = replace(cfg, epochs=next_epoch)
                 with EpochTimer() as timer:
@@ -608,11 +633,31 @@ def run_trial(
                 epoch = next_epoch
                 resume_state = stats["resume_state"]
                 last_stats = stats
-                decision = budget.record_epoch(epoch, timer.duration_seconds or 0.0)
+                # One chunk can cover several epochs (chunk_size ==
+                # checkpoint_cadence_epochs); record_epoch expects one
+                # sample per epoch, or its median-based ETA projection
+                # multiplies a whole chunk's duration by the *individual*
+                # remaining-epoch count, wildly overestimating time left and
+                # triggering a premature budget_exceeded stop. Split the
+                # chunk's measured duration evenly across the epochs it
+                # covered instead -- the finest granularity actually
+                # available, since the trainer reports no per-epoch timing
+                # within one call.
+                epochs_in_chunk = epoch - chunk_start_epoch
+                per_epoch_seconds = (timer.duration_seconds or 0.0) / epochs_in_chunk
+                for covered_epoch in range(chunk_start_epoch + 1, epoch + 1):
+                    decision = budget.record_epoch(covered_epoch, per_epoch_seconds)
 
                 trainer_state_payload = {
                     "epoch": resume_state.epoch, "global_step": resume_state.global_step,
                     "best_validation_metric": resume_state.best_validation_metric,
+                    # Not a top-level save_factory_checkpoint field -- folded
+                    # into trainer_state (a free-form mapping) so a later
+                    # resume can restore the EMA target's Polyak-averaged
+                    # history instead of silently rebuilding it as a fresh
+                    # copy of the resumed online weights (checkpoint.py's
+                    # TrainerResumeState docstring).
+                    "target_encoder_state_dict": resume_state.target_encoder_state_dict,
                 }
                 chunk_optimizer = _optimizer_for_state(model, cfg.lr, resume_state.optimizer_state_dict)
                 save_factory_checkpoint(
@@ -648,7 +693,15 @@ def run_trial(
                     completion_status = STATUS_BUDGET_EXCEEDED
                     break
 
-            assert best_eval is not None  # the loop always runs >=1 iteration
+            if best_eval is None:
+                # A resumed run whose seeded best (the pre-crash checkpoint)
+                # was never beaten leaves checkpoints/best-validation.pt
+                # untouched -- correctly still the pre-crash weights -- but
+                # this call's own loop never captured its evaluation report.
+                # Reconstruct it by re-evaluating that same checkpoint
+                # rather than reporting the (worse) last-chunk model here.
+                existing_best = load_factory_checkpoint(str(artifacts.checkpoints_dir / "best-validation.pt"))
+                best_eval = _evaluate(existing_best.model, validation_dataset, resolved_spec, cfg)
             total_trial_seconds = time.monotonic() - trial_started
             budget_report = build_budget_report(
                 budget, completion_status=completion_status, total_trial_seconds=total_trial_seconds,
