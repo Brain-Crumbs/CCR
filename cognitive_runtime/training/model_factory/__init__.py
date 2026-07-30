@@ -126,6 +126,26 @@ from cognitive_runtime.training.model_factory.comparison import (
     paired_bootstrap_interval,
     paired_permutation_interval,
 )
+from cognitive_runtime.training.model_factory.registry import (
+    DECISION_HOLD,
+    DECISION_PROMOTE,
+    DECISION_TEST_USE,
+    LINEAGE_MANIFEST_NAME,
+    REGISTRY_FORMAT,
+    ChampionEntry,
+    LineageCycleError,
+    LineageGraph,
+    LineageNode,
+    RegistryError,
+    RegistrySlot,
+    hold,
+    leading_champion,
+    lineage_graph,
+    population,
+    promote,
+    record_test_use,
+    registry_path,
+)
 if TYPE_CHECKING:
     from cognitive_runtime.training.model_factory.corpus import (
         CORPUS_MANIFEST_FORMAT,
@@ -243,6 +263,24 @@ __all__ = [
     "compare_paired_episodes",
     "paired_bootstrap_interval",
     "paired_permutation_interval",
+    "REGISTRY_FORMAT",
+    "LINEAGE_MANIFEST_NAME",
+    "DECISION_PROMOTE",
+    "DECISION_HOLD",
+    "DECISION_TEST_USE",
+    "RegistryError",
+    "LineageCycleError",
+    "ChampionEntry",
+    "RegistrySlot",
+    "LineageNode",
+    "LineageGraph",
+    "registry_path",
+    "promote",
+    "hold",
+    "leading_champion",
+    "population",
+    "record_test_use",
+    "lineage_graph",
 ]
 
 
