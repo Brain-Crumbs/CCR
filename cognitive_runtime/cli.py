@@ -1964,7 +1964,13 @@ def cmd_factory_compare(args: argparse.Namespace) -> None:
                 f"cannot compare {candidate_id!r} (selection_metric={candidate_metric!r}) against "
                 f"{baseline_id!r} (selection_metric={baseline_metric!r}): selection metrics differ"
             )
-        comparison = compare_paired_episodes(candidate_series, baseline_series, primary_metric=baseline_metric)
+        # minimum_episode_count=1 matches runner._build_comparison's own override of
+        # compare_paired_episodes's default (5): whether a handful of paired episodes is
+        # *statistically* enough to trust is a promotion-policy question, not a reason for
+        # this read-only command to contradict the comparison persisted for the same runs.
+        comparison = compare_paired_episodes(
+            candidate_series, baseline_series, primary_metric=baseline_metric, minimum_episode_count=1,
+        )
         decision = (
             "candidate_improves"
             if comparison.status == "evaluable" and comparison.mean_delta is not None and comparison.mean_delta < 0
@@ -1978,13 +1984,26 @@ def cmd_factory_compare(args: argparse.Namespace) -> None:
 
 
 def cmd_factory_promote(args: argparse.Namespace) -> None:
-    """``ccr factory promote <run>`` (issue #228): record a run as a
-    champion-population member of one ``(family, tier, objective)`` registry
-    slot (``--hold`` records an evaluated-but-not-promoted decision instead).
-    ``--family``/``--tier``/``--objective`` default from the run's own
-    organism, recorded budget tier, and declared selection metric."""
+    """``ccr factory promote <run>`` (issue #228): gate a run against
+    ``promotion.evaluate_promotion``'s seven promotion conditions (data
+    quality, split overlap, rollout health, primary-metric margin, safety,
+    training-time budget, and -- with ``--durable`` -- sealed-test
+    confirmation), then record it as a champion-population member of one
+    ``(family, tier, objective)`` registry slot only if every gate passes.
+    A candidate that fails any gate is refused and recorded as a hold
+    instead, exactly like the workflow's own "promote only if gates pass"
+    (``--hold`` records an evaluated-but-not-promoted decision directly,
+    skipping gate evaluation). ``--family``/``--tier``/``--objective``
+    default from the run's own organism, recorded budget tier, and declared
+    selection metric."""
     from cognitive_runtime.training.model_factory.checkpoint import read_factory_checkpoint_metadata
-    from cognitive_runtime.training.model_factory.registry import RegistryError, hold, promote
+    from cognitive_runtime.training.model_factory.corpus import resolve_corpus
+    from cognitive_runtime.training.model_factory.promotion import (
+        PromotionPolicy,
+        TestConfirmation,
+        evaluate_promotion,
+    )
+    from cognitive_runtime.training.model_factory.registry import RegistryError, hold, leading_champion, promote
     from cognitive_runtime.training.model_factory.runner import _resolve_selection_metric
 
     run_directory = _factory_run_directory(args.root, args.run, args.organism)
@@ -2002,21 +2021,89 @@ def cmd_factory_promote(args: argparse.Namespace) -> None:
         )
 
     registry_root = run_directory.parent
-    try:
-        if args.hold:
+
+    if args.hold:
+        try:
             slot = hold(registry_root, family=family, tier=tier, objective=objective,
                         run_id=args.run, reason=args.reason)
-        else:
-            checkpoint_path = run_directory / "checkpoints" / "best-validation.pt"
-            checkpoint_meta = read_factory_checkpoint_metadata(str(checkpoint_path))
-            validation_payload, ticks_per_frame = _factory_load_validation(run_directory)
-            metric_value, _ = _resolve_selection_metric(validation_payload, objective, ticks_per_frame)
-            slot = promote(
-                registry_root, family=family, tier=tier, objective=objective, run_id=args.run,
-                checkpoint_path=checkpoint_path, checkpoint_sha256=checkpoint_meta.get("checkpoint_sha256"),
-                metrics={"selection_metric": objective, "selection_metric_value": metric_value},
-                as_leading=not args.no_as_leading, reason=args.reason,
+        except RegistryError as exc:
+            sys.exit(f"promotion refused: {exc}")
+        print(f"family={family} tier={tier} objective={objective}")
+        print(f"leading_champion: {slot.leading_champion}")
+        print(f"population: {[entry.run_id for entry in slot.population]}")
+        return
+
+    experiment_report_path = run_directory / "experiment_report.json"
+    if not experiment_report_path.is_file():
+        sys.exit(
+            f"ccr factory promote: no experiment_report.json for {args.run!r}; "
+            "the run is not gate-evaluable"
+        )
+    with experiment_report_path.open(encoding="utf-8") as handle:
+        experiment_report = json.load(handle)
+
+    corpus = resolve_corpus(
+        trial_spec["data"]["corpus_id"], root=args.corpus_root, organism=trial_spec["organism"],
+    )
+    with (corpus.directory / "quality_report.json").open(encoding="utf-8") as handle:
+        data_quality = json.load(handle)
+    with (corpus.directory / "split_overlap_report.json").open(encoding="utf-8") as handle:
+        split_overlap = json.load(handle)
+
+    comparison = None
+    comparison_path = run_directory / "metrics" / "comparison.json"
+    if comparison_path.is_file():
+        with comparison_path.open(encoding="utf-8") as handle:
+            comparison = json.load(handle)
+
+    has_champion = leading_champion(registry_root, family=family, tier=tier, objective=objective) is not None
+
+    test_confirmation = None
+    if args.durable:
+        test_metrics_path = run_directory / "metrics" / "test.json"
+        if not test_metrics_path.is_file():
+            sys.exit(
+                f"ccr factory promote --durable: no metrics/test.json for {args.run!r}; "
+                "run 'ccr factory test' first"
             )
+        with test_metrics_path.open(encoding="utf-8") as handle:
+            test_payload = json.load(handle)
+        test_confirmation = TestConfirmation(
+            run_id=test_payload["run_id"], performed=True, passed=test_payload["passed"],
+            test_uses_after=test_payload["test_uses_after"],
+            max_sealed_test_uses=test_payload["max_sealed_test_uses"], reason=test_payload.get("reason"),
+        )
+
+    policy = PromotionPolicy(minimum_practical_margin=args.minimum_practical_margin)
+    verdict = evaluate_promotion(
+        policy=policy, candidate_run_id=args.run, experiment_report=experiment_report,
+        data_quality=data_quality, split_overlap=split_overlap, has_champion=has_champion,
+        comparison=comparison, durable=args.durable, test_confirmation=test_confirmation,
+    )
+    for gate in verdict.gates:
+        status = "PASS" if gate.passed else ("N/A" if not gate.applicable else "FAIL")
+        print(f"[{status}] {gate.name}: {gate.reason}")
+
+    if not verdict.promoted:
+        gate_reason = "; ".join(verdict.reasons)
+        hold_reason = f"{args.reason}; {gate_reason}" if args.reason else gate_reason
+        try:
+            hold(registry_root, family=family, tier=tier, objective=objective, run_id=args.run, reason=hold_reason)
+        except RegistryError:
+            pass  # best-effort audit trail; the refusal below is what matters
+        sys.exit(f"promotion refused (gates failed): {gate_reason}")
+
+    try:
+        checkpoint_path = run_directory / "checkpoints" / "best-validation.pt"
+        checkpoint_meta = read_factory_checkpoint_metadata(str(checkpoint_path))
+        validation_payload, ticks_per_frame = _factory_load_validation(run_directory)
+        metric_value, _ = _resolve_selection_metric(validation_payload, objective, ticks_per_frame)
+        slot = promote(
+            registry_root, family=family, tier=tier, objective=objective, run_id=args.run,
+            checkpoint_path=checkpoint_path, checkpoint_sha256=checkpoint_meta.get("checkpoint_sha256"),
+            metrics={"selection_metric": objective, "selection_metric_value": metric_value},
+            as_leading=not args.no_as_leading, reason=args.reason,
+        )
     except RegistryError as exc:
         sys.exit(f"promotion refused: {exc}")
 
@@ -2864,7 +2951,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_factory_compare.set_defaults(func=cmd_factory_compare)
 
     p_factory_promote = factory_sub.add_parser(
-        "promote", help="record a run as a champion-population member of one registry slot"
+        "promote", help="gate a run against evaluate_promotion and, if every gate passes, record it "
+                        "as a champion-population member of one registry slot"
     )
     p_factory_promote.add_argument("run", help="run id to promote")
     p_factory_promote.add_argument("--family", default=None,
@@ -2876,17 +2964,25 @@ def build_parser() -> argparse.ArgumentParser:
                                    help="registry slot objective (default: the run's declared "
                                         "evaluation.selection_metric)")
     p_factory_promote.add_argument("--hold", action="store_true",
-                                   help="record an evaluated-but-not-promoted decision instead of "
-                                        "promoting")
+                                   help="record an evaluated-but-not-promoted decision directly, "
+                                        "skipping gate evaluation")
     p_factory_promote.add_argument("--no-as-leading", action="store_true",
                                    help="add to the champion population without becoming the slot's "
                                         "new leading champion")
+    p_factory_promote.add_argument("--durable", action="store_true",
+                                   help="also require the durable_test_confirmation gate: a prior "
+                                        "'ccr factory test' pass recorded in metrics/test.json")
+    p_factory_promote.add_argument("--minimum-practical-margin", type=float, default=0.0,
+                                   help="required primary-metric improvement magnitude (default: 0.0)")
     p_factory_promote.add_argument("--reason", default=None, help="free-form audit note")
     p_factory_promote.add_argument("--organism", default=None,
                                    help="run's organism, only needed if the run id is ambiguous "
                                         "across organisms under --root")
     p_factory_promote.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
                                    help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_promote.add_argument("--corpus-root", default=None,
+                                   help=f"corpora root directory, for the data-quality/split-overlap "
+                                        f"gates (default: {_FACTORY_CORPORA_ROOT_DEFAULT!r})")
     p_factory_promote.set_defaults(func=cmd_factory_promote)
 
     p_factory_show = factory_sub.add_parser(

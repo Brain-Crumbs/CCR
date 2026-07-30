@@ -115,7 +115,7 @@ node viewer/server.js --data-dir notebooks/runs
 | `ccr factory baseline <spec>` | Resolve a spec and launch one fresh/clone/resume/fine_tune Model Factory trial |
 | `ccr factory clone <run> --set path=value` | Build a clone/fine_tune child spec from an existing run and launch it |
 | `ccr factory compare <run> <run>...` | Pair each candidate's validation evidence against a baseline run |
-| `ccr factory promote <run>` | Record a run as a champion-population member of a registry slot |
+| `ccr factory promote <run>` | Gate a run against `evaluate_promotion`'s promotion gates and, if all pass, record it as a champion-population member of a registry slot |
 | `ccr factory show [run]` | Print a run's complete effective config, contract hashes, display name, and completion status |
 | `ccr factory lineage [run]` | Render a run's ancestor graph (configuration parents + weight donor) |
 | `ccr factory corpus build <spec>` | Record/reuse episodes, gate them, and freeze a Model Factory corpus |

@@ -124,6 +124,70 @@ def _write_budget_report(artifacts: RunArtifacts, *, tier: str = "fast") -> None
     (artifacts.metrics_dir / "budget_report.json").write_text(json.dumps(payload))
 
 
+def _write_experiment_report(
+    artifacts: RunArtifacts, *, checkpoint_sha256: str = "a" * 64, beats_copy_last: bool = True, healthy: bool = True,
+) -> None:
+    """A minimal ``experiment_report.json`` that clears every
+    ``evaluate_promotion`` gate that reads it directly (checkpoint identity,
+    evaluation mode, training-time budget, rollout-beats-copy-last, rollout
+    health, metric schema, event-stratified evaluability)."""
+    payload = {
+        "checkpoint": {"path": str(artifacts.checkpoints_dir / "best-validation.pt"), "sha256": checkpoint_sha256},
+        "training_stats": {"evaluation_mode": "held_out", "completion_status": "completed"},
+        "metrics": {
+            "rollout": {
+                "horizons": {"4": {"beats_copy_last": beats_copy_last}},
+                "rollout_health": {"state": "healthy" if healthy else "frozen_rollout"},
+            },
+            "direct": {},
+        },
+        "event_stratified_metrics": {},
+    }
+    (artifacts.directory / "experiment_report.json").write_text(json.dumps(payload))
+
+
+def _build_passing_corpus(tmp_path: Path, monkeypatch, *, organism: str, corpus_id: str) -> Path:
+    """A real, quality/split-overlap-gated corpus on disk via ``build_corpus``
+    with the recorder faked out -- mirrors
+    ``tests/test_model_factory_corpus.py``'s own fixture pattern. World is
+    ``minecraft``/``simulated`` (not ``crafter``) so building it never touches
+    ``training.nursery`` (and therefore never imports torch): only a
+    ``crafter``-world corpus's ``DataContract.semantic_vocabulary_version``
+    reaches into that module.
+    """
+    import cognitive_runtime.training.model_factory.corpus as corpus_module
+    from types import SimpleNamespace
+
+    scenario = SimpleNamespace(name="synthetic")
+    monkeypatch.setattr(corpus_module, "_scenarios_for_world", lambda world: {"synthetic": scenario})
+    monkeypatch.setattr(corpus_module, "validate_nursery_recordings", lambda *args, **kwargs: [])
+
+    cache = tmp_path / "episode-cache" / corpus_id
+
+    def record_or_reuse(_record_dir, _session_id, seed, scenario_, _cfg):
+        session = cache / f"{scenario_.name}-{seed}"
+        session.mkdir(parents=True, exist_ok=True)
+        (session / "session.json").write_text(json.dumps({"session_id": session.name}))
+        (session / "episode_00000.decisions.jsonl").write_text("{}\n")
+        (session / "episode_00000.streams.jsonl").write_text(
+            json.dumps({"stream_id": "vision.frame.pixels", "frame_ref": f"frame-{seed}"}) + "\n"
+        )
+        return str(session)
+
+    monkeypatch.setattr(corpus_module, "_record_or_reuse_scenario_episode", record_or_reuse)
+
+    corpus_root = tmp_path / "corpora"
+    spec = {
+        "root": str(corpus_root),
+        "organism": organism,
+        "corpus_id": corpus_id,
+        "generator": {"world": "minecraft", "backend": "simulated", "episode_cache_dir": str(cache)},
+        "splits": {"train": {"synthetic": [1]}, "validation": {"synthetic": [2]}, "test": {"synthetic": [3]}},
+    }
+    corpus_module.build_corpus(spec)
+    return corpus_root
+
+
 # --------------------------------------------------------------------- parsing + dispatch
 
 
@@ -347,18 +411,26 @@ def test_factory_compare_reports_paired_decision(tmp_path, capsys):
     assert "decision=hold" in out
 
 
-def test_factory_promote_records_champion_with_zero_extra_flags(tmp_path, capsys):
+def test_factory_promote_records_champion_when_every_gate_passes(tmp_path, capsys, monkeypatch):
     """Matches the epic proposal's own terse example: ``factory promote
-    child-b`` with no --family/--tier/--objective."""
+    child-b`` with no --family/--tier/--objective -- now that promotion is
+    gated, this also proves a passing candidate still promotes cleanly."""
     root = tmp_path / "runs"
     artifacts = _make_run(root, "crafter-baseline-0001", _spec())
+    corpus_root = _build_passing_corpus(tmp_path, monkeypatch, organism="crafter-baseline", corpus_id="generic-v1")
     _write_checkpoint_metadata(artifacts)
     _write_validation(artifacts, ["b"], [0.5])
     _write_budget_report(artifacts, tier="fast")
+    _write_experiment_report(artifacts)
 
-    main(["factory", "promote", "--root", str(root), "crafter-baseline-0001", "--no-trace"])
+    main([
+        "factory", "promote", "--root", str(root), "--corpus-root", str(corpus_root),
+        "crafter-baseline-0001", "--no-trace",
+    ])
     out = capsys.readouterr().out
 
+    assert "[PASS] checkpoint_identity" in out
+    assert "[PASS] rollout_beats_copy_last" in out
     assert "leading_champion: crafter-baseline-0001" in out
     with (root / "crafter-baseline" / "registry.json").open() as handle:
         registry = json.load(handle)
@@ -367,7 +439,35 @@ def test_factory_promote_records_champion_with_zero_extra_flags(tmp_path, capsys
     assert slot["population"][0]["run_id"] == "crafter-baseline-0001"
 
 
-def test_factory_promote_hold_records_decision_without_touching_population(tmp_path, capsys):
+def test_factory_promote_refuses_and_holds_when_a_gate_fails(tmp_path, capsys, monkeypatch):
+    """A run that would only 'win an A/B' without clearing its gates (here:
+    it does not beat copy-last) must be refused, not promoted -- and the
+    refusal is itself recorded as a hold, never silently dropped."""
+    root = tmp_path / "runs"
+    artifacts = _make_run(root, "crafter-baseline-0001", _spec())
+    corpus_root = _build_passing_corpus(tmp_path, monkeypatch, organism="crafter-baseline", corpus_id="generic-v1")
+    _write_checkpoint_metadata(artifacts)
+    _write_validation(artifacts, ["b"], [0.5])
+    _write_budget_report(artifacts, tier="fast")
+    _write_experiment_report(artifacts, beats_copy_last=False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main([
+            "factory", "promote", "--root", str(root), "--corpus-root", str(corpus_root),
+            "crafter-baseline-0001", "--no-trace",
+        ])
+    assert "gates failed" in str(excinfo.value)
+    assert "rollout" in str(excinfo.value)
+
+    with (root / "crafter-baseline" / "registry.json").open() as handle:
+        registry = json.load(handle)
+    slot = registry["slots"]["crafter-baseline"]["fast"]["direct.t+4.model_mse"]
+    assert slot["leading_champion"] is None
+    assert slot["population"] == []
+    assert slot["history"][0]["action"] == "hold"
+
+
+def test_factory_promote_hold_flag_skips_gate_evaluation(tmp_path, capsys):
     root = tmp_path / "runs"
     artifacts = _make_run(root, "crafter-baseline-0001", _spec())
     _write_budget_report(artifacts, tier="fast")
