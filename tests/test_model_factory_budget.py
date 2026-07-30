@@ -31,7 +31,8 @@ def test_budget_tiers_match_epic_15_1():
 def test_slow_warmup_epoch_does_not_trigger_premature_stop():
     """A pessimistic first-epoch ETA must not stop a run that is actually fine."""
     budget = TrainingBudget(
-        max_training_seconds=budget_seconds_for_tier("fast"), warmup_epochs=1, checkpoint_cadence_epochs=5,
+        max_training_seconds=budget_seconds_for_tier("fast"), total_epochs=21,
+        warmup_epochs=1, checkpoint_cadence_epochs=5,
     )
 
     warmup_decision = budget.record_epoch(1, 55.0)  # CUDA warm-up + data priming
@@ -49,29 +50,53 @@ def test_slow_warmup_epoch_does_not_trigger_premature_stop():
     assert all(not d.should_stop_now for d in decisions)
     assert budget.elapsed_seconds == 55.0 + 10.0 * 20
     assert budget.median_epoch_seconds() == 10.0
+    # The full-run projection (not just a one-epoch lookahead) confirms the
+    # steady-state trajectory finishes comfortably inside the budget.
+    assert decisions[-1].projected_seconds == budget.elapsed_seconds
 
 
-def test_over_budget_run_requests_stop_and_fires_at_checkpoint_boundary():
-    budget = TrainingBudget(max_training_seconds=100.0, warmup_epochs=1, checkpoint_cadence_epochs=4)
+def test_over_budget_run_requests_stop_as_soon_as_the_full_run_projection_overruns():
+    """The projection covers every remaining epoch, so a genuine overrun is
+    caught immediately after warm-up -- not only once elapsed time itself
+    approaches the deadline (which a one-epoch lookahead would delay)."""
+    budget = TrainingBudget(
+        max_training_seconds=100.0, total_epochs=10, warmup_epochs=1, checkpoint_cadence_epochs=4,
+    )
 
     budget.record_epoch(1, 5.0)  # warm-up, excluded from the ETA
-    d2 = budget.record_epoch(2, 40.0)  # elapsed=45, median=40, projected=85 <= 100
-    assert not d2.stop_requested
-    assert not d2.should_stop_now
+    d2 = budget.record_epoch(2, 40.0)  # elapsed=45, median=40, 8 epochs remain: projected=365 > 100
+    assert d2.projected_seconds == 45.0 + 40.0 * 8
+    assert d2.stop_requested
+    assert not d2.at_checkpoint_boundary  # epoch 2 is not a multiple of the cadence
+    assert not d2.should_stop_now  # requested, but not yet at a safe boundary
+    assert not d2.hard_deadline_exceeded
 
-    d3 = budget.record_epoch(3, 40.0)  # elapsed=85, median=40, projected=125 > 100
+    d3 = budget.record_epoch(3, 40.0)  # elapsed=85, still not a checkpoint boundary
     assert d3.stop_requested
-    assert not d3.at_checkpoint_boundary  # epoch 3 is not a multiple of the cadence
-    assert not d3.should_stop_now  # requested, but not yet at a safe boundary
+    assert not d3.at_checkpoint_boundary
+    assert not d3.should_stop_now
     assert not d3.hard_deadline_exceeded
 
-    d4 = budget.record_epoch(4, 5.0)  # elapsed=90, still under the hard deadline
+    d4 = budget.record_epoch(4, 5.0)  # elapsed=90, epoch 4 is a checkpoint boundary
     assert d4.stop_requested  # sticky
-    assert d4.at_checkpoint_boundary  # epoch 4 is a checkpoint boundary
+    assert d4.at_checkpoint_boundary
     assert d4.should_stop_now
     assert not d4.hard_deadline_exceeded
 
     assert isinstance(d4, BudgetDecision)
+
+
+def test_projection_is_none_without_a_declared_total_epochs():
+    """Without ``total_epochs`` there is no honest full-run projection, so no
+    graceful stop is ever requested -- only the hard deadline still applies."""
+    budget = TrainingBudget(max_training_seconds=100.0, warmup_epochs=1, checkpoint_cadence_epochs=4)
+
+    budget.record_epoch(1, 5.0)
+    d2 = budget.record_epoch(2, 40.0)
+
+    assert d2.median_epoch_seconds == 40.0
+    assert d2.projected_seconds is None
+    assert not d2.stop_requested
 
 
 def test_hard_deadline_enforced_even_off_checkpoint_cadence():
@@ -165,6 +190,26 @@ def test_build_budget_report_rejects_unknown_status_and_impossible_totals():
         )
 
 
+def test_build_budget_report_rejects_a_completed_report_that_ran_past_its_cap():
+    """A report cannot claim completed while measured time exceeds the cap --
+    that combination is self-contradictory and would slip past a promotion
+    gate that only checks the literal completion_status string."""
+    budget = TrainingBudget(max_training_seconds=100.0)
+    budget.record_epoch(1, 60.0)
+    budget.record_epoch(2, 60.0)  # elapsed=120 > max_training_seconds=100
+
+    with pytest.raises(ValueError, match="completion_status='completed'"):
+        build_budget_report(
+            budget, completion_status=STATUS_COMPLETED, total_trial_seconds=150.0, precision="fp32",
+        )
+
+    # The honest status for the same timings is accepted without complaint.
+    report = build_budget_report(
+        budget, completion_status=STATUS_BUDGET_EXCEEDED, total_trial_seconds=150.0, precision="fp32",
+    )
+    assert report["completion_status"] == STATUS_BUDGET_EXCEEDED
+
+
 def test_write_budget_report_round_trips(tmp_path):
     budget = TrainingBudget(max_training_seconds=600.0)
     budget.record_epoch(1, 10.0)
@@ -225,7 +270,7 @@ def test_budget_exceeded_experiment_is_never_eligible_for_promotion():
 
 
 def test_completed_experiment_with_same_shape_is_still_promotable():
-    """The gate is specific to budget_exceeded, not to every completion_status."""
+    """The gate blocks non-"completed" statuses, not every completion_status."""
     report = build_experiment_report(
         experiment={"experiment_id": "completed-run"},
         checkpoint={"path": "/models/last.pt", "sha256": "deadbeef"},
@@ -234,6 +279,22 @@ def test_completed_experiment_with_same_shape_is_still_promotable():
     )
 
     assert report["promotion_verdict"]["promoted"] is True
+
+
+@pytest.mark.parametrize("completion_status", [STATUS_TIMEOUT_UNRECOVERABLE, "failed", "cancelled"])
+def test_every_incomplete_completion_status_is_refused_promotion(completion_status):
+    """Not just budget_exceeded: any declared non-"completed" terminal status
+    (a watchdog kill, a crash, an operator cancellation, ...) must be refused
+    even if it happens to carry a valid checkpoint and passing metrics."""
+    report = build_experiment_report(
+        experiment={"experiment_id": "incomplete-run"},
+        checkpoint={"path": "/models/last.pt", "sha256": "deadbeef"},
+        training_stats={"completion_status": completion_status},
+        rollout_metrics={"horizons": {1: {"beats_copy_last": True}}, "event_metrics": {}},
+    )
+
+    assert report["promotion_verdict"]["promoted"] is False
+    assert f"{completion_status} trial cannot support promotion" in report["promotion_verdict"]["reasons"]
 
 
 @pytest.mark.parametrize("torch_available", [True])

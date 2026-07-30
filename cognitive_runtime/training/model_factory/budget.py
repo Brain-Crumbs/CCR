@@ -78,6 +78,9 @@ class BudgetDecision:
     epochs_recorded: int
     elapsed_seconds: float
     median_epoch_seconds: Optional[float]
+    #: Full-run completion estimate (elapsed + median * remaining epochs);
+    #: ``None`` unless both a median and ``TrainingBudget.total_epochs`` are
+    #: known -- never a misleading one-epoch-ahead number.
     projected_seconds: Optional[float]
     stop_requested: bool
     hard_deadline_exceeded: bool
@@ -106,6 +109,13 @@ class TrainingBudget:
     first sample, of the remaining recorded durations, so one further
     slow/fast outlier epoch cannot swing the projection.
 
+    ``total_epochs``, when declared (``TrainingContract.epoch_budget``),
+    lets the projection cover *every* remaining epoch rather than just the
+    next one: ``elapsed + median * (total_epochs - epoch)``. Without it,
+    there is no honest way to project full-run completion, so no graceful
+    stop is ever requested -- only the hard deadline below still protects
+    the budget.
+
     Call :meth:`record_epoch` with the *absolute* epoch number (not a count
     relative to this monitor instance) so the checkpoint-boundary check
     stays correct across a resumed run that starts measuring partway through
@@ -113,6 +123,7 @@ class TrainingBudget:
     """
 
     max_training_seconds: float
+    total_epochs: Optional[int] = None
     warmup_epochs: int = 1
     checkpoint_cadence_epochs: Optional[int] = None
     _durations: List[float] = field(default_factory=list, repr=False)
@@ -123,6 +134,8 @@ class TrainingBudget:
             raise ValueError("max_training_seconds must be positive")
         if self.warmup_epochs < 0:
             raise ValueError("warmup_epochs must not be negative")
+        if self.total_epochs is not None and self.total_epochs <= 0:
+            raise ValueError("total_epochs must be positive when declared")
 
     @property
     def elapsed_seconds(self) -> float:
@@ -150,6 +163,16 @@ class TrainingBudget:
             return None
         return statistics.median(representative)
 
+    def _projected_total_seconds(self, epoch: int, elapsed: float, median: Optional[float]) -> Optional[float]:
+        """Full-run completion projection: elapsed plus every remaining epoch
+        at the median rate -- not just the next one, or a real overrun many
+        epochs out would only surface once ``elapsed`` alone had already
+        blown the deadline (defeating the point of a *graceful* stop)."""
+        if median is None or self.total_epochs is None:
+            return None
+        remaining_epochs = max(self.total_epochs - epoch, 0)
+        return elapsed + median * remaining_epochs
+
     def record_epoch(self, epoch: int, duration_seconds: float) -> BudgetDecision:
         """Record one completed epoch's training-only duration.
 
@@ -162,7 +185,7 @@ class TrainingBudget:
         self._durations.append(duration_seconds)
         elapsed = self.elapsed_seconds
         median = self.median_epoch_seconds()
-        projected = elapsed + median if median is not None else None
+        projected = self._projected_total_seconds(epoch, elapsed, median)
 
         hard_exceeded = elapsed >= self.max_training_seconds
         if projected is not None and projected > self.max_training_seconds:
@@ -249,6 +272,17 @@ def build_budget_report(
             "total_trial_seconds must be at least measured_training_seconds "
             f"({total_trial_seconds!r} < {budget.elapsed_seconds!r})"
         )
+    if completion_status == STATUS_COMPLETED and budget.elapsed_seconds > budget.max_training_seconds:
+        # A report cannot claim a clean tier completion while also reporting
+        # measured training time past the declared cap -- that contradiction
+        # is exactly the "claimed 10-minute eligibility" §15.1 promises stays
+        # interpretable. The caller should report budget_exceeded instead.
+        raise ValueError(
+            "completion_status='completed' but measured_training_seconds "
+            f"({budget.elapsed_seconds!r}) exceeds max_training_seconds "
+            f"({budget.max_training_seconds!r}); report completion_status="
+            f"{STATUS_BUDGET_EXCEEDED!r} for a trial that ran past its cap"
+        )
     profile = dict(hardware_profile) if hardware_profile is not None else _device_info()
     return {
         "format": BUDGET_REPORT_FORMAT,
@@ -262,6 +296,7 @@ def build_budget_report(
         "completion_status": completion_status,
         "epochs_recorded": budget.epochs_recorded,
         "warmup_epochs": budget.warmup_epochs,
+        "total_epochs": budget.total_epochs,
     }
 
 
