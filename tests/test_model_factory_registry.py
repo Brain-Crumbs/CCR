@@ -27,6 +27,26 @@ from cognitive_runtime.training.model_factory.registry import (
     record_test_use,
     registry_path,
 )
+from cognitive_runtime.training.model_factory.state import (
+    STATE_BUDGET_EXCEEDED,
+    STATE_CANCELLED,
+    STATE_COMPLETED,
+    STATE_FAILED,
+    STATE_RUNNING,
+    IncompleteRunError,
+    create_state,
+    state_path,
+    transition,
+)
+
+
+def _mark_completed(root, run_id):
+    """Drive a fresh run's persisted trial state to `completed` -- the gate
+    `promote` requires before a run can enter the champion population."""
+    path = state_path(root / run_id)
+    create_state(path, run_id)
+    transition(path, STATE_RUNNING)
+    transition(path, STATE_COMPLETED)
 
 
 def _write_lineage(
@@ -53,6 +73,8 @@ def _write_lineage(
 
 
 def test_promoting_a_scale_champion_leaves_the_fast_champion_intact(tmp_path):
+    _mark_completed(tmp_path, "run-fast-1")
+    _mark_completed(tmp_path, "run-scale-1")
     promote(
         tmp_path, family="generic_action_effects_v1", tier="fast", objective="rollout.t+4",
         run_id="run-fast-1", checkpoint_path="checkpoints/best-validation.pt",
@@ -71,6 +93,8 @@ def test_promoting_a_scale_champion_leaves_the_fast_champion_intact(tmp_path):
 
 
 def test_promoting_a_new_leader_replaces_only_its_own_slots_leader(tmp_path):
+    _mark_completed(tmp_path, "a")
+    _mark_completed(tmp_path, "b")
     kwargs = dict(family="f", tier="fast", objective="obj", checkpoint_path="p", checkpoint_sha256="c" * 64, metrics={})
     promote(tmp_path, run_id="a", **kwargs)
     promote(tmp_path, run_id="b", **kwargs)
@@ -82,6 +106,8 @@ def test_promoting_a_new_leader_replaces_only_its_own_slots_leader(tmp_path):
 
 
 def test_promote_can_add_a_population_member_without_becoming_the_leader(tmp_path):
+    _mark_completed(tmp_path, "a")
+    _mark_completed(tmp_path, "b")
     promote(tmp_path, family="f", tier="fast", objective="obj", run_id="a",
             checkpoint_path="p", checkpoint_sha256="c" * 64, metrics={})
     promote(tmp_path, family="f", tier="fast", objective="obj", run_id="b",
@@ -93,6 +119,7 @@ def test_promote_can_add_a_population_member_without_becoming_the_leader(tmp_pat
 
 
 def test_unknown_tier_is_rejected(tmp_path):
+    _mark_completed(tmp_path, "a")
     with pytest.raises(RegistryError, match="unknown runtime budget tier"):
         promote(tmp_path, family="f", tier="medium", objective="obj", run_id="a",
                 checkpoint_path="p", checkpoint_sha256="c" * 64, metrics={})
@@ -111,6 +138,7 @@ class _FakeTensor:
 
 
 def test_promote_rejects_a_non_json_safe_metric_value(tmp_path):
+    _mark_completed(tmp_path, "a")
     with pytest.raises(RegistryError, match="tensors or model weights"):
         promote(
             tmp_path, family="f", tier="fast", objective="obj", run_id="a",
@@ -121,6 +149,7 @@ def test_promote_rejects_a_non_json_safe_metric_value(tmp_path):
 
 
 def test_registry_document_never_contains_a_state_dict_style_key(tmp_path):
+    _mark_completed(tmp_path, "a")
     promote(
         tmp_path, family="f", tier="fast", objective="obj", run_id="a",
         checkpoint_path="checkpoints/best-validation.pt", checkpoint_sha256="c" * 64,
@@ -131,6 +160,38 @@ def test_registry_document_never_contains_a_state_dict_style_key(tmp_path):
         assert forbidden not in raw
     document = json.loads(raw)
     assert document["format"] == REGISTRY_FORMAT
+
+
+# --------------------------------------------------------------------- promotion gate (MF-B5 reuse)
+
+
+def test_promote_rejects_a_run_with_no_persisted_trial_state(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        promote(tmp_path, family="f", tier="fast", objective="obj", run_id="a",
+                checkpoint_path="p", checkpoint_sha256="c" * 64, metrics={})
+    assert not registry_path(tmp_path).exists()
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        (),  # still queued
+        (STATE_RUNNING,),  # interrupted mid-flight
+        (STATE_RUNNING, STATE_FAILED),
+        (STATE_RUNNING, STATE_BUDGET_EXCEEDED),
+        (STATE_CANCELLED,),
+    ],
+)
+def test_promote_rejects_a_run_that_has_not_completed(tmp_path, steps):
+    path = state_path(tmp_path / "a")
+    create_state(path, "a")
+    for step in steps:
+        transition(path, step)
+
+    with pytest.raises(IncompleteRunError):
+        promote(tmp_path, family="f", tier="fast", objective="obj", run_id="a",
+                checkpoint_path="p", checkpoint_sha256="c" * 64, metrics={})
+    assert not registry_path(tmp_path).exists()
 
 
 # --------------------------------------------------------------------- AC3: concurrent promotions
@@ -172,7 +233,15 @@ _PROMOTE_WORKER_SCRIPT = textwrap.dedent(
 
 def _run_promote_workers(tmp_path, jobs):
     """Launch one real subprocess per (label, family, tier, objective, run_id,
-    sha) job, release them together, and return their JSON results."""
+    sha) job, release them together, and return their JSON results.
+
+    Each job's run_id is first driven to `completed` in this (parent)
+    process, since the run directories live on the shared filesystem and
+    `promote` now requires a completed trial state to accept a candidate.
+    """
+    for _label, _family, _tier, _objective, run_id, _sha in jobs:
+        _mark_completed(tmp_path, run_id)
+
     repo_root = str(__import__("pathlib").Path(__file__).resolve().parents[1])
     procs, outcomes = [], []
     for label, family, tier, objective, run_id, sha in jobs:
@@ -236,6 +305,7 @@ def test_concurrent_promotions_to_the_same_slot_serialize_without_corruption(tmp
 
 
 def test_hold_records_a_decision_without_touching_leading_champion_or_population(tmp_path):
+    _mark_completed(tmp_path, "a")
     promote(tmp_path, family="f", tier="fast", objective="obj", run_id="a",
             checkpoint_path="p", checkpoint_sha256="c" * 64, metrics={})
     hold(tmp_path, family="f", tier="fast", objective="obj", run_id="b", reason="did not clear the margin")
@@ -246,6 +316,7 @@ def test_hold_records_a_decision_without_touching_leading_champion_or_population
 
 
 def test_record_test_use_increments_the_named_champions_counter(tmp_path):
+    _mark_completed(tmp_path, "a")
     promote(tmp_path, family="f", tier="fast", objective="obj", run_id="a",
             checkpoint_path="p", checkpoint_sha256="c" * 64, metrics={})
 
@@ -257,6 +328,7 @@ def test_record_test_use_increments_the_named_champions_counter(tmp_path):
 
 
 def test_record_test_use_rejects_a_run_id_not_in_the_population(tmp_path):
+    _mark_completed(tmp_path, "a")
     promote(tmp_path, family="f", tier="fast", objective="obj", run_id="a",
             checkpoint_path="p", checkpoint_sha256="c" * 64, metrics={})
     with pytest.raises(RegistryError, match="not a population member"):
@@ -266,6 +338,28 @@ def test_record_test_use_rejects_a_run_id_not_in_the_population(tmp_path):
 def test_record_test_use_rejects_an_unknown_slot(tmp_path):
     with pytest.raises(RegistryError, match="no registry slot"):
         record_test_use(tmp_path, family="f", tier="fast", objective="obj", run_id="a")
+
+
+def test_re_promoting_a_run_preserves_its_accumulated_test_uses(tmp_path):
+    """Regression: re-promoting an existing population member (e.g. to
+    refresh its checkpoint pointer or metrics) must not reset the sealed
+    test-use ledger `record_test_use` already accumulated for it -- that
+    would let the explicit test-use budget (epic §10.3) be bypassed by a
+    re-promotion."""
+    _mark_completed(tmp_path, "a")
+    promote(tmp_path, family="f", tier="fast", objective="obj", run_id="a",
+            checkpoint_path="p", checkpoint_sha256="c" * 64, metrics={"m": 1.0})
+    record_test_use(tmp_path, family="f", tier="fast", objective="obj", run_id="a")
+    record_test_use(tmp_path, family="f", tier="fast", objective="obj", run_id="a")
+
+    # Re-promote the same run with an updated checkpoint pointer/metrics.
+    promote(tmp_path, family="f", tier="fast", objective="obj", run_id="a",
+            checkpoint_path="p2", checkpoint_sha256="d" * 64, metrics={"m": 2.0})
+
+    champion = leading_champion(tmp_path, family="f", tier="fast", objective="obj")
+    assert champion.checkpoint_path == "p2"
+    assert champion.metrics == {"m": 2.0}
+    assert champion.test_uses == 2
 
 
 # --------------------------------------------------------------------- AC4/5: lineage graph

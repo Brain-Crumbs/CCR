@@ -42,7 +42,13 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 from cognitive_runtime.training.model_factory.artifacts import LINEAGE_FORMAT, atomic_write_json
 from cognitive_runtime.training.model_factory.budget import BUDGET_TIERS
-from cognitive_runtime.training.model_factory.state import _lock_path_for, _locked
+from cognitive_runtime.training.model_factory.state import (
+    _lock_path_for,
+    _locked,
+    load_state,
+    require_completed_for_promotion,
+    state_path,
+)
 
 REGISTRY_FORMAT = "model-factory-registry-v1"
 LINEAGE_MANIFEST_NAME = "lineage.json"
@@ -252,7 +258,13 @@ def promote(
     Different tiers are always different slots (epic §15.1): promoting a
     ``scale`` result never touches the ``fast`` slot for the same family and
     objective. Re-promoting an existing population member's ``run_id``
-    replaces that member's record rather than duplicating it.
+    replaces that member's checkpoint/metrics but preserves its accumulated
+    ``test_uses`` ledger rather than resetting it to zero.
+
+    ``<root>/<run_id>/state.json`` must record MF-B5's ``completed`` trial
+    state (epic §16: "never lets an incomplete artifact enter promotion").
+    A running, failed, budget-exceeded, cancelled, or nonexistent run raises
+    rather than entering the champion population.
     """
     _validate_slot_key(family, tier, objective)
     if not run_id:
@@ -260,6 +272,7 @@ def promote(
     if not checkpoint_sha256:
         raise RegistryError("checkpoint_sha256 must not be empty")
     _validate_registry_safe(dict(metrics), path="metrics")
+    require_completed_for_promotion(load_state(state_path(Path(root) / run_id)))
 
     path = registry_path(root)
     with _locked(_lock_path_for(path)):
@@ -267,12 +280,18 @@ def promote(
         slot_payload = _get_slot_payload(document, family, tier, objective) or _new_slot_payload(
             family, tier, objective,
         )
+        previous_test_uses = 0
+        for item in slot_payload.get("population", []):
+            if item.get("run_id") == run_id:
+                previous_test_uses = int(item.get("test_uses", 0))
+                break
         entry = ChampionEntry(
             run_id=run_id,
             checkpoint_path=str(checkpoint_path),
             checkpoint_sha256=checkpoint_sha256,
             metrics=dict(metrics),
             promoted_at=now(),
+            test_uses=previous_test_uses,
         )
         population_entries = [
             ChampionEntry.from_dict(item) for item in slot_payload.get("population", [])
