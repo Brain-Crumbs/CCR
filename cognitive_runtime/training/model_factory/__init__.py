@@ -115,6 +115,17 @@ from cognitive_runtime.training.model_factory.state import (
     transition,
     write_heartbeat,
 )
+from cognitive_runtime.training.model_factory.comparison import (
+    COMPARISON_FORMAT,
+    DEFAULT_CONFIDENCE as COMPARISON_DEFAULT_CONFIDENCE,
+    DEFAULT_MIN_EPISODE_COUNT,
+    DEFAULT_RESAMPLES,
+    PairedComparison,
+    compare_paired,
+    compare_paired_episodes,
+    paired_bootstrap_interval,
+    paired_permutation_interval,
+)
 if TYPE_CHECKING:
     from cognitive_runtime.training.model_factory.corpus import (
         CORPUS_MANIFEST_FORMAT,
@@ -223,6 +234,15 @@ __all__ = [
     "retry_failed_run",
     "reserve_devices",
     "release_devices",
+    "COMPARISON_FORMAT",
+    "COMPARISON_DEFAULT_CONFIDENCE",
+    "DEFAULT_MIN_EPISODE_COUNT",
+    "DEFAULT_RESAMPLES",
+    "PairedComparison",
+    "compare_paired",
+    "compare_paired_episodes",
+    "paired_bootstrap_interval",
+    "paired_permutation_interval",
 ]
 
 
