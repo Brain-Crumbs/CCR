@@ -112,6 +112,14 @@ node viewer/server.js --data-dir notebooks/runs
 | `ccr view --session <path> --episode <id>` | Inspect a single recorded episode |
 | `ccr review --session <path>` | Post-run session review with baseline comparison |
 | `ccr trace list` / `ccr trace show` | Inspect run traces: phase timings, loss curves, config, git commit |
+| `ccr factory baseline <spec>` | Resolve a spec and launch one fresh/clone/resume/fine_tune Model Factory trial |
+| `ccr factory clone <run> --set path=value` | Build a clone/fine_tune child spec from an existing run and launch it |
+| `ccr factory compare <run> <run>...` | Pair each candidate's validation evidence against a baseline run |
+| `ccr factory promote <run>` | Record a run as a champion-population member of a registry slot |
+| `ccr factory show [run]` | Print a run's complete effective config, contract hashes, display name, and completion status |
+| `ccr factory lineage [run]` | Render a run's ancestor graph (configuration parents + weight donor) |
+| `ccr factory corpus build <spec>` | Record/reuse episodes, gate them, and freeze a Model Factory corpus |
+| `ccr factory test <run>` | The sealed-test final action: evaluate a seed-confirmed candidate against the sealed test split |
 
 Run `ccr <command> --help` for full option details.
 
