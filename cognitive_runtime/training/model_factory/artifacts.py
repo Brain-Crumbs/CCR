@@ -321,6 +321,10 @@ def allocate_run_artifacts(
     """
     if spec.training_contract_hash != training_contract.hash:
         raise ValueError("ExperimentSpec training contract does not match training_contract")
+    if spec.mode == "fine_tune" and sibling_group is not None:
+        raise ValueError(
+            "fine_tune runs are lineage branches, not within-stage A/B siblings"
+        )
 
     # prediction_export imports torch for its model-export functions, so keep
     # this import at the allocation boundary.  Importing contracts/specs (or
