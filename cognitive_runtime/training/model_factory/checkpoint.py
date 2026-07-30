@@ -389,6 +389,92 @@ def restore_rng_state(rng_state: Mapping[str, Any]) -> None:
         torch.cuda.set_rng_state_all(cuda_state)
 
 
+def capture_trainer_rng_state(generator: Any) -> Dict[str, Any]:
+    """Capture the four global streams plus a trainer's own explicit
+    ``torch.Generator`` (issue #220).
+
+    A trainer that draws window/scheduled-sampling decisions from its own
+    ``torch.Generator()`` instead of the global default generator has a
+    fifth RNG consumer :func:`capture_rng_state` cannot see: constructing a
+    ``torch.Generator`` and seeding it decouples its internal state from
+    ``torch.get_rng_state()``/``torch.set_rng_state()`` entirely. Losing that
+    state at a resume boundary would silently replay the *first* window
+    permutation/scheduled-sampling draw again instead of continuing the
+    interrupted sequence, breaking exact resume equivalence without raising
+    any error.
+    """
+    state = dict(capture_rng_state())
+    state["trainer_generator"] = generator.get_state()
+    return state
+
+
+def restore_trainer_rng_state(rng_state: Mapping[str, Any], generator: Any) -> None:
+    """Restore the state captured by :func:`capture_trainer_rng_state`."""
+    restore_rng_state(rng_state)
+    generator.set_state(rng_state["trainer_generator"])
+
+
+def checkpoint_due(epochs_completed: int, cadence: Optional[int]) -> bool:
+    """True when ``epochs_completed`` lands on a periodic checkpoint cadence.
+
+    ``cadence`` of ``None`` or non-positive disables periodic checkpointing;
+    only an improved validation metric can still trigger a save. Epoch 0
+    (no training yet) never qualifies.
+    """
+    if not cadence or cadence <= 0 or epochs_completed <= 0:
+        return False
+    return epochs_completed % cadence == 0
+
+
+@dataclass
+class TrainerResumeState:
+    """Everything a trainer needs to continue training byte-for-byte from
+    where it stopped, beyond the model weights (already restored into the
+    resumed model instance passed back in as ``initial_model``).
+
+    ``epoch``/``global_step``/``best_validation_metric`` mirror the
+    checkpoint contract's ``trainer_state`` (MF-B1); ``rng_state`` is the
+    :func:`capture_trainer_rng_state` snapshot -- the four global streams
+    plus the trainer's own window/scheduled-sampling generator.
+    ``target_encoder_state_dict`` is the EMA target encoder's weights
+    (``ActionWorldModelConfig.ema_target_decay``), when enabled: an
+    uninterrupted run's EMA copy holds the Polyak-averaged history of every
+    preceding step and generally differs from the online model, so it must
+    be restored explicitly rather than rebuilt as a fresh copy of the
+    resumed online weights.
+    """
+
+    epoch: int
+    global_step: int
+    optimizer_state_dict: Dict[str, Any]
+    rng_state: Dict[str, Any]
+    best_validation_metric: Optional[float] = None
+    target_encoder_state_dict: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class BestValidationTracker:
+    """Whether a new reading improves on the declared selection metric.
+
+    ``best-validation.pt`` must follow this, never the training loss (issue
+    #220's acceptance criterion) -- callers feed it validation readings only.
+    """
+
+    mode: str = "min"
+    best: Optional[float] = None
+
+    def offer(self, value: float) -> bool:
+        """Record ``value`` as the new best and return ``True`` if it improves."""
+        if self.mode not in ("min", "max"):
+            raise ValueError(f"selection mode must be 'min' or 'max', got {self.mode!r}")
+        improved = self.best is None or (
+            value < self.best if self.mode == "min" else value > self.best
+        )
+        if improved:
+            self.best = value
+        return improved
+
+
 def _model_definition(model: Any) -> Dict[str, Any]:
     """Persist every constructor setting required to rebuild the cortex."""
     cfg = model.config

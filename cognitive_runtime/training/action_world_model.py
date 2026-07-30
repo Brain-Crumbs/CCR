@@ -44,7 +44,7 @@ import math
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 log = logging.getLogger("ccr.training.cortex")
 
@@ -58,6 +58,10 @@ from cognitive_runtime.runtime.replay import load_session_metadata, require_stre
 from cognitive_runtime.training.event_evaluation import (
     COW_ID, evaluate_entity_predictions, extract_frame_event_labels, flattened_motion_metrics,
     motion_stratified_metrics, rollout_health as classify_rollout_health,
+)
+from cognitive_runtime.training.model_factory.checkpoint import (
+    BestValidationTracker, TrainerResumeState, capture_trainer_rng_state, checkpoint_due,
+    restore_trainer_rng_state,
 )
 
 PIXEL_STREAM = "vision.frame.pixels"
@@ -789,8 +793,17 @@ def _train_autoregressive_objective(
     max_context: Optional[int],
     curriculum_epochs: int,
     ticks_per_frame: float,
-) -> Dict[str, Any]:
-    """Train all causal prefixes and configured direct horizons (C1)."""
+    *,
+    resume_state: Optional[TrainerResumeState] = None,
+    checkpoint_step: Optional[Callable[[int, int, Any], None]] = None,
+) -> Tuple[Dict[str, Any], Any, int]:
+    """Train all causal prefixes and configured direct horizons (C1).
+
+    Returns ``(stats, optimizer, global_step)`` rather than just ``stats`` so
+    the caller can assemble a final :class:`TrainerResumeState` uniformly for
+    both objectives (issue #220) without this function needing to know about
+    validation or best-checkpoint tracking.
+    """
     torch, F = _torch()
     horizons_ticks = tuple(model.horizons_ticks)
     if not horizons_ticks or horizons_ticks[0] < 1:
@@ -816,6 +829,12 @@ def _train_autoregressive_objective(
         raise ValueError("no autoregressive targets: episodes are shorter than the first horizon")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    start_epoch = 0
+    global_step = 0
+    if resume_state is not None:
+        optimizer.load_state_dict(resume_state.optimizer_state_dict)
+        start_epoch = resume_state.epoch
+        global_step = resume_state.global_step
     curves: Dict[str, List[float]] = {
         "total_loss": [], "pixel_loss": [], "latent_loss": [],
         "reward_loss": [], "terminal_loss": [], "risk_loss": [], "uncertainty_loss": [],
@@ -841,7 +860,7 @@ def _train_autoregressive_objective(
         else cfg.autoregressive_rollout_weight
     )
     model.train()
-    for epoch_idx in range(cfg.epochs):
+    for epoch_idx in range(start_epoch, cfg.epochs):
         epoch_started = time.perf_counter()
         if cfg.context_length_curriculum and max_context:
             progress = min(epoch_idx / max(curriculum_epochs - 1, 1), 1.0)
@@ -1019,6 +1038,7 @@ def _train_autoregressive_objective(
             optimizer.step()
             if target_encoder is not None:
                 _update_ema_target_encoder(target_encoder, model, float(cfg.ema_target_decay))
+            global_step += 1
 
             seen += 1
             for key, value in (
@@ -1050,6 +1070,8 @@ def _train_autoregressive_objective(
                **({"train/context_length": model.context_length}
                   if getattr(model, "context_length", None) else {})},
         )
+        if checkpoint_step is not None:
+            checkpoint_step(epoch_idx + 1, global_step, optimizer)
 
     log.info("training complete  final_total=%.4f", curves["total_loss"][-1])
     trace_event("cortex.train.done", objective="autoregressive",
@@ -1057,12 +1079,12 @@ def _train_autoregressive_objective(
                 duration_s=round(time.perf_counter() - training_started, 3))
     if cfg.context_length_curriculum and max_context:
         model.set_context_length(max_context)
-    return {
+    stats = {
         "samples": float(sum(
             max(0, pixels.shape[0] - min(horizon_frames))
             for _e, pixels, _t, _a in episodes
         )),
-        "episodes": float(len(episodes)), "epochs": float(cfg.epochs),
+        "episodes": float(len(episodes)), "epochs": float(cfg.epochs - start_epoch),
         "action_keys": list(model.action_keys), "warmup_frames": cfg.warmup_frames,
         "rollout_frames": cfg.rollout_frames, "loss_curves": curves,
         "training_objective": "autoregressive",
@@ -1075,6 +1097,7 @@ def _train_autoregressive_objective(
         "ema_target_enabled": target_encoder is not None, "ema_target_decay": cfg.ema_target_decay,
         **{f"final_{key}": curves[key][-1] for key in curves},
     }
+    return stats, optimizer, global_step
 
 
 def _window_weights(
@@ -1103,6 +1126,11 @@ def train_action_world_model(
     *,
     initial_model: Optional[Any] = None,
     transition_weights: Optional[Sequence[Sequence[float]]] = None,
+    resume_state: Optional[TrainerResumeState] = None,
+    checkpoint_cadence_epochs: Optional[int] = None,
+    on_checkpoint: Optional[Callable[..., None]] = None,
+    validation_fn: Optional[Callable[[Any], float]] = None,
+    checkpoint_selection_mode: str = "min",
 ) -> Tuple[Any, Dict[str, Any]]:
     """Train the action-conditioned world model with short-rollout scheduled
     sampling over every episode in ``dataset``.
@@ -1137,6 +1165,44 @@ def train_action_world_model(
     ``torch.utils.data.WeightedRandomSampler``. ``None`` (default)
     preserves the original uniform-permutation behavior. Ignored under the
     ``"autoregressive"`` objective, which does not sample windows this way.
+
+    ``resume_state`` (issue #220), when given, continues training exactly
+    from a prior call's return value (``stats["resume_state"]``) instead of
+    starting a fresh optimizer/RNG trajectory: the epoch loop starts at
+    ``resume_state.epoch``, the optimizer is restored via
+    ``load_state_dict``, and every RNG stream this trainer consumes -- the
+    four global streams (python/numpy/torch_cpu/torch_cuda) plus the
+    trainer's own explicit window/scheduled-sampling ``torch.Generator``,
+    which is a distinct RNG consumer the global streams cannot capture -- is
+    restored before training resumes. ``initial_model`` must already carry
+    the checkpoint's weights; this argument only restores what the model
+    object itself cannot hold. ``resume_state=None`` (default) preserves
+    today's behavior exactly: a fresh ``torch.manual_seed(cfg.seed)`` and a
+    freshly seeded window/scheduled-sampling generator.
+
+    ``validation_fn``, when given, is called with the model (in eval mode)
+    at the end of *every* epoch regardless of cadence or ``on_checkpoint``;
+    its return value is tracked as the declared selection metric
+    (``checkpoint_selection_mode``, ``"min"`` or ``"max"``), so
+    ``stats["resume_state"].best_validation_metric`` reflects it even if no
+    persistence callback is configured. ``best-validation.pt`` must follow
+    this metric, never the training loss.
+
+    ``checkpoint_cadence_epochs`` and ``on_checkpoint`` implement the
+    periodic-checkpoint cadence hook: every time training completes an
+    epoch count that lands on the declared cadence
+    (``cognitive_runtime.training.model_factory.checkpoint.checkpoint_due``),
+    or ``validation_fn`` reports a new best, ``on_checkpoint(model, state,
+    is_best=...)`` is called with the live model -- already holding that
+    epoch's trained weights -- and a :class:`TrainerResumeState` snapshot,
+    so a caller can persist both (for example via
+    ``save_factory_checkpoint``). A fresh call builds ``model`` inside this
+    function and does not return it until every epoch finishes, so passing
+    it explicitly here is the only way a caller can reach epoch-specific
+    weights for a periodic checkpoint. The final ``stats["resume_state"]``
+    is always populated regardless of these arguments, so the base
+    stop-and-continue primitive (train N epochs, then resume for the rest)
+    works without configuring cadence or validation at all.
     """
     torch, F = _torch()
 
@@ -1169,8 +1235,28 @@ def train_action_world_model(
             "training_objective must be 'windowed_rollout' or 'autoregressive', got "
             f"{cfg.training_objective!r}"
         )
-    torch.manual_seed(cfg.seed)
-    generator = torch.Generator().manual_seed(cfg.seed)
+    if checkpoint_selection_mode not in ("min", "max"):
+        raise ValueError(
+            f"checkpoint_selection_mode must be 'min' or 'max', got {checkpoint_selection_mode!r}"
+        )
+    if resume_state is not None and resume_state.epoch >= cfg.epochs:
+        # Reject explicitly rather than entering an epoch loop that runs
+        # zero iterations: empty loss curves would otherwise raise a
+        # confusing IndexError deep in the final stats assembly instead of
+        # a clear, actionable error at the call boundary.
+        raise ValueError(
+            f"resume_state.epoch ({resume_state.epoch}) has already reached or passed "
+            f"cfg.epochs ({cfg.epochs}); raise cfg.epochs to train additional epochs"
+        )
+    if resume_state is None:
+        # Fresh start: unchanged from pre-#220 behavior. A resumed call
+        # instead restores every RNG stream this trainer consumes below,
+        # once ``generator`` exists.
+        torch.manual_seed(cfg.seed)
+        generator = torch.Generator().manual_seed(cfg.seed)
+    else:
+        generator = torch.Generator()
+        restore_trainer_rng_state(resume_state.rng_state, generator)
     expected_workspace_modalities = _workspace_modalities(dataset, cfg.workspace_enabled)
     expected_workspace_layout = dataset.workspace_layout_hash if expected_workspace_modalities else None
 
@@ -1228,6 +1314,12 @@ def train_action_world_model(
         target_encoder = copy.deepcopy(model)
         target_encoder.requires_grad_(False)
         target_encoder.eval()
+        if resume_state is not None and resume_state.target_encoder_state_dict is not None:
+            # An uninterrupted run's EMA copy holds the Polyak-averaged
+            # history of every preceding step, not merely the current online
+            # model -- restore that exact history rather than resetting the
+            # slow target back to a deepcopy of the just-resumed weights.
+            target_encoder.load_state_dict(resume_state.target_encoder_state_dict)
     episodes = _episode_tensors(dataset, model.reconstruction_shape, device=device)
     #: Per-episode reward/terminal/risk targets (issue #169), aligned 1:1
     #: with ``episodes`` by index.
@@ -1238,12 +1330,68 @@ def train_action_world_model(
 
     max_context = getattr(model, "context_length_max", None)
     curriculum_epochs = max(cfg.context_length_curriculum_epochs or cfg.epochs, 1)
+
+    best_tracker = BestValidationTracker(
+        mode=checkpoint_selection_mode,
+        best=resume_state.best_validation_metric if resume_state is not None else None,
+    )
+
+    def _checkpoint_step(epochs_completed: int, step: int, step_optimizer: Any) -> None:
+        """Cadence hook (issue #220): periodic + best-validation checkpoints.
+
+        Validation (when ``validation_fn`` is given) always runs at the end
+        of every epoch, independent of whether a persistence callback is
+        installed -- otherwise ``stats["resume_state"].best_validation_metric``
+        would silently stay ``None`` for a caller that only wants the
+        tracked metric, not disk writes. ``on_checkpoint`` receives the live
+        ``model`` explicitly: for a fresh call (no ``initial_model``) the
+        model is built inside this function and not returned until every
+        epoch finishes, so without this a caller has no way to reach the
+        epoch-specific weights a periodic checkpoint must persist.
+        """
+        is_best = False
+        if validation_fn is not None:
+            was_training = model.training
+            model.eval()
+            try:
+                is_best = best_tracker.offer(float(validation_fn(model)))
+            finally:
+                model.train(was_training)
+        if on_checkpoint is None:
+            return
+        if not is_best and not checkpoint_due(epochs_completed, checkpoint_cadence_epochs):
+            return
+        on_checkpoint(
+            model,
+            TrainerResumeState(
+                epoch=epochs_completed, global_step=step,
+                optimizer_state_dict=step_optimizer.state_dict(),
+                rng_state=capture_trainer_rng_state(generator),
+                best_validation_metric=best_tracker.best,
+                target_encoder_state_dict=(
+                    target_encoder.state_dict() if target_encoder is not None else None
+                ),
+            ),
+            is_best=is_best,
+        )
+
     if cfg.training_objective == "autoregressive":
-        stats = _train_autoregressive_objective(
+        stats, optimizer, global_step = _train_autoregressive_objective(
             model, dataset, episodes, head_targets, cfg, target_encoder, generator,
             max_context, curriculum_epochs, dataset.ticks_per_frame,
+            resume_state=resume_state, checkpoint_step=_checkpoint_step,
         )
         stats["ticks_per_frame"] = dataset.ticks_per_frame
+        stats["global_step"] = global_step
+        stats["resume_state"] = TrainerResumeState(
+            epoch=cfg.epochs, global_step=global_step,
+            optimizer_state_dict=optimizer.state_dict(),
+            rng_state=capture_trainer_rng_state(generator),
+            best_validation_metric=best_tracker.best,
+            target_encoder_state_dict=(
+                target_encoder.state_dict() if target_encoder is not None else None
+            ),
+        )
         diagnostics = representation_collapse_diagnostics(model, dataset, config=cfg)
         stats["representation_diagnostics"] = diagnostics
         if cfg.collapse_gate_enabled and diagnostics["gate_evaluable"] and not diagnostics["passed"]:
@@ -1286,6 +1434,12 @@ def train_action_world_model(
         )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    start_epoch = 0
+    global_step = 0
+    if resume_state is not None:
+        optimizer.load_state_dict(resume_state.optimizer_state_dict)
+        start_epoch = resume_state.epoch
+        global_step = resume_state.global_step
     curves: Dict[str, List[float]] = {
         "total_loss": [],
         "pixel_loss": [],
@@ -1320,7 +1474,7 @@ def train_action_world_model(
     )
     training_started = time.perf_counter()
     model.train()
-    for epoch_idx in range(cfg.epochs):
+    for epoch_idx in range(start_epoch, cfg.epochs):
         epoch_started = time.perf_counter()
         if cfg.context_length_curriculum and max_context:
             progress = min(epoch_idx / max(curriculum_epochs - 1, 1), 1.0)
@@ -1642,6 +1796,7 @@ def train_action_world_model(
             optimizer.step()
             if target_encoder is not None:
                 _update_ema_target_encoder(target_encoder, model, float(cfg.ema_target_decay))
+            global_step += 1
 
             seen += batch_n
             epoch["total_loss"] += float(total.detach()) * batch_n
@@ -1676,6 +1831,7 @@ def train_action_world_model(
                **({"train/context_length": model.context_length}
                   if getattr(model, "context_length", None) else {})},
         )
+        _checkpoint_step(epoch_idx + 1, global_step, optimizer)
 
     log.info("training complete  final_total=%.4f", curves["total_loss"][-1])
     trace_event("cortex.train.done", objective="windowed_rollout",
@@ -1691,7 +1847,7 @@ def train_action_world_model(
     stats: Dict[str, Any] = {
         "samples": float(len(starts)),
         "episodes": float(len(episodes)),
-        "epochs": float(cfg.epochs),
+        "epochs": float(cfg.epochs - start_epoch),
         "action_keys": list(dataset.action_keys),
         "ticks_per_frame": dataset.ticks_per_frame,
         "warmup_frames": cfg.warmup_frames,
@@ -1720,7 +1876,17 @@ def train_action_world_model(
         "ema_target_decay": cfg.ema_target_decay,
         "training_objective": "windowed_rollout",
         "device": str(_model_device(model)),
+        "global_step": global_step,
     }
+    stats["resume_state"] = TrainerResumeState(
+        epoch=cfg.epochs, global_step=global_step,
+        optimizer_state_dict=optimizer.state_dict(),
+        rng_state=capture_trainer_rng_state(generator),
+        best_validation_metric=best_tracker.best,
+        target_encoder_state_dict=(
+            target_encoder.state_dict() if target_encoder is not None else None
+        ),
+    )
     diagnostics = representation_collapse_diagnostics(model, dataset, config=cfg)
     stats["representation_diagnostics"] = diagnostics
     if cfg.collapse_gate_enabled and diagnostics["gate_evaluable"] and not diagnostics["passed"]:
