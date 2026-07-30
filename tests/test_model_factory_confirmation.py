@@ -227,6 +227,15 @@ def test_confirm_across_seeds_produces_one_child_per_seed_with_lineage_naming_th
         assert child.episode_count == 2  # two frozen validation sessions
         assert child.within_seed_spread >= 0.0
 
+        # Regression guard (Codex review): metric_value/within_seed_spread
+        # must be the *raw* per-episode model MSE, matching the child's own
+        # validation.json -- not model_over_copy_last_mse's derived ratio,
+        # which would otherwise be compared against baseline_metric_value's
+        # raw-MSE units and silently corrupt the durable-confirmation decision.
+        validation = json.loads((child_directory / "metrics" / "validation.json").read_text(encoding="utf-8"))
+        raw_per_episode = next(iter(validation["per_episode_model_mse"].values()))
+        assert child.metric_value == pytest.approx(sum(raw_per_episode) / len(raw_per_episode))
+
     assert report.across_seed_spread >= 0.0
     # A generous (1000.0) baseline: real toy-model MSE must be far below it.
     assert report.confirmed is True
@@ -250,6 +259,35 @@ def test_confirm_across_seeds_win_losing_the_multi_seed_aggregate_is_not_confirm
     assert report.confirmed is False
     assert "not durable across independent training seeds" in report.reason
     assert report.aggregate_metric_mean > report.baseline_metric_value
+
+
+def test_confirm_across_seeds_rejects_a_seed_rerun_that_exceeded_its_training_budget(tmp_path, corpus, monkeypatch):
+    """AC (Codex review): a seed rerun that hit budget_exceeded is not
+    promotable evidence (mirrors promotion.py's training_time_budget gate)
+    and must not be silently folded into the durable-confirmation aggregate."""
+    import dataclasses as dc
+
+    import cognitive_runtime.training.model_factory.confirmation as confirmation_module
+
+    _, candidate = _winning_candidate(tmp_path, corpus, baseline_value=1_000.0)
+
+    real_run_trial = confirmation_module.run_trial
+    calls = {"count": 0}
+
+    def _flaky_run_trial(*args, **kwargs):
+        result = real_run_trial(*args, **kwargs)
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return dc.replace(result, state="budget_exceeded")
+        return result
+
+    monkeypatch.setattr(confirmation_module, "run_trial", _flaky_run_trial)
+
+    with pytest.raises(ConfirmationError, match="did not complete within its training-time budget"):
+        confirm_across_seeds(
+            candidate.run_id, [1, 2], organism=ORGANISM,
+            root=str(tmp_path / "runs"), corpus_root=str(tmp_path / "corpora"),
+        )
 
 
 def test_confirm_across_seeds_module_imports_cleanly_without_torch():
@@ -298,10 +336,23 @@ def _population(root, organism, *, family="fam", tier="fast", objective="obj"):
     return {entry.run_id: entry for entry in entries}
 
 
+def _write_seed_confirmation(directory: Path, run_id: str, *, confirmed: bool = True, reason: str = "stub"):
+    """A stand-in for a real confirm_across_seeds report: final_test only
+    reads confirmed_run_id/confirmed/reason, so tests that are not
+    exercising confirm_across_seeds itself can stub this precondition
+    directly rather than paying for extra real seed reruns."""
+    (directory / "metrics").mkdir(parents=True, exist_ok=True)
+    (directory / "metrics" / "seed_confirmation.json").write_text(
+        json.dumps({"confirmed_run_id": run_id, "confirmed": confirmed, "reason": reason}),
+        encoding="utf-8",
+    )
+
+
 def test_final_test_writes_metrics_test_json_matching_the_promotion_gates(tmp_path, corpus):
     result = _run(_spec_dict(corpus.corpus_id), tmp_path)
     root = str(tmp_path / "runs")
     _promote(root, ORGANISM, result.run_id)
+    _write_seed_confirmation(result.directory, result.run_id)
     policy = PromotionPolicy(minimum_practical_margin=0.1, max_sealed_test_uses=3)
 
     outcome = final_test(
@@ -335,6 +386,7 @@ def test_final_test_refuses_a_second_call_for_the_same_run(tmp_path, corpus):
     result = _run(_spec_dict(corpus.corpus_id), tmp_path)
     root = str(tmp_path / "runs")
     _promote(root, ORGANISM, result.run_id)
+    _write_seed_confirmation(result.directory, result.run_id)
     policy = PromotionPolicy(minimum_practical_margin=0.1, max_sealed_test_uses=3)
 
     final_test(
@@ -356,6 +408,7 @@ def test_final_test_refused_when_budget_already_exhausted_writes_nothing(tmp_pat
     result = _run(_spec_dict(corpus.corpus_id), tmp_path)
     root = str(tmp_path / "runs")
     _promote(root, ORGANISM, result.run_id)
+    _write_seed_confirmation(result.directory, result.run_id)
     policy = PromotionPolicy(minimum_practical_margin=0.1, max_sealed_test_uses=1)
 
     # Exhaust the budget directly (not through final_test), simulating an
@@ -397,6 +450,7 @@ def test_final_test_requires_a_completed_run(tmp_path, corpus):
 def test_final_test_requires_an_existing_registry_population_member(tmp_path, corpus):
     result = _run(_spec_dict(corpus.corpus_id), tmp_path)
     root = str(tmp_path / "runs")
+    _write_seed_confirmation(result.directory, result.run_id)
     # Deliberately never promoted into the registry.
     policy = PromotionPolicy(minimum_practical_margin=0.1, max_sealed_test_uses=3)
     with pytest.raises(RegistryError):
@@ -412,12 +466,48 @@ def test_final_test_requires_the_corpus_to_declare_test_sessions(tmp_path):
     result = _run(_spec_dict(corpus_without_test.corpus_id), tmp_path)
     root = str(tmp_path / "runs")
     _promote(root, ORGANISM, result.run_id)
+    _write_seed_confirmation(result.directory, result.run_id)
     policy = PromotionPolicy(minimum_practical_margin=0.1, max_sealed_test_uses=3)
     with pytest.raises(ConfirmationError, match="no sealed test sessions"):
         final_test(
             result.run_id, organism=ORGANISM, family="fam", tier="fast", objective="obj",
             policy=policy, root=root, corpus_root=str(tmp_path / "corpora"),
         )
+
+
+def test_final_test_requires_a_prior_confirm_across_seeds_pass(tmp_path, corpus):
+    """AC (Codex review): a durable champion needs both the multi-seed and
+    the sealed-test evidence -- final_test must not stand in for a
+    confirm_across_seeds call that was never made, or that did not hold."""
+    result = _run(_spec_dict(corpus.corpus_id), tmp_path)
+    root = str(tmp_path / "runs")
+    _promote(root, ORGANISM, result.run_id)
+    policy = PromotionPolicy(minimum_practical_margin=0.1, max_sealed_test_uses=3)
+
+    # No metrics/seed_confirmation.json at all.
+    with pytest.raises(ConfirmationError, match="no metrics/seed_confirmation.json"):
+        final_test(
+            result.run_id, organism=ORGANISM, family="fam", tier="fast", objective="obj",
+            policy=policy, root=root, corpus_root=str(tmp_path / "corpora"),
+        )
+
+    # A seed confirmation exists but recorded confirmed=False.
+    _write_seed_confirmation(result.directory, result.run_id, confirmed=False, reason="lost the aggregate")
+    with pytest.raises(ConfirmationError, match="was not confirmed across seeds"):
+        final_test(
+            result.run_id, organism=ORGANISM, family="fam", tier="fast", objective="obj",
+            policy=policy, root=root, corpus_root=str(tmp_path / "corpora"),
+        )
+
+    # A seed confirmation exists but names a different run entirely.
+    _write_seed_confirmation(result.directory, "some-other-run", confirmed=True)
+    with pytest.raises(ConfirmationError, match="a different confirmed run"):
+        final_test(
+            result.run_id, organism=ORGANISM, family="fam", tier="fast", objective="obj",
+            policy=policy, root=root, corpus_root=str(tmp_path / "corpora"),
+        )
+
+    assert not (result.directory / "metrics" / "test.json").exists()
 
 
 def test_final_test_module_imports_cleanly_without_torch():
@@ -470,6 +560,7 @@ def test_no_search_step_ever_opens_the_sealed_test_partition(tmp_path, corpus, m
     # Sanity check: the tracking hook does catch a real sealed-test read.
     root = str(tmp_path / "runs")
     _promote(root, ORGANISM, candidate.run_id)
+    _write_seed_confirmation(candidate.directory, candidate.run_id)
     policy = PromotionPolicy(minimum_practical_margin=0.1, max_sealed_test_uses=3)
     final_test(
         candidate.run_id, organism=ORGANISM, family="fam", tier="fast", objective="obj",

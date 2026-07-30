@@ -58,11 +58,13 @@ from cognitive_runtime.training.model_factory.checkpoint import (
 from cognitive_runtime.training.model_factory.corpus import resolve_corpus
 from cognitive_runtime.training.model_factory.promotion import (
     PromotionPolicy,
+    SealedTestBudgetExhaustedError,
     TestConfirmation,
     _rollout_beats_copy_last_gate,
     _rollout_health_gate,
     perform_sealed_test_action,
 )
+from cognitive_runtime.training.model_factory.registry import RegistryError, population as _population
 from cognitive_runtime.training.model_factory.runner import (
     RUNS_ROOT_DEFAULT,
     _action_world_model_config,
@@ -75,6 +77,7 @@ from cognitive_runtime.training.model_factory.runner import (
 from cognitive_runtime.training.model_factory.spec import ExperimentSpec, _thaw
 from cognitive_runtime.training.model_factory.spec import resolve as resolve_spec
 from cognitive_runtime.training.model_factory.state import (
+    STATE_COMPLETED,
     _lock_path_for,
     _locked,
     load_state,
@@ -127,12 +130,66 @@ def _require_completed(run_directory: Path) -> None:
     require_completed_for_promotion(load_state(state_path(run_directory)))
 
 
+def _require_confirmed_across_seeds(run_directory: Path, run_id: str) -> None:
+    """``final_test`` may only confirm a candidate that already passed
+    :func:`confirm_across_seeds` -- a durable champion needs both kinds of
+    evidence (epic §10.2/§10.3), never a sealed-test pass standing in for a
+    multi-seed rerun that was never performed."""
+    path = run_directory / "metrics" / "seed_confirmation.json"
+    if not path.is_file():
+        raise ConfirmationError(
+            f"run {run_id!r} has no metrics/seed_confirmation.json; final_test requires a prior "
+            "confirm_across_seeds call that confirmed this exact run before it may sealed-test it"
+        )
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("confirmed_run_id") != run_id:
+        raise ConfirmationError(
+            f"run {run_id!r}'s metrics/seed_confirmation.json names a different confirmed run "
+            f"({payload.get('confirmed_run_id')!r}); a seed confirmation may not be reused across runs"
+        )
+    if not payload.get("confirmed"):
+        raise ConfirmationError(
+            f"run {run_id!r} was not confirmed across seeds ({payload.get('reason')}); "
+            "final_test refuses to sealed-test a configuration whose multi-seed aggregate did not hold"
+        )
+
+
+def _check_test_budget_eligibility(
+    organism_directory: Path, *, family: str, tier: str, objective: str, run_id: str, max_uses: int,
+) -> None:
+    """Best-effort pre-check so an ineligible or already-exhausted call never
+    pays for a sealed-data evaluation it cannot record.
+
+    Not itself the authoritative guard -- ``record_test_use``'s single
+    locked critical section (invoked via ``perform_sealed_test_action``
+    after evaluation) remains the one atomic check-then-act two racing
+    callers are resolved against; this unlocked read only short-circuits the
+    ordinary (non-racing) case of a run that was never promoted into this
+    slot, or whose budget this call already knows is spent.
+    """
+    entries = _population(organism_directory, family=family, tier=tier, objective=objective)
+    entry = next((item for item in entries if item.run_id == run_id), None)
+    if entry is None:
+        raise RegistryError(
+            f"run_id {run_id!r} is not a population member of family={family!r} tier={tier!r} objective={objective!r}"
+        )
+    if entry.test_uses >= max_uses:
+        raise SealedTestBudgetExhaustedError(run_id, max_uses, entry.test_uses)
+
+
 # --------------------------------------------------------------- confirm_across_seeds
 
 
 @dataclass(frozen=True)
 class SeedConfirmationChild:
-    """One training-seed rerun of the confirmed configuration."""
+    """One training-seed rerun of the confirmed configuration.
+
+    ``metric_value`` and ``within_seed_spread`` are both the mean and
+    population standard deviation of the *raw* per-episode model MSE at the
+    selection metric's declared report/horizon -- never a derived ratio/rate
+    -- so they stay directly comparable to ``baseline_metric_value``.
+    """
 
     seed: int
     run_id: str
@@ -273,7 +330,23 @@ def confirm_across_seeds(
             naming_seed=naming_seed, trace_dir=trace_dir,
             heartbeat_timeout_seconds=heartbeat_timeout_seconds,
         )
-        metric_value, per_episode = _resolve_selection_metric(result.evaluation, selection_metric, ticks_per_frame)
+        if result.state != STATE_COMPLETED:
+            raise ConfirmationError(
+                f"seed {seed} rerun {result.run_id!r} did not complete within its training-time budget "
+                f"(state={result.state!r}); a durable confirmation requires every seed rerun to complete, "
+                "exactly like the training_time_budget promotion gate"
+            )
+        # `_resolve_selection_metric`'s per-episode values are always the raw
+        # per-episode model MSE at the selection metric's declared
+        # report/horizon -- never a derived ratio/rate such as
+        # model_over_copy_last_mse, even when that is what selection_metric
+        # names (see runner._resolve_selection_metric's own docstring). Use
+        # that raw mean, not the resolved (possibly ratio) scalar, so the
+        # aggregate below stays in the same units as baseline_metric_value,
+        # which is likewise computed from comparison.json's raw
+        # baseline_raw_errors.
+        _, per_episode = _resolve_selection_metric(result.evaluation, selection_metric, ticks_per_frame)
+        metric_value = statistics.fmean(per_episode)
         within_seed_spread = statistics.pstdev(per_episode)
         atomic_write_json(
             _run_directory(root, organism, result.run_id) / "confirmation_source.json",
@@ -354,15 +427,25 @@ def final_test(
     """Evaluate ``run_id``'s best-validation checkpoint against the sealed
     test split, exactly once.
 
-    ``run_id`` must already be a completed trial and a population member of
-    the ``(family, tier, objective)`` registry slot (i.e. already promoted
+    ``run_id`` must already be: a completed trial; confirmed by a prior
+    :func:`confirm_across_seeds` call recorded in its own
+    ``metrics/seed_confirmation.json`` with ``confirmed=True`` (durable
+    promotion requires both the multi-seed and the sealed-test evidence,
+    never sealed-test evidence alone); and a population member of the
+    ``(family, tier, objective)`` registry slot (i.e. already promoted
     non-durably) -- ``perform_sealed_test_action`` (the sole sanctioned
     sealed-test-budget charge, :mod:`.promotion`) enforces the latter.
     Refuses immediately, before touching the corpus or the checkpoint, if
-    ``metrics/test.json`` already exists for this run. If the sealed-test
-    budget is already exhausted for ``run_id``, the call is refused and
-    nothing is written -- a lost race for the budget's last use leaves no
-    partial ``metrics/test.json`` behind.
+    ``metrics/test.json`` already exists for this run, or if the sealed-test
+    budget is already known to be exhausted for ``run_id`` -- so an
+    ineligible or already-exhausted call never pays for a sealed-data
+    evaluation it cannot record. (This eligibility pre-check is a best-effort
+    optimization, not the authoritative guard: the same
+    ``perform_sealed_test_action`` call every ``final_test`` still makes
+    after evaluating remains the one atomic, lock-guarded budget charge that
+    two concurrent callers racing for the same last remaining use are
+    resolved against.) A call refused this way, or refused later by the
+    atomic charge itself, writes nothing.
 
     ``passed`` reuses the same ``rollout_beats_copy_last``/``rollout_health``
     gates :mod:`.promotion` already applies for ordinary (validation-based)
@@ -376,8 +459,14 @@ def final_test(
             raise TestAlreadyPerformedError(run_id)
 
         _require_completed(run_directory)
+        _require_confirmed_across_seeds(run_directory, run_id)
         spec = _load_run_spec(run_directory)
         selection_metric = spec.evaluation["selection_metric"]
+
+        _check_test_budget_eligibility(
+            Path(root) / organism, family=family, tier=tier, objective=objective,
+            run_id=run_id, max_uses=policy.max_sealed_test_uses,
+        )
 
         corpus = resolve_corpus(
             spec.data["corpus_id"], allow_record=False, root=corpus_root, organism=spec.organism,
