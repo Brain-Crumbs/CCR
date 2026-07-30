@@ -105,6 +105,14 @@ def build_experiment_report(
         reasons.append("checkpoint identity requires path and sha256")
     if training_stats.get("evaluation_mode") == "training_replay":
         reasons.append("training-replay evaluation cannot support promotion")
+    completion_status = training_stats.get("completion_status")
+    # Any declared non-"completed" status -- budget_exceeded,
+    # timeout_unrecoverable, failed, cancelled, or a future addition -- is an
+    # incomplete or abnormally-ended trial. Only the exact terminal success
+    # status is promotion-eligible; a report that omits the field entirely
+    # (older or non-factory callers) is unaffected.
+    if completion_status is not None and completion_status != "completed":
+        reasons.append(f"{completion_status} trial cannot support promotion")
     for horizon, values in horizons.items():
         if not values.get("beats_copy_last", False):
             reasons.append(f"rollout t+{horizon} does not beat copy-last")
