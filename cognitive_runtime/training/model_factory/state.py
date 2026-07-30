@@ -345,42 +345,106 @@ def write_heartbeat(
     )
 
 
+def _iso_to_epoch(value: str) -> float:
+    return dt.datetime.fromisoformat(value).timestamp()
+
+
+def _read_heartbeat(path: Path) -> Optional[Dict[str, Any]]:
+    """Return the validated heartbeat payload, or ``None`` if never written."""
+    if not path.exists():
+        return None
+    payload = _read_json(path)
+    if payload.get("format") != HEARTBEAT_FORMAT:
+        raise StateError(f"invalid trial heartbeat file: {path}")
+    return payload
+
+
 def heartbeat_age_seconds(
     path: Union[str, Path], *, clock: Callable[[], float] = time.time,
 ) -> float:
     """Seconds since the last heartbeat, or ``math.inf`` if none was ever
     written -- a worker that dies before its first heartbeat is exactly as
-    stale as one that stopped heartbeating, never mistaken for fresh."""
-    target = Path(path)
-    if not target.exists():
+    stale as one that stopped heartbeating, never mistaken for fresh.
+
+    Clamped at zero: a wall-clock rollback must never surface as a negative
+    age, which :func:`~cognitive_runtime.training.model_factory.budget.watchdog_expired`
+    rejects outright.
+    """
+    payload = _read_heartbeat(Path(path))
+    if payload is None:
         return math.inf
-    payload = _read_json(target)
-    if payload.get("format") != HEARTBEAT_FORMAT:
-        raise StateError(f"invalid trial heartbeat file: {target}")
-    return clock() - float(payload["heartbeat_seconds"])
+    return max(clock() - float(payload["heartbeat_seconds"]), 0.0)
+
+
+def _heartbeat_age_for_state(
+    state: TrialState, heartbeat_file: Union[str, Path], *, clock: Callable[[], float],
+) -> float:
+    """Heartbeat age for ``state``, falling back to time-since-active when
+    there is no heartbeat this run can be judged by.
+
+    Two distinct cases share this fallback: the worker's first heartbeat
+    hasn't landed yet (its declared grace period must still apply, not an
+    instant ``math.inf`` false-positive), and ``heartbeat_file`` holds a
+    leftover or misdirected record stamped with a *different* ``run_id`` --
+    which must never vouch for this run's liveness just because its own
+    timestamp looks fresh.
+    """
+    payload = _read_heartbeat(Path(heartbeat_file))
+    if payload is not None and payload.get("run_id") == state.run_id:
+        return max(clock() - float(payload["heartbeat_seconds"]), 0.0)
+    return max(clock() - _iso_to_epoch(state.updated_at), 0.0)
+
+
+def _resolve_timeout(state: TrialState, timeout_seconds: Optional[float]) -> float:
+    """Prefer the timeout declared at :func:`create_state` time; an explicit
+    caller-supplied value is only accepted when it agrees with that
+    declaration, so a restarted watchdog can never silently enforce a
+    different contract than the one persisted on the run."""
+    declared = state.heartbeat_timeout_seconds
+    if timeout_seconds is None:
+        if declared is None:
+            raise StateError(
+                f"no heartbeat_timeout_seconds declared for run {state.run_id!r} "
+                "and none supplied"
+            )
+        return declared
+    if declared is not None and declared != timeout_seconds:
+        raise StateError(
+            f"timeout_seconds={timeout_seconds!r} conflicts with the "
+            f"heartbeat_timeout_seconds={declared!r} declared at creation for "
+            f"run {state.run_id!r}"
+        )
+    return timeout_seconds
 
 
 def is_stale(
     state: TrialState,
     heartbeat_file: Union[str, Path],
     *,
-    timeout_seconds: float,
+    timeout_seconds: Optional[float] = None,
     clock: Callable[[], float] = time.time,
 ) -> bool:
-    """True when ``state`` is active and its heartbeat gap exceeds the
-    declared watchdog timeout. A non-active (not-yet-launched or already
-    terminal) run is never stale -- there is no live worker to have gone
-    quiet."""
+    """True when ``state`` is active and its heartbeat gap exceeds its
+    watchdog timeout. A non-active (not-yet-launched or already terminal)
+    run is never stale -- there is no live worker to have gone quiet.
+
+    ``timeout_seconds`` defaults to the value declared at
+    :func:`create_state` time; see :func:`_resolve_timeout` for the
+    override rule. See :func:`_heartbeat_age_for_state` for how a missing
+    or mismatched-``run_id`` heartbeat is judged.
+    """
     if state.state not in ACTIVE_STATES:
         return False
-    return watchdog_expired(heartbeat_age_seconds(heartbeat_file, clock=clock), timeout_seconds)
+    resolved_timeout = _resolve_timeout(state, timeout_seconds)
+    age = _heartbeat_age_for_state(state, heartbeat_file, clock=clock)
+    return watchdog_expired(age, resolved_timeout)
 
 
 def recover_stale_worker(
     path: Union[str, Path],
     heartbeat_file: Union[str, Path],
     *,
-    timeout_seconds: float,
+    timeout_seconds: Optional[float] = None,
     clock: Callable[[], float] = time.time,
 ) -> Optional[TrialState]:
     """Detect and, if stale, atomically fail a run whose worker stopped
@@ -390,7 +454,8 @@ def recover_stale_worker(
     is ``failed``, recorded with a distinct machine-readable reason so a
     later operator can tell a watchdog kill apart from any other failure.
     Returns ``None`` (a no-op) when the heartbeat is still current, so a
-    polling loop can call this unconditionally every tick.
+    polling loop can call this unconditionally every tick. ``timeout_seconds``
+    follows :func:`is_stale`'s declared-timeout rule.
     """
     target = Path(path)
     with _locked(_lock_path_for(target)):

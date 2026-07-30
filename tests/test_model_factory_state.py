@@ -201,17 +201,125 @@ def test_watchdog_ignores_a_run_with_no_live_worker_expected(tmp_path):
     assert load_state(state_file).state == STATE_QUEUED
 
 
-def test_a_never_heartbeated_active_run_is_immediately_stale(tmp_path):
+def test_a_freshly_launched_worker_gets_its_full_grace_period_before_its_first_heartbeat(tmp_path):
+    """Regression: a watchdog poll landing between `queued -> running` and
+    the worker's first `write_heartbeat` call must not treat the missing
+    file as an infinite gap -- a newly launched, responsive worker with a
+    long declared timeout must not be failed immediately."""
+    state_file = state_path(tmp_path)
+    heartbeat_file = heartbeat_path(tmp_path)  # not written yet
+    create_state(state_file, "run-a")
+    transition(state_file, STATE_RUNNING)
+
+    assert not is_stale(load_state(state_file), heartbeat_file, timeout_seconds=300.0)
+    assert recover_stale_worker(state_file, heartbeat_file, timeout_seconds=300.0) is None
+    assert load_state(state_file).state == STATE_RUNNING
+
+
+def test_a_never_heartbeated_run_becomes_stale_once_its_grace_period_elapses(tmp_path):
     """A worker that dies before its first heartbeat is exactly as stale as
-    one that stopped heartbeating -- never mistaken for fresh."""
+    one that stopped heartbeating -- once its grace period actually elapses,
+    never mistaken for fresh forever."""
     state_file = state_path(tmp_path)
     heartbeat_file = heartbeat_path(tmp_path)  # never written
     create_state(state_file, "run-a")
     transition(state_file, STATE_RUNNING)
 
-    assert is_stale(load_state(state_file), heartbeat_file, timeout_seconds=0.001)
-    recovered = recover_stale_worker(state_file, heartbeat_file, timeout_seconds=0.001)
+    time.sleep(0.1)
+
+    assert is_stale(load_state(state_file), heartbeat_file, timeout_seconds=0.01)
+    recovered = recover_stale_worker(state_file, heartbeat_file, timeout_seconds=0.01)
     assert recovered.state == STATE_FAILED
+
+
+def test_a_heartbeat_belonging_to_a_different_run_id_is_not_trusted(tmp_path):
+    """A leftover or misdirected heartbeat stamped with a *different*
+    run_id must not keep a genuinely dead run classified as healthy just
+    because its own timestamp looks fresh."""
+    state_file = state_path(tmp_path)
+    heartbeat_file = heartbeat_path(tmp_path)
+    create_state(state_file, "run-a")
+
+    import datetime as _dt
+
+    import cognitive_runtime.training.model_factory.state as state_module
+
+    old_timestamp = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=1)).isoformat()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(state_module, "_now_iso", lambda: old_timestamp)
+        transition(state_file, STATE_RUNNING)  # "entered running" an hour ago
+
+    # A brand-new heartbeat -- but stamped with a different run's id.
+    write_heartbeat(heartbeat_file, run_id="some-other-run")
+
+    state = load_state(state_file)
+    assert is_stale(state, heartbeat_file, timeout_seconds=5.0)
+    recovered = recover_stale_worker(state_file, heartbeat_file, timeout_seconds=5.0)
+    assert recovered is not None
+    assert recovered.state == STATE_FAILED
+
+
+def test_recovery_uses_the_timeout_declared_at_creation_when_not_overridden(tmp_path):
+    state_file = state_path(tmp_path)
+    heartbeat_file = heartbeat_path(tmp_path)
+    create_state(state_file, "run-a", heartbeat_timeout_seconds=0.01)
+    transition(state_file, STATE_RUNNING)
+    write_heartbeat(heartbeat_file, run_id="run-a")
+
+    time.sleep(0.1)
+
+    recovered = recover_stale_worker(state_file, heartbeat_file)  # no override supplied
+    assert recovered is not None
+    assert recovered.state == STATE_FAILED
+
+
+def test_is_stale_requires_a_timeout_from_somewhere(tmp_path):
+    state_file = state_path(tmp_path)
+    create_state(state_file, "run-a")  # no heartbeat_timeout_seconds declared
+    transition(state_file, STATE_RUNNING)
+
+    with pytest.raises(StateError, match="no heartbeat_timeout_seconds"):
+        is_stale(load_state(state_file), heartbeat_path(tmp_path))
+
+
+def test_is_stale_rejects_an_override_that_conflicts_with_the_declared_timeout(tmp_path):
+    state_file = state_path(tmp_path)
+    create_state(state_file, "run-a", heartbeat_timeout_seconds=60.0)
+    transition(state_file, STATE_RUNNING)
+
+    with pytest.raises(StateError, match="conflicts with"):
+        is_stale(load_state(state_file), heartbeat_path(tmp_path), timeout_seconds=30.0)
+
+    # A non-conflicting (matching) override is accepted.
+    assert is_stale(
+        load_state(state_file), heartbeat_path(tmp_path), timeout_seconds=60.0,
+    ) in (True, False)
+
+
+def test_a_backward_clock_adjustment_is_treated_as_a_fresh_heartbeat_not_an_error(tmp_path):
+    """A wall-clock rollback after a heartbeat was written must not raise
+    inside the watchdog -- that would stop a polling loop from recovering
+    any later, genuinely stale worker."""
+    state_file = state_path(tmp_path)
+    heartbeat_file = heartbeat_path(tmp_path)
+    create_state(state_file, "run-a")
+    transition(state_file, STATE_RUNNING)
+
+    clock = {"now": 1_000_000.0}
+
+    def fake_clock() -> float:
+        return clock["now"]
+
+    write_heartbeat(heartbeat_file, run_id="run-a", clock=fake_clock)
+    clock["now"] = 999_999.0  # the clock moved backward after the heartbeat
+
+    # Must not raise ValueError from a negative age reaching watchdog_expired.
+    assert not is_stale(
+        load_state(state_file), heartbeat_file, timeout_seconds=300.0, clock=fake_clock,
+    )
+    assert recover_stale_worker(
+        state_file, heartbeat_file, timeout_seconds=300.0, clock=fake_clock,
+    ) is None
 
 
 _SIGKILL_WORKER_SCRIPT = textwrap.dedent(
