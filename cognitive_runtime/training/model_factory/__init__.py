@@ -156,6 +156,12 @@ if TYPE_CHECKING:
         build_corpus,
         resolve_corpus,
     )
+    from cognitive_runtime.training.model_factory.runner import (
+        DEFAULT_EPOCH_BUDGET,
+        RUNS_ROOT_DEFAULT,
+        TrialResult,
+        run_trial,
+    )
 
 __all__ = [
     "ArchitectureContract",
@@ -281,6 +287,10 @@ __all__ = [
     "population",
     "record_test_use",
     "lineage_graph",
+    "DEFAULT_EPOCH_BUDGET",
+    "RUNS_ROOT_DEFAULT",
+    "TrialResult",
+    "run_trial",
 ]
 
 
@@ -294,6 +304,17 @@ _LAZY_CORPUS_EXPORTS = {
     "resolve_corpus",
 }
 
+#: run_trial() always needs torch to do real work, so -- like the corpus
+#: module -- it is exported lazily to keep `import
+#: cognitive_runtime.training.model_factory` itself usable in the core-only
+#: install (issue #225).
+_LAZY_RUNNER_EXPORTS = {
+    "DEFAULT_EPOCH_BUDGET",
+    "RUNS_ROOT_DEFAULT",
+    "TrialResult",
+    "run_trial",
+}
+
 
 def __getattr__(name: str):
     """Keep the existing core-only Model Factory import boundary torch-free."""
@@ -301,4 +322,8 @@ def __getattr__(name: str):
         from cognitive_runtime.training.model_factory import corpus
 
         return getattr(corpus, name)
+    if name in _LAZY_RUNNER_EXPORTS:
+        from cognitive_runtime.training.model_factory import runner
+
+        return getattr(runner, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
