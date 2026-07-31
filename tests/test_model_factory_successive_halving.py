@@ -508,6 +508,71 @@ def test_no_survivor_when_every_candidate_is_gate_eliminated(tmp_path, corpus, m
     assert report.champion_comparison is None
 
 
+def test_last_rung_never_marks_multiple_candidates_as_advanced(tmp_path, corpus, monkeypatch):
+    """Regression (Codex review): the last rung has no next budget to
+    advance to, so RungReport.survivor_indices/advanced must stay empty
+    there even when several candidates pass both gates -- final_survivor_run_id
+    (picked by primary metric, ties broken by run_id) is the only record of
+    which one is the campaign's winner."""
+    budgets = (1, 2)
+    n = 4
+    rung0_ids = [f"sh-r0-c{i}" for i in range(n)]
+    rung1_ids = [f"sh-r1-c{i}" for i in range(n)]
+    _install_controls(
+        monkeypatch,
+        # Candidates 1 and 2 have the best rung-0 metric (guaranteeing both
+        # are among the top (4 // halving_factor == 2) kept) and both pass
+        # rung 1's gates too, with candidate 1 the best there.
+        gate_overrides={run_id: True for run_id in rung0_ids + rung1_ids},
+        metric_overrides={
+            rung0_ids[0]: 10.0, rung0_ids[1]: 1.0, rung0_ids[2]: 2.0, rung0_ids[3]: 11.0,
+            rung1_ids[1]: 1.0, rung1_ids[2]: 2.0,
+        },
+    )
+
+    report = _run_halving(_base_spec(corpus.corpus_id), tmp_path, budgets=budgets, n=n, seed=14)
+
+    rung1 = report.rungs[1]
+    assert rung1.rung_index == 1
+    assert rung1.survivor_indices == ()
+    assert all(result.advanced is False for result in rung1.results)
+    gate_passing_indices = {result.candidate_index for result in rung1.results if result.gate_passed}
+    assert gate_passing_indices == {1, 2}
+    assert report.final_survivor_run_id == rung1_ids[1]
+    assert report.final_survivor_metric_value == pytest.approx(1.0)
+
+
+def test_stage_budget_seconds_caps_the_whole_campaign(tmp_path, corpus, monkeypatch):
+    """AC/Codex review: stage_budget_seconds is a campaign-wide wall-clock
+    cap, not merely a per-genome cost-projection hint passed to propose() --
+    once it is spent, no further run_trial call is ever launched, in this
+    rung or any later one."""
+    real_run_trial = search_module.run_trial
+    calls = []
+
+    def _counting_run_trial(spec, *, run_id=None, **kwargs):
+        calls.append(run_id)
+        return real_run_trial(spec, run_id=run_id, **kwargs)
+
+    monkeypatch.setattr(search_module, "run_trial", _counting_run_trial)
+
+    budgets = (1, 2)
+    n = 3
+    report = _run_halving(
+        _base_spec(corpus.corpus_id), tmp_path, budgets=budgets, n=n, seed=15,
+        stage_budget_seconds=0.0,
+    )
+
+    assert calls == []  # the cap was already spent before the very first candidate
+    assert report.stage_budget_exceeded is True
+    assert len(report.rungs) == 1
+    assert [result.state for result in report.rungs[0].results] == ["not_attempted"] * n
+    assert all(result.epochs_executed == 0 for result in report.rungs[0].results)
+    assert all(result.gate_passed is False for result in report.rungs[0].results)
+    assert report.total_epochs_executed == 0
+    assert report.final_survivor_run_id is None
+
+
 # --------------------------------------------------------------------------- report shape
 
 

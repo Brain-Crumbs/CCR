@@ -57,6 +57,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -322,6 +323,12 @@ SUCCESSIVE_HALVING_FORMAT = "model-factory-successive-halving-v1"
 #: schema were built, not re-run per rung.
 _HALVING_GATES = (_rollout_beats_copy_last_gate, _rollout_health_gate)
 
+#: A candidate never launched because the campaign's own ``stage_budget_seconds``
+#: was already spent -- distinct from ``run_trial``'s own per-trial
+#: ``"budget_exceeded"`` (a trial that *started* but hit its individual
+#: ``training.max_training_seconds``).
+STATE_NOT_ATTEMPTED = "not_attempted"
+
 
 @dataclass(frozen=True)
 class RungCandidateResult:
@@ -332,9 +339,11 @@ class RungCandidateResult:
     (``budget_report["epochs_recorded"]``) -- the physical number of epochs
     trained this rung, never the rung's cumulative target. ``metric_value``
     and ``gates`` are only populated when ``state == "completed"``: a
-    candidate that ran out of its training-time budget mid-rung has no
-    trustworthy validation reading to rank or gate on, so it is eliminated
-    outright.
+    candidate that ran out of its training-time budget mid-rung (``state ==
+    "budget_exceeded"``), or was never launched because the campaign's own
+    ``stage_budget_seconds`` was already spent (``state ==
+    "not_attempted"``, see :data:`STATE_NOT_ATTEMPTED`), has no trustworthy
+    validation reading to rank or gate on, so it is eliminated outright.
     """
 
     candidate_index: int
@@ -401,6 +410,7 @@ class SuccessiveHalvingReport:
     total_epochs_executed: int
     theoretical_halving_epochs: int
     from_scratch_epochs: int
+    stage_budget_exceeded: bool
     final_survivor_run_id: Optional[str]
     final_survivor_metric_value: Optional[float]
     champion_comparison: Optional[Mapping[str, Any]]
@@ -417,6 +427,7 @@ class SuccessiveHalvingReport:
             "total_epochs_executed": self.total_epochs_executed,
             "theoretical_halving_epochs": self.theoretical_halving_epochs,
             "from_scratch_epochs": self.from_scratch_epochs,
+            "stage_budget_exceeded": self.stage_budget_exceeded,
             "final_survivor_run_id": self.final_survivor_run_id,
             "final_survivor_metric_value": self.final_survivor_metric_value,
             "champion_comparison": dict(self.champion_comparison) if self.champion_comparison is not None else None,
@@ -551,6 +562,19 @@ def run_successive_halving(
     (:func:`~.comparison.compare_paired_episodes`) against the final
     survivor's validation reading; ``None`` when there is no survivor (every
     candidate was eliminated) or no champion was named.
+
+    ``stage_budget_seconds``, when given, is a campaign-wide wall-clock cap
+    -- distinct from each candidate's own ``training.max_training_seconds``
+    (which every ``run_trial`` call already enforces per-trial, and which
+    :func:`propose` holds fixed across every candidate). Without this cap,
+    ``n`` siblings at rung 0 alone could consume up to ``n`` full per-trial
+    budgets, and every later rung would add more, letting the campaign as a
+    whole run arbitrarily long. Checked before launching *each* candidate:
+    once the campaign's elapsed wall-clock time reaches
+    ``stage_budget_seconds``, every remaining candidate (in the current rung
+    and any later rung) is recorded with ``state="not_attempted"`` and never
+    launched, :attr:`SuccessiveHalvingReport.stage_budget_exceeded` is
+    ``True``, and no further rungs run.
     """
     resolved_budgets = _validate_budgets(budgets)
     if halving_factor < 2:
@@ -575,11 +599,14 @@ def run_successive_halving(
 
     alive: List[_CandidateTrack] = list(tracks)
     rungs: List[RungReport] = []
+    final_candidates: List[Tuple[_CandidateTrack, RungCandidateResult]] = []
     reference_episode_ids: Optional[Tuple[str, ...]] = None
     total_epochs_executed = 0
     theoretical_halving_epochs = 0
     from_scratch_epochs = 0
     previous_budget = 0
+    stage_started = time.monotonic()
+    stage_budget_exceeded = False
 
     for rung_index, budget in enumerate(resolved_budgets):
         delta = budget - previous_budget
@@ -601,6 +628,26 @@ def run_successive_halving(
                     track.spec, mode="fine_tune", parent=dict(track.parent), training=child_training,
                 )
             validate_spec(child_spec)
+
+            # The campaign-wide wall-clock cap (distinct from each
+            # run_trial call's own per-trial `training.max_training_seconds`,
+            # which propose() already holds fixed across every candidate):
+            # `n` siblings at rung 0 alone can otherwise consume up to `n`
+            # full per-trial budgets before a single elimination ever
+            # happens. Checked *before* launching each call so an
+            # already-exhausted stage never starts one more trial.
+            if stage_budget_seconds is not None and (time.monotonic() - stage_started) >= stage_budget_seconds:
+                stage_budget_exceeded = True
+                results.append(RungCandidateResult(
+                    candidate_index=track.index, run_id=run_id, mode=child_spec.mode, budget=budget,
+                    epochs_executed=0, state=STATE_NOT_ATTEMPTED, metric_value=None, gates=(),
+                    gate_passed=False, advanced=False,
+                    reason=(
+                        f"skipped: the campaign's stage_budget_seconds ({stage_budget_seconds!r}) was "
+                        "already exhausted before this candidate could be attempted"
+                    ),
+                ))
+                continue
 
             result = run_trial(
                 child_spec, root=root, corpus_root=corpus_root, run_id=run_id,
@@ -665,8 +712,15 @@ def run_successive_halving(
             (track, result) for track, result in zip(participants, results) if result.gate_passed
         ]
         if is_last_rung:
-            target_keep = len(gate_passing)
-            survivors = gate_passing
+            # Nothing advances *from* the last rung -- there is no further
+            # budget to continue to (RungReport's own contract). Every
+            # gate-passing candidate here is a *candidate* for
+            # final_survivor_run_id, decided once below, after the loop --
+            # not an intermediate rung survivor, so `survivors` (which
+            # feeds `alive`/`advanced`/`survivor_indices`) stays empty.
+            target_keep = 0
+            survivors: List[Tuple[_CandidateTrack, RungCandidateResult]] = []
+            final_candidates = gate_passing
         else:
             target_keep = max(1, len(participants) // halving_factor)
             ranked = sorted(gate_passing, key=lambda pair: (pair[1].metric_value, pair[1].run_id))
@@ -679,6 +733,9 @@ def run_successive_halving(
             reason = result.reason
             if result.gate_passed and not advanced:
                 reason = (
+                    "passed both safety gates at the final rung; ranked among the final "
+                    "survivors by primary metric (no further budget to advance to)"
+                    if is_last_rung else
                     f"eliminated by successive-halving rank: kept only the best {target_keep} of "
                     f"{len(gate_passing)} gate-passing candidate(s) by {selection_metric!r} "
                     "(ties broken by run_id)"
@@ -692,15 +749,17 @@ def run_successive_halving(
 
         alive = [track for track, _ in survivors]
         previous_budget = budget
-        if not alive:
+        if not alive or stage_budget_exceeded:
             break
 
     final_survivor_run_id: Optional[str] = None
     final_survivor_metric_value: Optional[float] = None
-    if alive:
-        best_track = min(alive, key=lambda track: (track.last_metric_value, track.run_id))
+    if final_candidates:
+        best_track, best_result = min(
+            final_candidates, key=lambda pair: (pair[1].metric_value, pair[1].run_id),
+        )
         final_survivor_run_id = best_track.run_id
-        final_survivor_metric_value = best_track.last_metric_value
+        final_survivor_metric_value = best_result.metric_value
 
     champion_comparison: Optional[Dict[str, Any]] = None
     if champion_run_id is not None and final_survivor_run_id is not None:
@@ -729,7 +788,8 @@ def run_successive_halving(
         format=SUCCESSIVE_HALVING_FORMAT, seed=seed, method=method, budgets=resolved_budgets,
         initial_candidates=n, halving_factor=halving_factor, rungs=tuple(rungs),
         total_epochs_executed=total_epochs_executed, theoretical_halving_epochs=theoretical_halving_epochs,
-        from_scratch_epochs=from_scratch_epochs, final_survivor_run_id=final_survivor_run_id,
+        from_scratch_epochs=from_scratch_epochs, stage_budget_exceeded=stage_budget_exceeded,
+        final_survivor_run_id=final_survivor_run_id,
         final_survivor_metric_value=final_survivor_metric_value, champion_comparison=champion_comparison,
     )
 
@@ -739,6 +799,7 @@ __all__ = [
     "SearchError",
     "propose",
     "SUCCESSIVE_HALVING_FORMAT",
+    "STATE_NOT_ATTEMPTED",
     "RungCandidateResult",
     "RungReport",
     "SuccessiveHalvingReport",
