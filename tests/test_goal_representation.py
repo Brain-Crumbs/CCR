@@ -134,6 +134,15 @@ def test_goal_distribution_config_rejects_max_below_min():
         _config(min_initial_distance=5.0, max_initial_distance=4.0)
 
 
+def test_goal_distribution_config_rejects_zero_width_range():
+    """``max_initial_distance == min_initial_distance`` looks plausible but
+    is not sampleable: ``sample_caregiver_goal`` draws continuous points
+    from a bounding box, so a zero-width ring has ~0 probability of ever
+    landing on it and every reset would exhaust its attempts."""
+    with pytest.raises(ValueError):
+        _config(min_initial_distance=5.0, max_initial_distance=5.0)
+
+
 def test_goal_distribution_config_to_contract_dict_is_plain_data():
     config = _config(max_initial_distance=12.0)
     payload = config.to_contract_dict()
@@ -485,6 +494,32 @@ def test_crafter_world_second_episode_reset_gets_its_own_active_goal():
     assert len(events) == 1
     assert events[0].payload["active"] is True
     assert events[0].payload["source"] == CAREGIVER_SOURCE
+
+
+def test_crafter_world_snapshot_restore_preserves_goal_tracker_state():
+    """Regression: ``snapshot()``/``restore()`` must roll the caregiver goal
+    tracker back with the rest of the episode state, or a restored rollout
+    would rewind the world/position but keep whatever goal state happened
+    to be current at restore time (e.g. an already-arrived goal reporting
+    active again, or vice versa)."""
+    program, sensory, motor = _crafter_world(
+        goal_enabled=True, goal_min_initial_distance=4.0, goal_arrival_radius=1.0,
+        goal_commitment_horizon_ticks=1000,
+    )
+    goal_position = program._goal_setter.tracker._goal_position
+    snapshot_id = program.snapshot()
+
+    assert program._goal_setter.tracker.evaluate_arrival(goal_position) is True
+    program.step()
+    assert _goal_events(sensory)[-1].payload["active"] is False
+
+    program.restore(snapshot_id)
+    sensory.drain()
+    program.step()
+    restored_events = _goal_events(sensory)
+    assert restored_events
+    assert restored_events[-1].payload["active"] is True
+    assert program._goal_setter.tracker._goal_position == goal_position
 
 
 def test_crafter_world_harness_arrival_deactivates_the_published_goal():

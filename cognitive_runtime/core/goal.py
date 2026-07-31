@@ -162,11 +162,17 @@ class GoalDistributionConfig:
                 "arrived"
             )
         if self.max_initial_distance is not None and (
-            self.max_initial_distance < self.min_initial_distance
+            self.max_initial_distance <= self.min_initial_distance
         ):
+            # Strictly greater, not >=: sampling draws continuous points from
+            # a bounding box (`sample_caregiver_goal`), so a zero-width range
+            # (max == min) has ~0 probability of ever landing exactly on that
+            # distance -- every reset would exhaust its sampling attempts and
+            # raise, even though this config looked valid.
             raise ValueError(
-                f"max_initial_distance ({self.max_initial_distance!r}) must be >= "
-                f"min_initial_distance ({self.min_initial_distance!r})"
+                f"max_initial_distance ({self.max_initial_distance!r}) must be > "
+                f"min_initial_distance ({self.min_initial_distance!r}); a zero-width range "
+                "is not sampleable by sample_caregiver_goal's continuous rejection sampling"
             )
 
     def to_contract_dict(self) -> dict:

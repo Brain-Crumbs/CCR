@@ -343,6 +343,13 @@ class CrafterWorld(Program):
             (
                 self._env, self._tick, self._dead, self._done, self._last_action,
                 self._last_obs, self._last_state, self._achievements_earned,
+                # The caregiver goal tracker (issue #238) is per-episode
+                # mutable state too -- without it, restoring a snapshot taken
+                # while a goal was still active (or before/after it was
+                # reached) would rewind the world but leave the *current*
+                # goal state in place, desyncing internal.goal from the
+                # restored position.
+                self._goal_setter,
             )
         )
         return snapshot_id
@@ -351,6 +358,7 @@ class CrafterWorld(Program):
         (
             self._env, self._tick, self._dead, self._done, self._last_action,
             self._last_obs, self._last_state, self._achievements_earned,
+            self._goal_setter,
         ) = copy.deepcopy(self._snapshots[snapshot_id])
 
     def metadata(self) -> ProgramMetadata:
