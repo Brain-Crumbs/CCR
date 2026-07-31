@@ -46,6 +46,15 @@ from cognitive_runtime.training.model_factory.contracts import (
 )
 from cognitive_runtime.training.model_factory.genome import GenomeRepairError, build_schema
 from cognitive_runtime.training.model_factory.spec import DOCUMENT_FORMAT, resolve
+from cognitive_runtime.training.model_factory.state import (
+    STATE_COMPLETED,
+    STATE_FAILED,
+    STATE_RUNNING,
+    IncompleteRunError,
+    create_state,
+    state_path,
+    transition,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ORGANISM = "Crafter"
@@ -112,6 +121,19 @@ def _spec(*, lr, scheduled_sampling_p, rollout_frames, tier, selection_metric, c
     })
 
 
+def _write_trial_state(directory: Path, run_id: str, final_state: str) -> None:
+    """Drive a fabricated run's state.json through the real state machine to
+    ``final_state`` (``load_parent`` requires ``completed``; other tests use
+    this to exercise the rejection path for a non-completed parent)."""
+    path = state_path(directory)
+    create_state(path, run_id)
+    if final_state == "queued":
+        return
+    transition(path, STATE_RUNNING)
+    if final_state != STATE_RUNNING:
+        transition(path, final_state)
+
+
 def _make_parent_run(
     tmp_path: Path,
     *,
@@ -126,6 +148,7 @@ def _make_parent_run(
     selection_metric: str = "rollout.t+4.model_over_copy_last_mse",
     checkpoint_sha256: str = "0" * 64,
     checkpoint_name: str = "best-validation.pt",
+    trial_state: str = STATE_COMPLETED,
 ) -> Path:
     """Fabricate one completed parent run's on-disk artifacts: the JSON
     manifests ``load_parent`` actually reads, plus a hand-written checkpoint
@@ -143,6 +166,7 @@ def _make_parent_run(
     Path(f"{checkpoint_path}.json").write_text(
         json.dumps({"format": HEADER_FORMAT, "checkpoint_sha256": checkpoint_sha256}), encoding="utf-8",
     )
+    _write_trial_state(artifacts.directory, run_id, trial_state)
     return artifacts.directory
 
 
@@ -183,8 +207,26 @@ def test_load_parent_rejects_declared_tier_not_matching_recorded_budget(tmp_path
         load_parent(tmp_path, ORGANISM, "run-1", _schema(), tier="scale")
 
 
-def test_load_parent_raises_when_trial_spec_is_missing(tmp_path):
+@pytest.mark.parametrize("trial_state", [STATE_RUNNING, STATE_FAILED])
+def test_load_parent_rejects_a_run_that_is_not_completed(tmp_path, trial_state):
+    _make_parent_run(
+        tmp_path, run_id="run-1", lr=1e-4, scheduled_sampling_p=0.1, rollout_frames=4,
+        trial_state=trial_state,
+    )
+    with pytest.raises(IncompleteRunError, match="not eligible for promotion"):
+        load_parent(tmp_path, ORGANISM, "run-1", _schema(), tier="fast")
+
+
+def test_load_parent_raises_when_state_json_is_missing(tmp_path):
     (tmp_path / ORGANISM / "ghost").mkdir(parents=True)
+    with pytest.raises(BreedingError, match="no state.json"):
+        load_parent(tmp_path, ORGANISM, "ghost", _schema(), tier="fast")
+
+
+def test_load_parent_raises_when_trial_spec_is_missing(tmp_path):
+    directory = tmp_path / ORGANISM / "ghost"
+    directory.mkdir(parents=True)
+    _write_trial_state(directory, "ghost", STATE_COMPLETED)
     with pytest.raises(BreedingError, match="no trial_spec.json"):
         load_parent(tmp_path, ORGANISM, "ghost", _schema(), tier="fast")
 
@@ -408,6 +450,20 @@ def test_breed_every_gene_traces_to_a_named_parent_a_mutation_or_a_repair(tmp_pa
             assert lineage.child_genome[name] == expected_after_mutation
 
 
+def test_breed_rejects_a_schema_that_does_not_match_the_parents_recorded_stage(tmp_path):
+    parent_a, parent_b, schema = _default_parents(tmp_path)
+    assert schema.version != "generic_action_effects_v1"
+    other_schema = build_schema(
+        "another_stage_v1",
+        {"scheduled_sampling_p": {
+            "type": "float", "bounds": (0.0, 0.5), "default": 0.25,
+            "mutation": {"distribution": "normal_perturb", "sigma": 0.05},
+        }},
+    )
+    with pytest.raises(BreedingError, match="genome schema"):
+        breed(parent_a, parent_b, other_schema, objective="windowed_rollout", generation=1, seed=0)
+
+
 def test_breed_rejects_an_unknown_training_objective(tmp_path):
     parent_a, parent_b, schema = _default_parents(tmp_path)
     with pytest.raises(ValueError, match="unknown training objective"):
@@ -461,6 +517,14 @@ def test_breed_restores_fixed_budget_fields_even_if_a_schema_declares_a_gene_for
     )
     result = breed(rogue_a, rogue_b, rogue_schema, objective="windowed_rollout", generation=1, seed=0, mutation_rate=1.0)
     assert result.child_spec.training["max_training_seconds"] == tier_seconds
+    # lineage.json's own recorded child_genome must never describe a value
+    # trial_spec.json no longer actually trains with (the fixed field is
+    # restored in the genome itself, not just in the assembled training
+    # block), and any diff introduced by that restoration is itself
+    # explained as a recorded repair.
+    assert result.lineage.child_genome["max_training_seconds"] == tier_seconds
+    if "max_training_seconds" in result.lineage.mutations:
+        assert result.lineage.repairs["max_training_seconds"]["to"] == tier_seconds
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +566,23 @@ def test_record_breeding_lineage_rejects_a_mismatched_weight_donor(tmp_path):
     )
     with pytest.raises(BreedingError, match="does not match"):
         record_breeding_lineage(child_artifacts.directory, other_result.lineage)
+
+
+def test_record_breeding_lineage_rejects_mismatched_configuration_parents(tmp_path):
+    parent_a, parent_b, schema = _default_parents(tmp_path)
+    result = breed(parent_a, parent_b, schema, objective="windowed_rollout", generation=1, seed=0)
+    architecture = _architecture_contract("a")
+    data = _data_contract("a")
+    training = TrainingContract(**dict(result.child_spec.training))
+    child_artifacts = allocate_run_artifacts(
+        tmp_path, result.child_spec, architecture, data, training, run_id="child-3",
+    )
+    # A lineage record naming the same weight donor but different
+    # configuration parents (e.g. mixed up with a sibling bred child) must
+    # still be refused -- matching the donor alone is not enough.
+    foreign_lineage = replace(result.lineage, parent_b_run_id="some-other-run")
+    with pytest.raises(BreedingError, match="configuration_parents"):
+        record_breeding_lineage(child_artifacts.directory, foreign_lineage)
 
 
 def test_record_breeding_lineage_requires_an_already_allocated_run(tmp_path):

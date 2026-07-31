@@ -95,6 +95,11 @@ from cognitive_runtime.training.model_factory.spec import (
     resolve as resolve_spec,
     validate as validate_spec,
 )
+from cognitive_runtime.training.model_factory.state import (
+    load_state,
+    require_completed_for_promotion,
+    state_path,
+)
 
 #: The one genetic operator this module implements (§14.2's "uniform
 #: crossover"). Recorded verbatim into a bred child's
@@ -110,7 +115,9 @@ LINEAGE_DETAIL_FORMAT = "model-factory-breeding-lineage-v1"
 #: gene rooted at any of these three ``TrainingContract`` fields, and letting
 #: crossover/mutation vary them would silently move a bred child out of the
 #: budget tier both parents were required (by :func:`check_compatible`) to
-#: share. Restored from the weight donor's own spec after every genome merge.
+#: share. Restored from the weight donor's own spec directly in the resolved
+#: genome, before it is merged into ``training`` or recorded into the
+#: lineage (see :func:`breed`).
 _FIXED_BUDGET_FIELDS: Tuple[str, ...] = ("epoch_budget", "step_budget", "max_training_seconds")
 
 _MISSING = object()
@@ -220,8 +227,20 @@ def load_parent(
     own persisted ``training.max_training_seconds`` so a mislabeled tier is
     rejected immediately rather than silently corrupting a later
     :func:`check_compatible` comparison.
+
+    Requires ``run_id``'s own persisted trial state (:mod:`.state`) to be
+    ``completed`` -- the same gate :func:`~.state.require_completed_for_promotion`
+    enforces on the promotion path. A run with a checkpoint on disk but a
+    ``running``/``failed``/``cancelled``/``budget_exceeded`` state was never
+    fully evaluated, so breeding from it would let an incompletely-evaluated
+    trial influence offspring exactly like an unpromoted candidate.
     """
     directory = Path(root) / organism / run_id
+    try:
+        trial_state = load_state(state_path(directory))
+    except FileNotFoundError:
+        raise BreedingError(f"no state.json for run at {directory}") from None
+    require_completed_for_promotion(trial_state)
     spec = _load_run_spec(directory)
 
     expected_seconds = budget_seconds_for_tier(tier)
@@ -428,11 +447,21 @@ def breed(
     corpus. The child's ``data``/``model`` blocks are copied unchanged from
     the weight donor's own spec (compatibility already guarantees the other
     parent's are equivalent), and ``epoch_budget``/``step_budget``/
-    ``max_training_seconds`` are restored from the donor's spec after the
-    genome merge so a caller-supplied schema can never let crossover or
-    mutation drift the child out of the budget tier both parents share.
+    ``max_training_seconds`` are restored from the donor's spec directly in
+    the resolved genome (before it is merged into ``training`` or recorded
+    into the lineage) so a caller-supplied schema can never let crossover or
+    mutation drift the child -- or its lineage record -- out of the budget
+    tier both parents share.
     """
     check_compatible(parent_a, parent_b)
+    for parent in (parent_a, parent_b):
+        if parent.genome_schema_version != genome_schema.version:
+            raise BreedingError(
+                f"parent {parent.run_id!r} was loaded under genome schema "
+                f"{parent.genome_schema_version!r}, but breed() was given schema "
+                f"{genome_schema.version!r}; both parents' genomes must be read under "
+                "the exact schema breed() uses for crossover and mutation"
+            )
     rng = random.Random(seed)
 
     if weight_donor is None:
@@ -458,6 +487,18 @@ def breed(
         min_episode_length=min_episode_length, stage_budget_seconds=stage_budget_seconds,
         cost_model=cost_model,
     )
+    # §13.1/§15's fixed-budget-tier discipline: restore any of these three
+    # TrainingContract fields a caller-supplied schema might declare a gene
+    # for, directly in the genome that becomes *both* trial_spec.json's
+    # training block and lineage.json's own child_genome below. Restoring
+    # only where the genome is later merged into `training` (as
+    # search.propose() does) would leave lineage.json's recorded
+    # child_genome/repairs describing a crossed-over or mutated value that
+    # trial_spec.json no longer actually trains with, defeating
+    # reproduction from the lineage record alone.
+    for field in _FIXED_BUDGET_FIELDS:
+        if field in child_genome:
+            child_genome[field] = donor.spec.training.get(field)
     repairs = {
         name: {"from": mutated_genome[name], "to": child_genome[name]}
         for name in genome_schema.genes
@@ -465,8 +506,6 @@ def breed(
     }
 
     child_training = _apply_genome(donor.spec.training, child_genome)
-    for field in _FIXED_BUDGET_FIELDS:
-        child_training[field] = donor.spec.training.get(field)
 
     child_evolution = {
         "generation": generation,
@@ -528,6 +567,13 @@ def record_breeding_lineage(run_directory: Union[str, Path], lineage: BreedingLi
         raise BreedingError(
             f"lineage.json weight_donor ({existing.get('weight_donor')!r}) does not match "
             f"this breeding record's weight donor ({lineage.weight_donor_run_id!r}); refusing to "
+            "attach a breeding record to a run it does not describe"
+        )
+    expected_parents = [lineage.parent_a_run_id, lineage.parent_b_run_id]
+    if list(existing.get("configuration_parents") or []) != expected_parents:
+        raise BreedingError(
+            f"lineage.json configuration_parents ({existing.get('configuration_parents')!r}) does not "
+            f"match this breeding record's configuration parents ({expected_parents!r}); refusing to "
             "attach a breeding record to a run it does not describe"
         )
     enriched = dict(existing)
