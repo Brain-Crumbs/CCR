@@ -146,6 +146,11 @@ from cognitive_runtime.training.model_factory.genome import (
     repair,
     sample_genome,
 )
+from cognitive_runtime.training.model_factory.search import (
+    METHODS as SEARCH_METHODS,
+    SearchError,
+    propose,
+)
 from cognitive_runtime.training.model_factory.registry import (
     DECISION_HOLD,
     DECISION_PROMOTE,
@@ -329,6 +334,9 @@ __all__ = [
     "project_cost_seconds",
     "repair",
     "sample_genome",
+    "SEARCH_METHODS",
+    "SearchError",
+    "propose",
 ]
 
 
