@@ -31,6 +31,12 @@
 # episode counts, and every generator parameter -- all frozen into this
 # corpus's ``DataContract`` and hashed into ``data_contract_hash``.
 #
+# ``episode_ticks: 200`` applies to the two motor_babbling scenarios (the
+# four canaries fix their own, typically shorter, episode length regardless
+# of this value -- see ``_record_scenario_episode``): long enough that both
+# evaluation modes' ``n > horizon_frames + warmup_frames`` requirement is
+# comfortably met at every declared horizon below, including t+100.
+#
 # The four canary scenarios (walk_forward_short, blocked_forward, turn,
 # approach_entity) keep their own specialized quality gates
 # (NurseryScenario's per-scenario thresholds) regardless of this corpus's
@@ -41,7 +47,7 @@ organism: Crafter
 generator:
   world: crafter
   backend: crafter
-  episode_ticks: 40
+  episode_ticks: 200
   horizons: [1, 10, 100]
 splits:
   train:
@@ -58,7 +64,17 @@ splits:
     blocked_forward: [1000]
     turn: [1000]
     approach_entity: [1000]
-  test: {}
+  # Sealed test (split_roles.test below): disjoint seeds from train/validation,
+  # queried only by the explicit final_test action (never routine search or
+  # promotion). Left empty here would refuse every final_test call for a
+  # candidate trained from this corpus once training cost is already spent.
+  test:
+    motor_babbling_open: [2000, 2001]
+    motor_babbling_walls: [2000, 2001]
+    walk_forward_short: [2000]
+    blocked_forward: [2000]
+    turn: [2000]
+    approach_entity: [2000]
 # Epic Sec 12.2's declared data-collection mix: the *train*-split scenario
 # weights that must be reproduced (within tolerance) by every corpus build
 # sharing this declaration -- a build that misses them fails its quality
