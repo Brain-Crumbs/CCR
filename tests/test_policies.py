@@ -1,9 +1,12 @@
 """Baseline policy behavior tests."""
 
+import pytest
+
+from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.observation import Observation
 from cognitive_runtime.core.perception import State
-from cognitive_runtime.policies import NullPolicy, RandomPolicy, ScriptedSurvivalPolicy
+from cognitive_runtime.policies import ActionBurstPolicy, NullPolicy, RandomPolicy, ScriptedSurvivalPolicy
 from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
 
 
@@ -58,6 +61,77 @@ def test_random_policy_samples_action_space_deterministically():
     assert seq_a == seq_b
     assert all(action in ACTION_SPACE for action in seq_a)
     assert len({action.key() for action in seq_a}) > 5
+
+
+_BABBLING_ACTIONS = [
+    Action("MOVE_UP"), Action("MOVE_DOWN"), Action("MOVE_LEFT"), Action("MOVE_RIGHT"), Action("NULL"),
+]
+
+
+def test_action_burst_policy_is_deterministic_given_seed():
+    a = ActionBurstPolicy(_BABBLING_ACTIONS, seed=7)
+    b = ActionBurstPolicy(_BABBLING_ACTIONS, seed=7)
+    memory = Memory()
+    seq_a = [a.decide(_state(_obs()), memory, None) for _ in range(200)]
+    seq_b = [b.decide(_state(_obs()), memory, None) for _ in range(200)]
+    assert seq_a == seq_b
+
+
+def test_action_burst_policy_only_samples_its_action_subset():
+    policy = ActionBurstPolicy(_BABBLING_ACTIONS, seed=1)
+    memory = Memory()
+    seq = [policy.decide(_state(_obs()), memory, None) for _ in range(200)]
+    assert set(seq) <= set(_BABBLING_ACTIONS)
+    assert len(set(seq)) > 1
+
+
+def test_action_burst_policy_holds_each_action_within_its_burst_bounds():
+    """Sampled burst lengths (``rng.randint(min, max)``) must land in
+    [1, 4] -- checked by spying on the burst-length draw itself, not by
+    inferring runs from the emitted action sequence: two consecutive bursts
+    can coincidentally sample the same action back to back (5 actions, so a
+    repeat has ~20% odds per resample), which would otherwise read as one
+    longer run."""
+    policy = ActionBurstPolicy(_BABBLING_ACTIONS, min_burst_ticks=1, max_burst_ticks=4, seed=2)
+    drawn_lengths = []
+    original_randint = policy.rng.randint
+
+    def spy_randint(a, b):
+        length = original_randint(a, b)
+        drawn_lengths.append(length)
+        return length
+
+    policy.rng.randint = spy_randint
+    memory = Memory()
+    for _ in range(500):
+        policy.decide(_state(_obs()), memory, None)
+
+    assert drawn_lengths
+    assert min(drawn_lengths) >= 1
+    assert max(drawn_lengths) <= 4
+    # Every burst length in [1, 4] should be observed across a long sample.
+    assert set(drawn_lengths) == {1, 2, 3, 4}
+
+
+def test_action_burst_policy_reset_restarts_the_same_deterministic_sequence():
+    policy = ActionBurstPolicy(_BABBLING_ACTIONS, seed=9)
+    memory = Memory()
+    first = [policy.decide(_state(_obs()), memory, None) for _ in range(50)]
+    policy.reset()
+    second = [policy.decide(_state(_obs()), memory, None) for _ in range(50)]
+    assert first == second
+
+
+def test_action_burst_policy_rejects_empty_action_space():
+    with pytest.raises(ValueError):
+        ActionBurstPolicy([], seed=0)
+
+
+def test_action_burst_policy_rejects_invalid_burst_bounds():
+    with pytest.raises(ValueError):
+        ActionBurstPolicy(_BABBLING_ACTIONS, min_burst_ticks=0, seed=0)
+    with pytest.raises(ValueError):
+        ActionBurstPolicy(_BABBLING_ACTIONS, min_burst_ticks=4, max_burst_ticks=1, seed=0)
 
 
 def test_scripted_policy_eats_when_hungry():
