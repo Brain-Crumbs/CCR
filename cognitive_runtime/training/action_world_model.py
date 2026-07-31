@@ -56,8 +56,8 @@ from cognitive_runtime.core.streams import TemporalBuffer, TemporalFusion
 from cognitive_runtime.core.streams.events import StreamSpec
 from cognitive_runtime.runtime.replay import load_session_metadata, require_streams_v2
 from cognitive_runtime.training.event_evaluation import (
-    COW_ID, evaluate_entity_predictions, extract_frame_event_labels, flattened_motion_metrics,
-    motion_stratified_metrics, rollout_health as classify_rollout_health,
+    ACTION_EFFECT_CLASSES, COW_ID, evaluate_entity_predictions, extract_frame_event_labels,
+    flattened_motion_metrics, motion_stratified_metrics, rollout_health as classify_rollout_health,
 )
 from cognitive_runtime.training.model_factory.checkpoint import (
     BestValidationTracker, TrainerResumeState, capture_trainer_rng_state, checkpoint_due,
@@ -1947,6 +1947,11 @@ def evaluate_action_world_model_direct(
     entity_cells = {tick: [] for tick in ticks}
     strata = {tick: {name: [] for name in ("moving", "static", "blocked", "turning", "entity_entry", "entity_exit")}
                for tick in ticks}
+    # MF-E1's mutually-exclusive/exhaustive taxonomy (issue #237, epic #212
+    # Sec 12.3), kept separate from ``strata`` above: that dict's own
+    # "blocked"/"moving" keys are overlapping event flags, not a partition,
+    # so pooling them the same way would double-count transitions.
+    effect_strata = {tick: {cls: [] for cls in ACTION_EFFECT_CLASSES} for tick in ticks}
 
     was_training = model.training
     model.eval()
@@ -1976,8 +1981,15 @@ def evaluate_action_world_model_direct(
                 starts = list(starts)[:max_starts_per_episode]
             episode_mse = {tick: [] for tick in ticks}
             action_names = [dataset.action_keys[index] for index in episode.actions]
+            # Length-guarded like ``episode.semantic_grids`` itself just
+            # below: a mismatched facing recording only forgoes
+            # ``turned_only`` detection (extract_frame_event_labels treats a
+            # missing facings arg as "unknown"), it must never index out of
+            # bounds against a shorter/longer recorded stream.
+            facings = episode.facing if len(episode.facing) == len(episode.semantic_grids) else None
             labels = extract_frame_event_labels(
                 episode.semantic_grids, positions=episode.positions, actions=action_names,
+                facings=facings,
             ) if len(episode.semantic_grids) == len(episode.frames) else []
             for t in starts:
                 decoded_by_tick = {}
@@ -2012,6 +2024,7 @@ def evaluate_action_world_model_direct(
                         if event_label.entity_left: strata[tick]["entity_exit"].append(row)
                         if t < len(episode.facing) and t + frame < len(episode.facing) and episode.facing[t] != episode.facing[t + frame]:
                             strata[tick]["turning"].append(row)
+                        effect_strata[tick][event_label.action_effect_class].append(row)
                         logits = visual.get("semantic_logits")
                         if logits is not None and logits.shape[1] > COW_ID:
                             probabilities = torch.softmax(logits[0], dim=0)[COW_ID]
@@ -2065,10 +2078,11 @@ def evaluate_action_world_model_direct(
         "prediction_health": {"prediction_dispersion": _mean(prediction_dispersion) if prediction_dispersion else 0.0,
                               "target_dispersion": _mean(target_dispersion) if target_dispersion else 0.0},
         "event_metrics": {
-            tick: (lambda motion: {
+            tick: (lambda motion, effect_class: {
                 "entity": evaluate_entity_predictions(entity_labels[tick], entity_probabilities[tick], entity_cells[tick]),
                 "motion": motion, **flattened_motion_metrics(motion),
-            })(motion_stratified_metrics(strata[tick]))
+                "effect_class": effect_class,
+            })(motion_stratified_metrics(strata[tick]), motion_stratified_metrics(effect_strata[tick]))
             for tick in ticks
         },
         "per_episode_model_mse": per_episode_model_mse,
@@ -2142,6 +2156,12 @@ def evaluate_action_world_model(
         h: {name: [] for name in ("moving", "static", "blocked", "turning", "entity_entry", "entity_exit")}
         for h in horizons_sorted
     }
+    # MF-E1's mutually-exclusive/exhaustive taxonomy (issue #237, epic #212
+    # Sec 12.3), kept separate from ``strata`` above -- see the matching
+    # comment in ``evaluate_action_world_model_direct``.
+    effect_strata: Dict[int, Dict[str, List[Dict[str, float]]]] = {
+        h: {cls: [] for cls in ACTION_EFFECT_CLASSES} for h in horizons_sorted
+    }
 
     was_training = model.training
     model.eval()
@@ -2174,8 +2194,15 @@ def evaluate_action_world_model(
                 starts = list(starts)[:max_starts_per_episode]
             episode_model_mse: Dict[int, List[float]] = {h: [] for h in horizons_sorted}
             action_names = [dataset.action_keys[index] for index in episode.actions]
+            # Length-guarded like ``episode.semantic_grids`` itself just
+            # below: a mismatched facing recording only forgoes
+            # ``turned_only`` detection (extract_frame_event_labels treats a
+            # missing facings arg as "unknown"), it must never index out of
+            # bounds against a shorter/longer recorded stream.
+            facings = episode.facing if len(episode.facing) == len(episode.semantic_grids) else None
             labels = extract_frame_event_labels(
                 episode.semantic_grids, positions=episode.positions, actions=action_names,
+                facings=facings,
             ) if len(episode.semantic_grids) == len(episode.frames) else []
             for t in starts:
                 reference_encoding = model.encode_visual(pixels[t : t + 1])
@@ -2222,6 +2249,7 @@ def evaluate_action_world_model(
                             strata[h]["entity_exit"].append(row)
                         if t < len(episode.facing) and t + h < len(episode.facing) and episode.facing[t] != episode.facing[t + h]:
                             strata[h]["turning"].append(row)
+                        effect_strata[h][event_label.action_effect_class].append(row)
                         logits = rollout[h].semantic_logits
                         if logits is not None and logits.shape[1] > COW_ID:
                             probabilities = torch.softmax(logits.squeeze(0), dim=0)[COW_ID]
@@ -2324,10 +2352,11 @@ def evaluate_action_world_model(
         "workspace_modalities": workspace_report,
         "rollout_health": rollout_health,
         "event_metrics": {
-            h: (lambda motion: {
+            h: (lambda motion, effect_class: {
                 "entity": evaluate_entity_predictions(entity_labels[h], entity_probabilities[h], entity_cells[h]),
                 "motion": motion, **flattened_motion_metrics(motion),
-            })(motion_stratified_metrics(strata[h]))
+                "effect_class": effect_class,
+            })(motion_stratified_metrics(strata[h]), motion_stratified_metrics(effect_strata[h]))
             for h in horizons_sorted
         },
         "per_episode_model_mse": per_episode_model_mse,

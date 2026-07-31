@@ -11,18 +11,30 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence, Union
+
+import yaml
 
 from cognitive_runtime.record.quality import SplitOverlapReport, audit_split_overlap
+from cognitive_runtime.training.action_effect_taxonomy import ACTION_EFFECT_LABEL_VERSION
 from cognitive_runtime.training.model_factory.artifacts import atomic_write_json
 from cognitive_runtime.training.model_factory.contracts import DataContract, contract_hash
 CORPUS_SPEC_FORMAT = "model-factory-corpus-spec-v1"
 CORPUS_MANIFEST_FORMAT = "model-factory-corpus-manifest-v1"
 QUALITY_REPORT_FORMAT = "model-factory-corpus-quality-v1"
 SPLIT_OVERLAP_REPORT_FORMAT = "model-factory-corpus-split-overlap-v1"
+
+#: Epic #212 Sec 12.6's "role of each split" field, applied when a spec
+#: doesn't declare its own ``split_roles``.
+DEFAULT_SPLIT_ROLES: Dict[str, str] = {
+    "train": "generic_training",
+    "validation": "validation",
+    "test": "sealed_test",
+}
 
 # In-process convenience only.  The on-disk fallback in ``_corpus_directory``
 # keeps resolution usable by a later process when the conventional root is
@@ -185,6 +197,88 @@ def _split_assignments(spec: Mapping[str, Any], cfg: CorpusNurseryConfig) -> Dic
     return result
 
 
+def _scenario_mix_policy(spec: Mapping[str, Any], splits: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize an optional declared per-scenario data-collection mix
+    (epic #212 Sec 12.2). Returns ``None`` when the spec declares none --
+    the mix gate is opt-in, since not every corpus (e.g. a single-scenario
+    canary-only corpus) has a percentage policy to check.
+    """
+    raw = spec.get("scenario_mix")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise TypeError("corpus spec scenario_mix must be a mapping")
+    split = str(raw.get("split", "train"))
+    if split not in splits:
+        raise ValueError(f"scenario_mix split {split!r} is not one of train/validation/test")
+    weights_raw = raw.get("weights")
+    if not isinstance(weights_raw, Mapping) or not weights_raw:
+        raise ValueError("corpus spec scenario_mix requires a non-empty weights mapping")
+    weights = {str(scenario): float(fraction) for scenario, fraction in weights_raw.items()}
+    unknown = set(weights) - set(splits[split])
+    if unknown:
+        raise ValueError(
+            f"scenario_mix weights name scenarios not in the {split!r} split: {sorted(unknown)!r}"
+        )
+    total_weight = sum(weights.values())
+    if not math.isclose(total_weight, 1.0, abs_tol=1e-6):
+        raise ValueError(f"scenario_mix weights must sum to 1.0, got {total_weight!r}")
+    tolerance = float(raw.get("tolerance", 0.1))
+    if tolerance < 0:
+        raise ValueError(f"scenario_mix tolerance must be non-negative, got {tolerance!r}")
+    return {"split": split, "weights": weights, "tolerance": tolerance}
+
+
+def _scenario_mix_report(
+    sessions: Mapping[str, Sequence[Mapping[str, Any]]],
+    policy: Optional[Mapping[str, Any]],
+) -> tuple[Optional[Dict[str, Any]], list[str]]:
+    """Realised-vs-declared scenario mix.
+
+    The declared percentages are "a starting data-collection policy, not a
+    fixed scientific constant" (epic #212 Sec 12.2), but a build that misses
+    them beyond the declared ``tolerance`` fails its quality gate rather
+    than being silently accepted (issue #237's acceptance criterion) -- a
+    generator bug or a rejected-episode retry loop that skews the realised
+    mix must be visible, not just the requested one.
+    """
+    if not policy:
+        return None, []
+    split = str(policy["split"])
+    weights: Mapping[str, float] = policy["weights"]
+    tolerance = float(policy["tolerance"])
+    entries = sessions.get(split, [])
+    total = len(entries)
+    counts: Dict[str, int] = {}
+    for entry in entries:
+        scenario = str(entry["scenario"])
+        counts[scenario] = counts.get(scenario, 0) + 1
+    realised = {
+        scenario: (counts.get(scenario, 0) / total if total else 0.0)
+        for scenario in weights
+    }
+    issues: list[str] = []
+    for scenario, declared_fraction in weights.items():
+        actual = realised[scenario]
+        if abs(actual - declared_fraction) > tolerance:
+            issues.append(
+                f"scenario mix: {split!r} split's realised {scenario!r} fraction "
+                f"{actual:.1%} is outside the declared {declared_fraction:.1%} "
+                f"+/- {tolerance:.1%} tolerance"
+            )
+    report = {
+        "format": "model-factory-corpus-scenario-mix-v1",
+        "split": split,
+        "declared": dict(weights),
+        "tolerance": tolerance,
+        "realised": realised,
+        "realised_counts": counts,
+        "total_sessions": total,
+        "within_tolerance": not issues,
+    }
+    return report, issues
+
+
 def _corpus_spec_payload(spec: Mapping[str, Any], cfg: CorpusNurseryConfig, splits: Mapping[str, Any]) -> Dict[str, Any]:
     """The immutable declaration, excluding where the corpus happens to live."""
     generator = _ordinary(cfg)
@@ -205,6 +299,10 @@ def _corpus_spec_payload(spec: Mapping[str, Any], cfg: CorpusNurseryConfig, spli
         "split_overlap_policy": _ordinary(spec.get("split_overlap_policy", {
             "max_corresponding_frame_fraction": cfg.max_corresponding_frame_fraction,
         })),
+        # Epic #212 Sec 12.6's "role of each split" field.
+        "split_roles": _ordinary(spec.get("split_roles", DEFAULT_SPLIT_ROLES)),
+        # Epic #212 Sec 12.2's declared data-collection mix, when present.
+        "scenario_mix_policy": _scenario_mix_policy(spec, splits),
     }
     return payload
 
@@ -294,6 +392,40 @@ def _session_quality_evidence(
     return evidence
 
 
+def _scenario_generator_summary(
+    generator_evidence: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Per-scenario generator identity (epic #212 Sec 12.6), deduplicated
+    from per-session evidence.
+
+    Strips the fields that vary *per episode* by construction --
+    ``generator_seed``, and ``layout_distribution``'s own
+    ``layout_seed``/``realised_layout`` -- leaving only the generator's
+    constant declared shape: name, version, action subset, burst
+    distribution, and (for ``motor_babbling_walls``) the wall/layout
+    distribution. Every episode of one scenario shares this shape by
+    construction (it comes from that scenario's one generator function), so
+    the first episode's cleaned evidence stands for the whole scenario.
+    """
+    summary: Dict[str, Dict[str, Any]] = {}
+    for entry in generator_evidence.values():
+        generator = entry.get("generator")
+        if not generator:
+            continue
+        scenario = str(entry["scenario"])
+        if scenario in summary:
+            continue
+        cleaned = {key: value for key, value in generator.items() if key != "generator_seed"}
+        layout = cleaned.get("layout_distribution")
+        if isinstance(layout, Mapping):
+            cleaned["layout_distribution"] = {
+                key: value for key, value in layout.items()
+                if key not in ("layout_seed", "realised_layout")
+            }
+        summary[scenario] = cleaned
+    return summary
+
+
 def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapping[str, Any]]]) -> DataContract:
     generator = spec["generator"]
     quality_policy = spec["quality_policy"]
@@ -305,6 +437,7 @@ def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapp
         # explicit.  This includes the declared layout distribution and mix
         # bounds, not just post-hoc aggregate counts.
         program_config["scenario_generator_evidence"] = generator_evidence
+    is_crafter = generator["world"] == "crafter"
     return DataContract(
         world=str(generator["world"]),
         backend=str(generator["backend"]),
@@ -323,14 +456,17 @@ def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapp
             or "unspecified"
         ),
         semantic_vocabulary_version=(
-            _nursery_module().SEMANTIC_VOCABULARY_VERSION
-            if generator["world"] == "crafter" else "none"
+            _nursery_module().SEMANTIC_VOCABULARY_VERSION if is_crafter else "none"
         ),
         preprocessing_version=str(spec["preprocessing_version"]),
         horizons_ticks=tuple(int(value) for value in generator["horizons"]),
         ticks_per_frame=1.0,
         quality_policy=quality_policy,
         split_overlap_policy=spec["split_overlap_policy"],
+        scenario_generators=_scenario_generator_summary(generator_evidence),
+        action_effect_label_schema_version=(ACTION_EFFECT_LABEL_VERSION if is_crafter else ""),
+        split_roles=dict(spec.get("split_roles", DEFAULT_SPLIT_ROLES)),
+        scenario_mix_policy=dict(spec.get("scenario_mix_policy") or {}),
     )
 
 
@@ -375,6 +511,27 @@ def _verify_manifest_sessions(
                 f"corpus {corpus_id!r} manifest {split!r} sessions do not match its data contract"
             )
     return sessions
+
+
+def load_corpus_spec(path: Union[str, Path]) -> Dict[str, Any]:
+    """Load a raw corpus spec document from ``.yaml``/``.yml``/``.json``.
+
+    Mirrors ``spec.load_spec``'s input-convenience contract: YAML/JSON is
+    accepted input, the plain mapping is returned unresolved and
+    unvalidated -- :func:`build_corpus` is what freezes and gates it.
+    """
+    path = Path(path)
+    suffix = path.suffix.lower()
+    text = path.read_text(encoding="utf-8")
+    if suffix in (".yaml", ".yml"):
+        raw = yaml.safe_load(text)
+    elif suffix == ".json":
+        raw = json.loads(text)
+    else:
+        raise ValueError(f"unsupported corpus spec file extension {suffix!r} for {path}")
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"corpus spec file {path} must contain a mapping at the top level")
+    return dict(raw)
 
 
 def build_corpus(spec: Mapping[str, Any]) -> ResolvedCorpus:
@@ -446,6 +603,9 @@ def build_corpus(spec: Mapping[str, Any]) -> ResolvedCorpus:
                     ),
                 ))
 
+    mix_report, mix_issues = _scenario_mix_report(sessions, frozen_spec.get("scenario_mix_policy"))
+    quality_issues.extend(mix_issues)
+
     set_issues = _check_split_sets(sessions)
     pair_reports: Dict[str, Dict[str, Any]] = {}
     overlap_issues = list(set_issues)
@@ -467,6 +627,7 @@ def build_corpus(spec: Mapping[str, Any]) -> ResolvedCorpus:
         "passed": not quality_issues,
         "issues": quality_issues,
         "action_effect_evidence": _session_quality_evidence(sessions),
+        "scenario_mix_report": mix_report,
     }
     split_payload = {
         "format": SPLIT_OVERLAP_REPORT_FORMAT,
@@ -549,7 +710,9 @@ __all__ = [
     "CORPUS_MANIFEST_FORMAT",
     "QUALITY_REPORT_FORMAT",
     "SPLIT_OVERLAP_REPORT_FORMAT",
+    "DEFAULT_SPLIT_ROLES",
     "ResolvedCorpus",
     "build_corpus",
+    "load_corpus_spec",
     "resolve_corpus",
 ]
