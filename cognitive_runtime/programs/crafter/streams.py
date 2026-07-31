@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from cognitive_runtime.core.goal import GOAL_STREAM, GOAL_STREAM_SPEC, GoalState
 from cognitive_runtime.core.streams.bus import SensoryStreamBus
 from cognitive_runtime.core.streams.delta import DeltaPublisher
 from cognitive_runtime.core.streams.events import StreamEvent, StreamSpec
@@ -186,6 +187,7 @@ def build_crafter_stream_specs(
                    "unlocked achievement.",
                    nominal_rate_hz=20.0,
                    payload_schema='{"value": float, "components": dict}'),
+        GOAL_STREAM_SPEC,
     ]
 
 
@@ -216,6 +218,7 @@ class CrafterStreamPublisher:
         reward_signal: Optional[Any] = None,
         died: bool = False,
         paced: bool = True,
+        goal_state: Optional[GoalState] = None,
     ) -> List[StreamEvent]:
         """Publish this tick's streams from the current state snapshot.
 
@@ -252,6 +255,13 @@ class CrafterStreamPublisher:
         pub("body.alive", state["alive"])
         pub("spatial.position", state["position"])
         pub("spatial.facing", state["facing"])
+        if goal_state is not None:
+            # Every tick, not on-change: `distance`/`relative_position` move
+            # with the agent even while `active`/`source` stay constant, so
+            # a delta publisher would republish nearly every tick anyway --
+            # `force=True` makes that explicit rather than relying on
+            # incidental float inequality.
+            pub(GOAL_STREAM, goal_state.as_payload(), force=True)
 
         for name, count in achievement_events:
             published.append(

@@ -19,6 +19,7 @@ import copy
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from cognitive_runtime.core.action import NULL_ACTION, Action
+from cognitive_runtime.core.goal import INACTIVE_GOAL_STATE, GoalState
 from cognitive_runtime.core.observation import Observation
 from cognitive_runtime.core.program import ActionResult, Program, ProgramMetadata
 from cognitive_runtime.core.reward import RewardSignal
@@ -32,6 +33,7 @@ from cognitive_runtime.core.streams.motor import (
 from cognitive_runtime.core.streams.pacer import RatePacer
 from cognitive_runtime.programs.crafter.actions import ACTION_NAME_TO_INDEX, ACTION_SPACE
 from cognitive_runtime.programs.crafter.config import CrafterConfig
+from cognitive_runtime.programs.crafter.goals import CaregiverGoalSetter
 from cognitive_runtime.programs.crafter.observations import (
     OBSERVATION_KEYS,
     build_observation,
@@ -107,6 +109,11 @@ class CrafterWorld(Program):
         #: captured into ``_last_state`` and published as the episode's
         #: first recorded frame.
         self._post_reset_hook: Optional[Callable[[Any], None]] = None
+        #: Caregiver goal setting (epic #212 §12.4, issue #238); `None` when
+        #: `CrafterConfig.goal_enabled` is off (the default -- see
+        #: `initialize()`, which (re)builds this from the resolved config
+        #: before the first `reset()`).
+        self._goal_setter: Optional[CaregiverGoalSetter] = None
         self.initialize(config)
 
     # ------------------------------------------------------------ interface
@@ -114,6 +121,11 @@ class CrafterWorld(Program):
     def initialize(self, config: Optional[Dict[str, Any]] = None) -> None:
         if config:
             self._config = CrafterConfig.from_dict(config)
+        self._goal_setter = (
+            CaregiverGoalSetter(self._config.goal_distribution_config())
+            if self._config.goal_enabled
+            else None
+        )
         self.reset(seed=self._seed)
 
     def freeze_reset(self) -> None:
@@ -161,6 +173,15 @@ class CrafterWorld(Program):
         self._achievements_earned = {
             name: count for name, count in self._last_state["achievements"].items() if count
         }
+        if self._goal_setter is not None:
+            # One caregiver goal per episode, proposed once here -- deterministic
+            # in the episode seed alone, matching this Program's own determinism
+            # contract (see the fresh-``Env``-per-reset comment above).
+            self._goal_setter.reset(
+                spawn_position=self._position_tuple(),
+                world_size=self._config.area,
+                seed=self._seed,
+            )
         self._pending_reward = RewardSignal()
         self._pending_achievement_events = []
         self._pending_died = False
@@ -180,6 +201,19 @@ class CrafterWorld(Program):
         if action.name not in _VALID_ACTION_NAMES:
             return f"unknown action {action.name}"
         return None
+
+    def _position_tuple(self) -> Tuple[float, float]:
+        position = self._last_state["position"]
+        return (float(position["x"]), float(position["y"]))
+
+    def _current_goal_state(self) -> GoalState:
+        """This tick's ``internal.goal`` payload -- the harness's own
+        arrival decision (epic #212 §12.4's anti-gaming requirement), from
+        ``self._last_state``'s ground-truth position, never from anything a
+        policy/motor command wrote."""
+        if self._goal_setter is None:
+            return INACTIVE_GOAL_STATE
+        return self._goal_setter.tick(current_position=self._position_tuple())
 
     def _advance(self, action: Action) -> None:
         """Apply one crafter step; refreshes cached state/reward/events.
@@ -288,7 +322,7 @@ class CrafterWorld(Program):
         self._publisher.publish_tick(
             self._tick, self._last_state, self._last_obs, timestamp,
             self._pending_achievement_events, reward_signal=self._pending_reward,
-            died=self._pending_died,
+            died=self._pending_died, goal_state=self._current_goal_state(),
         )
         for reason in rejections:
             self._sensory_bus.publish("event.action_rejected", {"reason": reason}, timestamp)
@@ -299,6 +333,7 @@ class CrafterWorld(Program):
         timestamp = self._tick * _SIM_SECONDS_PER_TICK
         self._publisher.publish_tick(
             self._tick, self._last_state, self._last_obs, timestamp, [], paced=False,
+            goal_state=self._current_goal_state(),
         )
 
     def snapshot(self) -> str:

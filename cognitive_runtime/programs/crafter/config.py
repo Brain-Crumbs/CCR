@@ -11,7 +11,9 @@ is a safe no-op for everything Crafter doesn't understand.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
+
+from cognitive_runtime.core.goal import GoalDistributionConfig
 
 
 @dataclass
@@ -25,6 +27,18 @@ class CrafterConfig:
     # SurvivalBoxConfig's convention; ignored in fast-forward mode.
     realtime_vision_hz: float = 10.0
     realtime_body_heartbeat_hz: float = 2.0
+    # Caregiver goal setting (epic #212 §12.4, issue #238). Off by default --
+    # the generic-training suite (§12.2) doesn't use a goal; a navigation
+    # scenario (§12.4 stage 1+, gated on this issue) turns it on. The four
+    # knobs below feed one `GoalDistributionConfig` (`goal_distribution_
+    # config()`) rather than being a nested dataclass field directly, so a
+    # flat `program_config` dict (CLI/JSON) can still set them by name like
+    # every other Crafter config key.
+    goal_enabled: bool = False
+    goal_min_initial_distance: float = 6.0
+    goal_max_initial_distance: Optional[float] = None
+    goal_commitment_horizon_ticks: int = 20
+    goal_arrival_radius: float = 1.5
 
     @staticmethod
     def from_dict(raw: Dict[str, Any]) -> "CrafterConfig":
@@ -33,6 +47,17 @@ class CrafterConfig:
             if hasattr(cfg, key):
                 setattr(cfg, key, value)
         return cfg
+
+    def goal_distribution_config(self) -> GoalDistributionConfig:
+        """The caregiver goal-proposal parameters as one
+        `GoalDistributionConfig` (epic #212 §12.6: exposed for the
+        `DataContract` via `GoalDistributionConfig.to_contract_dict()`)."""
+        return GoalDistributionConfig(
+            min_initial_distance=self.goal_min_initial_distance,
+            max_initial_distance=self.goal_max_initial_distance,
+            commitment_horizon_ticks=self.goal_commitment_horizon_ticks,
+            arrival_radius=self.goal_arrival_radius,
+        )
 
 
 def area_from_world_size(world_size: int) -> Tuple[int, int]:
