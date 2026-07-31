@@ -5,7 +5,7 @@ the bounded set of tunable *training-only* configuration genes a search
 policy may recombine and mutate for one stage. It never declares an
 architecture field, a scenario-generator field, or a reward-semantics field
 (§14.5) -- those are simply not representable as genes here, not merely
-discouraged by convention (see :func:`_assert_no_forbidden_genes`).
+discouraged by convention (see :func:`_assert_genes_are_training_contract_paths`).
 
 Each :class:`Gene` declares its type, a bounded range or a discrete set of
 choices, a default, and a mutation distribution; a declaration missing any
@@ -35,6 +35,7 @@ from typing import Any, Callable, Dict, FrozenSet, Mapping, Optional, Tuple
 
 from cognitive_runtime.training.model_factory.contracts import (
     ArchitectureContract,
+    TrainingContract,
     contract_hash,
 )
 
@@ -49,19 +50,6 @@ MUTATION_DISTRIBUTIONS: Tuple[str, ...] = (
     "normal_perturb",
     "categorical_resample",
 )
-
-#: DataContract/generator fields (epic §5.2) that name the scenario/program
-#: identity, plus a few reward-semantics names used elsewhere in the
-#: codebase (``cognitive_runtime/programs/minecraft/rewards.py``). §14.5
-#: forbids a gene from reaching either category. Unlike architecture fields,
-#: there is no single frozen dataclass enumerating every scenario-generator
-#: or reward field in the codebase, so this list is a best-effort
-#: complement to the structural ``ArchitectureContract`` check below.
-_SCENARIO_AND_REWARD_FIELDS: FrozenSet[str] = frozenset({
-    "world", "backend", "program_config", "scenario_names",
-    "scenario_code_version", "goal", "reward",
-    "reward_weights", "reward_shaping", "reward_config", "terminal_condition",
-})
 
 
 class GenomeSchemaError(ValueError):
@@ -194,17 +182,36 @@ class Gene:
             value = rng.uniform(low, high)
         return int(round(value)) if self.type == "int" else float(value)
 
+    def _finite_numeric(self, value: Any) -> float:
+        """Coerce ``value`` to a finite ``float``, or raise :class:`GenomeRepairError`.
+
+        NaN/Inf must never survive into a resolved genome: ``min(max(nan,
+        low), high)`` silently returns ``nan`` rather than a bounded value
+        (NaN comparisons are always false), so an unguarded clip/mutate
+        would let a corrupt parent or restored genome pass through with a
+        recorded value that no longer matches its actual (near-zero, since
+        e.g. ``random_value < nan`` is always false) training effect.
+        """
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise GenomeRepairError(f"gene {self.name!r} value {value!r} is not numeric") from exc
+        if not math.isfinite(numeric):
+            raise GenomeRepairError(f"gene {self.name!r} value {numeric!r} is not finite")
+        return numeric
+
     def mutate(self, value: Any, rng: random.Random) -> Any:
         """Perturb (numeric) or resample (categorical) ``value`` per §14.2."""
         if self.choices is not None:
             remaining = [choice for choice in self.choices if choice != value]
             return rng.choice(remaining) if remaining else value
         low, high = self.bounds  # type: ignore[misc]
+        numeric_value = self._finite_numeric(value)
         if self.mutation.distribution == "log_normal_perturb":
-            anchor = math.log(min(max(float(value), low), high))
+            anchor = math.log(min(max(numeric_value, low), high))
             perturbed = math.exp(rng.gauss(anchor, self.mutation.sigma))
         else:
-            perturbed = rng.gauss(float(value), self.mutation.sigma)
+            perturbed = rng.gauss(numeric_value, self.mutation.sigma)
         clipped = min(max(perturbed, low), high)
         return int(round(clipped)) if self.type == "int" else float(clipped)
 
@@ -222,10 +229,7 @@ class Gene:
                 )
             return value
         low, high = self.bounds  # type: ignore[misc]
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError) as exc:
-            raise GenomeRepairError(f"gene {self.name!r} value {value!r} is not numeric") from exc
+        numeric = self._finite_numeric(value)
         clipped = min(max(numeric, low), high)
         return int(round(clipped)) if self.type == "int" else float(clipped)
 
@@ -269,22 +273,44 @@ _ARCHITECTURE_FIELDS: FrozenSet[str] = frozenset(
     field.name for field in dataclass_fields(ArchitectureContract)
 )
 
+#: The only gene roots a schema may use. An allowlist against
+#: ``TrainingContract``'s own declared fields is a structurally stronger
+#: guarantee than a hand-maintained denylist of forbidden names: a gene
+#: reaching architecture, scenario-generator, data-membership, or
+#: reward-semantics state is unreachable by construction, because none of
+#: those are ``TrainingContract`` fields, rather than merely absent from a
+#: list someone has to remember to keep in sync.
+_TRAINING_CONTRACT_FIELDS: FrozenSet[str] = frozenset(
+    field.name for field in dataclass_fields(TrainingContract)
+)
 
-def _assert_no_forbidden_genes(version: str, gene_names: Tuple[str, ...]) -> None:
+
+def _assert_genes_are_training_contract_paths(version: str, gene_names: Tuple[str, ...]) -> None:
     """§14.5's guardrail, enforced structurally rather than by convention.
 
-    A dotted gene name such as ``"optimizer.lr"`` is checked by its root
-    (``"optimizer"``) as well as its full name, so a gene nested under a
-    forbidden top-level field is caught too.
+    A dotted gene name such as ``"optimizer.lr"`` is rooted at
+    ``"optimizer"``; every gene's root must name a real
+    :class:`TrainingContract` field (the allowlist above), so a resolved
+    gene value is always mergeable back into a spec's ``training`` block.
+    The explicit :data:`_ARCHITECTURE_FIELDS` check below is redundant with
+    the allowlist today (no field name is shared between the two
+    contracts) but is kept because issue #229's acceptance criterion asks
+    for it literally: "assert by enumerating the schema against the
+    ArchitectureContract field list".
     """
     roots = {name.split(".", 1)[0] for name in gene_names}
-    forbidden = (
-        (set(gene_names) | roots) & (_ARCHITECTURE_FIELDS | _SCENARIO_AND_REWARD_FIELDS)
-    )
+    unknown_roots = roots - _TRAINING_CONTRACT_FIELDS
+    if unknown_roots:
+        raise GenomeSchemaError(
+            f"genome schema {version!r} declares gene(s) rooted outside TrainingContract's "
+            f"declared fields, which §14.5 forbids: {sorted(unknown_roots)!r} "
+            f"(allowed roots: {sorted(_TRAINING_CONTRACT_FIELDS)!r})"
+        )
+    forbidden = (set(gene_names) | roots) & _ARCHITECTURE_FIELDS
     if forbidden:
         raise GenomeSchemaError(
-            f"genome schema {version!r} declares gene(s) reaching an architecture, "
-            f"scenario-generator, or reward-semantics field, which §14.5 forbids: {sorted(forbidden)!r}"
+            f"genome schema {version!r} declares gene(s) reaching an ArchitectureContract "
+            f"field, which §14.5 forbids: {sorted(forbidden)!r}"
         )
 
 
@@ -304,7 +330,7 @@ class GenomeSchema:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "genes", MappingProxyType(dict(self.genes)))
-        _assert_no_forbidden_genes(self.version, tuple(self.genes))
+        _assert_genes_are_training_contract_paths(self.version, tuple(self.genes))
 
     @property
     def gene_names(self) -> Tuple[str, ...]:
@@ -366,9 +392,22 @@ def _verify_schema_integrity(schema: GenomeSchema, expected_content_hash: str) -
 
 
 # §14.2's default training-only schema for the generic_action_effects stage.
-# `transition_balance_policy.*` mirrors TrainingContract's field name
-# (contracts.py) so a resolved gene value can be merged straight into an
-# ExperimentSpec's `training` block via a dotted-path override.
+# Every gene name mirrors a real TrainingContract leaf (contracts.py) --
+# `_assert_genes_are_training_contract_paths` enforces this structurally --
+# so a resolved gene value can be merged straight into an ExperimentSpec's
+# `training` block via a dotted-path override.
+#
+# Two genes below are declared per the issue #229 gene table and §17's
+# "new configurable properties" list, but are not yet consumed by the real
+# trainer: `optimizer.weight_decay` is recorded on TrainingContract for
+# identity, matching the pre-existing, documented limitation in
+# `runner.py::_action_world_model_config` (`ActionWorldModelConfig`/
+# `torch.optim.Adam` construction never receives it); `transition_balance_
+# policy.*` has no consumer anywhere in the codebase yet (§17 lists it as
+# still-to-be-exposed). Evolving either gene today cannot change measured
+# training behavior -- a real search over this schema must wire both into
+# the trainer first, or drop them, before comparing genomes that differ
+# only in these fields as if the difference were signal.
 _GENERIC_ACTION_EFFECTS_V1_GENES: Dict[str, Dict[str, Any]] = {
     "optimizer.lr": {
         "type": "float",
@@ -377,6 +416,9 @@ _GENERIC_ACTION_EFFECTS_V1_GENES: Dict[str, Dict[str, Any]] = {
         "default": 3e-4,
         "mutation": {"distribution": "log_normal_perturb", "sigma": 0.3},
     },
+    # NOT YET WIRED -- see the module note above. Declared for
+    # TrainingContract identity/schema completeness (issue #229's gene
+    # table); training behavior does not yet depend on this value.
     "optimizer.weight_decay": {
         "type": "float",
         "bounds": (1e-7, 1e-1),
@@ -393,14 +435,19 @@ _GENERIC_ACTION_EFFECTS_V1_GENES: Dict[str, Dict[str, Any]] = {
     # Windowed-only losses: `action_world_model.py`'s autoregressive path
     # (`_train_autoregressive_objective`) uses `autoregressive_rollout_*_weight`
     # instead, so these have no effect under that objective (issue #229).
-    "closed_loop_pixel_loss_weight": {
+    # Named under `loss_weights.*`, not top-level, because that is the
+    # TrainingContract leaf `runner.py::_action_world_model_config` actually
+    # merges into `ActionWorldModelConfig` -- `ActionWorldModelConfig` has
+    # matching `closed_loop_pixel_loss_weight`/`closed_loop_latent_loss_weight`
+    # fields, so a resolved gene value here does reach the real trainer.
+    "loss_weights.closed_loop_pixel_loss_weight": {
         "type": "float",
         "bounds": (0.0, 1.0),
         "default": 0.25,
         "mutation": {"distribution": "normal_perturb", "sigma": 0.1},
         "active_objectives": frozenset({"windowed_rollout"}),
     },
-    "closed_loop_latent_loss_weight": {
+    "loss_weights.closed_loop_latent_loss_weight": {
         "type": "float",
         "bounds": (0.0, 1.0),
         "default": 0.25,
@@ -419,6 +466,10 @@ _GENERIC_ACTION_EFFECTS_V1_GENES: Dict[str, Dict[str, Any]] = {
         "default": 3,
         "mutation": {"distribution": "categorical_resample"},
     },
+    # NOT YET WIRED -- see the module note above. No code anywhere in the
+    # repository reads `training.transition_balance_policy` yet (§17: a
+    # "new configurable property" still to be exposed); declared here so
+    # the schema is ready the moment that consumer lands.
     "transition_balance_policy.stationary_cap": {
         "type": "float",
         "bounds": (0.0, 1.0),
@@ -433,7 +484,7 @@ _GENERIC_ACTION_EFFECTS_V1_GENES: Dict[str, Dict[str, Any]] = {
 #: version will fail to import.
 _EXPECTED_CONTENT_HASHES: Dict[str, str] = {
     "generic_action_effects_v1": (
-        "d1b981a3e03826f09cc2b255bb9a178eb0f03c7609a1bb66273dfe3662e9055c"
+        "e247442c3fac00d30f90ca411cce0a7c4b7428247f963e3034dc22b0e408135d"
     ),
 }
 

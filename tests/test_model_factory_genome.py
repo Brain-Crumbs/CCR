@@ -138,26 +138,26 @@ def test_unknown_gene_type_fails_to_load():
 # ---------------------------------------------------------------------------
 
 def test_windowed_only_gene_inactive_under_autoregressive():
-    gene = GENERIC_ACTION_EFFECTS_V1.genes["closed_loop_pixel_loss_weight"]
+    gene = GENERIC_ACTION_EFFECTS_V1.genes["loss_weights.closed_loop_pixel_loss_weight"]
     assert gene.is_active("windowed_rollout")
     assert not gene.is_active("autoregressive")
 
 
 def test_active_gene_names_excludes_inactive_genes_for_objective():
     active = GENERIC_ACTION_EFFECTS_V1.active_gene_names("autoregressive")
-    assert "closed_loop_pixel_loss_weight" not in active
-    assert "closed_loop_latent_loss_weight" not in active
+    assert "loss_weights.closed_loop_pixel_loss_weight" not in active
+    assert "loss_weights.closed_loop_latent_loss_weight" not in active
     assert "optimizer.lr" in active
 
     active_windowed = GENERIC_ACTION_EFFECTS_V1.active_gene_names("windowed_rollout")
-    assert "closed_loop_pixel_loss_weight" in active_windowed
+    assert "loss_weights.closed_loop_pixel_loss_weight" in active_windowed
 
 
 def test_crossover_never_recombines_inactive_gene_under_autoregressive():
     rng = random.Random(0)
     parent_a = default_genome(GENERIC_ACTION_EFFECTS_V1)
     parent_b = dict(parent_a)
-    parent_b["closed_loop_pixel_loss_weight"] = 0.9999
+    parent_b["loss_weights.closed_loop_pixel_loss_weight"] = 0.9999
     parent_b["optimizer.lr"] = 0.005
 
     # Run many trials: an inactive gene's child value must always equal
@@ -169,7 +169,7 @@ def test_crossover_never_recombines_inactive_gene_under_autoregressive():
             GENERIC_ACTION_EFFECTS_V1, parent_a, parent_b,
             objective="autoregressive", rng=random.Random(i),
         )
-        assert child["closed_loop_pixel_loss_weight"] == parent_a["closed_loop_pixel_loss_weight"]
+        assert child["loss_weights.closed_loop_pixel_loss_weight"] == parent_a["loss_weights.closed_loop_pixel_loss_weight"]
         if child["optimizer.lr"] == parent_b["optimizer.lr"]:
             saw_parent_b_lr = True
     assert saw_parent_b_lr
@@ -177,14 +177,14 @@ def test_crossover_never_recombines_inactive_gene_under_autoregressive():
 
 def test_mutate_never_touches_inactive_gene_under_autoregressive():
     genome = default_genome(GENERIC_ACTION_EFFECTS_V1)
-    original_inactive_value = genome["closed_loop_pixel_loss_weight"]
+    original_inactive_value = genome["loss_weights.closed_loop_pixel_loss_weight"]
     rng = random.Random(1)
     for _ in range(200):
         genome = mutate(
             GENERIC_ACTION_EFFECTS_V1, genome,
             objective="autoregressive", rng=rng, mutation_rate=1.0,
         )
-    assert genome["closed_loop_pixel_loss_weight"] == original_inactive_value
+    assert genome["loss_weights.closed_loop_pixel_loss_weight"] == original_inactive_value
     # An active gene mutating at rate=1.0 for 200 rounds should have moved.
     assert genome["optimizer.lr"] != default_genome(GENERIC_ACTION_EFFECTS_V1)["optimizer.lr"]
 
@@ -197,8 +197,8 @@ def test_mutate_can_touch_windowed_only_gene_under_windowed_rollout():
             GENERIC_ACTION_EFFECTS_V1, genome,
             objective="windowed_rollout", rng=rng, mutation_rate=1.0,
         )
-    assert genome["closed_loop_pixel_loss_weight"] != default_genome(GENERIC_ACTION_EFFECTS_V1)[
-        "closed_loop_pixel_loss_weight"
+    assert genome["loss_weights.closed_loop_pixel_loss_weight"] != default_genome(GENERIC_ACTION_EFFECTS_V1)[
+        "loss_weights.closed_loop_pixel_loss_weight"
     ]
 
 
@@ -294,19 +294,53 @@ def test_shipped_schema_declares_no_architecture_contract_fields():
 
 @pytest.mark.parametrize("forbidden_name", ["latent_width", "backbone", "action_vocabulary"])
 def test_building_a_schema_with_an_architecture_field_gene_fails(forbidden_name):
-    with pytest.raises(GenomeSchemaError, match="architecture"):
+    # No architecture field is a TrainingContract field, so the allowlist
+    # check rejects these before the explicit ArchitectureContract check
+    # (below) is even reached; test_architecture_contract_check_is_a_real_
+    # second_layer_not_just_dead_code exercises that second layer directly.
+    with pytest.raises(GenomeSchemaError, match="TrainingContract"):
         build_schema("bad", {forbidden_name: _bounded_spec()})
 
 
-@pytest.mark.parametrize("forbidden_name", ["world", "reward_weights", "goal"])
-def test_building_a_schema_with_a_scenario_or_reward_field_gene_fails(forbidden_name):
-    with pytest.raises(GenomeSchemaError, match="scenario-generator, or reward-semantics"):
+@pytest.mark.parametrize(
+    "forbidden_name",
+    # Scenario-generator, reward-semantics, and data-membership fields: none
+    # of these are TrainingContract fields, so the allowlist rejects them
+    # structurally rather than via a hand-maintained denylist of names.
+    ["world", "reward_weights", "goal", "scenario_seed", "data.train_sessions"],
+)
+def test_building_a_schema_with_a_non_training_contract_field_gene_fails(forbidden_name):
+    with pytest.raises(GenomeSchemaError, match="TrainingContract"):
         build_schema("bad", {forbidden_name: _bounded_spec()})
 
 
 def test_building_a_schema_with_a_dotted_forbidden_root_fails():
-    with pytest.raises(GenomeSchemaError, match="architecture"):
+    with pytest.raises(GenomeSchemaError, match="TrainingContract"):
         build_schema("bad", {"backbone_kwargs.dropout": _bounded_spec()})
+
+
+def test_shipped_schema_gene_roots_are_all_training_contract_fields():
+    from cognitive_runtime.training.model_factory.contracts import TrainingContract
+
+    training_fields = {f.name for f in dataclass_fields(TrainingContract)}
+    roots = {name.split(".", 1)[0] for name in GENERIC_ACTION_EFFECTS_V1.gene_names}
+    assert roots <= training_fields
+
+
+def test_architecture_contract_check_is_a_real_second_layer_not_just_dead_code(monkeypatch):
+    # TrainingContract and ArchitectureContract share no field names today,
+    # so the explicit ArchitectureContract check in
+    # _assert_genes_are_training_contract_paths never actually fires via
+    # the public build_schema() path. Exercise its logic directly (with the
+    # allowlist patched to simulate a hypothetical future name collision)
+    # so this defense-in-depth layer is not silently untested dead code.
+    import cognitive_runtime.training.model_factory.genome as genome_module
+
+    monkeypatch.setattr(
+        genome_module, "_TRAINING_CONTRACT_FIELDS", frozenset({"optimizer", "latent_width"})
+    )
+    with pytest.raises(GenomeSchemaError, match="ArchitectureContract"):
+        genome_module._assert_genes_are_training_contract_paths("t", ("latent_width",))
 
 
 # ---------------------------------------------------------------------------
@@ -324,24 +358,29 @@ def test_get_schema_rejects_unknown_version():
         get_schema("does_not_exist_v99")
 
 
+# "scheduled_sampling_p" (an actual TrainingContract field) stands in for a
+# generic gene name in these schema-mechanics tests, now that gene roots
+# must be allowlisted TrainingContract fields.
+
 def test_two_schemas_with_identical_genes_hash_identically():
-    genes = {"g": _bounded_spec()}
+    genes = {"scheduled_sampling_p": _bounded_spec()}
     a = build_schema("t", genes)
     b = build_schema("t", dict(genes))
     assert a.content_hash == b.content_hash
 
 
 def test_changing_a_bound_changes_the_content_hash():
-    baseline = build_schema("t", {"g": _bounded_spec()})
-    changed = build_schema("t", {"g": _bounded_spec(bounds=(0.0, 2.0))})
+    baseline = build_schema("t", {"scheduled_sampling_p": _bounded_spec()})
+    changed = build_schema("t", {"scheduled_sampling_p": _bounded_spec(bounds=(0.0, 2.0))})
     assert baseline.content_hash != changed.content_hash
 
 
 def test_changing_default_or_mutation_sigma_changes_the_content_hash():
-    baseline = build_schema("t", {"g": _bounded_spec()})
-    changed_default = build_schema("t", {"g": _bounded_spec(default=0.6)})
+    baseline = build_schema("t", {"scheduled_sampling_p": _bounded_spec()})
+    changed_default = build_schema("t", {"scheduled_sampling_p": _bounded_spec(default=0.6)})
     changed_sigma = build_schema(
-        "t", {"g": _bounded_spec(mutation={"distribution": "normal_perturb", "sigma": 0.2})}
+        "t",
+        {"scheduled_sampling_p": _bounded_spec(mutation={"distribution": "normal_perturb", "sigma": 0.2})},
     )
     assert baseline.content_hash != changed_default.content_hash
     assert baseline.content_hash != changed_sigma.content_hash
@@ -352,13 +391,13 @@ def test_shipped_schema_content_hash_matches_its_pinned_value():
     # this ever fails, a gene's bounds/choices/default/mutation changed in
     # place. The fix is a new schema version, not updating the pin here.
     assert GENERIC_ACTION_EFFECTS_V1.content_hash == (
-        "d1b981a3e03826f09cc2b255bb9a178eb0f03c7609a1bb66273dfe3662e9055c"
+        "e247442c3fac00d30f90ca411cce0a7c4b7428247f963e3034dc22b0e408135d"
     )
 
 
 def test_hash_is_independent_of_gene_declaration_order():
-    genes_forward = {"a": _bounded_spec(), "b": _choice_spec()}
-    genes_reversed = {"b": _choice_spec(), "a": _bounded_spec()}
+    genes_forward = {"scheduled_sampling_p": _bounded_spec(), "batch_size": _choice_spec()}
+    genes_reversed = {"batch_size": _choice_spec(), "scheduled_sampling_p": _bounded_spec()}
     assert build_schema("t", genes_forward).content_hash == build_schema("t", genes_reversed).content_hash
 
 
@@ -411,6 +450,24 @@ def test_repair_rejects_choice_value_not_in_choices():
     genome["rollout_frames"] = 7
     with pytest.raises(GenomeRepairError, match="allowed choices"):
         repair(GENERIC_ACTION_EFFECTS_V1, genome, objective="windowed_rollout")
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_repair_rejects_non_finite_gene_value_instead_of_silently_clipping(bad_value):
+    genome = default_genome(GENERIC_ACTION_EFFECTS_V1)
+    genome["scheduled_sampling_p"] = bad_value
+    with pytest.raises(GenomeRepairError, match="not finite"):
+        repair(GENERIC_ACTION_EFFECTS_V1, genome, objective="windowed_rollout")
+
+
+def test_mutate_rejects_non_finite_input_value_instead_of_propagating_nan():
+    genome = default_genome(GENERIC_ACTION_EFFECTS_V1)
+    genome["scheduled_sampling_p"] = float("nan")
+    with pytest.raises(GenomeRepairError, match="not finite"):
+        mutate(
+            GENERIC_ACTION_EFFECTS_V1, genome,
+            objective="windowed_rollout", rng=random.Random(0), mutation_rate=1.0,
+        )
 
 
 def test_crossover_rejects_parent_missing_a_gene():
