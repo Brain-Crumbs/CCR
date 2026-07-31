@@ -28,6 +28,7 @@ import json
 import hashlib
 import logging
 import os
+import random
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -300,6 +301,11 @@ class NurseryScenario:
     #: blocked phase that never actually unblocks (``blocked_forward``'s
     #: recovery action failing to move the agent).
     max_longest_stationary_run: Optional[int] = None
+    #: Declared lower/upper fractions for action-effect classes.  These are
+    #: evaluated from MF-E1's recorded labels after every episode, rather
+    #: than inferred from the requested policy.  An empty mapping means this
+    #: scenario has no action-effect balance contract.
+    action_effect_mix_bounds: Dict[str, Tuple[float, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -1056,6 +1062,135 @@ def _crafter_motor_babbling_open(seed: int, cfg: NurseryConfig) -> ScenarioRecor
     )
 
 
+# --------------------------------------------------------------------------- motor_babbling_walls (issue #236; epic #212 §12.2)
+
+_MOTOR_BABBLING_WALLS_GENERATOR_NAME = "motor_babbling_walls"
+_MOTOR_BABBLING_WALLS_GENERATOR_VERSION = "v1"
+_MOTOR_BABBLING_WALLS_LAYOUT_RADIUS = 5
+_MOTOR_BABBLING_WALLS_BARRIER_OFFSETS = (-2, 2)
+_MOTOR_BABBLING_WALLS_GAP_OFFSETS = (-2, -1, 0, 1, 2)
+
+# Bounds deliberately leave room for the finite-sample noise of a 40-tick
+# smoke recording, while ruling out an almost entirely blocked pocket.  A
+# blocked Crafter directional attempt can also change facing, but MF-E1
+# correctly classifies it as ``blocked`` (not ``turned_only``), so the latter
+# is reported with a zero lower bound rather than fabricated as a turn.
+_MOTOR_BABBLING_WALLS_OUTCOME_MIX_BOUNDS: Dict[str, Tuple[float, float]] = {
+    "moved": (0.10, 0.85),
+    "blocked": (0.05, 0.70),
+    "turned_only": (0.0, 0.25),
+    # NULL is part of the declared action subset and is always reported, but
+    # a short burst sample may legitimately contain none (seed 1000 does),
+    # so it has no positive lower bound.
+    "no_op": (0.0, 0.50),
+}
+_MOTOR_BABBLING_WALLS_MAX_STATIONARY_TAIL = 8
+
+
+def _crafter_motor_babbling_walls_layout(seed: int) -> Dict[str, Any]:
+    """Draw one reproducible local-wall layout from ``seed``.
+
+    The outer ring keeps the random walk local.  A seed-selected spanning
+    barrier with one gap creates two nearby chambers and a recovery route;
+    it is a corridor layout rather than an unconstrained random pile of
+    stones that can accidentally box the player in.
+    """
+    rng = random.Random(seed)
+    return {
+        "layout_seed": seed,
+        "barrier_orientation": rng.choice(("vertical", "horizontal")),
+        "barrier_offset": rng.choice(_MOTOR_BABBLING_WALLS_BARRIER_OFFSETS),
+        "gap_offset": rng.choice(_MOTOR_BABBLING_WALLS_GAP_OFFSETS),
+    }
+
+
+def _crafter_motor_babbling_walls_setup(
+    layout: Dict[str, Any], dx: int, dy: int, env: Any,
+) -> None:
+    """Install a bounded local corridor plus a seeded internal wall."""
+    _crafter_remove_wildlife(env)
+    x, y = int(env._player.pos[0]), int(env._player.pos[1])
+    radius = _MOTOR_BABBLING_WALLS_LAYOUT_RADIUS
+    _crafter_clear_terrain(env._world, x, y, radius)
+
+    # A closed perimeter prevents a long episode from wandering into
+    # seed-dependent terrain or the world edge.  The interior barrier has a
+    # guaranteed gap, so every chamber has a recovery path.
+    for offset in range(-radius, radius + 1):
+        env._world[(x - radius, y + offset)] = "stone"
+        env._world[(x + radius, y + offset)] = "stone"
+        env._world[(x + offset, y - radius)] = "stone"
+        env._world[(x + offset, y + radius)] = "stone"
+
+    orientation = layout["barrier_orientation"]
+    barrier_offset = int(layout["barrier_offset"])
+    gap_offset = int(layout["gap_offset"])
+    for along in range(-radius + 1, radius):
+        if along == gap_offset:
+            continue
+        if orientation == "vertical":
+            env._world[(x + barrier_offset, y + along)] = "stone"
+        else:
+            env._world[(x + along, y + barrier_offset)] = "stone"
+    env._player.facing = (dx, dy)
+
+
+def _crafter_motor_babbling_walls(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    """Action bursts in a seeded nearby-wall/corridor layout.
+
+    The episode is accepted only after its realised MF-E1 outcome mix clears
+    ``_MOTOR_BABBLING_WALLS_OUTCOME_MIX_BOUNDS``; see
+    ``_record_scenario_episode``.  This is intentionally a post-recording
+    check because the policy's requested action histogram cannot prove what
+    the world actually allowed.
+    """
+    dx, dy, _forward_action, _backward_action = _crafter_seeded_route(seed)
+    layout = _crafter_motor_babbling_walls_layout(seed)
+
+    def scene_setup(program: Any) -> None:
+        program.set_post_reset_hook(
+            lambda env: _crafter_motor_babbling_walls_setup(layout, dx, dy, env)
+        )
+
+    return ScenarioRecording(
+        policy=ActionBurstPolicy(
+            _MOTOR_BABBLING_ACTION_SUBSET,
+            min_burst_ticks=_MOTOR_BABBLING_MIN_BURST_TICKS,
+            max_burst_ticks=_MOTOR_BABBLING_MAX_BURST_TICKS,
+            seed=seed,
+        ),
+        scene_setup=scene_setup,
+        program_config_extra={
+            "motor_babbling": {
+                "generator_name": _MOTOR_BABBLING_WALLS_GENERATOR_NAME,
+                "generator_version": _MOTOR_BABBLING_WALLS_GENERATOR_VERSION,
+                "action_subset": [action.key() for action in _MOTOR_BABBLING_ACTION_SUBSET],
+                "burst_ticks_distribution": {
+                    "policy": "uniform_integer",
+                    "min_ticks": _MOTOR_BABBLING_MIN_BURST_TICKS,
+                    "max_ticks": _MOTOR_BABBLING_MAX_BURST_TICKS,
+                },
+                "generator_seed": seed,
+                "layout_distribution": {
+                    "layout_seed": seed,
+                    "outer_wall": {"shape": "square_ring", "radius": _MOTOR_BABBLING_WALLS_LAYOUT_RADIUS},
+                    "interior_barrier": {
+                        "orientations": ["vertical", "horizontal"],
+                        "offsets": list(_MOTOR_BABBLING_WALLS_BARRIER_OFFSETS),
+                        "gap_offsets": list(_MOTOR_BABBLING_WALLS_GAP_OFFSETS),
+                        "guaranteed_recovery_gap": True,
+                    },
+                    "realised_layout": layout,
+                },
+                "outcome_mix_bounds": {
+                    outcome: {"min_fraction": lower, "max_fraction": upper}
+                    for outcome, (lower, upper) in _MOTOR_BABBLING_WALLS_OUTCOME_MIX_BOUNDS.items()
+                },
+            },
+        },
+    )
+
+
 CRAFTER_SCENARIOS: Dict[str, NurseryScenario] = {
     "walk_forward_short": NurseryScenario(
         "walk_forward_short",
@@ -1135,6 +1270,21 @@ CRAFTER_SCENARIOS: Dict[str, NurseryScenario] = {
         min_moving_transition_fraction=0.3,
         min_unique_frame_fraction=0.05,
     ),
+    "motor_babbling_walls": NurseryScenario(
+        "motor_babbling_walls",
+        "the same 1-4-tick uniform action bursts as motor_babbling_open, in a "
+        "seeded local wall ring with a seeded, gapped interior corridor -- 30% "
+        "of generic_action_effects_v1.  Its realised MF-E1 outcome mix is "
+        "reported and hard-gated so a boxed-in stationary tail is rejected "
+        "(issue #236; epic #212 §12.2).",
+        _crafter_motor_babbling_walls,
+        min_unique_frame_fraction=0.05,
+        max_longest_stationary_tail=_MOTOR_BABBLING_WALLS_MAX_STATIONARY_TAIL,
+        # A random walk can make a finite blocked detour before recovering;
+        # the explicit failure mode here is an unrecovered *tail*, which is
+        # why this scenario gates the tail rather than every interior pause.
+        action_effect_mix_bounds=_MOTOR_BABBLING_WALLS_OUTCOME_MIX_BOUNDS,
+    ),
 }
 
 
@@ -1161,6 +1311,109 @@ def _session_backend(session_dir: str) -> str:
     return ""
 
 
+def measure_action_effect_mix(session_dir: str, episode_id: str) -> Dict[str, Any]:
+    """Measure the realised MF-E1 outcome mix for one recorded episode.
+
+    This reads the action that *actually drove* each transition, including
+    NULL ticks, rather than counting policy samples.  It therefore remains
+    valid when action bursts, collision, or a future policy implementation
+    change the requested-versus-realised distribution.
+    """
+    from cognitive_runtime.training.action_effects import (
+        ACTION_EFFECT_CLASSES,
+        ACTION_EFFECT_LABEL_VERSION,
+        compute_action_effect_labels,
+    )
+
+    labels = compute_action_effect_labels(session_dir, episode_id)
+    counts = {outcome: 0 for outcome in ACTION_EFFECT_CLASSES}
+    for label in labels:
+        counts[label.action_effect_class] += 1
+    total = len(labels)
+    return {
+        "label_version": ACTION_EFFECT_LABEL_VERSION,
+        "transition_count": total,
+        "counts": counts,
+        "fractions": {
+            outcome: (count / total if total else 0.0)
+            for outcome, count in counts.items()
+        },
+    }
+
+
+def _action_effect_mix_issues(
+    mix: Dict[str, Any], bounds: Dict[str, Tuple[float, float]], *, where: str,
+) -> List[str]:
+    """Return contract violations for one realised action-effect mix."""
+    if not bounds:
+        return []
+    total = int(mix["transition_count"])
+    if total == 0:
+        return [f"{where}: no action-effect transitions were recorded"]
+    fractions = mix["fractions"]
+    issues: List[str] = []
+    for outcome, (minimum, maximum) in bounds.items():
+        actual = float(fractions.get(outcome, 0.0))
+        if actual < minimum or actual > maximum:
+            issues.append(
+                f"{where}: realised {outcome} fraction {actual:.1%} is outside "
+                f"the declared [{minimum:.1%}, {maximum:.1%}] action-effect mix bound"
+            )
+    return issues
+
+
+def _recorded_action_effect_quality_report(
+    session_dir: str, scenario: NurseryScenario,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Build and persist the per-session quality evidence for a scenario.
+
+    Failed episodes are written as ``accepted: false`` before the recorder
+    raises.  This makes rejection auditable and prevents a partial directory
+    from looking like a silently usable corpus input.
+    """
+    episodes: Dict[str, Dict[str, Any]] = {}
+    issues: List[str] = []
+    for episode_id in list_episodes(session_dir):
+        mix = measure_action_effect_mix(session_dir, episode_id)
+        episodes[episode_id] = mix
+        issues.extend(_action_effect_mix_issues(
+            mix, scenario.action_effect_mix_bounds,
+            where=f"{session_dir}/{episode_id}",
+        ))
+    report = {
+        "format": "nursery-action-effect-quality-v1",
+        "scenario": scenario.name,
+        "action_effect_mix_bounds": {
+            outcome: {"min_fraction": lower, "max_fraction": upper}
+            for outcome, (lower, upper) in scenario.action_effect_mix_bounds.items()
+        },
+        "episodes": episodes,
+        "accepted": not issues,
+        "issues": issues,
+    }
+    metadata_path = os.path.join(session_dir, "session.json")
+    with open(metadata_path, encoding="utf-8") as fh:
+        metadata = json.load(fh)
+    metadata["quality_report"] = report
+    with open(metadata_path, "w", encoding="utf-8") as fh:
+        json.dump(metadata, fh, indent=2, sort_keys=True)
+    return report, issues
+
+
+def _update_recorded_quality_report(
+    session_dir: str, report: Dict[str, Any], issues: Sequence[str],
+) -> None:
+    """Replace a provisional action-mix verdict with all quality-gate issues."""
+    report["accepted"] = not issues
+    report["issues"] = list(issues)
+    metadata_path = os.path.join(session_dir, "session.json")
+    with open(metadata_path, encoding="utf-8") as fh:
+        metadata = json.load(fh)
+    metadata["quality_report"] = report
+    with open(metadata_path, "w", encoding="utf-8") as fh:
+        json.dump(metadata, fh, indent=2, sort_keys=True)
+
+
 def validate_nursery_recordings(
     session_dirs: Sequence[str],
     scenario: NurseryScenario,
@@ -1183,7 +1436,7 @@ def validate_nursery_recordings(
     checks displacement ceilings, yaw sweep, episode completion, and pixel
     provenance (no mixing, and matching ``expected_pixel_source`` when set).
     """
-    return validate_recordings(
+    issues = validate_recordings(
         session_dirs,
         name=scenario.name,
         min_blocks_per_tick=scenario.min_blocks_per_tick,
@@ -1198,6 +1451,15 @@ def validate_nursery_recordings(
         max_longest_stationary_tail=scenario.max_longest_stationary_tail,
         max_longest_stationary_run=scenario.max_longest_stationary_run,
     )
+    if scenario.action_effect_mix_bounds:
+        for session_dir in session_dirs:
+            for episode_id in list_episodes(session_dir):
+                mix = measure_action_effect_mix(session_dir, episode_id)
+                issues.extend(_action_effect_mix_issues(
+                    mix, scenario.action_effect_mix_bounds,
+                    where=f"{session_dir}/{episode_id}",
+                ))
+    return issues
 
 
 def _measured_ticks_per_frame(session_dirs: Sequence[str]) -> float:
@@ -1619,12 +1881,23 @@ def _record_scenario_episode(
             close = getattr(program, "close", None)
             if callable(close):
                 close()
+        session_dir = os.path.join(record_dir, session_id)
+        if recording and scenario.action_effect_mix_bounds:
+            report, _mix_issues = _recorded_action_effect_quality_report(session_dir, scenario)
+            quality_issues = validate_nursery_recordings([session_dir], scenario)
+            _update_recorded_quality_report(session_dir, report, quality_issues)
+            if quality_issues:
+                raise ValueError(
+                    f"nursery scenario {scenario.name!r}: rejected recorded episode because it "
+                    "failed its declared quality bounds:\n  - "
+                    + "\n  - ".join(quality_issues)
+                )
         # Counted only once the episode is actually on disk: in a failed run
         # -- the trace where this counter is most worth reading -- an
         # increment before the runtime would overstate the usable recordings
         # by the very episode that killed the run.
         trace_counter("episodes_recorded")
-        return os.path.join(record_dir, session_id)
+        return session_dir
 
 
 def _cached_episode_identity(

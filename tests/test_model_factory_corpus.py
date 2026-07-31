@@ -110,6 +110,41 @@ def test_quality_gate_uses_the_declared_pixel_provenance_policy(tmp_path, monkey
     assert corpus.data_contract.pixel_provenance == "viewer"
 
 
+def test_data_contract_and_quality_report_expose_wall_generator_evidence(tmp_path, monkeypatch):
+    """Issue #236: a frozen corpus must expose the wall-layout distribution,
+    declared mix bounds, and each episode's realised mix as contract evidence,
+    not leave them implicit in the generator source."""
+    _install_fake_nursery(monkeypatch, tmp_path / "episode-cache")
+    original_record = corpus_module._record_or_reuse_scenario_episode
+
+    def record_with_wall_evidence(*args, **kwargs):
+        session_dir = original_record(*args, **kwargs)
+        path = Path(session_dir) / "session.json"
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+        metadata["program_config"] = {
+            "motor_babbling": {
+                "generator_name": "motor_babbling_walls",
+                "layout_distribution": {"outer_wall": {"shape": "square_ring"}},
+                "outcome_mix_bounds": {"blocked": {"min_fraction": 0.05, "max_fraction": 0.7}},
+            },
+        }
+        metadata["quality_report"] = {
+            "accepted": True,
+            "episodes": {"episode_00000": {"fractions": {"moved": 0.6, "blocked": 0.2}}},
+        }
+        path.write_text(json.dumps(metadata), encoding="utf-8")
+        return session_dir
+
+    monkeypatch.setattr(corpus_module, "_record_or_reuse_scenario_episode", record_with_wall_evidence)
+    corpus = corpus_module.build_corpus(_spec(tmp_path))
+
+    contract_evidence = corpus.data_contract.program_config["scenario_generator_evidence"]
+    assert set(contract_evidence) == {"synthetic-train-1", "synthetic-validation-2", "synthetic-test-3"}
+    assert contract_evidence["synthetic-train-1"]["generator"]["layout_distribution"]
+    quality = json.loads((corpus.directory / "quality_report.json").read_text(encoding="utf-8"))
+    assert quality["action_effect_evidence"]["synthetic-train-1"]["quality_report"]["accepted"] is True
+
+
 def test_resolve_refuses_a_missing_frozen_session_and_names_it(tmp_path, monkeypatch):
     _install_fake_nursery(monkeypatch, tmp_path / "episode-cache")
     corpus = corpus_module.build_corpus(_spec(tmp_path))
