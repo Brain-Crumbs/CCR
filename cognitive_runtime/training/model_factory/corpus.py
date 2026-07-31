@@ -266,14 +266,49 @@ def _write_split_lists(directory: Path, sessions: Mapping[str, Sequence[Mapping[
         })
 
 
+def _session_quality_evidence(
+    sessions: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> Dict[str, Any]:
+    """Read recorder-produced quality evidence without importing nursery.
+
+    Session metadata is part of each frozen session hash.  Copying its
+    declared generator parameters and realised action-effect mix into the
+    corpus report and DataContract makes a corpus self-describing without
+    making Model Factory's manifest-only import depend on torch.
+    """
+    evidence: Dict[str, Any] = {}
+    for split in ("train", "validation", "test"):
+        for entry in sessions[split]:
+            path = Path(str(entry["session_path"])) / "session.json"
+            with path.open(encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            quality = metadata.get("quality_report")
+            motor_babbling = (metadata.get("program_config") or {}).get("motor_babbling")
+            if quality is not None or motor_babbling is not None:
+                evidence[str(entry["session_id"])] = {
+                    "scenario": str(entry["scenario"]),
+                    "split": split,
+                    "quality_report": quality,
+                    "generator": motor_babbling,
+                }
+    return evidence
+
+
 def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapping[str, Any]]]) -> DataContract:
     generator = spec["generator"]
     quality_policy = spec["quality_policy"]
     all_entries = [entry for split in ("train", "validation", "test") for entry in sessions[split]]
+    program_config = dict(generator)
+    generator_evidence = _session_quality_evidence(sessions)
+    if generator_evidence:
+        # The session id keys make the seed-specific layout realisation
+        # explicit.  This includes the declared layout distribution and mix
+        # bounds, not just post-hoc aggregate counts.
+        program_config["scenario_generator_evidence"] = generator_evidence
     return DataContract(
         world=str(generator["world"]),
         backend=str(generator["backend"]),
-        program_config=generator,
+        program_config=program_config,
         scenario_names=tuple(sorted({str(entry["scenario"]) for entry in all_entries})),
         scenario_code_version=str(spec["scenario_code_version"]),
         train_session_ids=tuple(str(entry["session_id"]) for entry in sessions["train"]),
@@ -431,6 +466,7 @@ def build_corpus(spec: Mapping[str, Any]) -> ResolvedCorpus:
         "corpus_id": str(spec["corpus_id"]),
         "passed": not quality_issues,
         "issues": quality_issues,
+        "action_effect_evidence": _session_quality_evidence(sessions),
     }
     split_payload = {
         "format": SPLIT_OVERLAP_REPORT_FORMAT,

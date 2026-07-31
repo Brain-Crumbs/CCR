@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 
 import pytest
 
@@ -19,8 +20,10 @@ from cognitive_runtime.programs.crafter.streams import SEMANTIC_CLASS_IDS  # noq
 from cognitive_runtime.runtime.replay import list_episodes  # noqa: E402
 from cognitive_runtime.training.nursery import (  # noqa: E402
     CRAFTER_SCENARIOS,
+    NurseryScenario,
     NurseryConfig,
     _record_scenario_episode,
+    _crafter_box_in,
     _scenarios_for_world,
     measure_recording_quality,
     run_nursery_scenario,
@@ -54,7 +57,7 @@ def _semantic_ids_seen(session_dir: str, episode_id: str) -> set:
 def test_registry_has_every_crafter_scenario():
     assert set(CRAFTER_SCENARIOS) == {
         "walk_forward_short", "blocked_forward", "turn", "object_permanence",
-        "approach_entity", "motor_babbling_open",
+        "approach_entity", "motor_babbling_open", "motor_babbling_walls",
     }
 
 
@@ -206,18 +209,17 @@ def _motor_commands_seen(session_dir: str, episode_id: str) -> set:
     return actions
 
 
-def test_motor_babbling_open_only_emits_its_declared_action_subset(tmp_path):
+@pytest.mark.parametrize("scenario_name", ["motor_babbling_open", "motor_babbling_walls"])
+def test_motor_babbling_scenarios_only_emit_their_declared_action_subset(tmp_path, scenario_name):
     """Issue #235: the generator policy declares MOVE_UP/MOVE_DOWN/MOVE_LEFT/
     MOVE_RIGHT/NULL and nothing else. NULL never appears on the
     ``motor.command`` stream (a NULL decision emits no motor event -- see
     ``SingleActionPolicy.emit``), so this checks the recording only ever
     contains the four movement actions."""
-    scenario = CRAFTER_SCENARIOS["motor_babbling_open"]
+    scenario = CRAFTER_SCENARIOS[scenario_name]
     cfg = _crafter_config(episode_ticks=200)
     for seed in (0, 1, 2, 3, 1000):
-        session_dir = _record_scenario_episode(
-            str(tmp_path), f"crafter-babbling-{seed}", seed, scenario, cfg
-        )
+        session_dir = _record_scenario_episode(str(tmp_path), f"crafter-{scenario_name}-{seed}", seed, scenario, cfg)
         episode_id = list_episodes(session_dir)[0]
         actions = _motor_commands_seen(session_dir, episode_id)
         assert actions, (seed, actions)
@@ -246,6 +248,65 @@ def test_motor_babbling_open_records_its_generator_metadata(tmp_path):
     assert generator["generator_seed"] == 3
 
 
+def test_motor_babbling_walls_reports_seeded_layout_and_realised_outcome_mix(tmp_path):
+    """Issue #236: the contract carries both the declared wall distribution
+    and the *realised* MF-E1 outcome mix; requested action samples alone are
+    not evidence that the world supplied useful transitions."""
+    scenario = CRAFTER_SCENARIOS["motor_babbling_walls"]
+    cfg = _crafter_config(episode_ticks=80)
+    session_dir = _record_scenario_episode(str(tmp_path), "crafter-babbling-walls", 3, scenario, cfg)
+
+    with open(os.path.join(session_dir, "session.json"), encoding="utf-8") as fh:
+        metadata = json.load(fh)
+    generator = metadata["program_config"]["motor_babbling"]
+    report = metadata["quality_report"]
+    mix = report["episodes"]["episode_00000"]
+
+    assert generator["generator_name"] == "motor_babbling_walls"
+    assert generator["layout_distribution"]["layout_seed"] == 3
+    assert generator["layout_distribution"]["interior_barrier"]["guaranteed_recovery_gap"] is True
+    assert generator["outcome_mix_bounds"] == {
+        outcome: {"min_fraction": lower, "max_fraction": upper}
+        for outcome, (lower, upper) in scenario.action_effect_mix_bounds.items()
+    }
+    assert report["accepted"] is True
+    assert set(mix["fractions"]) >= {"moved", "blocked", "turned_only", "no_op"}
+    for outcome, (lower, upper) in scenario.action_effect_mix_bounds.items():
+        assert lower <= mix["fractions"][outcome] <= upper
+
+
+def test_motor_babbling_walls_rejects_a_boxed_in_stationary_tail(tmp_path):
+    """A direct regression fixture for the failure mode in #236: all action
+    bursts hit walls, producing a long blocked/stationary tail.  The recorder
+    writes rejected quality evidence and raises before such a session can be
+    returned to a corpus builder."""
+    walls = CRAFTER_SCENARIOS["motor_babbling_walls"]
+
+    def boxed_build(seed, cfg):
+        recording = walls.build(seed, cfg)
+
+        def scene_setup(program):
+            program.set_post_reset_hook(_crafter_box_in)
+
+        return replace(recording, scene_setup=scene_setup)
+
+    boxed = NurseryScenario(
+        "motor_babbling_walls_boxed_fixture", "test-only boxed wall fixture", boxed_build,
+        max_longest_stationary_tail=walls.max_longest_stationary_tail,
+        max_longest_stationary_run=walls.max_longest_stationary_run,
+        action_effect_mix_bounds=walls.action_effect_mix_bounds,
+    )
+    cfg = _crafter_config(episode_ticks=40)
+    with pytest.raises(ValueError, match="rejected recorded episode"):
+        _record_scenario_episode(str(tmp_path), "crafter-babbling-boxed", 0, boxed, cfg)
+
+    with open(tmp_path / "crafter-babbling-boxed" / "session.json", encoding="utf-8") as fh:
+        report = json.load(fh)["quality_report"]
+    assert report["accepted"] is False
+    assert report["episodes"]["episode_00000"]["fractions"]["blocked"] > 0.7
+    assert any("stationary tail" in issue for issue in report["issues"])
+
+
 def test_motor_babbling_open_starting_facing_varies_by_seed(tmp_path):
     scenario = CRAFTER_SCENARIOS["motor_babbling_open"]
     cfg = _crafter_config(episode_ticks=4)
@@ -265,7 +326,7 @@ def test_motor_babbling_open_starting_facing_varies_by_seed(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "scenario_name", ["walk_forward_short", "blocked_forward", "turn", "motor_babbling_open"]
+    "scenario_name", ["walk_forward_short", "blocked_forward", "turn", "motor_babbling_open", "motor_babbling_walls"]
 )
 def test_non_entity_scenarios_contain_no_entity_semantic_id(tmp_path, scenario_name):
     """Issue #202: wildlife must be *removed*, not merely frozen in place --
