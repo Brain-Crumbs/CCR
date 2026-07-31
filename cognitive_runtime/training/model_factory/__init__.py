@@ -151,6 +151,20 @@ from cognitive_runtime.training.model_factory.search import (
     SearchError,
     propose,
 )
+from cognitive_runtime.training.model_factory.population import (
+    POPULATION_POLICY_FORMAT,
+    ComputeLedger,
+    DuplicateSpecCache,
+    PopulationCandidate,
+    PopulationDecision,
+    PopulationError,
+    PopulationPolicy,
+    configuration_distance,
+    dominates,
+    replace_population,
+    resolved_spec_fingerprint,
+    select_parents,
+)
 from cognitive_runtime.training.model_factory.registry import (
     DECISION_HOLD,
     DECISION_PROMOTE,
@@ -337,6 +351,18 @@ __all__ = [
     "SEARCH_METHODS",
     "SearchError",
     "propose",
+    "POPULATION_POLICY_FORMAT",
+    "PopulationError",
+    "ComputeLedger",
+    "PopulationCandidate",
+    "PopulationPolicy",
+    "PopulationDecision",
+    "configuration_distance",
+    "dominates",
+    "replace_population",
+    "resolved_spec_fingerprint",
+    "DuplicateSpecCache",
+    "select_parents",
 ]
 
 
