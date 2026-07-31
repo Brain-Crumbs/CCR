@@ -42,6 +42,12 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 from cognitive_runtime.training.model_factory.artifacts import LINEAGE_FORMAT, atomic_write_json
 from cognitive_runtime.training.model_factory.budget import BUDGET_TIERS
+from cognitive_runtime.training.model_factory.population import (
+    PopulationCandidate,
+    PopulationDecision,
+    PopulationPolicy,
+    replace_population,
+)
 from cognitive_runtime.training.model_factory.state import (
     _lock_path_for,
     _locked,
@@ -265,6 +271,8 @@ def promote(
     as_leading: bool = True,
     reason: Optional[str] = None,
     now: Callable[[], str] = _now_iso,
+    population_policy: Optional[PopulationPolicy] = None,
+    population_candidates: Optional[Tuple[PopulationCandidate, ...]] = None,
 ) -> RegistrySlot:
     """Record ``run_id`` as a champion-population member of one exact
     ``(family, tier, objective)`` slot -- by default also its new leading
@@ -276,6 +284,14 @@ def promote(
     replaces that member's checkpoint/metrics but preserves its accumulated
     ``test_uses`` ledger rather than resetting it to zero.
 
+    When ``population_policy`` and ``population_candidates`` are supplied,
+    the candidate plus the current slot are replaced atomically through
+    :func:`population.replace_population`.  This is the production boundary
+    that enforces the bounded, deterministic D5 policy rather than merely
+    exposing it as a standalone helper.  Supplying only one of those two
+    arguments is rejected so a caller cannot accidentally bypass policy
+    enforcement.
+
     ``<root>/<run_id>/state.json`` must record MF-B5's ``completed`` trial
     state (epic §16: "never lets an incomplete artifact enter promotion").
     A running, failed, budget-exceeded, cancelled, or nonexistent run raises
@@ -286,6 +302,10 @@ def promote(
         raise RegistryError("run_id must not be empty")
     if not checkpoint_sha256:
         raise RegistryError("checkpoint_sha256 must not be empty")
+    if (population_policy is None) != (population_candidates is None):
+        raise RegistryError(
+            "population_policy and population_candidates must be supplied together"
+        )
     _validate_registry_safe(dict(metrics), path="metrics")
     require_completed_for_promotion(load_state(state_path(Path(root) / run_id)))
 
@@ -313,15 +333,45 @@ def promote(
             if item.get("run_id") != run_id
         ]
         population_entries.append(entry)
+        population_decision: Optional[PopulationDecision] = None
+        if population_policy is not None and population_candidates is not None:
+            candidate_ids = {candidate.run_id for candidate in population_candidates}
+            missing = sorted(entry.run_id for entry in population_entries if entry.run_id not in candidate_ids)
+            if missing:
+                raise RegistryError(
+                    "population policy requires a selection candidate for every existing "
+                    f"registry member; missing {missing!r}"
+                )
+            if run_id not in candidate_ids:
+                raise RegistryError(
+                    f"population policy candidates do not include the promoted run {run_id!r}"
+                )
+            try:
+                population_decision = replace_population(population_candidates, population_policy)
+            except ValueError as exc:
+                raise RegistryError(f"invalid population replacement request: {exc}") from exc
+            entries_by_run_id = {member.run_id: member for member in population_entries}
+            population_entries = [
+                entries_by_run_id[member.run_id] for member in population_decision.members
+            ]
+            slot_payload["leading_champion"] = population_decision.leading_champion
+        else:
+            if as_leading:
+                slot_payload["leading_champion"] = run_id
         slot_payload["population"] = [member.to_dict() for member in population_entries]
-        if as_leading:
-            slot_payload["leading_champion"] = run_id
         slot_payload["history"] = list(slot_payload.get("history", [])) + [{
             "action": DECISION_PROMOTE,
             "run_id": run_id,
             "at": entry.promoted_at,
-            "as_leading": as_leading,
+            "as_leading": (
+                population_decision.leading_champion == run_id
+                if population_decision is not None else as_leading
+            ),
+            "retained": run_id in {member.run_id for member in population_entries},
             "reason": reason,
+            "population_replacement": (
+                population_decision.to_dict() if population_decision is not None else None
+            ),
         }]
         _set_slot_payload(document, family, tier, objective, slot_payload)
         atomic_write_json(path, document)

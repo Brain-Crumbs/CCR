@@ -14,6 +14,7 @@ import subprocess
 import sys
 from collections.abc import Mapping as ABCMapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict
 
 import pytest
@@ -24,7 +25,13 @@ from cognitive_runtime.training.model_factory.genome import (
     GenomeRepairError,
     build_schema,
 )
-from cognitive_runtime.training.model_factory.search import METHODS, SearchError, propose
+import cognitive_runtime.training.model_factory.search as search_module
+from cognitive_runtime.training.model_factory.search import (
+    METHODS,
+    SearchError,
+    propose,
+    run_successive_halving,
+)
 from cognitive_runtime.training.model_factory.spec import (
     DOCUMENT_FORMAT,
     SpecError,
@@ -55,6 +62,47 @@ def _minimal_raw(**block_overrides: Dict[str, Any]) -> Dict[str, Any]:
 
 BASE_SPEC = resolve(_minimal_raw())
 SCHEMA = GENERIC_ACTION_EFFECTS_V1
+
+
+def test_successive_halving_reuses_duplicate_resolved_proposals_before_training(tmp_path, monkeypatch):
+    """A proposal collision must reuse the original validation result rather
+    than quietly launch a second identically-resolved trial."""
+    calls = []
+
+    monkeypatch.setattr(search_module, "propose", lambda *args, **kwargs: [BASE_SPEC, BASE_SPEC])
+    monkeypatch.setattr(
+        search_module,
+        "resolve_corpus",
+        lambda *args, **kwargs: SimpleNamespace(data_contract=SimpleNamespace(ticks_per_frame=1.0)),
+    )
+    monkeypatch.setattr(search_module, "_resolve_selection_metric", lambda *args: (1.0, [1.0]))
+    monkeypatch.setattr(
+        search_module,
+        "read_factory_checkpoint_metadata",
+        lambda *args, **kwargs: {"checkpoint_sha256": "a" * 64},
+    )
+
+    def fake_run_trial(spec, *, run_id, **kwargs):
+        calls.append(run_id)
+        directory = tmp_path / run_id
+        (directory / "metrics").mkdir(parents=True)
+        (directory / "metrics" / "validation.json").write_text(
+            '{"episode_ids": ["validation-1"]}', encoding="utf-8",
+        )
+        return SimpleNamespace(
+            run_id=run_id,
+            directory=directory,
+            state="completed",
+            budget_report={"epochs_recorded": 1},
+            evaluation={"rollout": {"horizons": {}, "rollout_health": {}}},
+        )
+
+    monkeypatch.setattr(search_module, "run_trial", fake_run_trial)
+    report = run_successive_halving(BASE_SPEC, SCHEMA, budgets=(1,), n=2, seed=3)
+
+    assert calls == ["sh3-r0-c0"]
+    assert [result.run_id for result in report.rungs[0].results] == ["sh3-r0-c0", "sh3-r0-c0"]
+    assert "reused prior result" in report.rungs[0].results[1].reason
 
 
 # ---------------------------------------------------------------------------
