@@ -1,5 +1,6 @@
 """Bounded random and Latin-hypercube trial proposals (epic #212, Phase D
-step 1, §13.1, issue #230).
+step 1, §13.1, issue #230), plus checkpoint-based successive halving
+(Phase D step 2, §13.2, issue #231, :func:`run_successive_halving`).
 
 ``propose()`` turns one fixed-parent ``ExperimentSpec`` plus a declared
 ``GenomeSchema`` into ``n`` sibling ``ExperimentSpec``s that vary only the
@@ -53,16 +54,30 @@ core-only install, before a checkpoint ever touches a GPU.
 
 from __future__ import annotations
 
+import json
 import math
 import random
-from dataclasses import replace
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
+from cognitive_runtime.training.model_factory.checkpoint import read_factory_checkpoint_metadata
+from cognitive_runtime.training.model_factory.comparison import compare_paired_episodes
+from cognitive_runtime.training.model_factory.corpus import resolve_corpus
 from cognitive_runtime.training.model_factory.genome import (
     Gene,
     GenomeSchema,
     project_cost_seconds,
     repair,
+)
+from cognitive_runtime.training.model_factory.promotion import (
+    _rollout_beats_copy_last_gate,
+    _rollout_health_gate,
+)
+from cognitive_runtime.training.model_factory.runner import (
+    RUNS_ROOT_DEFAULT,
+    _resolve_selection_metric,
+    run_trial,
 )
 from cognitive_runtime.training.model_factory.spec import (
     ExperimentSpec,
@@ -296,4 +311,436 @@ def propose(
     return proposals
 
 
-__all__ = ["METHODS", "SearchError", "propose"]
+SUCCESSIVE_HALVING_FORMAT = "model-factory-successive-halving-v1"
+
+#: successive_halving's own gate set (epic #212 §13.2): a candidate that
+#: fails either one is eliminated at that rung regardless of its primary
+#: metric. Mirrors the two rollout-based gates
+#: :mod:`.promotion`/:mod:`.confirmation` already apply -- the corpus's own
+#: data-quality/split-overlap gates and the representation-collapse probe are
+#: stage-level checks already enforced once when the frozen corpus and
+#: schema were built, not re-run per rung.
+_HALVING_GATES = (_rollout_beats_copy_last_gate, _rollout_health_gate)
+
+
+@dataclass(frozen=True)
+class RungCandidateResult:
+    """One candidate's outcome at one rung.
+
+    ``epochs_executed`` is exactly what
+    :func:`~.budget.build_budget_report` recorded for *this* call
+    (``budget_report["epochs_recorded"]``) -- the physical number of epochs
+    trained this rung, never the rung's cumulative target. ``metric_value``
+    and ``gates`` are only populated when ``state == "completed"``: a
+    candidate that ran out of its training-time budget mid-rung has no
+    trustworthy validation reading to rank or gate on, so it is eliminated
+    outright.
+    """
+
+    candidate_index: int
+    run_id: str
+    mode: str
+    budget: int
+    epochs_executed: int
+    state: str
+    metric_value: Optional[float]
+    gates: Tuple[Dict[str, Any], ...]
+    gate_passed: bool
+    advanced: bool
+    reason: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "candidate_index": self.candidate_index,
+            "run_id": self.run_id,
+            "mode": self.mode,
+            "budget": self.budget,
+            "epochs_executed": self.epochs_executed,
+            "state": self.state,
+            "metric_value": self.metric_value,
+            "gates": [dict(gate) for gate in self.gates],
+            "gate_passed": self.gate_passed,
+            "advanced": self.advanced,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class RungReport:
+    """Every candidate's result at one checkpoint budget, plus which
+    candidate indices advance to the next rung (empty at the last rung --
+    nothing advances *from* it, see :attr:`SuccessiveHalvingReport.final_survivor_run_id`)."""
+
+    rung_index: int
+    budget: int
+    delta_epochs: int
+    results: Tuple[RungCandidateResult, ...]
+    survivor_indices: Tuple[int, ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "rung_index": self.rung_index,
+            "budget": self.budget,
+            "delta_epochs": self.delta_epochs,
+            "results": [result.to_dict() for result in self.results],
+            "survivor_indices": list(self.survivor_indices),
+        }
+
+
+@dataclass(frozen=True)
+class SuccessiveHalvingReport:
+    """The full record of one checkpoint-based successive-halving campaign."""
+
+    format: str
+    seed: int
+    method: str
+    budgets: Tuple[int, ...]
+    initial_candidates: int
+    halving_factor: int
+    rungs: Tuple[RungReport, ...]
+    total_epochs_executed: int
+    theoretical_halving_epochs: int
+    from_scratch_epochs: int
+    final_survivor_run_id: Optional[str]
+    final_survivor_metric_value: Optional[float]
+    champion_comparison: Optional[Mapping[str, Any]]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "format": self.format,
+            "seed": self.seed,
+            "method": self.method,
+            "budgets": list(self.budgets),
+            "initial_candidates": self.initial_candidates,
+            "halving_factor": self.halving_factor,
+            "rungs": [rung.to_dict() for rung in self.rungs],
+            "total_epochs_executed": self.total_epochs_executed,
+            "theoretical_halving_epochs": self.theoretical_halving_epochs,
+            "from_scratch_epochs": self.from_scratch_epochs,
+            "final_survivor_run_id": self.final_survivor_run_id,
+            "final_survivor_metric_value": self.final_survivor_metric_value,
+            "champion_comparison": dict(self.champion_comparison) if self.champion_comparison is not None else None,
+        }
+
+
+class _CandidateTrack:
+    """Mutable per-candidate bookkeeping threaded across rungs.
+
+    Never exposed to callers -- :class:`RungCandidateResult`/
+    :class:`SuccessiveHalvingReport` are the public, immutable record of what
+    happened. ``spec`` is the candidate's fixed genome-varied
+    ``ExperimentSpec`` (identical ``data``/``model`` blocks and training
+    genes at every rung, per :func:`propose`'s own contract); only
+    ``training.epoch_budget``/``mode``/``parent`` are rebuilt fresh each
+    rung from it.
+    """
+
+    __slots__ = ("index", "spec", "run_id", "parent", "total_epochs_executed", "last_metric_value")
+
+    def __init__(self, index: int, spec: ExperimentSpec) -> None:
+        self.index = index
+        self.spec = spec
+        self.run_id: Optional[str] = None
+        self.parent: Optional[Dict[str, Any]] = None
+        self.total_epochs_executed = 0
+        self.last_metric_value: Optional[float] = None
+
+
+def _restore_numeric_keys(value: Any) -> Any:
+    """Undo the ``str(key)`` coercion a JSON round-trip applies to a
+    validation report's horizon-keyed mappings.
+
+    ``atomic_write_json`` (``artifacts._jsonable``) stringifies every
+    mapping key it writes -- JSON object keys are always strings -- but
+    ``_resolve_selection_metric`` looks a horizon up by its original
+    int/float tick-or-frame key. A ``metrics/validation.json`` read back
+    from disk (the champion comparison's only source for an out-of-process
+    champion) needs those keys restored before it can be resolved exactly
+    like the in-memory report ``run_trial`` itself produces.
+    """
+    if isinstance(value, Mapping):
+        restored: Dict[Any, Any] = {}
+        for key, item in value.items():
+            new_key: Any = key
+            if isinstance(key, str):
+                try:
+                    new_key = int(key)
+                except ValueError:
+                    try:
+                        new_key = float(key)
+                    except ValueError:
+                        new_key = key
+            restored[new_key] = _restore_numeric_keys(item)
+        return restored
+    if isinstance(value, list):
+        return [_restore_numeric_keys(item) for item in value]
+    return value
+
+
+def _validate_budgets(budgets: Sequence[int]) -> Tuple[int, ...]:
+    resolved = tuple(int(budget) for budget in budgets)
+    if not resolved:
+        raise SearchError("budgets must declare at least one checkpoint rung")
+    if any(budget <= 0 for budget in resolved):
+        raise SearchError(f"every budget must be a positive epoch count; got {resolved!r}")
+    if list(resolved) != sorted(set(resolved)):
+        raise SearchError(
+            f"budgets must be strictly increasing (each rung trains more epochs than the last); got {resolved!r}"
+        )
+    return resolved
+
+
+def run_successive_halving(
+    base_spec: ExperimentSpec,
+    genome_schema: GenomeSchema,
+    budgets: Sequence[int],
+    n: int,
+    seed: int,
+    *,
+    method: str = "lhs",
+    halving_factor: int = 2,
+    root: Union[str, Path] = RUNS_ROOT_DEFAULT,
+    corpus_root: Optional[Union[str, Path]] = None,
+    run_id_prefix: Optional[str] = None,
+    naming_seed: Optional[Union[str, int]] = None,
+    trace_dir: Optional[Union[str, Path]] = None,
+    heartbeat_timeout_seconds: Optional[float] = None,
+    champion_run_id: Optional[str] = None,
+    min_episode_length: Optional[int] = None,
+    stage_budget_seconds: Optional[float] = None,
+    cost_model: Callable[[Mapping[str, Any]], float] = project_cost_seconds,
+) -> SuccessiveHalvingReport:
+    """Checkpoint-based successive halving over ``budgets`` (epic #212 Phase D
+    step 2, §13.2, issue #231).
+
+    Trains ``n`` siblings (:func:`propose`, so only ``genome_schema``'s
+    training genes vary) fresh to ``budgets[0]``, evaluates each on the
+    corpus's fixed validation split, and retains the best half by
+    ``base_spec.evaluation["selection_metric"]`` **and** two safety gates
+    (``rollout_beats_copy_last``, ``rollout_health``) -- a gate failure
+    eliminates a candidate regardless of how good its primary metric is.
+    Survivors *continue* from their own checkpoint (``mode="fine_tune"``
+    against their own immediately-preceding rung's ``checkpoints/last.pt``,
+    with ``training.epoch_budget`` set to only the rung's *incremental*
+    epoch delta) to the next declared budget; §13.2's non-negotiable
+    constraint is that this must never retrain a survivor from scratch, and
+    :attr:`SuccessiveHalvingReport.total_epochs_executed` is the physical
+    epoch count actually run (via each rung's own
+    ``budget_report["epochs_recorded"]``) so that invariant is directly
+    checkable rather than assumed. The last rung applies the gates only (no
+    further rank-based elimination -- there is no next budget to advance
+    to); whichever gate-passing candidate has the best primary metric
+    (ties broken by ``run_id``, for a fixed ``seed``) is
+    ``final_survivor_run_id``.
+
+    ``run_id_prefix`` (default ``f"sh{seed}"``) plus each rung/candidate
+    index deterministically name every run -- never the factory's own
+    random ``new_run_id`` -- so ``final_survivor_run_id`` and every rung's
+    elimination order are exactly reproducible for a fixed ``seed`` across
+    processes, matching :func:`propose`'s own reproducibility guarantee.
+
+    Every rung evaluates the corpus's one frozen validation split (fixed by
+    ``base_spec.data["corpus_id"]``, never varied across siblings); this is
+    asserted directly by comparing every rung's persisted
+    ``metrics/validation.json["episode_ids"]`` against the first rung's.
+    Only ``run_trial`` is ever called, and it never resolves the corpus's
+    ``test`` split (see its own module docstring), so the sealed test split
+    is never queried here either.
+
+    ``champion_run_id``, when given, is paired-compared
+    (:func:`~.comparison.compare_paired_episodes`) against the final
+    survivor's validation reading; ``None`` when there is no survivor (every
+    candidate was eliminated) or no champion was named.
+    """
+    resolved_budgets = _validate_budgets(budgets)
+    if halving_factor < 2:
+        raise SearchError(f"halving_factor must be at least 2; got {halving_factor!r}")
+
+    candidates = propose(
+        base_spec, genome_schema, n, seed, method=method,
+        min_episode_length=min_episode_length, stage_budget_seconds=stage_budget_seconds,
+        cost_model=cost_model,
+    )
+    tracks = [
+        _CandidateTrack(index=index, spec=replace(spec, mode="fresh", parent=None))
+        for index, spec in enumerate(candidates)
+    ]
+
+    corpus = resolve_corpus(
+        base_spec.data["corpus_id"], allow_record=False, root=corpus_root, organism=base_spec.organism,
+    )
+    ticks_per_frame = float(corpus.data_contract.ticks_per_frame)
+    selection_metric = base_spec.evaluation["selection_metric"]
+    prefix = run_id_prefix or f"sh{seed}"
+
+    alive: List[_CandidateTrack] = list(tracks)
+    rungs: List[RungReport] = []
+    reference_episode_ids: Optional[Tuple[str, ...]] = None
+    total_epochs_executed = 0
+    theoretical_halving_epochs = 0
+    from_scratch_epochs = 0
+    previous_budget = 0
+
+    for rung_index, budget in enumerate(resolved_budgets):
+        delta = budget - previous_budget
+        participants = list(alive)
+        is_last_rung = rung_index == len(resolved_budgets) - 1
+        theoretical_halving_epochs += len(participants) * delta
+        from_scratch_epochs += len(participants) * budget
+
+        results: List[RungCandidateResult] = []
+        for track in participants:
+            run_id = f"{prefix}-r{rung_index}-c{track.index}"
+            child_training = _thaw(track.spec.training)
+            child_training["epoch_budget"] = delta
+            if rung_index == 0:
+                child_spec = replace(track.spec, mode="fresh", parent=None, training=child_training)
+            else:
+                assert track.parent is not None, "a surviving candidate must carry its prior rung's checkpoint"
+                child_spec = replace(
+                    track.spec, mode="fine_tune", parent=dict(track.parent), training=child_training,
+                )
+            validate_spec(child_spec)
+
+            result = run_trial(
+                child_spec, root=root, corpus_root=corpus_root, run_id=run_id,
+                naming_seed=naming_seed, trace_dir=trace_dir,
+                heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+            )
+
+            validation_path = Path(result.directory) / "metrics" / "validation.json"
+            with validation_path.open(encoding="utf-8") as handle:
+                validation_payload = json.load(handle)
+            episode_ids = tuple(validation_payload["episode_ids"])
+            if reference_episode_ids is None:
+                reference_episode_ids = episode_ids
+            elif episode_ids != reference_episode_ids:
+                raise SearchError(
+                    "successive halving requires the identical validation episode set at every "
+                    f"rung; rung {rung_index} candidate {track.index} ({run_id!r}) evaluated "
+                    f"{episode_ids!r}, expected {reference_episode_ids!r}"
+                )
+
+            epochs_executed = int(result.budget_report.get("epochs_recorded") or 0)
+            track.total_epochs_executed += epochs_executed
+            total_epochs_executed += epochs_executed
+            if track.total_epochs_executed > resolved_budgets[-1]:
+                raise SearchError(
+                    f"candidate {track.index} ({run_id!r}) has executed "
+                    f"{track.total_epochs_executed} epochs, exceeding the halving schedule's "
+                    f"declared maximum budget ({resolved_budgets[-1]})"
+                )
+
+            last_checkpoint_path = Path(result.directory) / "checkpoints" / "last.pt"
+            last_sha = read_factory_checkpoint_metadata(str(last_checkpoint_path))["checkpoint_sha256"]
+            track.run_id = run_id
+            track.parent = {"run_id": run_id, "checkpoint": "last.pt", "sha256": last_sha}
+
+            completed = result.state == "completed"
+            gate_dicts: Tuple[Dict[str, Any], ...] = ()
+            metric_value: Optional[float] = None
+            gate_passed = False
+            if not completed:
+                reason = f"rung did not complete within its training-time budget (state={result.state!r})"
+            else:
+                rollout_metrics = result.evaluation["rollout"]
+                gate_results = tuple(gate(rollout_metrics) for gate in _HALVING_GATES)
+                gate_dicts = tuple(gate.to_dict() for gate in gate_results)
+                gate_passed = all(gate.passed for gate in gate_results)
+                metric_value, _ = _resolve_selection_metric(result.evaluation, selection_metric, ticks_per_frame)
+                track.last_metric_value = metric_value
+                reason = (
+                    "passed both safety gates"
+                    if gate_passed
+                    else "; ".join(gate.reason for gate in gate_results if not gate.passed)
+                )
+
+            results.append(RungCandidateResult(
+                candidate_index=track.index, run_id=run_id, mode=child_spec.mode, budget=budget,
+                epochs_executed=epochs_executed, state=result.state, metric_value=metric_value,
+                gates=gate_dicts, gate_passed=gate_passed, advanced=False, reason=reason,
+            ))
+
+        gate_passing = [
+            (track, result) for track, result in zip(participants, results) if result.gate_passed
+        ]
+        if is_last_rung:
+            target_keep = len(gate_passing)
+            survivors = gate_passing
+        else:
+            target_keep = max(1, len(participants) // halving_factor)
+            ranked = sorted(gate_passing, key=lambda pair: (pair[1].metric_value, pair[1].run_id))
+            survivors = ranked[:target_keep]
+
+        survivor_ids = {track.index for track, _ in survivors}
+        final_results = []
+        for result in results:
+            advanced = result.candidate_index in survivor_ids
+            reason = result.reason
+            if result.gate_passed and not advanced:
+                reason = (
+                    f"eliminated by successive-halving rank: kept only the best {target_keep} of "
+                    f"{len(gate_passing)} gate-passing candidate(s) by {selection_metric!r} "
+                    "(ties broken by run_id)"
+                )
+            final_results.append(replace(result, advanced=advanced, reason=reason))
+
+        rungs.append(RungReport(
+            rung_index=rung_index, budget=budget, delta_epochs=delta,
+            results=tuple(final_results), survivor_indices=tuple(sorted(survivor_ids)),
+        ))
+
+        alive = [track for track, _ in survivors]
+        previous_budget = budget
+        if not alive:
+            break
+
+    final_survivor_run_id: Optional[str] = None
+    final_survivor_metric_value: Optional[float] = None
+    if alive:
+        best_track = min(alive, key=lambda track: (track.last_metric_value, track.run_id))
+        final_survivor_run_id = best_track.run_id
+        final_survivor_metric_value = best_track.last_metric_value
+
+    champion_comparison: Optional[Dict[str, Any]] = None
+    if champion_run_id is not None and final_survivor_run_id is not None:
+        organism_root = Path(root) / base_spec.organism
+        with (organism_root / champion_run_id / "metrics" / "validation.json").open(encoding="utf-8") as handle:
+            champion_validation = _restore_numeric_keys(json.load(handle))
+        with (organism_root / final_survivor_run_id / "metrics" / "validation.json").open(encoding="utf-8") as handle:
+            survivor_validation = _restore_numeric_keys(json.load(handle))
+        _, survivor_per_episode = _resolve_selection_metric(survivor_validation, selection_metric, ticks_per_frame)
+        _, champion_per_episode = _resolve_selection_metric(champion_validation, selection_metric, ticks_per_frame)
+        comparison = compare_paired_episodes(
+            dict(zip(survivor_validation["episode_ids"], survivor_per_episode)),
+            dict(zip(champion_validation["episode_ids"], champion_per_episode)),
+            primary_metric=selection_metric, minimum_episode_count=1,
+        )
+        payload = comparison.to_dict()
+        payload["champion_run_id"] = champion_run_id
+        payload["decision"] = (
+            "candidate_improves"
+            if comparison.status == "evaluable" and comparison.mean_delta is not None and comparison.mean_delta < 0
+            else "hold"
+        )
+        champion_comparison = payload
+
+    return SuccessiveHalvingReport(
+        format=SUCCESSIVE_HALVING_FORMAT, seed=seed, method=method, budgets=resolved_budgets,
+        initial_candidates=n, halving_factor=halving_factor, rungs=tuple(rungs),
+        total_epochs_executed=total_epochs_executed, theoretical_halving_epochs=theoretical_halving_epochs,
+        from_scratch_epochs=from_scratch_epochs, final_survivor_run_id=final_survivor_run_id,
+        final_survivor_metric_value=final_survivor_metric_value, champion_comparison=champion_comparison,
+    )
+
+
+__all__ = [
+    "METHODS",
+    "SearchError",
+    "propose",
+    "SUCCESSIVE_HALVING_FORMAT",
+    "RungCandidateResult",
+    "RungReport",
+    "SuccessiveHalvingReport",
+    "run_successive_halving",
+]
