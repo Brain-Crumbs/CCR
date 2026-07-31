@@ -228,29 +228,57 @@ def test_lhs_covers_every_stratum_exactly_once_for_bounded_genes(gene_name):
     assert sorted(strata) == list(range(n))
 
 
-def test_lhs_covers_every_stratum_exactly_once_for_a_custom_int_bounded_gene():
+def _int_bounds_schema(bounds):
     # The shipped schema declares no int+bounds gene (its int genes use
-    # `choices`); build one to exercise int rounding against the same
-    # exactly-one-per-stratum property, with a wide enough range that
-    # rounding cannot collapse two strata onto the same integer.
-    schema = build_schema(
+    # `choices`); build one to exercise int stratification against the
+    # exactly-one-per-stratum property.
+    low, high = bounds
+    return build_schema(
         "search-test-int-bounds",
         {
             "batch_size": {
                 "type": "int",
-                "bounds": (0, 800),
-                "default": 32,
+                "bounds": bounds,
+                "default": low,
                 "mutation": {"distribution": "normal_perturb", "sigma": 10.0},
             }
         },
     )
+
+
+def test_lhs_covers_every_stratum_exactly_once_for_a_custom_int_bounded_gene():
     n = 8
-    raw = _minimal_raw()
-    base = resolve(raw)
+    schema = _int_bounds_schema((0, 800))
+    base = resolve(_minimal_raw())
     proposals = propose(base, schema, n, seed=13, method="lhs")
     values = [spec.training["batch_size"] for spec in proposals]
     strata = [_stratum_index(v, 0, 800, False, n) for v in values]
     assert sorted(strata) == list(range(n))
+
+
+def test_lhs_int_stratification_has_no_collisions_when_domain_is_not_a_multiple_of_n():
+    # Regression for a real bug: continuous jitter-then-round(bounds=(0, 8),
+    # n=8) -- domain size 9, not a multiple of n=8 -- used to be able to
+    # round two different strata to the same integer while skipping
+    # another integer, which the strict `sorted(values) == list(range(n))`
+    # check below (all 8 of 9 possible integers, no repeats) catches.
+    n = 8
+    schema = _int_bounds_schema((0, 8))
+    base = resolve(_minimal_raw())
+    proposals = propose(base, schema, n, seed=0, method="lhs")
+    values = sorted(spec.training["batch_size"] for spec in proposals)
+    assert len(set(values)) == n
+    assert all(0 <= v <= 8 for v in values)
+
+
+def test_lhs_int_gene_rejects_more_samples_than_its_domain_size():
+    # bounds (0, 3) has only 4 distinct integers; n=5 can never satisfy
+    # "exactly one sample per stratum" (pigeonhole), so this must raise
+    # rather than silently emit a batch with a duplicate.
+    schema = _int_bounds_schema((0, 3))
+    base = resolve(_minimal_raw())
+    with pytest.raises(SearchError, match="distinct value"):
+        propose(base, schema, 5, seed=0, method="lhs")
 
 
 def test_lhs_covers_every_choice_evenly_for_categorical_genes():
@@ -342,6 +370,65 @@ def test_propose_returns_only_specs_that_pass_validation():
         from cognitive_runtime.training.model_factory.spec import validate
 
         validate(spec)
+
+
+# ---------------------------------------------------------------------------
+# Acceptance: the batch's budget tier is held fixed, even if a caller-
+# supplied schema declares a gene rooted at a budget-defining field.
+# `genome._assert_genes_are_training_contract_paths` allows any
+# TrainingContract field as a gene root, including epoch_budget/
+# step_budget/max_training_seconds -- propose() must not let those vary
+# across a batch regardless.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "field,bounds",
+    [("epoch_budget", (5, 500)), ("step_budget", (100, 100000)), ("max_training_seconds", (60.0, 1200.0))],
+)
+def test_propose_holds_budget_fields_fixed_even_if_schema_declares_a_gene_for_them(field, bounds):
+    schema = build_schema(
+        f"search-test-{field}",
+        {
+            field: {
+                "type": "float" if isinstance(bounds[0], float) else "int",
+                "bounds": bounds,
+                "default": bounds[0],
+                "mutation": {"distribution": "normal_perturb", "sigma": 1.0},
+            }
+        },
+    )
+    raw = _minimal_raw(training={field: bounds[0]})
+    base = resolve(raw)
+    for method in ("lhs", "random"):
+        proposals = propose(base, schema, 8, seed=53, method=method)
+        assert all(spec.training[field] == base.training[field] for spec in proposals)
+
+
+# ---------------------------------------------------------------------------
+# Acceptance (defense in depth): a dotted gene path that traverses through
+# an existing *scalar* TrainingContract leaf must raise rather than
+# silently overwrite that leaf with a dict.
+# ---------------------------------------------------------------------------
+
+def test_propose_rejects_a_gene_path_traversing_an_existing_scalar_field():
+    # `batch_size` is a scalar int TrainingContract leaf; a gene rooted at
+    # "batch_size.foo" passes genome.build_schema's allowlist check (its
+    # root, "batch_size", is a real TrainingContract field) but must not
+    # be silently mergeable -- it would replace the scalar with {"foo": ...}.
+    schema = build_schema(
+        "search-test-scalar-traversal",
+        {
+            "batch_size.foo": {
+                "type": "float",
+                "bounds": (0.0, 1.0),
+                "default": 0.5,
+                "mutation": {"distribution": "normal_perturb", "sigma": 0.1},
+            }
+        },
+    )
+    base = resolve(_minimal_raw())
+    with pytest.raises(SearchError, match="non-mapping"):
+        propose(base, schema, 4, seed=59, method="lhs")
 
 
 # ---------------------------------------------------------------------------

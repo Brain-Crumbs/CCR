@@ -7,8 +7,14 @@ schema's training-only genes -- §13.1's discipline: "Do not jointly vary
 architecture, data split, objective, and loss weights." Every other block
 (``organism``, ``mode``, ``parent``, ``data``, ``model``, ``evaluation``,
 ``evolution``) is copied from the base spec via ``dataclasses.replace``, so
-a proposal batch can never accidentally drift the corpus, architecture, or
-budget-tier declaration a search is supposed to hold fixed.
+a proposal batch can never accidentally drift the corpus or architecture
+declaration a search is supposed to hold fixed. The budget tier
+(``training.epoch_budget``/``step_budget``/``max_training_seconds``) is
+additionally restored from the base spec unconditionally after every
+genome merge, because those three fields are otherwise ordinary
+``TrainingContract`` leaves a caller-supplied schema is free to declare a
+gene against -- letting a batch's compute budget itself vary would make
+its successive-halving comparisons meaningless.
 
 Two sampling strategies:
 
@@ -66,27 +72,59 @@ from cognitive_runtime.training.model_factory.spec import validate as validate_s
 
 METHODS: Tuple[str, ...] = ("random", "lhs")
 
+#: §13.1/§15's fixed-budget-tier discipline is a spec-level, not merely
+#: schema-level, invariant: `genome._assert_genes_are_training_contract_paths`
+#: allows any `TrainingContract` field as a gene root, including these three
+#: budget-defining fields, so a caller-supplied schema *can* declare a gene
+#: rooted at one of them. Letting that vary the budget across siblings would
+#: make successive-halving comparisons across a batch meaningless (unequal
+#: compute) and could silently exceed the batch's intended budget tier, so
+#: `propose()` restores these three fields from `base_spec` unconditionally
+#: after merging any genome, regardless of what the schema declares.
+_FIXED_BUDGET_FIELDS: Tuple[str, ...] = ("epoch_budget", "step_budget", "max_training_seconds")
+
 
 class SearchError(ValueError):
     """A malformed proposal request (bad ``n``, ``method``, or objective)."""
+
+
+_MISSING = object()
 
 
 def _set_nested(mapping: Dict[str, Any], dotted_path: str, value: Any) -> None:
     """Set ``mapping[a][b]... = value`` for a dotted gene path.
 
     ``mapping`` must already be a fully mutable (fresh, ``_thaw``-ed) tree;
-    every intermediate node visited is mutated in place, creating a fresh
-    ``dict`` only where the existing value is missing or not itself a
-    ``dict``. Mirrors how genome gene roots are declared
-    (``genome._assert_genes_are_training_contract_paths``): every gene name
-    is rooted at a real ``TrainingContract`` field, so this always lands
-    inside a spec's ``training`` block.
+    every intermediate node visited is mutated in place. Mirrors how genome
+    gene roots are declared (``genome._assert_genes_are_training_contract_paths``):
+    every gene name is rooted at a real ``TrainingContract`` field, so this
+    always lands inside a spec's ``training`` block -- but
+    ``_assert_genes_are_training_contract_paths`` only checks that the
+    *root* segment names a real field, not that every intermediate segment
+    is itself mapping-valued (``genome.build_schema({"batch_size.foo": ...})``
+    passes that check even though ``TrainingContract.batch_size`` is a
+    scalar ``int``). Traversing through an existing non-mapping value would
+    otherwise silently replace it with a fresh ``{}``, and the corrupted
+    leaf (a ``dict`` where a scalar belongs) would not be caught by
+    ``spec.validate`` -- dataclass field annotations are not enforced at
+    runtime -- surfacing only much later as a ``TypeError`` deep inside the
+    trainer. Raise here instead, at the moment the schema/spec mismatch is
+    actually knowable.
     """
     parts = dotted_path.split(".")
     cursor = mapping
     for part in parts[:-1]:
-        if not isinstance(cursor.get(part), dict):
-            cursor[part] = {}
+        existing = cursor.get(part, _MISSING)
+        if existing is _MISSING:
+            existing = {}
+        elif not isinstance(existing, Mapping):
+            raise SearchError(
+                f"gene {dotted_path!r} traverses through {part!r}, an existing "
+                f"non-mapping training value ({existing!r}); every intermediate "
+                "segment of a dotted gene path must name a mapping-valued "
+                "TrainingContract field"
+            )
+        cursor[part] = dict(existing)
         cursor = cursor[part]
     cursor[parts[-1]] = value
 
@@ -112,7 +150,48 @@ def _lhs_strata(n: int, rng: random.Random) -> List[float]:
     return [(stratum + rng.random()) / n for stratum in order]
 
 
+def _lhs_int_stratified_values(gene: Gene, n: int, rng: random.Random) -> List[int]:
+    """Exact, collision-free stratification for a bounded, non-log-scale int gene.
+
+    Continuous jitter-then-round (as used for float genes below) can push a
+    rounded value into a *neighboring* stratum whenever the domain size
+    isn't an exact multiple of ``n`` -- e.g. bounds ``(0, 8)`` (9 possible
+    values) with ``n=8`` can round two different strata to the same
+    integer while skipping another integer entirely, breaking the
+    exactly-one-sample-per-stratum guarantee. Instead, partition the
+    gene's ``domain_size = high - low + 1`` integers into ``n`` contiguous,
+    non-overlapping blocks (as evenly sized as possible) and draw one
+    uniformly random integer from *within* each block. Blocks never
+    overlap by construction, so collisions are structurally impossible
+    whenever ``n <= domain_size``; that inequality is checked explicitly
+    because no assignment can satisfy the guarantee once it fails
+    (pigeonhole).
+    """
+    low, high = int(gene.bounds[0]), int(gene.bounds[1])  # type: ignore[index]
+    domain_size = high - low + 1
+    if n > domain_size:
+        raise SearchError(
+            f"cannot draw {n} Latin-hypercube-stratified samples for int gene "
+            f"{gene.name!r}, which has only {domain_size} distinct value(s) in "
+            f"bounds {gene.bounds!r}; reduce n or widen the gene's bounds"
+        )
+    block_sizes = [domain_size // n + (1 if i < domain_size % n else 0) for i in range(n)]
+    values: List[int] = []
+    start = low
+    for size in block_sizes:
+        values.append(rng.randrange(start, start + size))
+        start += size
+    rng.shuffle(values)
+    return values
+
+
 def _lhs_bounded_values(gene: Gene, n: int, rng: random.Random) -> List[Any]:
+    if gene.type == "int" and not gene.log_scale:
+        return _lhs_int_stratified_values(gene, n, rng)
+    # Float genes (and the rare log-scale int gene, where an exact discrete
+    # partition of the log-space domain has no well-defined "one integer
+    # per stratum" analogue) use continuous jitter; no shipped schema
+    # declares a log-scale int gene today.
     low, high = gene.bounds  # type: ignore[misc]
     if gene.log_scale:
         low, high = math.log(low), math.log(high)
@@ -209,6 +288,8 @@ def propose(
             cost_model=cost_model,
         )
         training = _apply_genome(base_spec.training, repaired)
+        for field in _FIXED_BUDGET_FIELDS:
+            training[field] = base_spec.training.get(field)
         candidate = replace(base_spec, training=training)
         validate_spec(candidate)
         proposals.append(candidate)
