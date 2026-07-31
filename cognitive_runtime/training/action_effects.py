@@ -24,18 +24,26 @@ reads (``vision.frame.grid``, ``spatial.position``, ``spatial.facing``) are a
 generic ``core.streams`` naming convention Minecraft's own catalog shares, so
 they're declared locally rather than imported from ``programs.crafter``, the
 same way ``action_world_model.py`` declares its own. Generalizing the
-action-name partition to other Programs is #237's job
-(``generic_action_effects_v1``), not this one's.
+action-name partition to other Programs is a later increment's job.
+
+The classification rule itself (``classify_action_effect``) and its five-class
+taxonomy live in ``action_effect_taxonomy.py``, a dependency-free module this
+one re-exports from: issue #237 reuses that exact rule for event-stratified
+evaluation (``event_evaluation.py``) without pulling Crafter or this module's
+torch-adjacent imports into that lighter-weight evaluation path.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from cognitive_runtime.programs.crafter.actions import ACTION_SPACE
 from cognitive_runtime.runtime.replay import iter_cognitive_ticks
+from cognitive_runtime.training.action_effect_taxonomy import (  # noqa: F401
+    ACTION_EFFECT_CLASSES, ACTION_EFFECT_LABEL_VERSION, ActionEffectClass, classify_action_effect,
+)
 from cognitive_runtime.training.action_world_model import (
     PIXEL_STREAM, _tick_action_name, _tick_facing, _tick_position,
 )
@@ -48,22 +56,6 @@ from cognitive_runtime.training.action_world_model import (
 #: ``POSITION_STREAM`` as its own local constants instead of reaching into a
 #: particular Program's stream catalog.
 VISION_STREAM = "vision.frame.grid"
-
-#: Bump whenever the classification rule below changes meaning. This label
-#: schema version is surfaced here for inclusion in the Model Factory
-#: ``DataContract`` (epic #212 Sec 12.6, mirroring how
-#: ``streams.SEMANTIC_VOCABULARY_VERSION`` is wired into it) -- a changed
-#: derivation rule must change the corpus's data-contract hash.
-ACTION_EFFECT_LABEL_VERSION = "action-effect-v1"
-
-ActionEffectClass = Literal["moved", "turned_only", "blocked", "interacted", "no_op"]
-
-#: The five classes, exhaustive and mutually exclusive (see
-#: ``classify_action_effect``'s precedence rule for how ambiguous transitions
-#: resolve to exactly one).
-ACTION_EFFECT_CLASSES: Tuple[str, ...] = (
-    "moved", "turned_only", "blocked", "interacted", "no_op",
-)
 
 #: Crafter's four directional actions -- the only actions that move the
 #: agent, and the only ones ``spatial.facing`` tracks: every directional
@@ -104,56 +96,6 @@ class ActionEffectLabel:
     blocked: bool
     semantic_grid_changed: bool
     action_effect_class: ActionEffectClass
-
-
-def classify_action_effect(
-    *,
-    position_changed: bool,
-    blocked: bool,
-    interacted: bool,
-    facing_changed: bool,
-) -> ActionEffectClass:
-    """The action-effect class for one transition, given its derived signals.
-
-    Classes are mutually exclusive and total; this precedence order resolves
-    every ambiguous case a transition's signals can produce:
-
-    1. ``moved`` -- position changed, regardless of what else did. A
-       transition that both moved and would otherwise qualify as
-       ``interacted`` (a world-changing, non-movement action fired the same
-       tick displacement happened) is reported as ``moved``: displacement is
-       the more specific fact.
-    2. ``blocked`` -- a directional move was attempted and *positively known*
-       to have been refused (``blocked`` is only ever set when both
-       endpoint positions are recorded and equal -- see
-       ``compute_action_effect_labels``; a movement action whose position is
-       simply unrecorded is never inferred as blocked). Takes priority over
-       a same-transition facing change: Crafter turns *by* attempting a
-       blocked move (``programs.crafter.observations`` documents this), so a
-       blocked directional attempt is reported as ``blocked``, not
-       ``turned_only`` -- the agent acted and the world refused, which is
-       the distinction this label exists to capture, not folded into
-       ``no_op``.
-    3. ``interacted`` -- a non-movement, non-``NULL`` action (chop/mine/
-       attack/drink/collect/sleep/place/craft) with no position change.
-    4. ``turned_only`` -- facing changed with no position change and no
-       movement/interaction action drove it. Doesn't occur in current Crafter
-       recordings (every facing change there comes from a directional move,
-       already caught by ``blocked`` when position is known, or falls
-       through to here when it isn't), but keeps the taxonomy total for a
-       world whose turn is a dedicated action rather than a blocked move.
-    5. ``no_op`` -- none of the above: the ``NULL`` action, or an unrecognized
-       one, with no observed effect.
-    """
-    if position_changed:
-        return "moved"
-    if blocked:
-        return "blocked"
-    if interacted:
-        return "interacted"
-    if facing_changed:
-        return "turned_only"
-    return "no_op"
 
 
 def _euclidean(delta: Optional[Tuple[float, float]]) -> float:

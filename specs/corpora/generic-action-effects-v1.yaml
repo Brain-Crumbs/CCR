@@ -1,0 +1,83 @@
+# generic_action_effects_v1 corpus spec (epic #212 Sec 12.2, Sec 12.6;
+# issue #237, MF-E4).
+#
+# YAML is input convenience only; the frozen ``corpus_spec.json``
+# build_corpus() writes under corpora/<organism>/<corpus_id>/ is what a
+# trial's ``DataContract`` is actually resolved from. Load and build with:
+#
+#   from cognitive_runtime.training.model_factory.corpus import (
+#       build_corpus, load_corpus_spec,
+#   )
+#   corpus = build_corpus(load_corpus_spec(
+#       "specs/corpora/generic-action-effects-v1.yaml"
+#   ))
+#
+# Suite (epic Sec 12.2):
+#
+#   generic_action_effects_v1
+#     60% motor_babbling_open
+#     30% motor_babbling_walls
+#     10% focused canaries
+#          walk_forward_short
+#          blocked_forward
+#          turn
+#          approach_entity
+#
+# "The percentages are a starting data-collection policy, not a fixed
+# scientific constant" -- the seed lists below are a small, fast-to-record
+# default (40 train episodes matching the declared mix exactly); scale
+# ``splits.train``'s seed lists up for a production corpus. What must stay
+# identical for a controlled A/B trial is the *resolved* scenario weights,
+# episode counts, and every generator parameter -- all frozen into this
+# corpus's ``DataContract`` and hashed into ``data_contract_hash``.
+#
+# The four canary scenarios (walk_forward_short, blocked_forward, turn,
+# approach_entity) keep their own specialized quality gates
+# (NurseryScenario's per-scenario thresholds) regardless of this corpus's
+# aggregate mix tolerance below -- see epic Sec 12.2's "the existing
+# focused scenarios remain canaries" and issue #237's acceptance criteria.
+corpus_id: crafter-generic-action-effects-v1
+organism: Crafter
+generator:
+  world: crafter
+  backend: crafter
+  episode_ticks: 40
+  horizons: [1, 10, 100]
+splits:
+  train:
+    motor_babbling_open: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+    motor_babbling_walls: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    walk_forward_short: [0]
+    blocked_forward: [0]
+    turn: [0]
+    approach_entity: [0]
+  validation:
+    motor_babbling_open: [1000, 1001]
+    motor_babbling_walls: [1000, 1001]
+    walk_forward_short: [1000]
+    blocked_forward: [1000]
+    turn: [1000]
+    approach_entity: [1000]
+  test: {}
+# Epic Sec 12.2's declared data-collection mix: the *train*-split scenario
+# weights that must be reproduced (within tolerance) by every corpus build
+# sharing this declaration -- a build that misses them fails its quality
+# gate (issue #237's acceptance criterion), it is not silently accepted.
+scenario_mix:
+  split: train
+  weights:
+    motor_babbling_open: 0.60
+    motor_babbling_walls: 0.30
+    walk_forward_short: 0.025
+    blocked_forward: 0.025
+    turn: 0.025
+    approach_entity: 0.025
+  tolerance: 0.05
+# Epic Sec 12.6's "role of each split" field.
+split_roles:
+  train: generic_training
+  validation: validation
+  test: sealed_test
+quality_policy:
+  enabled: true
+  expected_pixel_source: crafter

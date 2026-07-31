@@ -279,6 +279,12 @@ def test_train_evaluate_probe_and_round_trip(turn_session, tmp_path):
         assert entry["model_over_copy_last_mse"] is not None
     health = report["rollout_health"]
     assert set(health) >= {"prediction_dispersion", "target_dispersion", "frozen_rollout"}
+    # Issue #237: closed-loop rollout evaluation reports the same
+    # MF-E1 effect-class stratification as direct evaluation.
+    for tick in (1, 3):
+        assert set(report["event_metrics"][tick]["effect_class"]) == {
+            "moved", "turned_only", "blocked", "interacted", "no_op",
+        }
 
     probe = linear_probe_yaw(model, dataset)
     assert probe["n_samples"] > 0
@@ -313,6 +319,20 @@ def test_direct_evaluation_uses_direct_heads_not_closed_loop_rollout(turn_sessio
     assert report["prediction_mode"] == "direct"
     assert report["horizons_ticks"] == [1, 4]
     assert set(calls) == {1, 4}
+
+
+def test_direct_evaluation_reports_effect_class_stratified_metrics(turn_session):
+    """Issue #237: direct evaluation reports MF-E1 per-effect-class metrics
+    alongside the existing motion/entity stratification, for every declared
+    class (zero-sample classes included) so a downstream promotion gate can
+    always read all five."""
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    report = evaluate_action_world_model_direct(model, dataset, [1], warmup_frames=2)
+    effect_class = report["event_metrics"][1]["effect_class"]
+    assert set(effect_class) == {"moved", "turned_only", "blocked", "interacted", "no_op"}
+    for entry in effect_class.values():
+        assert "model_mse" in entry and "n_samples" in entry
 
 
 def test_windowed_rollout_trains_nondefault_direct_horizon_head(turn_session):

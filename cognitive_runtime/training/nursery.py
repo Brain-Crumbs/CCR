@@ -1884,7 +1884,9 @@ def _record_scenario_episode(
         session_dir = os.path.join(record_dir, session_id)
         if recording and scenario.action_effect_mix_bounds:
             report, _mix_issues = _recorded_action_effect_quality_report(session_dir, scenario)
-            quality_issues = validate_nursery_recordings([session_dir], scenario)
+            quality_issues = validate_nursery_recordings(
+                [session_dir], scenario, expected_pixel_source=cfg.expected_pixel_source,
+            )
             _update_recorded_quality_report(session_dir, report, quality_issues)
             if quality_issues:
                 raise ValueError(

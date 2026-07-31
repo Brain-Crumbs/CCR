@@ -189,10 +189,12 @@ if TYPE_CHECKING:
     from cognitive_runtime.training.model_factory.corpus import (
         CORPUS_MANIFEST_FORMAT,
         CORPUS_SPEC_FORMAT,
+        DEFAULT_SPLIT_ROLES,
         QUALITY_REPORT_FORMAT,
         SPLIT_OVERLAP_REPORT_FORMAT,
         ResolvedCorpus,
         build_corpus,
+        load_corpus_spec,
         resolve_corpus,
     )
     from cognitive_runtime.training.model_factory.runner import (
@@ -263,10 +265,12 @@ __all__ = [
     "write_budget_report",
     "CORPUS_SPEC_FORMAT",
     "CORPUS_MANIFEST_FORMAT",
+    "DEFAULT_SPLIT_ROLES",
     "QUALITY_REPORT_FORMAT",
     "SPLIT_OVERLAP_REPORT_FORMAT",
     "ResolvedCorpus",
     "build_corpus",
+    "load_corpus_spec",
     "resolve_corpus",
     "STATE_FORMAT",
     "HEARTBEAT_FORMAT",
@@ -369,10 +373,12 @@ __all__ = [
 _LAZY_CORPUS_EXPORTS = {
     "CORPUS_SPEC_FORMAT",
     "CORPUS_MANIFEST_FORMAT",
+    "DEFAULT_SPLIT_ROLES",
     "QUALITY_REPORT_FORMAT",
     "SPLIT_OVERLAP_REPORT_FORMAT",
     "ResolvedCorpus",
     "build_corpus",
+    "load_corpus_spec",
     "resolve_corpus",
 }
 

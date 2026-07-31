@@ -307,6 +307,28 @@ def test_motor_babbling_walls_rejects_a_boxed_in_stationary_tail(tmp_path):
     assert any("stationary tail" in issue for issue in report["issues"])
 
 
+def test_motor_babbling_walls_persisted_report_includes_pixel_provenance_mismatch(tmp_path):
+    """PR #269 review: the action-effect quality gate used to persist
+    ``accepted: true`` in ``session.json`` without checking
+    ``cfg.expected_pixel_source``, even though a later run or corpus gate
+    (which does pass it) could still reject the same recording -- leaving
+    the persisted session-level evidence contradicting the actual verdict.
+    Crafter always records pixel_source 'crafter' (adapter.py's own native
+    renderer, unlike Minecraft's grid/viewer duality), so a config that
+    expects 'viewer' is a deterministic mismatch fixture."""
+    scenario = CRAFTER_SCENARIOS["motor_babbling_walls"]
+    cfg = _crafter_config(episode_ticks=40, expected_pixel_source="viewer")
+    session_id = "crafter-babbling-walls-pixel-mismatch"
+    with pytest.raises(ValueError, match="rejected recorded episode"):
+        _record_scenario_episode(str(tmp_path), session_id, 3, scenario, cfg)
+
+    with open(tmp_path / session_id / "session.json", encoding="utf-8") as fh:
+        report = json.load(fh)["quality_report"]
+
+    assert report["accepted"] is False
+    assert any("pixel source" in issue for issue in report["issues"])
+
+
 def test_motor_babbling_open_starting_facing_varies_by_seed(tmp_path):
     scenario = CRAFTER_SCENARIOS["motor_babbling_open"]
     cfg = _crafter_config(episode_ticks=4)

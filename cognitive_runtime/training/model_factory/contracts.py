@@ -178,6 +178,34 @@ class DataContract(_ContractMixin):
     ticks_per_frame: float
     quality_policy: Mapping[str, Any] = field(default_factory=dict)
     split_overlap_policy: Mapping[str, Any] = field(default_factory=dict)
+    #: Epic #212 Sec 12.6's remaining generic-action-effects fields (issue
+    #: #237), each an explicit named field so its presence and its
+    #: contribution to ``data_contract_hash`` don't depend on inspecting
+    #: ``program_config``'s free-form generator evidence.
+    #:
+    #: Per-scenario generator identity: ``{scenario_name: {generator_name,
+    #: generator_version, action_subset, burst_ticks_distribution,
+    #: layout_distribution}}`` -- the constant generator-declared parameters
+    #: shared by every episode of that scenario (episode-varying fields like
+    #: the per-episode generator seed and realised layout live in
+    #: ``program_config["scenario_generator_evidence"]``, keyed by session,
+    #: since they are per-episode evidence, not a fixed corpus declaration).
+    scenario_generators: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    #: The MF-E1 action-effect label schema version (epic #212 Sec 12.3),
+    #: e.g. ``action_effect_taxonomy.ACTION_EFFECT_LABEL_VERSION``.
+    action_effect_label_schema_version: str = ""
+    #: The role of each split: generic training, validation, or sealed test
+    #: (epic #212 Sec 12.6's last bullet), e.g. ``{"train":
+    #: "generic_training", "validation": "validation", "test":
+    #: "sealed_test"}``.
+    split_roles: Mapping[str, str] = field(default_factory=dict)
+    #: The declared per-scenario data-collection mix (epic #212 Sec 12.2),
+    #: e.g. ``{"split": "train", "weights": {"motor_babbling_open": 0.6,
+    #: ...}, "tolerance": 0.1}``. "A starting data-collection policy, not a
+    #: fixed scientific constant" -- but the *resolved* weights must be
+    #: identical for a controlled A/B trial, so they are hashed here like
+    #: every other generator parameter.
+    scenario_mix_policy: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
