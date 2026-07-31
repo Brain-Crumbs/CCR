@@ -39,6 +39,7 @@ import torch.nn.functional as F
 from cognitive_runtime.core.action import NULL_ACTION, Action
 from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
 from cognitive_runtime.observability import span, trace_counter, trace_event, trace_metrics
+from cognitive_runtime.policies.action_burst import ActionBurstPolicy
 from cognitive_runtime.policies.constant_action import ConstantActionPolicy
 from cognitive_runtime.policies.null_policy import NullPolicy
 from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy
@@ -954,6 +955,107 @@ def _crafter_object_permanence(seed: int, cfg: NurseryConfig) -> ScenarioRecordi
     )
 
 
+# --------------------------------------------------------------------------- motor_babbling_open (issue #235; epic #212 §12.2)
+#
+# 60% of the default ``generic_action_effects_v1`` suite mix -- the single
+# largest source of generic world-model training data. Samples only
+# MOVE_UP/MOVE_DOWN/MOVE_LEFT/MOVE_RIGHT/NULL uniformly, holding each sampled
+# action for a burst of 1-4 ticks (``ActionBurstPolicy``) rather than
+# resampling every tick: a single-tick random policy barely decorrelates the
+# agent's position tick to tick, so the burst structure is what creates the
+# multi-tick displacement ego-motion learning needs (epic doc §12.2). The
+# burst-length distribution, action subset, generator name/version and
+# per-episode generator seed are recorded into every episode's
+# ``program_config`` (``NurseryScenario.build``'s ``program_config_extra``,
+# folded straight into ``session.json`` -- see ``_scenario_program_config``)
+# rather than left implicit, so a future ``DataContract`` (epic §12.6) can
+# read them straight out of the recorded evidence instead of re-deriving them
+# from this module's source.
+
+#: Generator identity (epic #212 §12.6's "scenario-generator name and
+#: version"). Bump the version whenever the sampling policy itself changes
+#: (action subset, burst bounds, or terrain/facing setup) -- not for
+#: unrelated nursery refactors -- so a corpus built against an old version
+#: is distinguishable from one built against a new one.
+_MOTOR_BABBLING_OPEN_GENERATOR_NAME = "motor_babbling_open"
+_MOTOR_BABBLING_OPEN_GENERATOR_VERSION = "v1"
+
+#: The five actions the epic doc's generator policy declares -- no others may
+#: ever appear in a ``motor_babbling_open`` recording.
+_MOTOR_BABBLING_ACTION_SUBSET: Tuple[Action, ...] = (
+    _CRAFTER_MOVE_UP, _CRAFTER_MOVE_DOWN, _CRAFTER_MOVE_LEFT, _CRAFTER_MOVE_RIGHT, NULL_ACTION,
+)
+_MOTOR_BABBLING_MIN_BURST_TICKS = 1
+_MOTOR_BABBLING_MAX_BURST_TICKS = 4
+
+
+def _crafter_motor_babbling_open_clear_radius() -> int:
+    """Clear-space radius around spawn for an omnidirectional babbling
+    policy (issue #235). Unlike the single-direction scenarios
+    (``walk_forward_short``'s corridor, ``blocked_forward``'s route), this
+    policy can move any of the four cardinal directions each burst, so a
+    single narrow corridor cannot cover it -- a square area centered on
+    spawn is cleared instead. Sized off the egocentric view radius, not
+    ``world_size``: just enough that the immediate few burst-ticks around
+    spawn are collision-free, while cells the agent's own view crop already
+    can't see from spawn keep the seed's generated terrain. An earlier
+    world_size-scaled radius over-cleared (world_size=48 gave a radius of
+    12, well past the 4-cell view crop) -- every seed's early frames showed
+    identical grass regardless of seed, which failed the train/holdout
+    split-overlap gate."""
+    return CrafterConfig().grid_radius + 2
+
+
+def _crafter_motor_babbling_open_setup(dx: int, dy: int, env: Any) -> None:
+    """Clear spawn's immediate surroundings and set the starting facing to
+    ``(dx, dy)`` -- Crafter otherwise always spawns the player facing
+    ``(0, 1)`` ("down"), regardless of seed. ``(dx, dy)`` cycles through all
+    four cardinal directions by seed (``_crafter_seeded_route``)."""
+    _crafter_remove_wildlife(env)
+    x, y = int(env._player.pos[0]), int(env._player.pos[1])
+    _crafter_clear_terrain(env._world, x, y, _crafter_motor_babbling_open_clear_radius())
+    env._player.facing = (dx, dy)
+
+
+def _crafter_motor_babbling_open(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    """Uniformly sample one of MOVE_UP/MOVE_DOWN/MOVE_LEFT/MOVE_RIGHT/NULL,
+    hold it for a uniformly sampled 1-4 ticks, then resample (epic #212
+    §12.2). Varies seed, starting facing, terrain and local map context
+    while retaining enough clear space around spawn for a healthy mix of
+    movement outcomes."""
+    dx, dy, _forward_action, _backward_action = _crafter_seeded_route(seed)
+
+    def scene_setup(program: Any) -> None:
+        # Registered as a post-reset hook (issue #202's pattern) so each
+        # seed's fresh world is cleared/faced before its first frame is ever
+        # published, not after.
+        program.set_post_reset_hook(lambda env: _crafter_motor_babbling_open_setup(dx, dy, env))
+
+    policy = ActionBurstPolicy(
+        _MOTOR_BABBLING_ACTION_SUBSET,
+        min_burst_ticks=_MOTOR_BABBLING_MIN_BURST_TICKS,
+        max_burst_ticks=_MOTOR_BABBLING_MAX_BURST_TICKS,
+        seed=seed,
+    )
+    return ScenarioRecording(
+        policy=policy,
+        scene_setup=scene_setup,
+        program_config_extra={
+            "motor_babbling": {
+                "generator_name": _MOTOR_BABBLING_OPEN_GENERATOR_NAME,
+                "generator_version": _MOTOR_BABBLING_OPEN_GENERATOR_VERSION,
+                "action_subset": [action.key() for action in _MOTOR_BABBLING_ACTION_SUBSET],
+                "burst_ticks_distribution": {
+                    "policy": "uniform_integer",
+                    "min_ticks": _MOTOR_BABBLING_MIN_BURST_TICKS,
+                    "max_ticks": _MOTOR_BABBLING_MAX_BURST_TICKS,
+                },
+                "generator_seed": seed,
+            },
+        },
+    )
+
+
 CRAFTER_SCENARIOS: Dict[str, NurseryScenario] = {
     "walk_forward_short": NurseryScenario(
         "walk_forward_short",
@@ -1016,6 +1118,22 @@ CRAFTER_SCENARIOS: Dict[str, NurseryScenario] = {
         min_blocks_per_tick=0.01,
         min_moving_transition_fraction=0.6,
         max_longest_stationary_tail=2,
+    ),
+    "motor_babbling_open": NurseryScenario(
+        "motor_babbling_open",
+        "uniformly sampled MOVE_UP/MOVE_DOWN/MOVE_LEFT/MOVE_RIGHT/NULL, each "
+        "held for a burst of 1-4 ticks, over cleared, seed-varied terrain and "
+        "starting facing -- 60% of the default generic_action_effects_v1 "
+        "suite mix and the single largest source of generic world-model "
+        "training data (issue #235; epic #212 §12.2).",
+        _crafter_motor_babbling_open,
+        # A symmetric random walk's *net* displacement can cancel out over a
+        # long episode by chance, so this gates on the per-transition
+        # movement signal rather than ``min_blocks_per_tick``: roughly 4/5
+        # sampled actions attempt movement (only NULL never does), and the
+        # cleared spawn area keeps most of those attempts unblocked.
+        min_moving_transition_fraction=0.3,
+        min_unique_frame_fraction=0.05,
     ),
 }
 

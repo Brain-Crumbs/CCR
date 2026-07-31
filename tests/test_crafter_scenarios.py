@@ -54,7 +54,7 @@ def _semantic_ids_seen(session_dir: str, episode_id: str) -> set:
 def test_registry_has_every_crafter_scenario():
     assert set(CRAFTER_SCENARIOS) == {
         "walk_forward_short", "blocked_forward", "turn", "object_permanence",
-        "approach_entity",
+        "approach_entity", "motor_babbling_open",
     }
 
 
@@ -196,7 +196,77 @@ def test_approach_entity_stays_dynamic_after_nearing_the_cow(tmp_path):
     assert quality.longest_stationary_tail <= scenario.max_longest_stationary_tail
 
 
-@pytest.mark.parametrize("scenario_name", ["walk_forward_short", "blocked_forward", "turn"])
+def _motor_commands_seen(session_dir: str, episode_id: str) -> set:
+    actions: set = set()
+    with open(os.path.join(session_dir, f"{episode_id}.streams.jsonl"), encoding="utf-8") as fh:
+        for line in fh:
+            record = json.loads(line)
+            if record.get("stream_id") == "motor.command":
+                actions.add(record["payload"]["action"])
+    return actions
+
+
+def test_motor_babbling_open_only_emits_its_declared_action_subset(tmp_path):
+    """Issue #235: the generator policy declares MOVE_UP/MOVE_DOWN/MOVE_LEFT/
+    MOVE_RIGHT/NULL and nothing else. NULL never appears on the
+    ``motor.command`` stream (a NULL decision emits no motor event -- see
+    ``SingleActionPolicy.emit``), so this checks the recording only ever
+    contains the four movement actions."""
+    scenario = CRAFTER_SCENARIOS["motor_babbling_open"]
+    cfg = _crafter_config(episode_ticks=200)
+    for seed in (0, 1, 2, 3, 1000):
+        session_dir = _record_scenario_episode(
+            str(tmp_path), f"crafter-babbling-{seed}", seed, scenario, cfg
+        )
+        episode_id = list_episodes(session_dir)[0]
+        actions = _motor_commands_seen(session_dir, episode_id)
+        assert actions, (seed, actions)
+        assert actions <= {"MOVE_UP", "MOVE_DOWN", "MOVE_LEFT", "MOVE_RIGHT"}, (seed, actions)
+
+
+def test_motor_babbling_open_records_its_generator_metadata(tmp_path):
+    """Issue #235's acceptance criterion: generator name/version, action
+    subset, burst-length distribution and generator seed must be recorded
+    (not hardcoded silently), so a ``DataContract`` can read them straight
+    out of the recorded evidence (epic #212 §12.6)."""
+    scenario = CRAFTER_SCENARIOS["motor_babbling_open"]
+    cfg = _crafter_config()
+    session_dir = _record_scenario_episode(str(tmp_path), "crafter-babbling-meta", 3, scenario, cfg)
+
+    with open(os.path.join(session_dir, "session.json"), encoding="utf-8") as fh:
+        metadata = json.load(fh)
+    generator = metadata["program_config"]["motor_babbling"]
+    assert generator["generator_name"] == "motor_babbling_open"
+    assert generator["generator_version"]
+    assert set(generator["action_subset"]) == {
+        "MOVE_UP", "MOVE_DOWN", "MOVE_LEFT", "MOVE_RIGHT", "NULL",
+    }
+    assert generator["burst_ticks_distribution"]["min_ticks"] == 1
+    assert generator["burst_ticks_distribution"]["max_ticks"] == 4
+    assert generator["generator_seed"] == 3
+
+
+def test_motor_babbling_open_starting_facing_varies_by_seed(tmp_path):
+    scenario = CRAFTER_SCENARIOS["motor_babbling_open"]
+    cfg = _crafter_config(episode_ticks=4)
+    facings = set()
+    for seed in (0, 1, 2, 3):
+        session_dir = _record_scenario_episode(
+            str(tmp_path), f"crafter-babbling-facing-{seed}", seed, scenario, cfg
+        )
+        episode_id = list_episodes(session_dir)[0]
+        with open(os.path.join(session_dir, f"{episode_id}.streams.jsonl"), encoding="utf-8") as fh:
+            for line in fh:
+                record = json.loads(line)
+                if record.get("stream_id") == "spatial.facing":
+                    facings.add((record["payload"].get("x"), record["payload"].get("y")))
+                    break
+    assert len(facings) > 1, facings
+
+
+@pytest.mark.parametrize(
+    "scenario_name", ["walk_forward_short", "blocked_forward", "turn", "motor_babbling_open"]
+)
 def test_non_entity_scenarios_contain_no_entity_semantic_id(tmp_path, scenario_name):
     """Issue #202: wildlife must be *removed*, not merely frozen in place --
     a frozen-but-rendered cow was silently becoming a permanent training
