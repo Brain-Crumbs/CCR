@@ -21,7 +21,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:
     # Issue #176: the CLI's default --world is now "crafter", and the
@@ -1835,6 +1835,99 @@ def _factory_slot_defaults(run_directory: Path, trial_spec: Mapping[str, Any]) -
     return family, tier
 
 
+def _factory_genome_value(training: Mapping[str, Any], dotted_path: str) -> Any:
+    """Read one declared genome field from a resolved training block."""
+    value: Any = training
+    for part in dotted_path.split("."):
+        if not isinstance(value, Mapping) or part not in value:
+            raise ValueError(f"resolved training block is missing declared genome field {dotted_path!r}")
+        value = value[part]
+    return value
+
+
+def _factory_present_genome_fields(
+    training: Mapping[str, Any], declared_fields: Sequence[str],
+) -> Tuple[str, ...]:
+    """Keep only schema-declared paths represented by this spec generation.
+
+    A schema can contain an inactive or not-yet-materialized optional field;
+    it is not a diversity dimension for a run that has no resolved value for
+    it.  The retained fields are still declared schema fields, never runtime
+    state or an inferred implementation detail.
+    """
+    present = []
+    for field in declared_fields:
+        try:
+            _factory_genome_value(training, field)
+        except ValueError:
+            continue
+        present.append(field)
+    if not present:
+        raise ValueError("no declared genome fields are present in the resolved training specification")
+    return tuple(present)
+
+
+def _factory_compute_ledger(run_directory: Path, *, seen: Optional[set[str]] = None) -> Any:
+    """Recover inclusive compute cost along the one checkpoint-donor lineage."""
+    from cognitive_runtime.training.model_factory.population import ComputeLedger
+
+    seen = set() if seen is None else set(seen)
+    run_id = run_directory.name
+    if run_id in seen:
+        raise ValueError(f"cycle while recovering compute lineage for {run_id!r}")
+    seen.add(run_id)
+    with (run_directory / "metrics" / "budget_report.json").open(encoding="utf-8") as handle:
+        budget = json.load(handle)
+    trial_compute = float(budget.get("total_trial_seconds", budget.get("measured_training_seconds", 0.0)))
+    lineage_path = run_directory / "lineage.json"
+    if not lineage_path.is_file():
+        return ComputeLedger.fresh(trial_compute)
+    with lineage_path.open(encoding="utf-8") as handle:
+        lineage = json.load(handle)
+    donor_run_id = lineage.get("weight_donor") or (lineage.get("parent") or {}).get("run_id")
+    if not donor_run_id:
+        return ComputeLedger.fresh(trial_compute)
+    return ComputeLedger.child(
+        trial_compute,
+        _factory_compute_ledger(run_directory.parent / str(donor_run_id), seen=seen),
+    )
+
+
+def _factory_population_candidate(
+    run_directory: Path,
+    *,
+    objective: str,
+    declared_genome_fields: Sequence[str],
+    gates: Optional[Mapping[str, bool]] = None,
+) -> Any:
+    """Build a validation-only D5 candidate from persisted run artifacts."""
+    from cognitive_runtime.training.model_factory.population import PopulationCandidate
+    from cognitive_runtime.training.model_factory.runner import _resolve_selection_metric
+
+    with (run_directory / "trial_spec.json").open(encoding="utf-8") as handle:
+        trial_spec = json.load(handle)
+    validation, ticks_per_frame = _factory_load_validation(run_directory)
+    primary_metric, _ = _resolve_selection_metric(validation, objective, ticks_per_frame)
+    with (run_directory / "metrics" / "budget_report.json").open(encoding="utf-8") as handle:
+        budget = json.load(handle)
+    return PopulationCandidate(
+        run_id=run_directory.name,
+        resolved_spec={key: value for key, value in trial_spec.items() if key != "format"},
+        genome={
+            field: _factory_genome_value(trial_spec["training"], field)
+            for field in declared_genome_fields
+        },
+        primary_metric=float(primary_metric),
+        runtime=float(budget.get("total_trial_seconds", budget.get("measured_training_seconds", 0.0))),
+        # The current generic-dynamics stage has no separate retention report;
+        # its fixed validation objective is the retained-performance reading.
+        retention_metric=float(primary_metric),
+        ledger=_factory_compute_ledger(run_directory),
+        gates=dict(gates or {}),
+        completion_status=str(budget.get("completion_status", "completed")),
+    )
+
+
 def _print_trial_result(result: Any) -> None:
     print(f"run_id: {result.run_id}")
     print(f"display_name: {result.display_name}")
@@ -1998,12 +2091,20 @@ def cmd_factory_promote(args: argparse.Namespace) -> None:
     selection metric."""
     from cognitive_runtime.training.model_factory.checkpoint import read_factory_checkpoint_metadata
     from cognitive_runtime.training.model_factory.corpus import resolve_corpus
+    from cognitive_runtime.training.model_factory.genome import GENERIC_ACTION_EFFECTS_V1
+    from cognitive_runtime.training.model_factory.population import PopulationPolicy
     from cognitive_runtime.training.model_factory.promotion import (
         PromotionPolicy,
         TestConfirmation,
         evaluate_promotion,
     )
-    from cognitive_runtime.training.model_factory.registry import RegistryError, hold, leading_champion, promote
+    from cognitive_runtime.training.model_factory.registry import (
+        RegistryError,
+        hold,
+        leading_champion,
+        population,
+        promote,
+    )
     from cognitive_runtime.training.model_factory.runner import _resolve_selection_metric
 
     run_directory = _factory_run_directory(args.root, args.run, args.organism)
@@ -2098,11 +2199,37 @@ def cmd_factory_promote(args: argparse.Namespace) -> None:
         checkpoint_meta = read_factory_checkpoint_metadata(str(checkpoint_path))
         validation_payload, ticks_per_frame = _factory_load_validation(run_directory)
         metric_value, _ = _resolve_selection_metric(validation_payload, objective, ticks_per_frame)
+        population_policy = PopulationPolicy(declared_genome_fields=_factory_present_genome_fields(
+            trial_spec["training"], GENERIC_ACTION_EFFECTS_V1.gene_names,
+        ))
+        existing_members = population(
+            registry_root, family=family, tier=tier, objective=objective,
+        )
+        candidates = [
+            _factory_population_candidate(
+                registry_root / entry.run_id,
+                objective=objective,
+                declared_genome_fields=population_policy.declared_genome_fields,
+            )
+            for entry in existing_members if entry.run_id != args.run
+        ]
+        candidates.append(_factory_population_candidate(
+            run_directory,
+            objective=objective,
+            declared_genome_fields=population_policy.declared_genome_fields,
+            gates={gate.name: gate.passed for gate in verdict.gates},
+        ))
+        candidate_ledger = candidates[-1].ledger
         slot = promote(
             registry_root, family=family, tier=tier, objective=objective, run_id=args.run,
             checkpoint_path=checkpoint_path, checkpoint_sha256=checkpoint_meta.get("checkpoint_sha256"),
-            metrics={"selection_metric": objective, "selection_metric_value": metric_value},
+            metrics={
+                "selection_metric": objective,
+                "selection_metric_value": metric_value,
+                "compute_ledger": candidate_ledger.to_dict(),
+            },
             as_leading=not args.no_as_leading, reason=args.reason,
+            population_policy=population_policy, population_candidates=tuple(candidates),
         )
     except RegistryError as exc:
         sys.exit(f"promotion refused: {exc}")

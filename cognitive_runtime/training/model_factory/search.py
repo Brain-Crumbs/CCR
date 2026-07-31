@@ -75,6 +75,7 @@ from cognitive_runtime.training.model_factory.promotion import (
     _rollout_beats_copy_last_gate,
     _rollout_health_gate,
 )
+from cognitive_runtime.training.model_factory.population import DuplicateSpecCache
 from cognitive_runtime.training.model_factory.runner import (
     RUNS_ROOT_DEFAULT,
     _resolve_selection_metric,
@@ -607,6 +608,14 @@ def run_successive_halving(
     previous_budget = 0
     stage_started = time.monotonic()
     stage_budget_exceeded = False
+    # A repaired proposal can still collide with an earlier one (for example
+    # when a small categorical domain is sampled twice).  Cache the actual
+    # resolved rung specification *before* invoking run_trial so a collision
+    # reuses its complete validation result instead of spending a second
+    # trial budget.  The cache spans rungs too: identical continuation specs
+    # share the same persisted parent/checkpoint identity and are equally
+    # duplicate work.
+    trial_cache = DuplicateSpecCache()
 
     for rung_index, budget in enumerate(resolved_budgets):
         delta = budget - previous_budget
@@ -649,11 +658,18 @@ def run_successive_halving(
                 ))
                 continue
 
-            result = run_trial(
-                child_spec, root=root, corpus_root=corpus_root, run_id=run_id,
-                naming_seed=naming_seed, trace_dir=trace_dir,
-                heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+            result, reused = trial_cache.reuse_or_run(
+                child_spec.to_dict(),
+                lambda: run_trial(
+                    child_spec, root=root, corpus_root=corpus_root, run_id=run_id,
+                    naming_seed=naming_seed, trace_dir=trace_dir,
+                    heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+                ),
             )
+            # A duplicate's result is anchored to the original immutable run
+            # directory.  Do not invent a second run ID for a trial that was
+            # deliberately never launched.
+            run_id = result.run_id
 
             validation_path = Path(result.directory) / "metrics" / "validation.json"
             with validation_path.open(encoding="utf-8") as handle:
@@ -701,6 +717,10 @@ def run_successive_halving(
                     if gate_passed
                     else "; ".join(gate.reason for gate in gate_results if not gate.passed)
                 )
+                if reused:
+                    reason = "duplicate resolved spec: reused prior result; " + reason
+            if reused and not completed:
+                reason = "duplicate resolved spec: reused prior result; " + reason
 
             results.append(RungCandidateResult(
                 candidate_index=track.index, run_id=run_id, mode=child_spec.mode, budget=budget,
@@ -732,11 +752,16 @@ def run_successive_halving(
             advanced = result.candidate_index in survivor_ids
             reason = result.reason
             if result.gate_passed and not advanced:
+                reused_prefix = (
+                    "duplicate resolved spec: reused prior result; "
+                    if result.reason.startswith("duplicate resolved spec: reused prior result;")
+                    else ""
+                )
                 reason = (
-                    "passed both safety gates at the final rung; ranked among the final "
+                    reused_prefix + "passed both safety gates at the final rung; ranked among the final "
                     "survivors by primary metric (no further budget to advance to)"
                     if is_last_rung else
-                    f"eliminated by successive-halving rank: kept only the best {target_keep} of "
+                    reused_prefix + f"eliminated by successive-halving rank: kept only the best {target_keep} of "
                     f"{len(gate_passing)} gate-passing candidate(s) by {selection_metric!r} "
                     "(ties broken by run_id)"
                 )

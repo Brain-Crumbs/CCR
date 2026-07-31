@@ -27,8 +27,17 @@ class PopulationError(ValueError):
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
     """Canonical JSON for a fully resolved specification or declared genome."""
+    def jsonable(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            if any(not isinstance(key, str) for key in item):
+                raise TypeError("mapping keys must be strings")
+            return {key: jsonable(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [jsonable(child) for child in item]
+        return item
+
     try:
-        return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        return json.dumps(jsonable(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise PopulationError("resolved specifications and genomes must be JSON-safe") from exc
 

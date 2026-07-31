@@ -27,6 +27,11 @@ from cognitive_runtime.training.model_factory.registry import (
     record_test_use,
     registry_path,
 )
+from cognitive_runtime.training.model_factory.population import (
+    ComputeLedger,
+    PopulationCandidate,
+    PopulationPolicy,
+)
 from cognitive_runtime.training.model_factory.state import (
     STATE_BUDGET_EXCEEDED,
     STATE_CANCELLED,
@@ -116,6 +121,42 @@ def test_promote_can_add_a_population_member_without_becoming_the_leader(tmp_pat
     assert leading_champion(tmp_path, family="f", tier="fast", objective="obj").run_id == "a"
     members = {entry.run_id for entry in population(tmp_path, family="f", tier="fast", objective="obj")}
     assert members == {"a", "b"}
+
+
+def test_policy_backed_promotion_replaces_the_persisted_population_atomically(tmp_path):
+    """D5 replacement is enforced at the registry write boundary, not merely
+    calculated by a caller and then ignored while appending the entry."""
+    _mark_completed(tmp_path, "leader")
+    _mark_completed(tmp_path, "near-worse")
+    policy = PopulationPolicy(declared_genome_fields=("optimizer.lr",), capacity=4)
+
+    def candidate(run_id, primary):
+        return PopulationCandidate(
+            run_id=run_id,
+            resolved_spec={"training": {"seed": run_id}},
+            genome={"optimizer.lr": 0.001},
+            primary_metric=primary,
+            runtime=1.0,
+            retention_metric=primary,
+            ledger=ComputeLedger.fresh(1.0),
+            gates={"quality": True},
+        )
+
+    leader = candidate("leader", 1.0)
+    promote(
+        tmp_path, family="f", tier="fast", objective="obj", run_id="leader",
+        checkpoint_path="leader.pt", checkpoint_sha256="a" * 64, metrics={},
+        population_policy=policy, population_candidates=(leader,),
+    )
+    slot = promote(
+        tmp_path, family="f", tier="fast", objective="obj", run_id="near-worse",
+        checkpoint_path="near-worse.pt", checkpoint_sha256="b" * 64, metrics={},
+        population_policy=policy, population_candidates=(leader, candidate("near-worse", 2.0)),
+    )
+
+    assert [member.run_id for member in slot.population] == ["leader"]
+    assert slot.leading_champion == "leader"
+    assert slot.history[-1]["retained"] is False
 
 
 def test_unknown_tier_is_rejected(tmp_path):
