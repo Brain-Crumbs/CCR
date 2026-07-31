@@ -13,6 +13,19 @@ module aligns with ``TransitionLabel``/``compute_scenario_transition_labels``
 taxonomy, and reuses the one-tick actuation-latency alignment and tick
 accessors ``_tick_position``/``_tick_facing``/``_tick_action_name`` that
 ``action_world_model.build_action_sequence_dataset`` already defines.
+
+Crafter-specific by design, not by accident: the epic's own text scopes this
+first increment to Crafter ("Crafter already records position, discrete
+facing, local semantic grids, and actions..."), and only
+``MOVEMENT_ACTION_NAMES``/``INTERACTION_ACTION_NAMES`` -- which need to know
+Crafter's own verb vocabulary (``MOVE_*`` vs. ``DO``/``SLEEP``/``PLACE_*``/
+``MAKE_*``) -- actually require that dependency. The stream ids this module
+reads (``vision.frame.grid``, ``spatial.position``, ``spatial.facing``) are a
+generic ``core.streams`` naming convention Minecraft's own catalog shares, so
+they're declared locally rather than imported from ``programs.crafter``, the
+same way ``action_world_model.py`` declares its own. Generalizing the
+action-name partition to other Programs is #237's job
+(``generic_action_effects_v1``), not this one's.
 """
 
 from __future__ import annotations
@@ -22,11 +35,19 @@ from dataclasses import dataclass
 from typing import List, Literal, Optional, Tuple
 
 from cognitive_runtime.programs.crafter.actions import ACTION_SPACE
-from cognitive_runtime.programs.crafter.streams import VISION_STREAM
 from cognitive_runtime.runtime.replay import iter_cognitive_ticks
 from cognitive_runtime.training.action_world_model import (
     PIXEL_STREAM, _tick_action_name, _tick_facing, _tick_position,
 )
+
+#: Same generic stream id both ``programs.minecraft.streams`` and
+#: ``programs.crafter.streams`` publish under (a shared "vision.frame.grid"
+#: convention, not Crafter-specific content) -- hardcoded here rather than
+#: imported from either Program module, matching how
+#: ``action_world_model.py`` declares ``PIXEL_STREAM``/``FACING_STREAM``/
+#: ``POSITION_STREAM`` as its own local constants instead of reaching into a
+#: particular Program's stream catalog.
+VISION_STREAM = "vision.frame.grid"
 
 #: Bump whenever the classification rule below changes meaning. This label
 #: schema version is surfaced here for inclusion in the Model Factory
