@@ -76,9 +76,10 @@ class ActionEffectLabel:
     #: Euclidean norm of ``position_delta``; ``0.0`` when unavailable.
     movement_magnitude: float
     facing_changed: bool
-    #: A directional move was attempted and the world refused it (no
-    #: position change) -- the agent acted and the world refused, distinct
-    #: from an ordinary idle frame.
+    #: A directional move was attempted and the world is positively known to
+    #: have refused it (both endpoint positions recorded and equal) -- the
+    #: agent acted and the world refused, distinct from an ordinary idle
+    #: frame. Never set when position is simply unrecorded.
     blocked: bool
     semantic_grid_changed: bool
     action_effect_class: ActionEffectClass
@@ -101,20 +102,24 @@ def classify_action_effect(
        ``interacted`` (a world-changing, non-movement action fired the same
        tick displacement happened) is reported as ``moved``: displacement is
        the more specific fact.
-    2. ``blocked`` -- a directional move was attempted and refused (``blocked``
-       is only ever set when position didn't change; see
-       ``compute_action_effect_labels``). Takes priority over a same-transition
-       facing change: Crafter turns *by* attempting a blocked move
-       (``programs.crafter.observations`` documents this), so a blocked
-       directional attempt is reported as ``blocked``, not ``turned_only`` --
-       the agent acted and the world refused, which is the distinction this
-       label exists to capture, not folded into ``no_op``.
+    2. ``blocked`` -- a directional move was attempted and *positively known*
+       to have been refused (``blocked`` is only ever set when both
+       endpoint positions are recorded and equal -- see
+       ``compute_action_effect_labels``; a movement action whose position is
+       simply unrecorded is never inferred as blocked). Takes priority over
+       a same-transition facing change: Crafter turns *by* attempting a
+       blocked move (``programs.crafter.observations`` documents this), so a
+       blocked directional attempt is reported as ``blocked``, not
+       ``turned_only`` -- the agent acted and the world refused, which is
+       the distinction this label exists to capture, not folded into
+       ``no_op``.
     3. ``interacted`` -- a non-movement, non-``NULL`` action (chop/mine/
        attack/drink/collect/sleep/place/craft) with no position change.
     4. ``turned_only`` -- facing changed with no position change and no
        movement/interaction action drove it. Doesn't occur in current Crafter
        recordings (every facing change there comes from a directional move,
-       already caught by ``blocked``), but keeps the taxonomy total for a
+       already caught by ``blocked`` when position is known, or falls
+       through to here when it isn't), but keeps the taxonomy total for a
        world whose turn is a dedicated action rather than a blocked move.
     5. ``no_op`` -- none of the above: the ``NULL`` action, or an unrecognized
        one, with no observed effect.
@@ -156,13 +161,19 @@ def compute_action_effect_labels(session_dir: str, episode_id: str) -> List[Acti
     grids: List[Optional[Tuple[Tuple[int, ...], ...]]] = []
     driving_actions: List[str] = []
 
-    last_committed_action: Optional[str] = None
+    last_committed_action: str = "NULL"
     last_facing: Optional[Tuple[float, float]] = None
     last_position: Optional[Tuple[float, float]] = None
     last_grid: Optional[Tuple[Tuple[int, ...], ...]] = None
 
     for _decision, sensory, motor in iter_cognitive_ticks(session_dir, episode_id):
-        this_tick_action_name = _tick_action_name(motor)
+        # A NULL-emitting policy publishes zero motor.command events this
+        # tick (``Policy.emit``'s "an empty list is NULL"), and
+        # ``CrafterWorld.step()`` applies NULL when it drains none -- so an
+        # absent tick action means NULL was actually applied, not "keep
+        # whatever the last real action was" (a move-then-idle sequence
+        # would otherwise mislabel the idle transition as another move).
+        this_tick_action_name = _tick_action_name(motor) or "NULL"
         facing = _tick_facing(sensory) or last_facing
         if facing is not None:
             last_facing = facing
@@ -177,7 +188,7 @@ def compute_action_effect_labels(session_dir: str, episode_id: str) -> List[Acti
 
         if any(record.get("stream_id") == PIXEL_STREAM for record in sensory):
             if positions:
-                driving_actions.append(last_committed_action or "NULL")
+                driving_actions.append(last_committed_action)
             positions.append(position)
             facings.append(facing)
             grids.append(last_grid)
@@ -186,17 +197,16 @@ def compute_action_effect_labels(session_dir: str, episode_id: str) -> List[Acti
         # any) was recorded against the *previous* tick's command --
         # program.step() applies a motor command at the start of the
         # following tick, so it drives the *next* frame, not this one.
-        if this_tick_action_name is not None:
-            last_committed_action = this_tick_action_name
+        last_committed_action = this_tick_action_name
 
     labels: List[ActionEffectLabel] = []
     for i, action in enumerate(driving_actions):
         pos_a, pos_b = positions[i], positions[i + 1]
+        position_known = pos_a is not None and pos_b is not None
         position_delta = (
-            (pos_b[0] - pos_a[0], pos_b[1] - pos_a[1])
-            if pos_a is not None and pos_b is not None else None
+            (pos_b[0] - pos_a[0], pos_b[1] - pos_a[1]) if position_known else None
         )
-        position_changed = position_delta is not None and position_delta != (0.0, 0.0)
+        position_changed = position_known and position_delta != (0.0, 0.0)
 
         facing_a, facing_b = facings[i], facings[i + 1]
         facing_changed = facing_a is not None and facing_b is not None and facing_a != facing_b
@@ -204,7 +214,12 @@ def compute_action_effect_labels(session_dir: str, episode_id: str) -> List[Acti
         grid_a, grid_b = grids[i], grids[i + 1]
         semantic_grid_changed = grid_a is not None and grid_b is not None and grid_a != grid_b
 
-        blocked = not position_changed and action in MOVEMENT_ACTION_NAMES
+        # Only assert "the world refused this move" when both endpoint
+        # positions are actually known and equal -- a movement action whose
+        # position is simply unrecorded (older/filtered recordings) must not
+        # be fabricated into a contact label; it falls through to
+        # turned_only/no_op below instead.
+        blocked = position_known and not position_changed and action in MOVEMENT_ACTION_NAMES
         interacted = not position_changed and action in INTERACTION_ACTION_NAMES
 
         action_effect_class = classify_action_effect(

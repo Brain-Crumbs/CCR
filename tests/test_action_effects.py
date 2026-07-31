@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import itertools
+import json
+import os
 
 import pytest
 
@@ -88,6 +90,94 @@ def test_classes_are_exhaustive_and_mutually_exclusive():
             interacted=interacted, facing_changed=facing_changed,
         )
         assert result in ACTION_EFFECT_CLASSES
+
+
+def _write_fixture_episode(session_dir, episode_id, ticks):
+    """Hand-write a minimal recorded episode ``iter_cognitive_ticks`` can
+    replay: ``ticks`` is a list of ``(sensory_records, motor_records)``
+    pairs, each record a ``{"stream_id": ..., "payload": ...}`` dict."""
+    os.makedirs(session_dir, exist_ok=True)
+    decisions_path = os.path.join(session_dir, f"{episode_id}.decisions.jsonl")
+    streams_path = os.path.join(session_dir, f"{episode_id}.streams.jsonl")
+    with open(decisions_path, "w", encoding="utf-8") as decisions_fh, \
+            open(streams_path, "w", encoding="utf-8") as streams_fh:
+        for sensory, motor in ticks:
+            counts: dict = {}
+            for record in sensory:
+                counts[record["stream_id"]] = counts.get(record["stream_id"], 0) + 1
+            decision = {"n_events_by_stream": counts, "motor_emitted": [None] * len(motor)}
+            decisions_fh.write(json.dumps(decision) + "\n")
+            for record in sensory + motor:
+                streams_fh.write(json.dumps(record) + "\n")
+
+
+def test_blocked_is_never_inferred_when_position_is_unrecorded(tmp_path):
+    """Regression (PR #266 review): a movement action with no observed
+    displacement must not be fabricated into ``blocked`` when position was
+    never recorded at all -- older/filtered recordings tolerate a missing
+    ``spatial.position`` stream, and ``blocked`` positively asserts contact,
+    not merely the absence of evidence of movement."""
+    def pixel():
+        return {"stream_id": "vision.frame.pixels", "payload": [[0]]}
+
+    def facing(x, y):
+        return {"stream_id": "spatial.facing", "payload": {"x": x, "y": y}}
+
+    def motor(action):
+        return {"stream_id": "motor.command", "payload": {"action": action}}
+
+    ticks = [
+        ([pixel(), facing(0, -1)], [motor("MOVE_UP")]),
+        ([pixel(), facing(1, 0)], [motor("MOVE_RIGHT")]),
+        ([pixel()], []),
+    ]
+    session_dir = str(tmp_path / "missing-position")
+    _write_fixture_episode(session_dir, "episode_00000", ticks)
+
+    labels = compute_action_effect_labels(session_dir, "episode_00000")
+
+    assert [label.action for label in labels] == ["MOVE_UP", "MOVE_RIGHT"]
+    assert all(not label.blocked for label in labels)
+    assert all(label.action_effect_class != "blocked" for label in labels)
+    # Facing changed on the first transition (no position evidence either
+    # way) -- turned_only, not a fabricated blocked.
+    assert labels[0].action_effect_class == "turned_only"
+    # No facing change, no position evidence, and NULL drove the second
+    # transition -- no_op.
+    assert labels[1].action_effect_class == "no_op"
+
+
+def test_null_tick_resets_the_driving_action(tmp_path):
+    """Regression (PR #266 review): a NULL-emitting policy publishes zero
+    motor.command events (``Policy.emit``'s "an empty list is NULL"); the
+    following transition's driving action must reset to NULL rather than
+    stick to whichever real action was last seen."""
+    def pixel():
+        return {"stream_id": "vision.frame.pixels", "payload": [[0]]}
+
+    def position(x, y):
+        return {"stream_id": "spatial.position", "payload": {"x": x, "y": y}}
+
+    def motor(action):
+        return {"stream_id": "motor.command", "payload": {"action": action}}
+
+    ticks = [
+        ([pixel(), position(0, 0)], [motor("MOVE_UP")]),
+        ([pixel(), position(0, -1)], []),  # NULL: nothing emitted this tick
+        ([pixel(), position(0, -1)], []),
+    ]
+    session_dir = str(tmp_path / "move-then-idle")
+    _write_fixture_episode(session_dir, "episode_00000", ticks)
+
+    labels = compute_action_effect_labels(session_dir, "episode_00000")
+
+    assert [label.action for label in labels] == ["MOVE_UP", "NULL"]
+    assert labels[0].action_effect_class == "moved"
+    # The idle transition must not stay labelled with the stale "MOVE_UP" --
+    # it's NULL with no displacement, i.e. no_op, not blocked.
+    assert labels[1].action == "NULL"
+    assert not labels[1].blocked
+    assert labels[1].action_effect_class == "no_op"
 
 
 # --------------------------------------------------------------------------- recorded-episode integration
