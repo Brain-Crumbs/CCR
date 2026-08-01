@@ -83,6 +83,7 @@ def test_stream_catalog_covers_the_crafter_taxonomy():
         "spatial.position", "spatial.facing",
         "event.achievement", "event.died", "event.action_rejected",
         "reward.scalar",
+        "internal.goal",
     }
     assert set(specs) == expected
 

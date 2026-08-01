@@ -55,7 +55,7 @@ generic: Minecraft health, a Linux battery and robot joint stress are all
 | `input` | Raw human input (demos) | `input.keypress` |
 | `world` | Global world state | `world.time`, `world.nearby_blocks` |
 | `motor` | Actions, the other direction | `motor.command` |
-| `internal` | Interoception: the runtime's own modulation signals, published back onto the bus (issue #58) | `internal.prediction_error`, `internal.reward_prediction_error`, `internal.learning_progress`, `internal.novelty`, `internal.risk`, `internal.risk_gate`, `internal.safe_novelty`, `internal.predicted_risk_aversion` (published every tick, `core/modulation.py`; the last three are issue #61's risk-gated intrinsic-drive terms); `internal.attention.weights` (published every tick by the deterministic attention controller, issue #59, `core/attention.py`) |
+| `internal` | Interoception: the runtime's own modulation signals, published back onto the bus (issue #58) | `internal.prediction_error`, `internal.reward_prediction_error`, `internal.learning_progress`, `internal.novelty`, `internal.risk`, `internal.risk_gate`, `internal.safe_novelty`, `internal.predicted_risk_aversion` (published every tick, `core/modulation.py`; the last three are issue #61's risk-gated intrinsic-drive terms); `internal.attention.weights` (published every tick by the deterministic attention controller, issue #59, `core/attention.py`); `internal.goal` (the active navigation goal -- relative position, distance, active, source; published by a Program's own caregiver goal setting when enabled, e.g. `programs/crafter/goals.py`, epic #212 §12.4, issue #238) |
 
 The `internal` modality is the biological-modulation analog (dopamine as
 reward-prediction-error, etc.): the agent's own error, progress, novelty and

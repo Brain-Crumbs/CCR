@@ -206,6 +206,15 @@ class DataContract(_ContractMixin):
     #: identical for a controlled A/B trial, so they are hashed here like
     #: every other generator parameter.
     scenario_mix_policy: Mapping[str, Any] = field(default_factory=dict)
+    #: The caregiver goal-proposal distribution for goal-conditioned
+    #: navigation stages (epic #212 Sec 12.4/12.6, issue #238):
+    #: ``GoalDistributionConfig.to_contract_dict()``, e.g.
+    #: ``{"min_initial_distance": 6.0, "max_initial_distance": None,
+    #: "commitment_horizon_ticks": 20, "arrival_radius": 1.5,
+    #: "distribution": "uniform_in_bounds", "generator_version":
+    #: "goal_distribution_v1"}``. Empty for any run that doesn't use goal
+    #: conditioning.
+    goal_distribution_policy: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
