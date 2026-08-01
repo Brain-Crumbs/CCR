@@ -2378,11 +2378,19 @@ def _cached_episode_identity(
     """
     episode_ticks = recording.episode_ticks or cfg.episode_ticks
     return {
-        "format": "nursery-episode-cache-v1",
+        "format": "nursery-episode-cache-v2",
         "world": cfg.world,
         "backend": cfg.backend,
         "scenario": scenario.name,
         "seed": int(seed),
+        # Split-aware scenarios derive controlled parameters from both the
+        # seed's pool and its position in that pool.  Preserve ordering here:
+        # moving the same seed from index 0 to index 1 can select a different
+        # distance or layout even though every other recording knob is equal.
+        "split_seed_pools": {
+            "train": tuple(int(value) for value in cfg.train_seeds),
+            "holdout": tuple(int(value) for value in cfg.holdout_seeds),
+        },
         "episode_ticks": int(episode_ticks),
         "program_config": _scenario_program_config(
             cfg, episode_ticks, recording.program_config_extra,

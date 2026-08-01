@@ -14,7 +14,7 @@ from __future__ import annotations
 import random
 from typing import List, Optional, Sequence
 
-from cognitive_runtime.core.action import Action
+from cognitive_runtime.core.action import Action, NULL_ACTION
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.perception import State
 from cognitive_runtime.core.policy import SingleActionPolicy
@@ -100,8 +100,10 @@ class TerminalRecoveryActionBurstPolicy(ActionBurstPolicy):
             raise ValueError(f"episode_ticks must be positive, got {episode_ticks!r}")
         if not terminal_actions:
             raise ValueError("terminal_actions must be non-empty")
-        if len(terminal_actions) > episode_ticks:
-            raise ValueError("terminal_actions cannot be longer than the episode")
+        if len(terminal_actions) >= episode_ticks:
+            raise ValueError(
+                "terminal_actions must leave one episode tick for the runtime's motor delay"
+            )
         unknown = set(terminal_actions) - set(self.action_space)
         if unknown:
             raise ValueError(f"terminal_actions must belong to action_space, got {unknown!r}")
@@ -114,9 +116,16 @@ class TerminalRecoveryActionBurstPolicy(ActionBurstPolicy):
         self._tick = 0
 
     def decide(self, state: State, memory: Memory, prediction: Optional[Prediction]) -> Action:
-        terminal_start = self.episode_ticks - len(self.terminal_actions)
-        if self._tick >= terminal_start:
-            index = min(self._tick - terminal_start, len(self.terminal_actions) - 1)
+        # CognitiveRuntime steps the world before asking the policy to emit,
+        # so an action emitted on tick N is applied on tick N + 1.  Start the
+        # suffix one tick early and emit NULL on the final (unapplied) policy
+        # tick.  This makes every declared recovery action affect the world
+        # exactly once without recording a misleading duplicate command.
+        terminal_start = self.episode_ticks - len(self.terminal_actions) - 1
+        if self._tick >= self.episode_ticks - 1:
+            action = NULL_ACTION
+        elif self._tick >= terminal_start:
+            index = self._tick - terminal_start
             action = self.terminal_actions[index]
         else:
             action = super().decide(state, memory, prediction)

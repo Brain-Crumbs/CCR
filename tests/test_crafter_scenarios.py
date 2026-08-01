@@ -101,6 +101,43 @@ def test_episode_cache_reuses_a_compatible_scenario_seed(monkeypatch, tmp_path):
     assert os.path.isfile(os.path.join(first, "nursery_cache.json"))
 
 
+def test_episode_cache_separates_different_split_parameter_assignments(monkeypatch, tmp_path):
+    """A seed's split-pool position controls scenario distance/layout knobs."""
+    calls = []
+
+    def fake_record(record_dir, session_id, seed, scenario, cfg, *, recording=None):
+        calls.append((record_dir, session_id, seed))
+        session_dir = os.path.join(record_dir, session_id)
+        os.makedirs(session_dir, exist_ok=True)
+        with open(os.path.join(session_dir, "session.json"), "w", encoding="utf-8") as fh:
+            json.dump({"session_id": session_id}, fh)
+        with open(os.path.join(session_dir, "episode_00000.decisions.jsonl"), "w", encoding="utf-8"):
+            pass
+        return session_dir
+
+    monkeypatch.setattr(nursery_module, "_record_scenario_episode", fake_record)
+    cache_dir = str(tmp_path / "episode-cache")
+    first_cfg = _crafter_config(episode_cache_dir=cache_dir, train_seeds=(0, 1))
+    reordered_cfg = replace(first_cfg, train_seeds=(1, 0))
+    scenario = CRAFTER_SCENARIOS["approach_entity"]
+
+    first = nursery_module._record_or_reuse_scenario_episode(
+        str(tmp_path / "run-a"), "approach-train-0", 0, scenario, first_cfg,
+    )
+    reordered = nursery_module._record_or_reuse_scenario_episode(
+        str(tmp_path / "run-b"), "approach-train-0", 0, scenario, reordered_cfg,
+    )
+
+    assert first != reordered
+    assert len(calls) == 2
+    with open(os.path.join(first, "nursery_cache.json"), encoding="utf-8") as fh:
+        first_identity = json.load(fh)
+    with open(os.path.join(reordered, "nursery_cache.json"), encoding="utf-8") as fh:
+        reordered_identity = json.load(fh)
+    assert first_identity["split_seed_pools"]["train"] == [0, 1]
+    assert reordered_identity["split_seed_pools"]["train"] == [1, 0]
+
+
 @pytest.mark.parametrize("scenario_name", sorted(CRAFTER_SCENARIOS))
 def test_each_crafter_scenario_passes_its_own_quality_gate(tmp_path, scenario_name):
     scenario = CRAFTER_SCENARIOS[scenario_name]

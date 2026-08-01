@@ -6,7 +6,13 @@ from cognitive_runtime.core.action import Action
 from cognitive_runtime.core.memory import Memory
 from cognitive_runtime.core.observation import Observation
 from cognitive_runtime.core.perception import State
-from cognitive_runtime.policies import ActionBurstPolicy, NullPolicy, RandomPolicy, ScriptedSurvivalPolicy
+from cognitive_runtime.policies import (
+    ActionBurstPolicy,
+    NullPolicy,
+    RandomPolicy,
+    ScriptedSurvivalPolicy,
+    TerminalRecoveryActionBurstPolicy,
+)
 from cognitive_runtime.programs.minecraft.actions import ACTION_SPACE
 
 
@@ -132,6 +138,34 @@ def test_action_burst_policy_rejects_invalid_burst_bounds():
         ActionBurstPolicy(_BABBLING_ACTIONS, min_burst_ticks=0, seed=0)
     with pytest.raises(ValueError):
         ActionBurstPolicy(_BABBLING_ACTIONS, min_burst_ticks=4, max_burst_ticks=1, seed=0)
+
+
+def test_terminal_recovery_actions_are_all_applied_despite_motor_delay():
+    terminal_actions = tuple(Action(name) for name in (
+        "MOVE_LEFT", "MOVE_RIGHT", "MOVE_UP", "MOVE_DOWN",
+    ))
+    policy = TerminalRecoveryActionBurstPolicy(
+        _BABBLING_ACTIONS,
+        episode_ticks=7,
+        terminal_actions=terminal_actions,
+        seed=3,
+    )
+    memory = Memory()
+    emissions = [policy.emit(_state(_obs()), memory, None) for _ in range(7)]
+
+    # The runtime applies the preceding emission before each policy decision.
+    applied = [[]] + emissions[:-1]
+    assert applied[-4:] == [[action] for action in terminal_actions]
+    assert emissions[-1] == []
+
+
+def test_terminal_recovery_requires_a_motor_delay_tick():
+    with pytest.raises(ValueError, match="motor delay"):
+        TerminalRecoveryActionBurstPolicy(
+            _BABBLING_ACTIONS,
+            episode_ticks=4,
+            terminal_actions=_BABBLING_ACTIONS[:4],
+        )
 
 
 def test_scripted_policy_eats_when_hungry():
