@@ -64,26 +64,6 @@ test("session quality verdicts are memoized until a session file changes", () =>
   assert.equal(calls, 2);
 });
 
-test("browser renders exactly one selected run's pixel-horizon viewer", async () => {
-  const source = fs.readFileSync(path.join(__dirname, "../public/session-browser.js"), "utf8");
-  const isolated = source.replace(/^import .*diagnostic-panels\.js.*$/m, "");
-  const { episodeUrls } = await import(`data:text/javascript;base64,${Buffer.from(isolated).toString("base64")}`);
-  assert.deepEqual(episodeUrls("pixel session", "episode_00000"), {
-    frames: "/api/sessions/pixel%20session/episodes/episode_00000/frames",
-    predictions: "/api/sessions/pixel%20session/episodes/episode_00000/predictions",
-  });
-  assert.equal(
-    episodeUrls("pixel session", "episode_00000", "joint cortex/42").predictions,
-    "/api/sessions/pixel%20session/episodes/episode_00000/predictions?experiment=joint%20cortex%2F42",
-  );
-  assert.match(source, /createElement\("pixel-horizon-viewer"\)/);
-  assert.match(source, /run-picker/);
-  assert.match(source, /"Organism"/);
-  assert.match(source, /"Run"/);
-  assert.doesNotMatch(source, /Dreamed vs actual/);
-  assert.doesNotMatch(source, /mountDiagnostics/);
-});
-
 test("clinic mode joins a selected organism/run to its cached prediction sessions", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-runs-"));
   const runsDir = path.join(root, "runs"), cacheDir = path.join(root, "episode_cache");
@@ -115,6 +95,37 @@ test("clinic mode joins a selected organism/run to its cached prediction session
   assert.deepEqual(listed.body.sessions.map((session) => session.id), ["cache/seed-20"]);
   const prediction = await get(port, `/api/sessions/cache%2Fseed-20/episodes/episode_00000/predictions${query}&experiment=run-1`);
   assert.equal(prediction.body.marker, "cached");
+
+  fs.writeFileSync(path.join(runDir, "contracts.json"), JSON.stringify({ architecture_hash: "arch-1" }));
+  fs.writeFileSync(path.join(runDir, "lineage.json"), JSON.stringify({ parent_run_id: null, mode: "fresh" }));
+  fs.mkdirSync(path.join(runDir, "metrics"), { recursive: true });
+  fs.writeFileSync(path.join(runDir, "metrics", "comparison.json"), JSON.stringify({
+    format: "model-factory-paired-comparison-v1", status: "evaluable", mean_delta: -0.01, win_rate: 0.7,
+  }));
+  const experiments = await get(port, `/api/experiments${query}`);
+  assert.equal(experiments.status, 200);
+  assert.equal(experiments.body.contracts.architecture_hash, "arch-1");
+  assert.equal(experiments.body.lineage.mode, "fresh");
+  assert.equal(experiments.body.data_manifest, null);
+  assert.equal(experiments.body.metrics.comparison.win_rate, 0.7);
+  assert.equal(experiments.body.metrics.validation, null);
+  assert.equal((await get(port, "/api/experiments?organism=Test&run=missing")).status, 404);
+
+  fs.writeFileSync(path.join(runsDir, "Test", "registry.json"), JSON.stringify({
+    format: "model-factory-registry-v1",
+    slots: { generic_action_effects_v1: { fast: { "rollout.t+4": {
+      leading_champion: "run-1",
+      population: [{ run_id: "run-1", checkpoint_path: "checkpoints/best-validation.pt", checkpoint_sha256: "abc123", metrics: {}, promoted_at: "2026-01-01T00:00:00Z", test_uses: 0 }],
+      history: [],
+    } } } },
+  }));
+  const registry = await get(port, "/api/registry?organism=Test");
+  assert.equal(registry.status, 200);
+  assert.equal(registry.body.slots.generic_action_effects_v1.fast["rollout.t+4"].leading_champion, "run-1");
+  assert.equal((await get(port, "/api/registry?organism=Nobody")).status, 404);
+  // organism is joined into a filesystem path; an uncatalogued value must
+  // never escape runsDir, even via traversal segments.
+  assert.equal((await get(port, `/api/registry?organism=${encodeURIComponent("../../../../etc")}`)).status, 404);
 });
 
 test("clinic mode uses a run session index to include cached training recordings", async (t) => {
@@ -142,12 +153,6 @@ test("service discovers sessions nested below the configured runs directory", as
   assert.deepEqual(listed.body.sessions.map((session) => session.id), ["Test/run-1/pixel-session"]);
   const detail = await get(server.address().port, "/api/sessions/Test%2Frun-1%2Fpixel-session");
   assert.equal(detail.status, 200);
-});
-
-test("frame panels honor the source selected in the prediction control", () => {
-  const source = fs.readFileSync(path.join(__dirname, "../public/pixel-horizon-viewer.js"), "utf8");
-  assert.match(source, /const comparisonSource = source;/);
-  assert.doesNotMatch(source, /const comparisonSource = this\._pred \? "model" : source;/);
 });
 
 test("prediction endpoint assembles forecasts recorded by a live cortex", async (t) => {
@@ -198,56 +203,18 @@ test("frame endpoint maps ordered decision windows in one forward pass", async (
   assert.deepEqual(result.body.frames.map((frame) => frame.tick), [10, 11, 12]);
 });
 
-async function panels() {
-  const source = fs.readFileSync(path.join(__dirname, "../public/diagnostic-panels.js"), "utf8");
-  return import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
-}
-
 test("dream strip endpoint serves the Phase 4 export independently per episode", async (t) => {
   const server = createServer({ dataDir: fixture() }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
   const result = await get(server.address().port, "/api/sessions/pixel-session/episodes/episode_00000/predictions?kind=dream");
   assert.equal(result.status, 200); assert.equal(result.body.kind, "dream");
 });
 
-test("EEG component renders neuromodulators, prediction error, and mode timeline", async () => {
-  const ui = await panels();
-  const model = ui.episodeDiagnostics([
-    { stream_id: "internal.dopamine", payload: { value: .2 }, seq: 1 },
-    { stream_id: "internal.acetylcholine", payload: { value: .3 }, seq: 1 },
-    { stream_id: "internal.adrenaline", payload: { value: .4 }, seq: 1 },
-    { stream_id: "internal.prediction_error", payload: { value: .5 }, seq: 1 },
-    { stream_id: "internal.arbiter.mode", payload: { mode: "afraid" }, seq: 1 },
-  ]);
-  const html = ui.renderEEGPanel(model);
-  for (const label of ["dopamine", "acetylcholine", "adrenaline", "prediction error", "afraid"]) assert.match(html, new RegExp(label));
-  assert.match(html, /class="time-cursor"/); assert.match(html, /data-tick="1"/);
-});
+// The React front end (viewer/web/src) has its own component/unit tests
+// (`npm --prefix viewer/web run test`, Vitest) for the EEG, attention,
+// developmental-ladder, and pixel-horizon panels this server feeds -- this
+// file covers only the server's API contract.
 
-test("attention component renders reasons from DecisionRecord rather than the stream payload", async () => {
-  const ui = await panels();
-  const streams = [{ stream_id: "internal.attention.weights", seq: 4, payload: {
-    focus_stream: "vision.frame.pixels", selected_streams: ["vision.frame.pixels", "body.health"],
-  } }];
-  const decisions = [{ tick_index: 4, attention: {
-    focus_stream: "vision.frame.pixels", selected_streams: ["vision.frame.pixels", "body.health"],
-    reasons: { "vision.frame.pixels": { components: { novelty: .75, boredom: -.1 } } },
-  } }];
-  const model = ui.episodeDiagnostics(streams, decisions);
-  const html = ui.renderAttentionPanel(model);
-  assert.match(html, /vision\.frame\.pixels/); assert.match(html, /novelty 0\.75/); assert.match(html, /body\.health/);
-  assert.doesNotMatch(html, /reason unavailable/);
-});
-
-test("developmental component renders passed and pending stage gates", async () => {
-  const ui = await panels();
-  const html = ui.renderDevelopmentPanel({ development: { stages: [
-    { name: "Gestation", passed: true, milestones: ["sensory baseline"] }, { name: "Crawling", passed: false },
-  ] } });
-  assert.match(html, /stage--passed[^>]*>[\s\S]*Gestation/); assert.match(html, /sensory baseline/); assert.match(html, /stage--pending[^>]*>[\s\S]*Crawling/);
-});
-
-test("clinic landing page has no public-internet runtime dependency", () => {
-  const html = fs.readFileSync(path.join(__dirname, "../public/index.html"), "utf8");
+test("web front-end source has no public-internet runtime dependency", () => {
+  const html = fs.readFileSync(path.join(__dirname, "../web/index.html"), "utf8");
   assert.doesNotMatch(html, /https?:\/\//);
-  assert.match(html, /\/pixel-horizon-viewer\.js/);
 });
