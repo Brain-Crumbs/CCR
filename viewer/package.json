@@ -1,14 +1,17 @@
 {
-  "name": "ccr-pixel-viewer",
-  "version": "0.1.0",
+  "name": "ccr-clinic",
+  "version": "0.2.0",
   "private": true,
-  "description": "Lightweight zero-dependency node server + reusable <pixel-horizon-viewer> web component: actual vs. predicted pixel frames per prediction horizon for recorded streams-v2 sessions.",
+  "description": "Zero-dependency Node/HTTP read-only API over streams-v2 Record sessions and Model Factory runs (server.js), plus a React presentation layer (web/) built into public/.",
   "license": "MIT",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check public/session-browser.js && node --check public/diagnostic-panels.js && node --check public/pixel-horizon-viewer.js",
-    "test": "node --test test/*.test.js"
+    "check": "node --check server.js",
+    "test": "node --test test/*.test.js",
+    "build": "npm --prefix web run build",
+    "dev": "npm --prefix web run dev",
+    "test:web": "npm --prefix web run test"
   },
   "engines": {
     "node": ">=18"
