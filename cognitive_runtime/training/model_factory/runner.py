@@ -38,6 +38,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+import statistics
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -70,6 +71,7 @@ from cognitive_runtime.training.model_factory.checkpoint import (
 from cognitive_runtime.training.model_factory.comparison import compare_paired_episodes
 from cognitive_runtime.training.model_factory.contracts import ArchitectureContract, TrainingContract
 from cognitive_runtime.training.model_factory.corpus import resolve_corpus
+from cognitive_runtime.training.model_factory.navigation_metrics import evaluate_navigation_sessions
 from cognitive_runtime.training.model_factory.spec import ExperimentSpec
 from cognitive_runtime.training.model_factory.spec import resolve as resolve_spec
 from cognitive_runtime.training.model_factory.spec import validate as validate_spec
@@ -105,6 +107,9 @@ RUNS_ROOT_DEFAULT = "runs"
 
 _SELECTION_METRIC_RE = re.compile(
     r"^(?P<report>rollout|direct)\.t\+(?P<ticks>\d+)\.(?P<stat>[a-zA-Z_][a-zA-Z0-9_]*)$"
+)
+_GOAL_NAVIGATION_METRICS = frozenset(
+    ("success_rate", "geodesic_efficiency", "collision_rate", "replan_recovery")
 )
 
 
@@ -299,12 +304,33 @@ def _load_existing_run_artifacts(root: Union[str, Path], organism: str, run_id: 
     )
 
 
-def _evaluate(model: Any, dataset: Any, spec: ExperimentSpec, cfg: Any) -> Dict[str, Any]:
+def _evaluate(
+    model: Any,
+    dataset: Any,
+    spec: ExperimentSpec,
+    cfg: Any,
+    *,
+    navigation_metrics: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     awm = _action_world_model_module()
-    return awm.evaluate_action_world_model_milestone(
+    result = awm.evaluate_action_world_model_milestone(
         model, dataset, tuple(int(tick) for tick in spec.data["horizons_ticks"]),
         warmup_frames=cfg.warmup_frames,
     )
+    if navigation_metrics is not None:
+        result["goal_navigation"] = dict(navigation_metrics)
+    return result
+
+
+def _selection_metric_mode(selection_metric: str) -> str:
+    """Best-checkpoint direction for one supported selection path."""
+    if selection_metric in (
+        "goal_navigation.success_rate",
+        "goal_navigation.geodesic_efficiency",
+        "goal_navigation.replan_recovery",
+    ):
+        return "max"
+    return "min"
 
 
 def _resolve_selection_metric(
@@ -313,18 +339,42 @@ def _resolve_selection_metric(
     """Resolve a spec's ``evaluation.selection_metric`` against one
     ``evaluate_action_world_model_milestone`` report.
 
-    Supports the epic's own example shape only --
-    ``"<rollout|direct>.t+<ticks>.<stat>"`` -- resolving a general metric
-    path (e.g. a future ``goal_navigation.success_rate``) is out of scope
-    for this issue. The per-episode values returned alongside the scalar
-    are always the raw per-episode model MSE at that horizon (matching
-    ``comparison.py``'s own documented recommendation), regardless of which
-    derived ``stat`` the selection metric names.
+    The second return value is always a lower-is-better per-episode error for
+    paired comparison.  Prediction metrics already are errors; higher-is-
+    better navigation scores are converted to ``1 - score`` while the scalar
+    remains the advertised raw score used for checkpoint selection/reporting.
     """
+    navigation_prefix = "goal_navigation."
+    if selection_metric.startswith(navigation_prefix):
+        metric = selection_metric[len(navigation_prefix):]
+        if metric not in _GOAL_NAVIGATION_METRICS:
+            raise ValueError(
+                f"unknown goal-navigation selection metric {metric!r}; expected one of "
+                f"{sorted(_GOAL_NAVIGATION_METRICS)!r}"
+            )
+        report = eval_result.get("goal_navigation")
+        if not isinstance(report, Mapping):
+            raise ValueError(
+                f"selection metric {selection_metric!r} requires goal-navigation evaluation evidence"
+            )
+        value = report.get(metric)
+        per_episode = (report.get("per_episode") or {}).get(metric)
+        if value is None or not isinstance(per_episode, Sequence):
+            raise ValueError(
+                f"selection metric {selection_metric!r} was not evaluable on the held-out corpus"
+            )
+        if metric == "collision_rate":
+            errors = [float(item) for item in per_episode]
+        elif metric == "replan_recovery":
+            errors = [0.0 if item is None else 1.0 - float(item) for item in per_episode]
+        else:
+            errors = [1.0 - float(item) for item in per_episode]
+        return float(value), errors
+
     match = _SELECTION_METRIC_RE.match(selection_metric)
     if not match:
         raise ValueError(
-            "run_trial only resolves selection metrics of the form "
+            "run_trial resolves goal_navigation.<metric> or selection metrics of the form "
             f"'<rollout|direct>.t+<ticks>.<stat>'; got {selection_metric!r}"
         )
     report_name = match.group("report")
@@ -344,6 +394,18 @@ def _resolve_selection_metric(
     value = horizons[horizon_key][stat]
     per_episode = report["per_episode_model_mse"][horizon_key]
     return float(value), [float(item) for item in per_episode]
+
+
+def _per_episode_retention_losses(eval_result: Mapping[str, Any]) -> List[float]:
+    """Reduce held-out multi-horizon prediction errors to one loss per episode."""
+    by_horizon = eval_result.get("per_episode_model_mse") or {}
+    series = [list(values) for _, values in sorted(by_horizon.items(), key=lambda item: str(item[0]))]
+    if not series or not series[0]:
+        raise ValueError("generic retention evaluation produced no per-episode prediction losses")
+    episode_count = len(series[0])
+    if any(len(values) != episode_count for values in series):
+        raise ValueError("generic retention horizons disagree on held-out episode count")
+    return [statistics.fmean(float(values[index]) for values in series) for index in range(episode_count)]
 
 
 def _optimizer_for_state(model: Any, lr: float, optimizer_state_dict: Optional[Mapping[str, Any]]) -> Any:
@@ -451,9 +513,10 @@ def run_trial(
     trial state machine (MF-B5) around the existing
     ``train_action_world_model``/``evaluate_action_world_model_milestone``.
     Writes ``checkpoints/last.pt``, ``checkpoints/best-validation.pt``,
-    ``metrics/validation.json``, ``metrics/budget_report.json``, and
-    (for ``clone``/``fine_tune``) ``metrics/comparison.json``, plus
-    ``experiment_report.json``. Never writes ``metrics/test.json`` -- that
+    ``metrics/validation.json`` and ``metrics/budget_report.json``; a
+    navigation continuation also writes ``metrics/retention.json``, while
+    ``clone``/``fine_tune`` writes ``metrics/comparison.json``. Every run
+    writes ``experiment_report.json``. Never writes ``metrics/test.json`` -- that
     is reserved for an explicit final-test action (MF-C5, issue #227).
     """
     resolved_spec = spec if isinstance(spec, ExperimentSpec) else resolve_spec(spec)
@@ -476,6 +539,10 @@ def run_trial(
     if not validation_entries:
         raise ValueError(f"corpus {corpus.corpus_id!r} has no validation sessions")
     validation_episode_ids = [str(entry["session_id"]) for entry in validation_entries]
+    navigation_evaluation = (
+        evaluate_navigation_sessions(validation_entries)
+        if corpus.data_contract.behavior_mixture_policy else None
+    )
 
     awm = _action_world_model_module()
     vocabulary = _nursery_module()._action_keys_for_world(resolved_spec.data["world"])
@@ -485,6 +552,32 @@ def run_trial(
     validation_dataset = awm.build_action_sequence_dataset(
         [entry["session_path"] for entry in validation_entries], action_keys=vocabulary,
     )
+
+    retention_policy = dict(corpus.data_contract.retention_policy)
+    retention_dataset = None
+    retention_episode_ids: List[str] = []
+    if retention_policy:
+        if resolved_spec.mode == "fresh":
+            raise ValueError(
+                "a navigation retention contract requires a parent checkpoint; use fine_tune "
+                "from a generic_action_effects_v1 candidate so before/after retention is measurable"
+            )
+        retention_corpus = resolve_corpus(
+            str(retention_policy["corpus_id"]), allow_record=False,
+            root=corpus_root, organism=resolved_spec.organism,
+        )
+        if retention_corpus.data_contract.behavior_mixture_policy:
+            raise ValueError(
+                "retention_policy.corpus_id must resolve to the generic action-effects corpus, "
+                "not another navigation corpus"
+            )
+        retention_entries = retention_corpus.manifest["sessions"]["validation"]
+        if not retention_entries:
+            raise ValueError("generic retention corpus has no validation sessions")
+        retention_episode_ids = [str(entry["session_id"]) for entry in retention_entries]
+        retention_dataset = awm.build_action_sequence_dataset(
+            [entry["session_path"] for entry in retention_entries], action_keys=vocabulary,
+        )
 
     cfg = _action_world_model_config(resolved_spec)
     torch = _torch()
@@ -502,6 +595,7 @@ def run_trial(
     resume_state: Optional[TrainerResumeState] = None
     parent_checkpoint_sha: Optional[str] = None
     baseline_eval: Optional[Dict[str, Any]] = None
+    retention_before_eval: Optional[Dict[str, Any]] = None
 
     if resolved_spec.mode != "fresh":
         parent_path = str(_parent_checkpoint_path(root, resolved_spec))
@@ -536,6 +630,9 @@ def run_trial(
                 # inside trainer_state, not as a top-level payload field.
                 target_encoder_state_dict=trainer_state.get("target_encoder_state_dict"),
             )
+
+    if retention_dataset is not None:
+        retention_before_eval = _evaluate(model, retention_dataset, resolved_spec, cfg)
 
     if resolved_spec.mode == "resume":
         artifacts = _load_existing_run_artifacts(root, resolved_spec.organism, run_id)
@@ -594,7 +691,10 @@ def run_trial(
             config=resolved_spec.to_dict(),
         ):
             if resolved_spec.mode in ("clone", "fine_tune"):
-                baseline_eval = _evaluate(model, validation_dataset, resolved_spec, cfg)
+                baseline_eval = _evaluate(
+                    model, validation_dataset, resolved_spec, cfg,
+                    navigation_metrics=navigation_evaluation,
+                )
 
             total_epochs = int(resolved_spec.training.get("epoch_budget") or DEFAULT_EPOCH_BUDGET)
             epoch = resume_state.epoch if resume_state is not None else 0
@@ -614,7 +714,7 @@ def run_trial(
             # "the best" regardless of the actual metric, silently
             # overwriting a genuinely better pre-crash checkpoint.
             best_tracker = BestValidationTracker(
-                mode="min",
+                mode=_selection_metric_mode(resolved_spec.evaluation["selection_metric"]),
                 best=resume_state.best_validation_metric if resume_state is not None else None,
             )
             trial_started = time.monotonic()
@@ -670,7 +770,10 @@ def run_trial(
                 )
                 write_heartbeat(trial_heartbeat_path, run_id=artifacts.run_id)
 
-                eval_result = _evaluate(model, validation_dataset, resolved_spec, cfg)
+                eval_result = _evaluate(
+                    model, validation_dataset, resolved_spec, cfg,
+                    navigation_metrics=navigation_evaluation,
+                )
                 metric_value, _ = _resolve_selection_metric(
                     eval_result, resolved_spec.evaluation["selection_metric"], train_dataset.ticks_per_frame,
                 )
@@ -701,7 +804,10 @@ def run_trial(
                 # Reconstruct it by re-evaluating that same checkpoint
                 # rather than reporting the (worse) last-chunk model here.
                 existing_best = load_factory_checkpoint(str(artifacts.checkpoints_dir / "best-validation.pt"))
-                best_eval = _evaluate(existing_best.model, validation_dataset, resolved_spec, cfg)
+                best_eval = _evaluate(
+                    existing_best.model, validation_dataset, resolved_spec, cfg,
+                    navigation_metrics=navigation_evaluation,
+                )
             total_trial_seconds = time.monotonic() - trial_started
             budget_report = build_budget_report(
                 budget, completion_status=completion_status, total_trial_seconds=total_trial_seconds,
@@ -725,7 +831,32 @@ def run_trial(
                 "per_episode_model_mse": best_eval["per_episode_model_mse"],
                 "episode_ids": validation_episode_ids,
             }
+            if "goal_navigation" in best_eval:
+                validation_payload["goal_navigation"] = best_eval["goal_navigation"]
             atomic_write_json(artifacts.metrics_dir / "validation.json", validation_payload)
+
+            if retention_dataset is not None and retention_before_eval is not None:
+                from sleep.forgetting import compute_forgetting_metric
+
+                best_checkpoint = load_factory_checkpoint(str(checkpoint_path))
+                retention_after_eval = _evaluate(
+                    best_checkpoint.model, retention_dataset, resolved_spec, cfg,
+                )
+                forgetting = compute_forgetting_metric(
+                    _per_episode_retention_losses(retention_before_eval),
+                    _per_episode_retention_losses(retention_after_eval),
+                    old_scenario=str(retention_policy["suite"]),
+                    new_scenario="goal_navigation_v1",
+                    tolerance=float(retention_policy["max_regression"]),
+                )
+                retention_payload = forgetting.to_dict()
+                retention_payload.update({
+                    "metric": str(retention_policy["metric"]),
+                    "corpus_id": str(retention_policy["corpus_id"]),
+                    "episode_ids": retention_episode_ids,
+                    "checkpoint_path": str(checkpoint_path),
+                })
+                atomic_write_json(artifacts.metrics_dir / "retention.json", retention_payload)
 
             comparison_payload: Optional[Dict[str, Any]] = None
             if resolved_spec.mode in ("clone", "fine_tune") and baseline_eval is not None:

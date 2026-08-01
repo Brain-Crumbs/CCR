@@ -745,6 +745,16 @@ class CognitiveRuntime:
             oracle_labels_record = (
                 self._oracle_labels_fn() if callable(self._oracle_labels_fn) else None
             )
+            navigation_behavior = getattr(self.policy, "latest_navigation_behavior", None)
+            if oracle_labels_record is not None and navigation_behavior is not None:
+                # Issue #240: keep the requested-vs-expert provenance beside
+                # the training-only A* label.  It never becomes a sensory
+                # stream, but it makes a random injection distinguishable
+                # even when it happened to sample the same action as A*.
+                oracle_labels_record = {
+                    **oracle_labels_record,
+                    "behavior_mixture": dict(navigation_behavior),
+                }
             self.recorder.write_cognitive_tick(
                 sensory_events=window.events,
                 motor_events=motor_events,

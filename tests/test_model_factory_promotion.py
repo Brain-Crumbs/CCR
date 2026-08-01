@@ -50,6 +50,7 @@ ALL_GATE_NAMES = {
     "event_stratified_evaluability",
     "metric_schema",
     "primary_metric_margin",
+    "generic_retention",
     "safety_metrics",
     "durable_test_confirmation",
 }

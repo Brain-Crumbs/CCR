@@ -40,6 +40,12 @@ class CrafterConfig:
     goal_max_initial_distance: Optional[float] = None
     goal_commitment_horizon_ticks: int = 20
     goal_arrival_radius: float = 1.5
+    # Optional deterministic caregiver goal used by solvability-checked
+    # navigation corpus generators (issue #240).  It is an offset from the
+    # episode's ground-truth spawn, not an absolute world coordinate, so the
+    # same declared layout can be translated safely inside different world
+    # sizes.  ``None`` preserves the ordinary seeded distribution above.
+    goal_fixed_offset: Optional[Tuple[float, float]] = None
     # A* oracle labels + potential-based geodesic reward shaping (epic #212
     # §12.4/12.5, issue #239). Both ride on `goal_enabled` -- there is no
     # separate on/off knob -- since neither means anything without an active

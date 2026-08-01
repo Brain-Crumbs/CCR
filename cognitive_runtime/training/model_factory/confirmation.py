@@ -56,6 +56,7 @@ from cognitive_runtime.training.model_factory.checkpoint import (
     read_factory_checkpoint_metadata,
 )
 from cognitive_runtime.training.model_factory.corpus import resolve_corpus
+from cognitive_runtime.training.model_factory.navigation_metrics import evaluate_navigation_sessions
 from cognitive_runtime.training.model_factory.promotion import (
     PromotionPolicy,
     SealedTestBudgetExhaustedError,
@@ -336,14 +337,10 @@ def confirm_across_seeds(
                 f"(state={result.state!r}); a durable confirmation requires every seed rerun to complete, "
                 "exactly like the training_time_budget promotion gate"
             )
-        # `_resolve_selection_metric`'s per-episode values are always the raw
-        # per-episode model MSE at the selection metric's declared
-        # report/horizon -- never a derived ratio/rate such as
-        # model_over_copy_last_mse, even when that is what selection_metric
-        # names (see runner._resolve_selection_metric's own docstring). Use
-        # that raw mean, not the resolved (possibly ratio) scalar, so the
-        # aggregate below stays in the same units as baseline_metric_value,
-        # which is likewise computed from comparison.json's raw
+        # `_resolve_selection_metric`'s per-episode values are normalized
+        # lower-is-better comparison errors. For prediction paths they are
+        # raw model MSE; higher-is-better navigation scores become 1-score.
+        # This stays in the same units/direction as comparison.json's
         # baseline_raw_errors.
         _, per_episode = _resolve_selection_metric(result.evaluation, selection_metric, ticks_per_frame)
         metric_value = statistics.fmean(per_episode)
@@ -485,7 +482,14 @@ def final_test(
         checkpoint_path = run_directory / "checkpoints" / "best-validation.pt"
         loaded = load_factory_checkpoint(str(checkpoint_path))
         cfg = _action_world_model_config(spec)
-        eval_result = _evaluate(loaded.model, test_dataset, spec, cfg)
+        navigation_metrics = (
+            evaluate_navigation_sessions(test_entries)
+            if corpus.data_contract.behavior_mixture_policy else None
+        )
+        eval_result = _evaluate(
+            loaded.model, test_dataset, spec, cfg,
+            navigation_metrics=navigation_metrics,
+        )
 
         rollout_metrics = eval_result["rollout"]
         beats_copy_last_gate = _rollout_beats_copy_last_gate(rollout_metrics)
@@ -523,6 +527,8 @@ def final_test(
             "max_sealed_test_uses": confirmation.max_sealed_test_uses,
             "performed_at": _now_iso(),
         }
+        if "goal_navigation" in eval_result:
+            payload["goal_navigation"] = eval_result["goal_navigation"]
         atomic_write_json(test_metrics_path, payload)
 
     return FinalTestResult(

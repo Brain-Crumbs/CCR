@@ -208,6 +208,7 @@ class CrafterWorld(Program):
                 spawn_position=self._position_tuple(),
                 world_size=self._config.area,
                 seed=self._seed,
+                fixed_offset=self._config.goal_fixed_offset,
             )
             self._oracle_writer.reset()
             self._pending_goal_state = self._goal_setter.tracker.state(self._position_tuple())
@@ -370,6 +371,19 @@ class CrafterWorld(Program):
         ever been proposed.
         """
         return self._pending_oracle_label.as_payload() if self._pending_oracle_label else None
+
+    def refresh_oracle_labels(self) -> Optional[Dict[str, Any]]:
+        """Replan after an in-tick scripted map edit.
+
+        Normal Crafter steps refresh the oracle automatically.  The
+        ``replan_after_block`` nursery generator (issue #240) deliberately
+        inserts an obstacle *between* observations and action selection; it
+        calls this narrow hook so the decision recorded for that same state
+        carries the real route-invalidation label instead of a stale route.
+        The result remains training-only and never enters the stream catalog.
+        """
+        self._pending_oracle_label = self._compute_oracle_label()
+        return self.oracle_labels()
 
     def is_complete(self) -> bool:
         return self._done

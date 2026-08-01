@@ -86,6 +86,7 @@ class CorpusNurseryConfig:
     expected_pixel_source: Optional[str] = None
     name: Optional[str] = None
     episode_cache_dir: Optional[str] = None
+    navigation_random_action_fraction: float = 0.25
 
 
 def _nursery_module():
@@ -279,6 +280,95 @@ def _scenario_mix_report(
     return report, issues
 
 
+def _behavior_mixture_policy(
+    spec: Mapping[str, Any], cfg: CorpusNurseryConfig, splits: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Freeze the navigation expert/random schedule into the DataContract."""
+    scenario_names = {
+        str(name) for per_scenario in splits.values() for name in per_scenario
+    }
+    if not any(name.startswith("navigate_") or name == "replan_after_block" for name in scenario_names):
+        return {}
+    fraction = float(cfg.navigation_random_action_fraction)
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError(
+            f"navigation_random_action_fraction must be between 0 and 1, got {fraction!r}"
+        )
+    raw = spec.get("behavior_mixture") or {}
+    if not isinstance(raw, Mapping):
+        raise TypeError("corpus spec behavior_mixture must be a mapping")
+    declared_fraction = raw.get("random_action_fraction", fraction)
+    if not math.isclose(float(declared_fraction), fraction, abs_tol=1e-12):
+        raise ValueError(
+            "behavior_mixture.random_action_fraction must match generator."
+            "navigation_random_action_fraction"
+        )
+    implemented = {
+        "expert_policy": "astar",
+        "expert_action_fraction": 1.0 - fraction,
+        "random_action_fraction": fraction,
+        "random_action_subset": [
+            "MOVE_UP", "MOVE_DOWN", "MOVE_LEFT", "MOVE_RIGHT",
+        ],
+        "schedule": "seeded_stratified_per_active_step",
+        "seed_rule": "episode_seed",
+    }
+    for key, value in raw.items():
+        if key in implemented and value != implemented[key]:
+            raise ValueError(
+                f"behavior_mixture.{key}={value!r} contradicts the recorded "
+                f"navigation policy {implemented[key]!r}"
+            )
+    return implemented
+
+
+def _retention_policy(spec: Mapping[str, Any], splits: Mapping[str, Any]) -> Dict[str, Any]:
+    scenario_names = {
+        str(name) for per_scenario in splits.values() for name in per_scenario
+    }
+    is_navigation = any(
+        name.startswith("navigate_") or name == "replan_after_block"
+        for name in scenario_names
+    )
+    raw = spec.get("retention_policy")
+    if not is_navigation and raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("navigation corpus spec requires a retention_policy mapping")
+    suite = str(raw.get("suite", ""))
+    if suite != "generic_action_effects_v1":
+        raise ValueError(
+            "navigation retention_policy.suite must be 'generic_action_effects_v1'"
+        )
+    max_regression = float(raw.get("max_regression", -1.0))
+    if max_regression < 0:
+        raise ValueError("retention_policy.max_regression must be non-negative")
+    replay = raw.get("replay_mixture")
+    if not isinstance(replay, Mapping) or not replay:
+        raise ValueError("retention_policy requires a non-empty replay_mixture")
+    replay_mixture = {str(key): float(value) for key, value in replay.items()}
+    if any(value < 0 for value in replay_mixture.values()) or not math.isclose(
+        sum(replay_mixture.values()), 1.0, abs_tol=1e-6
+    ):
+        raise ValueError("retention_policy.replay_mixture values must be non-negative and sum to 1.0")
+    metric = str(raw.get("metric", "heldout_prediction_loss"))
+    if metric != "heldout_prediction_loss":
+        raise ValueError(
+            "navigation retention_policy.metric must be 'heldout_prediction_loss'"
+        )
+    corpus_id = str(raw.get("corpus_id", "crafter-generic-action-effects-v1"))
+    if not corpus_id:
+        raise ValueError("navigation retention_policy.corpus_id must not be empty")
+    return {
+        "suite": suite,
+        "corpus_id": corpus_id,
+        "metric": metric,
+        "max_regression": max_regression,
+        "replay_mixture": replay_mixture,
+        "forgetting_metric": "sleep.forgetting.compute_forgetting_metric",
+    }
+
+
 def _corpus_spec_payload(spec: Mapping[str, Any], cfg: CorpusNurseryConfig, splits: Mapping[str, Any]) -> Dict[str, Any]:
     """The immutable declaration, excluding where the corpus happens to live."""
     generator = _ordinary(cfg)
@@ -303,6 +393,8 @@ def _corpus_spec_payload(spec: Mapping[str, Any], cfg: CorpusNurseryConfig, spli
         "split_roles": _ordinary(spec.get("split_roles", DEFAULT_SPLIT_ROLES)),
         # Epic #212 Sec 12.2's declared data-collection mix, when present.
         "scenario_mix_policy": _scenario_mix_policy(spec, splits),
+        "behavior_mixture_policy": _behavior_mixture_policy(spec, cfg, splits),
+        "retention_policy": _retention_policy(spec, splits),
     }
     return payload
 
@@ -381,13 +473,14 @@ def _session_quality_evidence(
             with path.open(encoding="utf-8") as handle:
                 metadata = json.load(handle)
             quality = metadata.get("quality_report")
-            motor_babbling = (metadata.get("program_config") or {}).get("motor_babbling")
-            if quality is not None or motor_babbling is not None:
+            program_config = metadata.get("program_config") or {}
+            generator = program_config.get("motor_babbling") or program_config.get("navigation")
+            if quality is not None or generator is not None:
                 evidence[str(entry["session_id"])] = {
                     "scenario": str(entry["scenario"]),
                     "split": split,
                     "quality_report": quality,
-                    "generator": motor_babbling,
+                    "generator": generator,
                 }
     return evidence
 
@@ -420,10 +513,59 @@ def _scenario_generator_summary(
         if isinstance(layout, Mapping):
             cleaned["layout_distribution"] = {
                 key: value for key, value in layout.items()
-                if key not in ("layout_seed", "realised_layout")
+                if key not in ("layout_seed", "terrain_seed", "realised_layout")
             }
         summary[scenario] = cleaned
+    # Navigation layouts deliberately vary by split and seed.  Keep the
+    # per-session realised cells in ``program_config`` evidence above, while
+    # making this per-scenario summary describe the *distribution* rather
+    # than accidentally presenting the first episode's wall coordinates as
+    # a constant generator parameter.
+    for scenario in list(summary):
+        navigation_layouts = [
+            entry["generator"].get("layout_distribution") or {}
+            for entry in generator_evidence.values()
+            if entry.get("scenario") == scenario
+            and entry.get("generator")
+            and entry["generator"].get("behavior_mixture")
+        ]
+        if not navigation_layouts:
+            continue
+        families_by_split: Dict[str, set[str]] = {}
+        for layout in navigation_layouts:
+            split = str(layout.get("split", "unspecified"))
+            family = layout.get("layout_family")
+            if family:
+                families_by_split.setdefault(split, set()).add(str(family))
+        summary[scenario]["layout_distribution"] = {
+            "layout_families_by_split": {
+                split: sorted(families) for split, families in sorted(families_by_split.items())
+            },
+            "solvability_check": "astar_before_recording",
+            "per_episode_realisations": "program_config.scenario_generator_evidence",
+            "dynamic_block": next(
+                (layout.get("dynamic_block") for layout in navigation_layouts if layout.get("dynamic_block")),
+                None,
+            ),
+        }
     return summary
+
+
+def _navigation_contract_policy(
+    generator_evidence: Mapping[str, Mapping[str, Any]], key: str,
+) -> Dict[str, Any]:
+    """One navigation policy declaration, requiring cross-session identity."""
+    declarations = [
+        dict(entry["generator"][key])
+        for entry in generator_evidence.values()
+        if entry.get("generator") and entry["generator"].get(key)
+    ]
+    if not declarations:
+        return {}
+    first = declarations[0]
+    if any(declaration != first for declaration in declarations[1:]):
+        raise ValueError(f"navigation sessions disagree on declared {key}")
+    return first
 
 
 def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapping[str, Any]]]) -> DataContract:
@@ -438,6 +580,15 @@ def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapp
         # bounds, not just post-hoc aggregate counts.
         program_config["scenario_generator_evidence"] = generator_evidence
     is_crafter = generator["world"] == "crafter"
+    behavior_mixture_policy = dict(spec.get("behavior_mixture_policy") or {})
+    recorded_behavior_mixture = _navigation_contract_policy(
+        generator_evidence, "behavior_mixture",
+    )
+    if behavior_mixture_policy and recorded_behavior_mixture != behavior_mixture_policy:
+        raise ValueError(
+            "navigation session behavior_mixture evidence does not match the corpus declaration: "
+            f"recorded={recorded_behavior_mixture!r}, declared={behavior_mixture_policy!r}"
+        )
     return DataContract(
         world=str(generator["world"]),
         backend=str(generator["backend"]),
@@ -467,6 +618,17 @@ def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapp
         action_effect_label_schema_version=(ACTION_EFFECT_LABEL_VERSION if is_crafter else ""),
         split_roles=dict(spec.get("split_roles", DEFAULT_SPLIT_ROLES)),
         scenario_mix_policy=dict(spec.get("scenario_mix_policy") or {}),
+        goal_distribution_policy=_navigation_contract_policy(
+            generator_evidence, "goal_distribution_policy",
+        ),
+        oracle_planner_policy=_navigation_contract_policy(
+            generator_evidence, "oracle_planner_policy",
+        ),
+        goal_reward_policy=_navigation_contract_policy(
+            generator_evidence, "goal_reward_policy",
+        ),
+        behavior_mixture_policy=recorded_behavior_mixture,
+        retention_policy=dict(spec.get("retention_policy") or {}),
     )
 
 

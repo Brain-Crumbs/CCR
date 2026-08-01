@@ -30,7 +30,7 @@ import logging
 import os
 import random
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
@@ -38,6 +38,10 @@ log = logging.getLogger("ccr.training.nursery")
 import torch.nn.functional as F
 
 from cognitive_runtime.core.action import NULL_ACTION, Action
+from cognitive_runtime.core.memory import Memory
+from cognitive_runtime.core.perception import State
+from cognitive_runtime.core.policy import SingleActionPolicy
+from cognitive_runtime.core.world_model import Prediction
 from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
 from cognitive_runtime.observability import span, trace_counter, trace_event, trace_metrics
 from cognitive_runtime.policies.action_burst import ActionBurstPolicy
@@ -214,6 +218,19 @@ class NurseryConfig:
     #: reused across experiment directories.  Model/training hyperparameters
     #: deliberately do not affect the key: they consume the same episodes.
     episode_cache_dir: Optional[str] = None
+    #: Goal-navigation demonstration mixture (epic #212 Sec 12.5, issue
+    #: #240): probability that a navigation step uses a uniformly sampled
+    #: cardinal action instead of the A* expert's next action.  The default
+    #: is deliberately inside the declared 20--30% starting band; callers
+    #: may tune it only as an explicit, contract-changing setting.
+    navigation_random_action_fraction: float = 0.25
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.navigation_random_action_fraction <= 1.0:
+            raise ValueError(
+                "navigation_random_action_fraction must be between 0 and 1 inclusive, "
+                f"got {self.navigation_random_action_fraction!r}"
+            )
 
 
 @dataclass
@@ -1191,6 +1208,385 @@ def _crafter_motor_babbling_walls(seed: int, cfg: NurseryConfig) -> ScenarioReco
     )
 
 
+# --------------------------------------------------------------------------- goal navigation (issue #240; epic #212 Sec 12.4/12.5)
+
+_NAVIGATION_GENERATOR_VERSION = "goal-navigation-layouts-v1"
+_NAVIGATION_ACTIONS: Tuple[Action, ...] = (
+    _CRAFTER_MOVE_UP, _CRAFTER_MOVE_DOWN, _CRAFTER_MOVE_LEFT, _CRAFTER_MOVE_RIGHT,
+)
+_NAVIGATION_GOAL_DISTANCE = 8
+_NAVIGATION_TWO_WALL_GOAL_DISTANCE = 10
+_NAVIGATION_CLEAR_RADIUS = 12
+_REPLAN_INVALIDATION_TICK = 3
+
+
+def _rotate_navigation_offset(offset: Tuple[int, int], quarter_turns: int) -> Tuple[int, int]:
+    """Rotate a relative layout coordinate without changing its topology."""
+    x, y = offset
+    for _ in range(quarter_turns % 4):
+        x, y = -y, x
+    return x, y
+
+
+def _navigation_wall(
+    *, x: int, span: int, gap: int, quarter_turns: int,
+) -> Tuple[Tuple[int, int], ...]:
+    return tuple(
+        _rotate_navigation_offset((x, y), quarter_turns)
+        for y in range(-span, span + 1)
+        if y != gap
+    )
+
+
+def _navigation_layout(seed: int, cfg: NurseryConfig, scenario_name: str) -> Dict[str, Any]:
+    """One deterministic relative-coordinate layout declaration.
+
+    ``navigate_two_wall`` uses different *families*, spans, and gap
+    positions for train versus holdout.  This makes disjointness a property
+    of the generator support rather than an accident of seed arithmetic.
+    """
+    split, index = _seed_split_index(seed, cfg)
+    rotation = index % 4
+    walls: Tuple[Tuple[int, int], ...] = ()
+    dynamic_block = None
+    goal_distance = _NAVIGATION_GOAL_DISTANCE
+    family = f"{scenario_name}-v1"
+
+    if scenario_name == "navigate_single_wall":
+        gap = (-2, 2)[index % 2]
+        walls = _navigation_wall(x=4, span=3, gap=gap, quarter_turns=rotation)
+        family = "single-wall-detour-v1"
+    elif scenario_name == "navigate_two_wall":
+        goal_distance = _NAVIGATION_TWO_WALL_GOAL_DISTANCE
+        if split == "train":
+            # Shorter training barriers with opposite outer gaps.
+            gaps = ((-2, 2), (2, -2))[index % 2]
+            span = 3
+            family = "two-wall-train-zigzag-v1"
+        else:
+            # Longer, shifted-gap barriers are not rotations/reflections of
+            # the training support (different span and gap magnitudes).
+            gaps = ((-3, 1), (1, 3))[index % 2]
+            span = 4
+            family = "two-wall-holdout-long-chicane-v1"
+        walls = (
+            *_navigation_wall(x=3, span=span, gap=gaps[0], quarter_turns=rotation),
+            *_navigation_wall(x=7, span=span, gap=gaps[1], quarter_turns=rotation),
+        )
+    elif scenario_name == "replan_after_block":
+        family = "dynamic-next-route-cell-v1"
+        dynamic_block = {
+            "invalidation_tick": _REPLAN_INVALIDATION_TICK,
+            "selection": "current_astar_frontier_barrier",
+            "material": "stone",
+        }
+    elif scenario_name != "navigate_open_goal":
+        raise ValueError(f"unknown navigation scenario {scenario_name!r}")
+
+    goal_offset = _rotate_navigation_offset((goal_distance, 0), rotation)
+    return {
+        "scenario": scenario_name,
+        "split": split,
+        "layout_family": family,
+        "layout_id": f"{family}-r{rotation}-v{index % 2}",
+        "rotation_quarter_turns": rotation,
+        "terrain_seed": seed,
+        "goal_offset": goal_offset,
+        "walls": walls,
+        "dynamic_block": dynamic_block,
+    }
+
+
+def _validate_navigation_layout_solvable(
+    env: Any,
+    *,
+    goal_offset: Tuple[int, int],
+    arrival_radius: float,
+    context: str,
+) -> List[Tuple[int, int]]:
+    """Return the checked shortest path or reject before recording starts."""
+    from cognitive_runtime.programs.crafter.oracle import (
+        astar_path_to_region,
+        build_walkable_grid,
+        compute_goal_region,
+    )
+
+    start = tuple(int(v) for v in env._player.pos)
+    goal = (start[0] + goal_offset[0], start[1] + goal_offset[1])
+    walkable = build_walkable_grid(env._sem_view())
+    region = compute_goal_region(goal, arrival_radius, tuple(int(v) for v in env._world.area))
+    path = astar_path_to_region(walkable, start, region, tuple(int(v) for v in env._world.area))
+    if path is None:
+        raise ValueError(
+            f"navigation layout {context!r} is unsolvable from {start} to caregiver goal {goal}; "
+            "rejecting it before recording"
+        )
+    return path
+
+
+def _setup_navigation_layout(
+    env: Any, *, layout: Mapping[str, Any], arrival_radius: float,
+) -> None:
+    """Install and preflight one generated navigation layout."""
+    _crafter_remove_wildlife(env)
+    start = tuple(int(v) for v in env._player.pos)
+    _crafter_clear_terrain(env._world, start[0], start[1], _NAVIGATION_CLEAR_RADIUS)
+    # Keep every cell walkable while making seeded train/holdout recordings
+    # visually distinct.  A fully synthetic all-grass square would make the
+    # same rotated route byte-identical across split seeds and invalidate the
+    # held-out claim even though the seed numbers differ.
+    terrain_rng = random.Random(int(layout["terrain_seed"]))
+    for rel_x in range(-_NAVIGATION_CLEAR_RADIUS, _NAVIGATION_CLEAR_RADIUS + 1):
+        for rel_y in range(-_NAVIGATION_CLEAR_RADIUS, _NAVIGATION_CLEAR_RADIUS + 1):
+            if (rel_x, rel_y) == (0, 0) or terrain_rng.random() >= 0.18:
+                continue
+            env._world[(start[0] + rel_x, start[1] + rel_y)] = terrain_rng.choice(("path", "sand"))
+    for rel_x, rel_y in layout["walls"]:
+        env._world[(start[0] + rel_x, start[1] + rel_y)] = "stone"
+    goal_offset = tuple(int(v) for v in layout["goal_offset"])
+    env._player.facing = (
+        0 if goal_offset[0] == 0 else (1 if goal_offset[0] > 0 else -1),
+        0 if goal_offset[1] == 0 else (1 if goal_offset[1] > 0 else -1),
+    )
+    _validate_navigation_layout_solvable(
+        env,
+        goal_offset=goal_offset,
+        arrival_radius=arrival_radius,
+        context=str(layout["layout_id"]),
+    )
+
+    # The dynamic scenario's actual cell is chosen from the live A* route at
+    # invalidation time.  Preflight the canonical direct-route cell as well:
+    # construction clears a two-dimensional recovery region, and this check
+    # mechanically guards a future layout edit from accidentally sealing it.
+    if layout.get("dynamic_block"):
+        canonical = _rotate_navigation_offset((4, 0), int(layout["rotation_quarter_turns"]))
+        target = (start[0] + canonical[0], start[1] + canonical[1])
+        if canonical[0]:
+            targets = [(target[0], target[1] + offset) for offset in (-1, 0, 1)]
+        else:
+            targets = [(target[0] + offset, target[1]) for offset in (-1, 0, 1)]
+        for cell in targets:
+            env._world[cell] = "stone"
+        try:
+            _validate_navigation_layout_solvable(
+                env,
+                goal_offset=goal_offset,
+                arrival_radius=arrival_radius,
+                context=f"{layout['layout_id']}-after-block",
+            )
+        finally:
+            for cell in targets:
+                env._world[cell] = "grass"
+
+
+class _NavigationBehaviorPolicy(SingleActionPolicy):
+    """Seeded A* demonstrations with explicit random-cardinal injections."""
+
+    name = "navigation-expert-random-v1"
+
+    def __init__(self, *, seed: int, random_action_fraction: float, layout: Mapping[str, Any]):
+        self.seed = int(seed)
+        self.random_action_fraction = float(random_action_fraction)
+        self.layout = layout
+        self._program: Any = None
+        self.latest_navigation_behavior: Optional[Dict[str, Any]] = None
+        self.reset()
+
+    def bind_program(self, program: Any) -> None:
+        self._program = program
+
+    def reset(self) -> None:
+        self._tick = 0
+        self._invalidation_applied = False
+        self._rng = random.Random(self.seed)
+        self._injection_accumulator = self._rng.random()
+        self.latest_navigation_behavior = None
+
+    def _invalidate_current_route(self) -> None:
+        labels = self._program.oracle_labels() or {}
+        next_action = labels.get("next_action")
+        if next_action is None:
+            raise ValueError("replan_after_block reached invalidation without an active A* route")
+        from cognitive_runtime.programs.crafter.oracle import MOVE_DIRECTIONS
+
+        dx, dy = MOVE_DIRECTIONS[str(next_action)]
+        x, y = (int(v) for v in self._program._env._player.pos)
+        goal_x, goal_y = (
+            int(round(value)) for value in self._program._goal_setter.tracker.position
+        )
+        if dx:
+            frontier_x = x + dx
+            blocked_cells = [
+                (frontier_x, cell_y)
+                for cell_y in range(min(y, goal_y) - 1, max(y, goal_y) + 2)
+            ]
+        else:
+            frontier_y = y + dy
+            blocked_cells = [
+                (cell_x, frontier_y)
+                for cell_x in range(min(x, goal_x) - 1, max(x, goal_x) + 2)
+            ]
+        width, height = self._program._config.area
+        blocked_cells = [
+            cell for cell in blocked_cells
+            if 0 <= cell[0] < width and 0 <= cell[1] < height
+        ]
+        for blocked_cell in blocked_cells:
+            self._program._env._world[blocked_cell] = "stone"
+        refreshed = self._program.refresh_oracle_labels() or {}
+        if refreshed.get("geodesic_distance") is None:
+            raise ValueError(
+                f"replan_after_block invalidation at {blocked_cells} made the goal unsolvable; "
+                "rejecting the episode"
+            )
+        if not refreshed.get("replan_required"):
+            raise ValueError(
+                f"replan_after_block inserted {blocked_cells} but did not invalidate the current route"
+            )
+        self._invalidation_applied = True
+
+    def decide(
+        self, state: State, memory: Memory, prediction: Optional[Prediction],
+    ) -> Action:
+        if self._program is None:
+            raise RuntimeError("navigation policy was not bound to its Crafter program")
+        dynamic = self.layout.get("dynamic_block")
+        route_invalidated = False
+        if (
+            dynamic
+            and not self._invalidation_applied
+            and self._tick == int(dynamic["invalidation_tick"])
+        ):
+            self._invalidate_current_route()
+            route_invalidated = True
+
+        labels = self._program.oracle_labels() or {}
+        expert_name = labels.get("next_action")
+        injected = False
+        if expert_name is not None:
+            self._injection_accumulator += self.random_action_fraction
+            if self._injection_accumulator >= 1.0:
+                self._injection_accumulator -= 1.0
+                injected = True
+        if injected:
+            action = self._rng.choice(_NAVIGATION_ACTIONS)
+            source = "random_cardinal"
+        elif expert_name is not None:
+            action = Action(str(expert_name))
+            source = "astar"
+        else:
+            action = NULL_ACTION
+            source = "goal_complete"
+        legal_action_mask = labels.get("legal_action_mask") or {}
+        self.latest_navigation_behavior = {
+            "source": source,
+            "injected": bool(injected),
+            "expert_action": expert_name,
+            "selected_action": action.key(),
+            "pre_action_geodesic_distance": labels.get("geodesic_distance"),
+            "selected_action_legal": (
+                bool(legal_action_mask.get(action.key()))
+                if action.key() in legal_action_mask else None
+            ),
+            "route_invalidated": route_invalidated,
+            "random_action_fraction": self.random_action_fraction,
+            "schedule": "seeded_stratified_per_active_step",
+        }
+        self._tick += 1
+        return action
+
+
+def _crafter_navigation(seed: int, cfg: NurseryConfig, scenario_name: str) -> ScenarioRecording:
+    from cognitive_runtime.core.goal import GoalDistributionConfig
+    from cognitive_runtime.programs.crafter.oracle import DEFAULT_MAP_COST_ASSUMPTIONS
+    from cognitive_runtime.training.navigation_reward import GoalRewardConfig
+
+    layout = _navigation_layout(seed, cfg, scenario_name)
+    policy = _NavigationBehaviorPolicy(
+        seed=seed,
+        random_action_fraction=cfg.navigation_random_action_fraction,
+        layout=layout,
+    )
+    arrival_radius = 0.5
+
+    def scene_setup(program: Any) -> None:
+        # Preflight the already-created deterministic seed *before* the
+        # runtime/Recorder exists, then install the same hook for the reset
+        # CognitiveRuntime performs at episode start.
+        def setup(env: Any) -> None:
+            _setup_navigation_layout(env, layout=layout, arrival_radius=arrival_radius)
+
+        setup(program._env)
+        program.set_post_reset_hook(setup)
+        policy.bind_program(program)
+
+    navigation_evidence = {
+        "generator_name": scenario_name,
+        "generator_version": _NAVIGATION_GENERATOR_VERSION,
+        "generator_seed": seed,
+        "layout_distribution": {
+            "split": layout["split"],
+            "layout_family": layout["layout_family"],
+            "layout_id": layout["layout_id"],
+            "rotation_quarter_turns": layout["rotation_quarter_turns"],
+            "terrain_seed": layout["terrain_seed"],
+            "goal_offset": list(layout["goal_offset"]),
+            "walls": [list(cell) for cell in layout["walls"]],
+            "dynamic_block": layout["dynamic_block"],
+            "solvability_check": "astar_before_recording",
+        },
+        "behavior_mixture": {
+            "expert_policy": "astar",
+            "expert_action_fraction": 1.0 - cfg.navigation_random_action_fraction,
+            "random_action_fraction": cfg.navigation_random_action_fraction,
+            "random_action_subset": [action.key() for action in _NAVIGATION_ACTIONS],
+            "schedule": "seeded_stratified_per_active_step",
+            "seed_rule": "episode_seed",
+        },
+        "goal_distribution_policy": GoalDistributionConfig(
+            min_initial_distance=4.0,
+            max_initial_distance=None,
+            commitment_horizon_ticks=48,
+            arrival_radius=arrival_radius,
+        ).to_contract_dict(),
+        "oracle_planner_policy": DEFAULT_MAP_COST_ASSUMPTIONS.to_contract_dict(),
+        "goal_reward_policy": GoalRewardConfig().to_contract_dict(
+            success_radius=arrival_radius,
+        ),
+    }
+    return ScenarioRecording(
+        policy=policy,
+        scene_setup=scene_setup,
+        episode_ticks=min(cfg.episode_ticks, 48),
+        program_config_extra={
+            "goal_enabled": True,
+            "goal_min_initial_distance": 4.0,
+            "goal_commitment_horizon_ticks": 48,
+            "goal_arrival_radius": arrival_radius,
+            "goal_fixed_offset": list(layout["goal_offset"]),
+            "goal_collision_penalty": 0.1,
+            "navigation": navigation_evidence,
+        },
+    )
+
+
+def _crafter_navigate_open_goal(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    return _crafter_navigation(seed, cfg, "navigate_open_goal")
+
+
+def _crafter_navigate_single_wall(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    return _crafter_navigation(seed, cfg, "navigate_single_wall")
+
+
+def _crafter_navigate_two_wall(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    return _crafter_navigation(seed, cfg, "navigate_two_wall")
+
+
+def _crafter_replan_after_block(seed: int, cfg: NurseryConfig) -> ScenarioRecording:
+    return _crafter_navigation(seed, cfg, "replan_after_block")
+
+
 CRAFTER_SCENARIOS: Dict[str, NurseryScenario] = {
     "walk_forward_short": NurseryScenario(
         "walk_forward_short",
@@ -1284,6 +1680,30 @@ CRAFTER_SCENARIOS: Dict[str, NurseryScenario] = {
         # the explicit failure mode here is an unrecovered *tail*, which is
         # why this scenario gates the tail rather than every interior pause.
         action_effect_mix_bounds=_MOTOR_BABBLING_WALLS_OUTCOME_MIX_BOUNDS,
+    ),
+    "navigate_open_goal": NurseryScenario(
+        "navigate_open_goal",
+        "direct movement to a reproducible caregiver-set coordinate in a solvability-checked open layout.",
+        _crafter_navigate_open_goal,
+        min_moving_transition_fraction=0.10,
+    ),
+    "navigate_single_wall": NurseryScenario(
+        "navigate_single_wall",
+        "goal navigation around one seeded wall with a required geodesic detour.",
+        _crafter_navigate_single_wall,
+        min_moving_transition_fraction=0.10,
+    ),
+    "navigate_two_wall": NurseryScenario(
+        "navigate_two_wall",
+        "longer two-wall routes whose holdout layout family is disjoint from training.",
+        _crafter_navigate_two_wall,
+        min_moving_transition_fraction=0.10,
+    ),
+    "replan_after_block": NurseryScenario(
+        "replan_after_block",
+        "a live obstacle invalidates the current A* route mid-episode and forces recovery replanning.",
+        _crafter_replan_after_block,
+        min_moving_transition_fraction=0.10,
     ),
 }
 

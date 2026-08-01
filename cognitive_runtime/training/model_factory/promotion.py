@@ -17,14 +17,17 @@ testable, independently blocking gates pass:
    margin is held, not promoted.
 4. ``safety_metrics`` -- no configured safety metric regresses beyond its
    own allowed margin.
-5. ``training_time_budget`` -- the run completed within its stage's
+5. ``generic_retention`` -- a ``goal_navigation_v1`` fine-tune supplies the
+   existing CI-refereed forgetting report for ``generic_action_effects_v1``
+   and stays within its DataContract's declared regression allowance.
+6. ``training_time_budget`` -- the run completed within its stage's
    declared training-time budget (never ``budget_exceeded``, ``failed``,
    ``cancelled``, or ``timeout_unrecoverable``).
-6. ``metric_schema`` -- raw and stratified metrics satisfy their versioned
+7. ``metric_schema`` -- raw and stratified metrics satisfy their versioned
    schema: the copy-last ratio (``model_over_copy_last_mse``) and the
    event-stratified rate (``cow_false_positive_rate``) are never present
    without the raw errors/counts they are computed from.
-7. ``durable_test_confirmation`` -- only checked when the caller declares
+8. ``durable_test_confirmation`` -- only checked when the caller declares
    ``durable=True``: a final sealed-test action (MF-C5, issue #227) must
    have confirmed the candidate before it may become a *durable* champion.
 
@@ -73,6 +76,7 @@ from cognitive_runtime.training.model_factory.registry import (
     DECISION_HOLD,
     DECISION_PROMOTE,
     TestBudgetExhaustedError,
+    GOAL_NAVIGATION_V1,
     record_test_use,
 )
 
@@ -442,6 +446,77 @@ def _safety_metrics_gate(safety_metrics: Sequence[SafetyMetricObservation]) -> G
     return GateResult("safety_metrics", ok, reason)
 
 
+def _generic_retention_gate(
+    *,
+    target_family: Optional[str],
+    retention_report: Optional[Union[Mapping[str, Any], Any]],
+    retention_policy: Optional[Mapping[str, Any]],
+) -> GateResult:
+    """Fail closed for navigation fine-tunes that forget generic dynamics.
+
+    The evidence is ``sleep.forgetting.compute_forgetting_metric``'s report,
+    not a second promotion-specific forgetting calculation.  We only verify
+    that its tolerance matches the immutable DataContract allowance and that
+    the report retained the declared generic suite.
+    """
+    if target_family != GOAL_NAVIGATION_V1.name:
+        return GateResult(
+            "generic_retention", True,
+            "generic retention is required only for goal_navigation_v1 promotion",
+            applicable=False,
+        )
+    policy = dict(retention_policy or {})
+    suite = policy.get("suite")
+    allowance = policy.get("max_regression")
+    replay_mixture = policy.get("replay_mixture")
+    if suite != "generic_action_effects_v1" or allowance is None or not replay_mixture:
+        return GateResult(
+            "generic_retention", False,
+            "goal_navigation_v1 requires a DataContract retention policy naming "
+            "generic_action_effects_v1, its replay mixture, and max_regression",
+        )
+    if retention_report is None:
+        return GateResult(
+            "generic_retention", False,
+            "goal_navigation_v1 promotion requires generic retention-suite evidence from "
+            "sleep.forgetting.compute_forgetting_metric",
+        )
+    if isinstance(retention_report, Mapping):
+        report = retention_report
+    else:
+        to_dict = getattr(retention_report, "to_dict", None)
+        if not callable(to_dict):
+            raise PromotionPolicyError(
+                "retention_report must be a mapping or ForgettingReport-like object with to_dict()"
+            )
+        report = to_dict()
+    if report.get("old_scenario") != suite:
+        return GateResult(
+            "generic_retention", False,
+            f"retention evidence covers {report.get('old_scenario')!r}, not declared suite {suite!r}",
+        )
+    tolerance = report.get("tolerance")
+    if tolerance is None or abs(float(tolerance) - float(allowance)) > 1e-12:
+        return GateResult(
+            "generic_retention", False,
+            f"forgetting report tolerance {tolerance!r} does not match the DataContract "
+            f"max_regression {allowance!r}",
+        )
+    forgetting_amount = report.get("forgetting_amount")
+    if forgetting_amount is None or float(forgetting_amount) > float(allowance) or not bool(
+        report.get("retained")
+    ):
+        return GateResult(
+            "generic_retention", False,
+            f"generic retention regressed by {forgetting_amount} beyond the "
+            f"declared allowance {allowance}",
+        )
+    return GateResult(
+        "generic_retention", True,
+        f"generic_action_effects_v1 retained within the declared regression allowance {allowance}",
+    )
+
+
 def _durable_test_confirmation_gate(
     durable: bool, test_confirmation: Optional[TestConfirmation], candidate_run_id: str,
 ) -> GateResult:
@@ -488,8 +563,11 @@ def evaluate_promotion(
     safety_metrics: Sequence[SafetyMetricObservation] = (),
     durable: bool = False,
     test_confirmation: Optional[TestConfirmation] = None,
+    target_family: Optional[str] = None,
+    retention_report: Optional[Union[Mapping[str, Any], Any]] = None,
+    retention_policy: Optional[Mapping[str, Any]] = None,
 ) -> PromotionVerdict:
-    """Gate one candidate against all seven conditions, returning a
+    """Gate one candidate against all configured conditions, returning a
     structured :class:`PromotionVerdict`.
 
     ``candidate_run_id`` is the run actually being evaluated. Gate 7 checks
@@ -539,6 +617,11 @@ def evaluate_promotion(
         _metric_schema_gate(rollout_metrics, event_stratified_metrics),
         _primary_metric_margin_gate(
             comparison, has_champion=has_champion, minimum_practical_margin=policy.minimum_practical_margin,
+        ),
+        _generic_retention_gate(
+            target_family=target_family,
+            retention_report=retention_report,
+            retention_policy=retention_policy,
         ),
         _safety_metrics_gate(safety_metrics),
         _durable_test_confirmation_gate(durable, test_confirmation, candidate_run_id),
