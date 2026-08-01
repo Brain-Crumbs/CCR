@@ -167,6 +167,27 @@ def test_resolve_refuses_changed_content_without_recording_a_replacement(tmp_pat
         corpus_module.resolve_corpus("frozen-v1", root=tmp_path / "corpora", organism="test-organism")
 
 
+def test_resolve_tolerates_a_clinic_prediction_export_written_into_a_frozen_session(tmp_path, monkeypatch):
+    """A Model Factory trial's clinic (viewer/) prediction export writes
+    ``<experiment_id>-predictions_<episode>.json`` straight into the
+    session's own directory (issue: auto-export Model Factory predictions),
+    including for a frozen corpus's validation sessions. Since multiple
+    trials against the same corpus each add their own such file there, it
+    must never perturb the corpus's content-integrity hash -- otherwise the
+    very first trial to export predictions would break every later resolve
+    of that corpus for every other trial."""
+    _install_fake_nursery(monkeypatch, tmp_path / "episode-cache")
+    corpus = corpus_module.build_corpus(_spec(tmp_path))
+    session = Path(corpus.manifest["sessions"]["validation"][0]["session_path"])
+
+    (session / "run-1-predictions_episode_00000.json").write_text("{}", encoding="utf-8")
+    (session / "run-2-predictions_episode_00000.json").write_text("{}", encoding="utf-8")
+    (session / "predictions_episode_00000.json").write_text("{}", encoding="utf-8")
+
+    resolved = corpus_module.resolve_corpus("frozen-v1", root=tmp_path / "corpora", organism="test-organism")
+    assert resolved.data_contract_hash == corpus.data_contract_hash
+
+
 def test_resolve_requires_manifest_sessions_to_match_the_data_contract(tmp_path, monkeypatch):
     _install_fake_nursery(monkeypatch, tmp_path / "episode-cache")
     corpus = corpus_module.build_corpus(_spec(tmp_path))

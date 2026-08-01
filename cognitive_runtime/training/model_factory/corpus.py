@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Union
@@ -444,19 +445,33 @@ def _corpus_directory(corpus_id: str, *, root: str | Path | None = None, organis
     raise ValueError(f"corpus id {corpus_id!r} is ambiguous under {base}; use organism/corpus_id")
 
 
+#: A ``prediction_export.py`` output written *into* a session directory
+#: after that session was recorded -- either the legacy
+#: ``[<name>-]predictions_<episode>.json`` or the Model Factory
+#: ``<experiment_id>-predictions_<episode>.json`` (``export_cortex_session_
+#: predictions``). Multiple trials trained against the same frozen corpus
+#: each write their own such file into the same validation session
+#: directory (so the clinic's Compare tab can show them side by side); none
+#: of them are recorded session content.
+_PREDICTION_EXPORT_RE = re.compile(r"^(?:[^/]+-)?predictions_.+\.json$")
+
+
 def _session_hash(session_dir: Path) -> str:
     """SHA-256 over every file that constitutes a recorded session.
 
     Path names are included as well as bytes, so replacing a stream or frame
     with a differently named file is detectable.  ``nursery_cache.json`` is
-    identity metadata, not recorded content, and is intentionally excluded.
+    identity metadata, not recorded content, and is intentionally excluded,
+    as is any ``prediction_export.py`` output (see ``_PREDICTION_EXPORT_RE``)
+    -- a diagnostic export written after the fact, never part of what the
+    corpus actually recorded, and never allowed to perturb its integrity hash.
     """
     if not session_dir.is_dir():
         raise FileNotFoundError(f"session directory is missing: {session_dir}")
     digest = hashlib.sha256()
     files = sorted(
         path for path in session_dir.rglob("*")
-        if path.is_file() and path.name != "nursery_cache.json"
+        if path.is_file() and path.name != "nursery_cache.json" and not _PREDICTION_EXPORT_RE.match(path.name)
     )
     if not files:
         raise ValueError(f"session directory contains no record files: {session_dir}")
