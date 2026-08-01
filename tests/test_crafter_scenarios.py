@@ -101,6 +101,43 @@ def test_episode_cache_reuses_a_compatible_scenario_seed(monkeypatch, tmp_path):
     assert os.path.isfile(os.path.join(first, "nursery_cache.json"))
 
 
+def test_episode_cache_separates_different_split_parameter_assignments(monkeypatch, tmp_path):
+    """A seed's split-pool position controls scenario distance/layout knobs."""
+    calls = []
+
+    def fake_record(record_dir, session_id, seed, scenario, cfg, *, recording=None):
+        calls.append((record_dir, session_id, seed))
+        session_dir = os.path.join(record_dir, session_id)
+        os.makedirs(session_dir, exist_ok=True)
+        with open(os.path.join(session_dir, "session.json"), "w", encoding="utf-8") as fh:
+            json.dump({"session_id": session_id}, fh)
+        with open(os.path.join(session_dir, "episode_00000.decisions.jsonl"), "w", encoding="utf-8"):
+            pass
+        return session_dir
+
+    monkeypatch.setattr(nursery_module, "_record_scenario_episode", fake_record)
+    cache_dir = str(tmp_path / "episode-cache")
+    first_cfg = _crafter_config(episode_cache_dir=cache_dir, train_seeds=(0, 1))
+    reordered_cfg = replace(first_cfg, train_seeds=(1, 0))
+    scenario = CRAFTER_SCENARIOS["approach_entity"]
+
+    first = nursery_module._record_or_reuse_scenario_episode(
+        str(tmp_path / "run-a"), "approach-train-0", 0, scenario, first_cfg,
+    )
+    reordered = nursery_module._record_or_reuse_scenario_episode(
+        str(tmp_path / "run-b"), "approach-train-0", 0, scenario, reordered_cfg,
+    )
+
+    assert first != reordered
+    assert len(calls) == 2
+    with open(os.path.join(first, "nursery_cache.json"), encoding="utf-8") as fh:
+        first_identity = json.load(fh)
+    with open(os.path.join(reordered, "nursery_cache.json"), encoding="utf-8") as fh:
+        reordered_identity = json.load(fh)
+    assert first_identity["split_seed_pools"]["train"] == [0, 1]
+    assert reordered_identity["split_seed_pools"]["train"] == [1, 0]
+
+
 @pytest.mark.parametrize("scenario_name", sorted(CRAFTER_SCENARIOS))
 def test_each_crafter_scenario_passes_its_own_quality_gate(tmp_path, scenario_name):
     scenario = CRAFTER_SCENARIOS[scenario_name]
@@ -248,6 +285,20 @@ def test_motor_babbling_open_records_its_generator_metadata(tmp_path):
     assert generator["burst_ticks_distribution"]["min_ticks"] == 1
     assert generator["burst_ticks_distribution"]["max_ticks"] == 4
     assert generator["generator_seed"] == 3
+    assert generator["hazard_policy"] == {"entered_lava": "replace_with_grass"}
+
+
+def test_motor_babbling_open_seed_twelve_does_not_die_on_lava(tmp_path):
+    """Regression for the shipped corpus: this 200-tick trajectory reached
+    generated lava and died before its quality evidence could be frozen."""
+    scenario = CRAFTER_SCENARIOS["motor_babbling_open"]
+    cfg = _crafter_config(episode_ticks=200)
+
+    session_dir = _record_scenario_episode(
+        str(tmp_path), "crafter-babbling-open-seed-twelve", 12, scenario, cfg,
+    )
+
+    assert not validate_nursery_recordings([session_dir], scenario)
 
 
 def test_motor_babbling_walls_reports_seeded_layout_and_realised_outcome_mix(tmp_path):
@@ -267,6 +318,11 @@ def test_motor_babbling_walls_reports_seeded_layout_and_realised_outcome_mix(tmp
     assert generator["generator_name"] == "motor_babbling_walls"
     assert generator["layout_distribution"]["layout_seed"] == 3
     assert generator["layout_distribution"]["interior_barrier"]["guaranteed_recovery_gap"] is True
+    assert generator["terminal_recovery_policy"] == {
+        "kind": "cardinal_cycle",
+        "actions": ["MOVE_LEFT", "MOVE_RIGHT", "MOVE_UP", "MOVE_DOWN"],
+        "ticks": 4,
+    }
     assert generator["outcome_mix_bounds"] == {
         outcome: {"min_fraction": lower, "max_fraction": upper}
         for outcome, (lower, upper) in scenario.action_effect_mix_bounds.items()
@@ -275,6 +331,21 @@ def test_motor_babbling_walls_reports_seeded_layout_and_realised_outcome_mix(tmp
     assert set(mix["fractions"]) >= {"moved", "blocked", "turned_only", "no_op"}
     for outcome, (lower, upper) in scenario.action_effect_mix_bounds.items():
         assert lower <= mix["fractions"][outcome] <= upper
+
+
+def test_motor_babbling_walls_seed_seven_has_no_long_stationary_tail(tmp_path):
+    """Regression for the shipped corpus: seed 7 used to end blocked for 23
+    ticks, causing ``ccr factory corpus build`` to fail deterministically."""
+    scenario = CRAFTER_SCENARIOS["motor_babbling_walls"]
+    cfg = _crafter_config(episode_ticks=200)
+
+    session_dir = _record_scenario_episode(
+        str(tmp_path), "crafter-babbling-walls-seed-seven", 7, scenario, cfg,
+    )
+
+    with open(os.path.join(session_dir, "session.json"), encoding="utf-8") as fh:
+        report = json.load(fh)["quality_report"]
+    assert report["accepted"] is True
 
 
 def test_motor_babbling_walls_rejects_a_boxed_in_stationary_tail(tmp_path):

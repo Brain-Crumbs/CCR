@@ -37,7 +37,7 @@ training:
   scheduled_sampling_p: 0.25
   loss_weights: {pixel: 1.0, latent: 1.0, semantic: 1.0}
   checkpoint_selection_policy: {metric: validation_loss, mode: min}
-  device: cpu
+  device: cuda
   precision: fp32
   determinism_policy: {deterministic: true, seed: 0}
 evaluation:

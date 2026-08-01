@@ -44,7 +44,7 @@ from cognitive_runtime.core.policy import SingleActionPolicy
 from cognitive_runtime.core.world_model import Prediction
 from cognitive_runtime.neural.pixel_stream_encoder import pixels_to_chw
 from cognitive_runtime.observability import span, trace_counter, trace_event, trace_metrics
-from cognitive_runtime.policies.action_burst import ActionBurstPolicy
+from cognitive_runtime.policies.action_burst import ActionBurstPolicy, TerminalRecoveryActionBurstPolicy
 from cognitive_runtime.policies.constant_action import ConstantActionPolicy
 from cognitive_runtime.policies.null_policy import NullPolicy
 from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy
@@ -639,6 +639,33 @@ def _crafter_remove_wildlife(env: Any) -> None:
             world.remove(obj)
 
 
+def _crafter_neutralize_entered_lava(env: Any) -> None:
+    """Keep an exploratory micro-scenario from ending when it reaches lava.
+
+    The open motor-babbling field intentionally retains seed-specific terrain
+    outside its initial visible clearing.  Crafter ordinarily sets health to
+    zero immediately on stepping into lava, which makes an otherwise useful
+    random trajectory terminate early.  Convert only the cell actually about
+    to be entered, preserving the seeded context until exploration reaches
+    that hazard.
+    """
+    original_move = env._player._move
+    directions = {
+        "left": (-1, 0), "right": (1, 0), "up": (0, -1), "down": (0, 1),
+    }
+
+    def safe_move(direction: str) -> None:
+        dx, dy = directions[direction]
+        x, y = int(env._player.pos[0]), int(env._player.pos[1])
+        target = (x + dx, y + dy)
+        material, _obj = env._world[target]
+        if material == "lava":
+            env._world[target] = "grass"
+        original_move(direction)
+
+    env._player._move = safe_move
+
+
 def _crafter_freeze_scripted_entities(env: Any, keep: Sequence[Any] = ()) -> None:
     """Remove every non-player creature except ``keep``, and freeze each
     kept entity's own default AI (no-op ``update``) -- issue #202's entity
@@ -1001,7 +1028,7 @@ def _crafter_object_permanence(seed: int, cfg: NurseryConfig) -> ScenarioRecordi
 #: unrelated nursery refactors -- so a corpus built against an old version
 #: is distinguishable from one built against a new one.
 _MOTOR_BABBLING_OPEN_GENERATOR_NAME = "motor_babbling_open"
-_MOTOR_BABBLING_OPEN_GENERATOR_VERSION = "v1"
+_MOTOR_BABBLING_OPEN_GENERATOR_VERSION = "v2"
 
 #: The five actions the epic doc's generator policy declares -- no others may
 #: ever appear in a ``motor_babbling_open`` recording.
@@ -1037,6 +1064,7 @@ def _crafter_motor_babbling_open_setup(dx: int, dy: int, env: Any) -> None:
     _crafter_remove_wildlife(env)
     x, y = int(env._player.pos[0]), int(env._player.pos[1])
     _crafter_clear_terrain(env._world, x, y, _crafter_motor_babbling_open_clear_radius())
+    _crafter_neutralize_entered_lava(env)
     env._player.facing = (dx, dy)
 
 
@@ -1074,6 +1102,7 @@ def _crafter_motor_babbling_open(seed: int, cfg: NurseryConfig) -> ScenarioRecor
                     "max_ticks": _MOTOR_BABBLING_MAX_BURST_TICKS,
                 },
                 "generator_seed": seed,
+                "hazard_policy": {"entered_lava": "replace_with_grass"},
             },
         },
     )
@@ -1082,7 +1111,7 @@ def _crafter_motor_babbling_open(seed: int, cfg: NurseryConfig) -> ScenarioRecor
 # --------------------------------------------------------------------------- motor_babbling_walls (issue #236; epic #212 §12.2)
 
 _MOTOR_BABBLING_WALLS_GENERATOR_NAME = "motor_babbling_walls"
-_MOTOR_BABBLING_WALLS_GENERATOR_VERSION = "v1"
+_MOTOR_BABBLING_WALLS_GENERATOR_VERSION = "v2"
 _MOTOR_BABBLING_WALLS_LAYOUT_RADIUS = 5
 _MOTOR_BABBLING_WALLS_BARRIER_OFFSETS = (-2, 2)
 _MOTOR_BABBLING_WALLS_GAP_OFFSETS = (-2, -1, 0, 1, 2)
@@ -1102,6 +1131,12 @@ _MOTOR_BABBLING_WALLS_OUTCOME_MIX_BOUNDS: Dict[str, Tuple[float, float]] = {
     "no_op": (0.0, 0.50),
 }
 _MOTOR_BABBLING_WALLS_MAX_STATIONARY_TAIL = 8
+# A four-direction suffix gives every non-boxed cell in the local wall layout
+# an escape attempt before recording ends.  It is deliberately explicit in
+# session provenance rather than silently biasing the random burst policy.
+_MOTOR_BABBLING_WALLS_TERMINAL_RECOVERY_ACTIONS: Tuple[Action, ...] = (
+    _CRAFTER_MOVE_LEFT, _CRAFTER_MOVE_RIGHT, _CRAFTER_MOVE_UP, _CRAFTER_MOVE_DOWN,
+)
 
 
 def _crafter_motor_babbling_walls_layout(seed: int) -> Dict[str, Any]:
@@ -1170,8 +1205,10 @@ def _crafter_motor_babbling_walls(seed: int, cfg: NurseryConfig) -> ScenarioReco
         )
 
     return ScenarioRecording(
-        policy=ActionBurstPolicy(
+        policy=TerminalRecoveryActionBurstPolicy(
             _MOTOR_BABBLING_ACTION_SUBSET,
+            episode_ticks=cfg.episode_ticks,
+            terminal_actions=_MOTOR_BABBLING_WALLS_TERMINAL_RECOVERY_ACTIONS,
             min_burst_ticks=_MOTOR_BABBLING_MIN_BURST_TICKS,
             max_burst_ticks=_MOTOR_BABBLING_MAX_BURST_TICKS,
             seed=seed,
@@ -1186,6 +1223,11 @@ def _crafter_motor_babbling_walls(seed: int, cfg: NurseryConfig) -> ScenarioReco
                     "policy": "uniform_integer",
                     "min_ticks": _MOTOR_BABBLING_MIN_BURST_TICKS,
                     "max_ticks": _MOTOR_BABBLING_MAX_BURST_TICKS,
+                },
+                "terminal_recovery_policy": {
+                    "kind": "cardinal_cycle",
+                    "actions": [action.key() for action in _MOTOR_BABBLING_WALLS_TERMINAL_RECOVERY_ACTIONS],
+                    "ticks": len(_MOTOR_BABBLING_WALLS_TERMINAL_RECOVERY_ACTIONS),
                 },
                 "generator_seed": seed,
                 "layout_distribution": {
@@ -1646,7 +1688,9 @@ CRAFTER_SCENARIOS: Dict[str, NurseryScenario] = {
         # The approach route turns around before collision, so a short
         # recording remains motion-rich rather than becoming a long blocked
         # tail after reaching the cow.
-        min_blocks_per_tick=0.01,
+        # This trajectory deliberately alternates approach and retreat.  Its
+        # final position can be near its start even though most individual
+        # transitions move, so net displacement is the wrong quality signal.
         min_moving_transition_fraction=0.6,
         max_longest_stationary_tail=2,
     ),
@@ -2334,11 +2378,19 @@ def _cached_episode_identity(
     """
     episode_ticks = recording.episode_ticks or cfg.episode_ticks
     return {
-        "format": "nursery-episode-cache-v1",
+        "format": "nursery-episode-cache-v2",
         "world": cfg.world,
         "backend": cfg.backend,
         "scenario": scenario.name,
         "seed": int(seed),
+        # Split-aware scenarios derive controlled parameters from both the
+        # seed's pool and its position in that pool.  Preserve ordering here:
+        # moving the same seed from index 0 to index 1 can select a different
+        # distance or layout even though every other recording knob is equal.
+        "split_seed_pools": {
+            "train": tuple(int(value) for value in cfg.train_seeds),
+            "holdout": tuple(int(value) for value in cfg.holdout_seeds),
+        },
         "episode_ticks": int(episode_ticks),
         "program_config": _scenario_program_config(
             cfg, episode_ticks, recording.program_config_extra,

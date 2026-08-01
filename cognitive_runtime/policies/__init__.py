@@ -8,7 +8,7 @@ from cognitive_runtime.policies.learned import LearnedPolicy
 from cognitive_runtime.policies.online_q import OnlineQLearner, OnlineQPolicy
 from cognitive_runtime.policies.constant_action import ConstantActionPolicy
 from cognitive_runtime.policies.scripted_sequence import ScriptedSequencePolicy
-from cognitive_runtime.policies.action_burst import ActionBurstPolicy
+from cognitive_runtime.policies.action_burst import ActionBurstPolicy, TerminalRecoveryActionBurstPolicy
 
 __all__ = [
     "NullPolicy",
@@ -21,4 +21,5 @@ __all__ = [
     "ConstantActionPolicy",
     "ScriptedSequencePolicy",
     "ActionBurstPolicy",
+    "TerminalRecoveryActionBurstPolicy",
 ]

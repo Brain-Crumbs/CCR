@@ -44,6 +44,7 @@
 # focused scenarios remain canaries" and issue #237's acceptance criteria.
 corpus_id: crafter-generic-action-effects-v1
 organism: Crafter
+scenario_code_version: nursery-scenarios-v2
 generator:
   world: crafter
   backend: crafter

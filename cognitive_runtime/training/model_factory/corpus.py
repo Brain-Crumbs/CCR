@@ -198,6 +198,33 @@ def _split_assignments(spec: Mapping[str, Any], cfg: CorpusNurseryConfig) -> Dic
     return result
 
 
+def _scenario_recording_config(
+    cfg: CorpusNurseryConfig,
+    splits: Mapping[str, Mapping[str, Sequence[int]]],
+    scenario_name: str,
+) -> CorpusNurseryConfig:
+    """Bind a scenario's declared corpus splits to its nursery seed pools.
+
+    Several scripted scenarios choose their train/held-out layout parameters
+    through ``cfg.train_seeds`` and ``cfg.holdout_seeds``.  A corpus has an
+    additional sealed-test split, which is held out for generation purposes
+    just like validation.  Passing the spec defaults here made a valid test
+    seed such as 2000 look unassigned and stopped a corpus build late in its
+    recording pass.
+    """
+    train_seeds = tuple(int(seed) for seed in splits["train"].get(scenario_name, ()))
+    held_out_seeds = tuple(
+        int(seed)
+        for split in ("validation", "test")
+        for seed in splits[split].get(scenario_name, ())
+    )
+    return dataclasses.replace(
+        cfg,
+        train_seeds=train_seeds,
+        holdout_seeds=held_out_seeds,
+    )
+
+
 def _scenario_mix_policy(spec: Mapping[str, Any], splits: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """Normalize an optional declared per-scenario data-collection mix
     (epic #212 Sec 12.2). Returns ``None`` when the spec declares none --
@@ -743,10 +770,11 @@ def build_corpus(spec: Mapping[str, Any]) -> ResolvedCorpus:
             except KeyError as exc:
                 raise ValueError(f"unknown {cfg.world} nursery scenario {scenario_name!r}") from exc
             paths: list[str] = []
+            scenario_cfg = _scenario_recording_config(cfg, splits, scenario_name)
             for seed in seeds:
                 session_id = f"{scenario_name}-{split}-{seed}"
                 session_dir = Path(_record_or_reuse_scenario_episode(
-                    str(directory / "recordings"), session_id, seed, scenario, cfg,
+                    str(directory / "recordings"), session_id, seed, scenario, scenario_cfg,
                 )).resolve()
                 paths.append(str(session_dir))
                 sessions[split].append({
