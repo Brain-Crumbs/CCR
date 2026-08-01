@@ -65,3 +65,60 @@ class ActionBurstPolicy(SingleActionPolicy):
         self._remaining -= 1
         assert self._current is not None
         return self._current
+
+
+class TerminalRecoveryActionBurstPolicy(ActionBurstPolicy):
+    """An action-burst policy with an explicit, finite terminal recovery.
+
+    ``motor_babbling_walls`` needs its random exploration to finish with a
+    guaranteed opportunity to leave any wall it happens to be touching.  The
+    normal prefix remains the same seeded, uniformly sampled 1--4 tick burst
+    process as :class:`ActionBurstPolicy`; only the declared suffix is
+    scripted.  This keeps the quality gate from mistaking an unlucky final
+    burst for useful blocked-action evidence.
+    """
+
+    name = "terminal-recovery-action-burst"
+
+    def __init__(
+        self,
+        action_space: Sequence[Action],
+        *,
+        episode_ticks: int,
+        terminal_actions: Sequence[Action],
+        min_burst_ticks: int = 1,
+        max_burst_ticks: int = 4,
+        seed: int = 0,
+    ):
+        super().__init__(
+            action_space,
+            min_burst_ticks=min_burst_ticks,
+            max_burst_ticks=max_burst_ticks,
+            seed=seed,
+        )
+        if episode_ticks <= 0:
+            raise ValueError(f"episode_ticks must be positive, got {episode_ticks!r}")
+        if not terminal_actions:
+            raise ValueError("terminal_actions must be non-empty")
+        if len(terminal_actions) > episode_ticks:
+            raise ValueError("terminal_actions cannot be longer than the episode")
+        unknown = set(terminal_actions) - set(self.action_space)
+        if unknown:
+            raise ValueError(f"terminal_actions must belong to action_space, got {unknown!r}")
+        self.episode_ticks = int(episode_ticks)
+        self.terminal_actions = tuple(terminal_actions)
+        self._tick = 0
+
+    def reset(self) -> None:
+        super().reset()
+        self._tick = 0
+
+    def decide(self, state: State, memory: Memory, prediction: Optional[Prediction]) -> Action:
+        terminal_start = self.episode_ticks - len(self.terminal_actions)
+        if self._tick >= terminal_start:
+            index = min(self._tick - terminal_start, len(self.terminal_actions) - 1)
+            action = self.terminal_actions[index]
+        else:
+            action = super().decide(state, memory, prediction)
+        self._tick += 1
+        return action

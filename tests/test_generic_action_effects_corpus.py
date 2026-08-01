@@ -164,6 +164,23 @@ def test_generic_action_effects_yaml_declares_the_epic_mix():
     assert set(splits["train"]) == set(SCENARIOS)
 
 
+def test_scenario_recording_config_treats_sealed_test_seeds_as_held_out():
+    """A corpus's test split is not a third layout regime: scripted
+    generators must use their held-out schedule for it, just as validation
+    does.  This covers the shipped ``blocked_forward`` test seed 2000."""
+    cfg = corpus_module.CorpusNurseryConfig(train_seeds=(0,), holdout_seeds=(1000,))
+    splits = {
+        "train": {"blocked_forward": (0,)},
+        "validation": {"blocked_forward": (1000,)},
+        "test": {"blocked_forward": (2000,)},
+    }
+
+    resolved = corpus_module._scenario_recording_config(cfg, splits, "blocked_forward")
+
+    assert resolved.train_seeds == (0,)
+    assert resolved.holdout_seeds == (1000, 2000)
+
+
 # ------------------------------------------------------------- mix builds
 
 

@@ -248,6 +248,20 @@ def test_motor_babbling_open_records_its_generator_metadata(tmp_path):
     assert generator["burst_ticks_distribution"]["min_ticks"] == 1
     assert generator["burst_ticks_distribution"]["max_ticks"] == 4
     assert generator["generator_seed"] == 3
+    assert generator["hazard_policy"] == {"entered_lava": "replace_with_grass"}
+
+
+def test_motor_babbling_open_seed_twelve_does_not_die_on_lava(tmp_path):
+    """Regression for the shipped corpus: this 200-tick trajectory reached
+    generated lava and died before its quality evidence could be frozen."""
+    scenario = CRAFTER_SCENARIOS["motor_babbling_open"]
+    cfg = _crafter_config(episode_ticks=200)
+
+    session_dir = _record_scenario_episode(
+        str(tmp_path), "crafter-babbling-open-seed-twelve", 12, scenario, cfg,
+    )
+
+    assert not validate_nursery_recordings([session_dir], scenario)
 
 
 def test_motor_babbling_walls_reports_seeded_layout_and_realised_outcome_mix(tmp_path):
@@ -267,6 +281,11 @@ def test_motor_babbling_walls_reports_seeded_layout_and_realised_outcome_mix(tmp
     assert generator["generator_name"] == "motor_babbling_walls"
     assert generator["layout_distribution"]["layout_seed"] == 3
     assert generator["layout_distribution"]["interior_barrier"]["guaranteed_recovery_gap"] is True
+    assert generator["terminal_recovery_policy"] == {
+        "kind": "cardinal_cycle",
+        "actions": ["MOVE_LEFT", "MOVE_RIGHT", "MOVE_UP", "MOVE_DOWN"],
+        "ticks": 4,
+    }
     assert generator["outcome_mix_bounds"] == {
         outcome: {"min_fraction": lower, "max_fraction": upper}
         for outcome, (lower, upper) in scenario.action_effect_mix_bounds.items()
@@ -275,6 +294,21 @@ def test_motor_babbling_walls_reports_seeded_layout_and_realised_outcome_mix(tmp
     assert set(mix["fractions"]) >= {"moved", "blocked", "turned_only", "no_op"}
     for outcome, (lower, upper) in scenario.action_effect_mix_bounds.items():
         assert lower <= mix["fractions"][outcome] <= upper
+
+
+def test_motor_babbling_walls_seed_seven_has_no_long_stationary_tail(tmp_path):
+    """Regression for the shipped corpus: seed 7 used to end blocked for 23
+    ticks, causing ``ccr factory corpus build`` to fail deterministically."""
+    scenario = CRAFTER_SCENARIOS["motor_babbling_walls"]
+    cfg = _crafter_config(episode_ticks=200)
+
+    session_dir = _record_scenario_episode(
+        str(tmp_path), "crafter-babbling-walls-seed-seven", 7, scenario, cfg,
+    )
+
+    with open(os.path.join(session_dir, "session.json"), encoding="utf-8") as fh:
+        report = json.load(fh)["quality_report"]
+    assert report["accepted"] is True
 
 
 def test_motor_babbling_walls_rejects_a_boxed_in_stationary_tail(tmp_path):
