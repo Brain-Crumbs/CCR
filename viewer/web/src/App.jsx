@@ -13,12 +13,15 @@ import { DevelopmentPanel } from "./components/DevelopmentPanel.jsx";
 import { ExperimentDetail } from "./components/ExperimentDetail.jsx";
 import { PairedComparisonPanel } from "./components/PairedComparisonPanel.jsx";
 import { ChampionRegistryPanel } from "./components/ChampionRegistryPanel.jsx";
+import { FactoryRunsPanel } from "./components/FactoryRunsPanel.jsx";
+import { CompareView } from "./components/CompareView.jsx";
 
 const TABS = [
   ["episode", "Episode"],
   ["development", "Development"],
   ["experiment", "Experiment"],
-  ["champions", "Champions"],
+  ["factory", "Factory"],
+  ["compare", "Compare"],
 ];
 
 /**
@@ -39,6 +42,7 @@ export function App() {
   const [summary, setSummary] = useState(null);
   const [artifacts, setArtifacts] = useState(null);
   const [registry, setRegistry] = useState(null);
+  const [factoryRuns, setFactoryRuns] = useState(null);
   const [sessionDetail, setSessionDetail] = useState(null);
   const [tick, setTick] = useState(null);
   const [tab, setTab] = useState("episode");
@@ -83,6 +87,7 @@ export function App() {
     if (!organism) return;
     let cancelled = false;
     api.registry(organism).then((r) => !cancelled && setRegistry(r), () => !cancelled && setRegistry(null));
+    api.factoryRuns(organism).then((r) => !cancelled && setFactoryRuns(r), () => !cancelled && setFactoryRuns(null));
     return () => { cancelled = true; };
   }, [organism]);
 
@@ -159,7 +164,15 @@ export function App() {
               <PairedComparisonPanel comparison={artifacts?.metrics?.comparison} />
             </>
           )}
-          {tab === "champions" && <ChampionRegistryPanel registry={registry} />}
+          {tab === "factory" && (
+            <>
+              <FactoryRunsPanel factoryRuns={factoryRuns} />
+              <ChampionRegistryPanel registry={registry} />
+            </>
+          )}
+          {tab === "compare" && (
+            <CompareView catalog={catalog} organism={organism} defaultRunA={run} />
+          )}
         </>
       )}
     </main>

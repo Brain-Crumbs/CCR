@@ -12,6 +12,8 @@
   --bad-fg: #8a3d2e;
   --amber-bg: #fbf1dd;
   --amber-fg: #8a611c;
+  --info-bg: #e3edf7;
+  --info-fg: #1f5487;
   font-family: Inter, ui-sans-serif, system-ui, sans-serif;
   background: var(--surface-1);
   color: var(--text-primary);
@@ -30,6 +32,8 @@
     --bad-fg: #e39c8a;
     --amber-bg: #332a12;
     --amber-fg: #e0b356;
+    --info-bg: #16283a;
+    --info-fg: #7db4e8;
   }
 }
 
@@ -78,6 +82,14 @@ button { cursor: pointer; }
 .quality-badge--green { background: var(--good-bg); color: var(--good-fg); }
 .quality-badge--amber { background: var(--amber-bg); color: var(--amber-fg); }
 .quality-badge--red { background: var(--bad-bg); color: var(--bad-fg); }
+
+/* Factory runs */
+.state-badge { padding: 1px 8px; border-radius: 999px; font-size: .7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; }
+.state-badge--green { background: var(--good-bg); color: var(--good-fg); }
+.state-badge--amber { background: var(--amber-bg); color: var(--amber-fg); }
+.state-badge--red { background: var(--bad-bg); color: var(--bad-fg); }
+.state-badge--info { background: var(--info-bg); color: var(--info-fg); }
+.state-badge--neutral { background: var(--surface-3); color: var(--text-secondary); }
 
 /* Tabs */
 .tabs { display: flex; gap: 4px; margin: 20px 0 16px; border-bottom: 1px solid var(--line); }

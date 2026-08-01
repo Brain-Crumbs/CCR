@@ -22,6 +22,7 @@ const SESSION_DETAIL = {
   exports: [], quality: { verdict: "green", issues: [], warnings: [] },
 };
 const REGISTRY = { format: "model-factory-registry-v1", slots: {} };
+const FACTORY_RUNS = { organism: "Crafter", runs: [] };
 const FRAMES = { shape: [1, 1, 3], dtype: "uint8", n_frames: 1, frames: [{ i: 0, t: 0, tick: 0, seq: 0, hash: "a", data: b64([1, 2, 3]) }] };
 
 function route(url) {
@@ -30,6 +31,7 @@ function route(url) {
   if (path.startsWith("/api/runs")) return jsonResponse(RUN_SUMMARY);
   if (path.startsWith("/api/experiments")) return jsonResponse(EXPERIMENTS);
   if (path.startsWith("/api/registry")) return jsonResponse(REGISTRY);
+  if (path.startsWith("/api/factory-runs")) return jsonResponse(FACTORY_RUNS);
   if (path.startsWith("/api/sessions") && path.includes("/episodes/") && path.endsWith("/frames") || path.includes("/frames?")) return jsonResponse(FRAMES);
   if (path.includes("/predictions")) return jsonResponse({ error: "no recorded predictions" }, false);
   if (path.startsWith("/api/sessions/")) return jsonResponse(SESSION_DETAIL);
@@ -51,10 +53,11 @@ describe("App", () => {
     expect(location.hash).toBe("#Crafter/run-1/run%2Fseed-1/episode_00000");
   });
 
-  it("switches to the Champions tab and renders the registry panel", async () => {
+  it("switches to the Factory tab and renders factory run state plus the registry panel", async () => {
     render(<App />);
     await waitFor(() => expect(screen.getByText("Crafter / run-1 / run/seed-1")).toBeInTheDocument());
-    fireEvent.click(screen.getByRole("tab", { name: "Champions" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Factory" }));
+    expect(screen.getByText(/no factory runs found/)).toBeInTheDocument();
     expect(screen.getByText(/no champions promoted yet/)).toBeInTheDocument();
   });
 

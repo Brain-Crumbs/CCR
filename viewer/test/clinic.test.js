@@ -144,6 +144,53 @@ test("clinic mode uses a run session index to include cached training recordings
   assert.deepEqual(listed.body.sessions.map((session) => session.id), ["cache/seed-21"]);
 });
 
+test("clinic mode mounts corpus sessions named in the run index under a corpus/ prefix, refusing paths outside the configured roots", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-corpus-"));
+  const runsDir = path.join(root, "runs"), cacheDir = path.join(root, "episode_cache"), corpusRoot = path.join(root, "corpora");
+  const runDir = path.join(runsDir, "Test", "run-3");
+  const corpusSession = path.join(corpusRoot, "Test", "corpus-1", "train", "seed-1");
+  const outsideSession = path.join(root, "outside", "seed-9");
+  fs.mkdirSync(runDir, { recursive: true }); fs.mkdirSync(corpusSession, { recursive: true }); fs.mkdirSync(outsideSession, { recursive: true });
+  fs.writeFileSync(path.join(runDir, "experiment.json"), JSON.stringify({ organism: "Test", experiment_id: "run-3" }));
+  fs.writeFileSync(path.join(runDir, "clinic_sessions.json"), JSON.stringify({
+    format: "clinic-session-index-v1",
+    sessions: [
+      { split: "train", scenario: "goal_navigation", session_dir: corpusSession },
+      { split: "train", scenario: "goal_navigation", session_dir: outsideSession },
+    ],
+  }));
+  fs.writeFileSync(path.join(corpusSession, "session.json"), JSON.stringify({ name: "Test" }));
+  fs.writeFileSync(path.join(corpusSession, "episode_00000.streams.jsonl"), "");
+  fs.writeFileSync(path.join(outsideSession, "session.json"), JSON.stringify({ name: "Test" }));
+  const server = createServer({ runsDir, episodeCacheDir: cacheDir, corpusRoot }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+  const listed = await get(server.address().port, "/api/sessions?organism=Test&run=run-3");
+  assert.deepEqual(listed.body.sessions.map((session) => session.id), ["corpus/Test/corpus-1/train/seed-1"]);
+});
+
+test("/api/factory-runs reports queued/running/completed/failed state across an organism's runs", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-factory-runs-"));
+  const runsDir = path.join(root, "runs");
+  const runA = path.join(runsDir, "Test", "run-a"), runB = path.join(runsDir, "Test", "run-b");
+  fs.mkdirSync(runA, { recursive: true }); fs.mkdirSync(runB, { recursive: true });
+  fs.writeFileSync(path.join(runA, "experiment.json"), JSON.stringify({ organism: "Test", experiment_id: "run-a" }));
+  fs.writeFileSync(path.join(runA, "lineage.json"), JSON.stringify({ mode: "fresh" }));
+  fs.writeFileSync(path.join(runA, "state.json"), JSON.stringify({ state: "completed", updated_at: "2026-01-02T00:00:00Z", reason: "completed" }));
+  fs.writeFileSync(path.join(runA, "experiment_report.json"), JSON.stringify({ promotion_verdict: { promoted: true, reasons: [] } }));
+  fs.writeFileSync(path.join(runB, "experiment.json"), JSON.stringify({ organism: "Test", experiment_id: "run-b" }));
+  fs.writeFileSync(path.join(runB, "lineage.json"), JSON.stringify({ mode: "clone" }));
+  fs.writeFileSync(path.join(runB, "state.json"), JSON.stringify({ state: "running", updated_at: "2026-01-03T00:00:00Z", reason: null }));
+  const server = createServer({ runsDir }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+  const port = server.address().port;
+  const result = await get(port, "/api/factory-runs?organism=Test");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.runs.map((r) => r.run), ["run-b", "run-a"]);
+  assert.deepEqual(result.body.runs[1], { run: "run-a", mode: "fresh", state: "completed", state_reason: "completed", updated_at: "2026-01-02T00:00:00Z", promoted: true });
+  assert.equal(result.body.runs[0].state, "running");
+  assert.equal(result.body.runs[0].promoted, null);
+  assert.equal((await get(port, "/api/factory-runs?organism=Nobody")).status, 404);
+  assert.equal((await get(port, "/api/factory-runs")).status, 400);
+});
+
 test("service discovers sessions nested below the configured runs directory", async (t) => {
   const root = fixture();
   const outer = path.join(root, "Test", "run-1"); fs.mkdirSync(outer, { recursive: true });
