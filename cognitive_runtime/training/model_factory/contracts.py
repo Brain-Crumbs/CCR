@@ -215,6 +215,20 @@ class DataContract(_ContractMixin):
     #: "goal_distribution_v1"}``. Empty for any run that doesn't use goal
     #: conditioning.
     goal_distribution_policy: Mapping[str, Any] = field(default_factory=dict)
+    #: The A* oracle's declared identity (epic #212 Sec 12.6, issue #239):
+    #: ``OracleMapCostAssumptions.to_contract_dict()``, e.g.
+    #: ``{"planner_version": "crafter-astar-v1", "connectivity":
+    #: "4-directional", "step_cost": 1.0, "walkable_materials": ["grass",
+    #: "path", "sand"], "avoid_lava": True}``. Empty for any run that doesn't
+    #: use oracle labels.
+    oracle_planner_policy: Mapping[str, Any] = field(default_factory=dict)
+    #: The potential-based geodesic navigation reward's shaping parameters
+    #: (epic #212 Sec 12.5/12.6, issue #239):
+    #: ``GoalRewardConfig.to_contract_dict(success_radius)``, e.g.
+    #: ``{"potential": "linear", "strength": 1.0, "falloff": None,
+    #: "discount": 1.0, "success_radius": 1.5, "success_bonus": 1.0}``.
+    #: Empty for any run that doesn't use goal-conditioned reward shaping.
+    goal_reward_policy: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

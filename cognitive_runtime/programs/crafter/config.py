@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 from cognitive_runtime.core.goal import GoalDistributionConfig
+from cognitive_runtime.training.navigation_reward import GoalRewardConfig
 
 
 @dataclass
@@ -39,6 +40,22 @@ class CrafterConfig:
     goal_max_initial_distance: Optional[float] = None
     goal_commitment_horizon_ticks: int = 20
     goal_arrival_radius: float = 1.5
+    # A* oracle labels + potential-based geodesic reward shaping (epic #212
+    # §12.4/12.5, issue #239). Both ride on `goal_enabled` -- there is no
+    # separate on/off knob -- since neither means anything without an active
+    # goal to plan/shape toward. The five knobs below feed one
+    # `GoalRewardConfig` (`goal_reward_config()`), same flattening convention
+    # as the `goal_distribution_config()` knobs above.
+    goal_reward_potential: str = "linear"
+    goal_reward_strength: float = 1.0
+    goal_reward_falloff: Optional[float] = None
+    goal_reward_discount: float = 1.0
+    goal_reward_success_bonus: float = 1.0
+    # A blocked directional move's penalty (epic §12.5: "keep ... collision
+    # ... separate in the recording and report"); 0.0 (off) by default so
+    # enabling navigation doesn't silently change episode returns for a
+    # caller that hasn't opted into a collision cost.
+    goal_collision_penalty: float = 0.0
 
     @staticmethod
     def from_dict(raw: Dict[str, Any]) -> "CrafterConfig":
@@ -57,6 +74,18 @@ class CrafterConfig:
             max_initial_distance=self.goal_max_initial_distance,
             commitment_horizon_ticks=self.goal_commitment_horizon_ticks,
             arrival_radius=self.goal_arrival_radius,
+        )
+
+    def goal_reward_config(self) -> GoalRewardConfig:
+        """The potential-based shaping parameters as one `GoalRewardConfig`
+        (epic #212 §12.6: exposed for the `DataContract` via
+        `GoalRewardConfig.to_contract_dict()`)."""
+        return GoalRewardConfig(
+            potential=self.goal_reward_potential,
+            strength=self.goal_reward_strength,
+            falloff=self.goal_reward_falloff,
+            discount=self.goal_reward_discount,
+            success_bonus=self.goal_reward_success_bonus,
         )
 
 

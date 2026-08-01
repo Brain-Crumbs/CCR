@@ -39,14 +39,20 @@ from cognitive_runtime.programs.crafter.observations import (
     build_observation,
     build_state,
 )
+from cognitive_runtime.programs.crafter.oracle import OracleLabel, OracleLabelWriter
 from cognitive_runtime.programs.crafter.streams import (
     BODY_HEARTBEAT_HZ,
     CrafterStreamPublisher,
     VISION_STREAM,
     build_crafter_stream_specs,
 )
+from cognitive_runtime.training.navigation_reward import NavigationRewardTracker
 
 _VALID_ACTION_NAMES = {a.name for a in ACTION_SPACE}
+#: Crafter's four directional actions -- the only ones that can move the
+#: agent, so the only ones a blocked-move "collision" penalty applies to
+#: (epic #212 §12.5).
+_MOVEMENT_ACTION_NAMES = frozenset({"MOVE_LEFT", "MOVE_RIGHT", "MOVE_UP", "MOVE_DOWN"})
 #: Matches MinecraftSurvivalBox's tick->seconds convention (20 ticks/sec).
 _SIM_SECONDS_PER_TICK = 0.05
 
@@ -114,6 +120,18 @@ class CrafterWorld(Program):
         #: `initialize()`, which (re)builds this from the resolved config
         #: before the first `reset()`).
         self._goal_setter: Optional[CaregiverGoalSetter] = None
+        #: A* oracle labels + potential-based geodesic reward shaping (epic
+        #: #212 §12.4/12.5, issue #239); both `None` whenever `_goal_setter`
+        #: is (there is nothing to plan/shape toward without an active goal).
+        self._oracle_writer: Optional[OracleLabelWriter] = None
+        self._reward_tracker: Optional[NavigationRewardTracker] = None
+        #: This tick's goal/oracle state, computed once per world-advance
+        #: (`reset()`/`_advance()`) and read by both the stream publisher
+        #: (`_current_goal_state()`) and `oracle_labels()` -- never
+        #: recomputed on demand, so a call to `oracle_labels()` never runs a
+        #: second A* search for state `step()` already derived this tick.
+        self._pending_goal_state: Optional[GoalState] = None
+        self._pending_oracle_label: Optional[OracleLabel] = None
         self.initialize(config)
 
     # ------------------------------------------------------------ interface
@@ -123,6 +141,12 @@ class CrafterWorld(Program):
             self._config = CrafterConfig.from_dict(config)
         self._goal_setter = (
             CaregiverGoalSetter(self._config.goal_distribution_config())
+            if self._config.goal_enabled
+            else None
+        )
+        self._oracle_writer = OracleLabelWriter() if self._config.goal_enabled else None
+        self._reward_tracker = (
+            NavigationRewardTracker(self._config.goal_reward_config())
             if self._config.goal_enabled
             else None
         )
@@ -182,6 +206,19 @@ class CrafterWorld(Program):
                 world_size=self._config.area,
                 seed=self._seed,
             )
+            self._oracle_writer.reset()
+            self._pending_goal_state = self._goal_setter.tracker.state(self._position_tuple())
+            self._pending_oracle_label = self._compute_oracle_label()
+            self._reward_tracker.reset()
+            initial_distance = (
+                self._pending_oracle_label.geodesic_distance
+                if self._pending_oracle_label is not None
+                else None
+            )
+            self._reward_tracker.prime(geodesic_distance=initial_distance)
+        else:
+            self._pending_goal_state = None
+            self._pending_oracle_label = None
         self._pending_reward = RewardSignal()
         self._pending_achievement_events = []
         self._pending_died = False
@@ -210,15 +247,44 @@ class CrafterWorld(Program):
         """This tick's ``internal.goal`` payload -- the harness's own
         arrival decision (epic #212 §12.4's anti-gaming requirement), from
         ``self._last_state``'s ground-truth position, never from anything a
-        policy/motor command wrote."""
+        policy/motor command wrote. Reads the cached value ``reset()``/
+        ``_advance()`` already computed rather than re-evaluating arrival a
+        second time this tick."""
         if self._goal_setter is None:
             return INACTIVE_GOAL_STATE
-        return self._goal_setter.tick(current_position=self._position_tuple())
+        assert self._pending_goal_state is not None
+        return self._pending_goal_state
+
+    def _compute_oracle_label(self) -> Optional[OracleLabel]:
+        """This tick's A* oracle label (issue #239): geodesic distance, next
+        optimal action, legal-action mask, path-progress delta and
+        replan-required, from the simulator's *full* semantic map
+        (``env._sem_view()``) -- never the egocentric crop the vision stream
+        publishes (see ``oracle.build_walkable_grid``'s docstring for why).
+        ``None`` when oracle labels are disabled (``goal_enabled=False``) or
+        no goal has ever been proposed."""
+        if self._oracle_writer is None or self._goal_setter is None:
+            return None
+        goal_position = self._goal_setter.tracker.position
+        if goal_position is None:
+            return None
+        current = self._position_tuple()
+        # The caregiver goal is sampled at a continuous point
+        # (`sample_caregiver_goal`'s rejection sampling over a bounding
+        # box); the A* grid works in integer cells, so the oracle plans to
+        # the goal's nearest cell.
+        return self._oracle_writer.label(
+            semantic=self._env._sem_view(),
+            position=(int(round(current[0])), int(round(current[1]))),
+            goal_position=(int(round(goal_position[0])), int(round(goal_position[1]))),
+            world_size=self._config.area,
+        )
 
     def _advance(self, action: Action) -> None:
         """Apply one crafter step; refreshes cached state/reward/events.
         Shared by ``act()`` and ``step()`` so both paths advance identically
         (mirrors ``MinecraftSurvivalBox``)."""
+        previous_position = self._position_tuple()
         index = ACTION_NAME_TO_INDEX[action.name]
         pixels, reward, done, info = self._env.step(index)
         self._tick += 1
@@ -234,7 +300,43 @@ class CrafterWorld(Program):
             if count > self._achievements_earned.get(name, 0):
                 self._achievements_earned[name] = count
                 self._pending_achievement_events.append((name, count))
-        self._pending_reward = RewardSignal.from_components({"crafter": round(float(reward), 6)})
+        task_reward = round(float(reward), 6)
+        if self._goal_setter is None:
+            self._pending_reward = RewardSignal.from_components({"crafter": task_reward})
+            return
+        # Goal-conditioned navigation (epic #212 §12.4/12.5, issue #239):
+        # goal progress, completion, collision and task reward stay
+        # separate components, never summed into one opaque "crafter" key.
+        current_position = self._position_tuple()
+        was_active = self._goal_setter.tracker.active
+        self._pending_goal_state = self._goal_setter.tick(current_position=current_position)
+        just_arrived = was_active and not self._pending_goal_state.active
+        self._pending_oracle_label = self._compute_oracle_label()
+        distance = (
+            self._pending_oracle_label.geodesic_distance
+            if self._pending_oracle_label is not None
+            else None
+        )
+        components = dict(
+            self._reward_tracker.compute(
+                geodesic_distance=distance,
+                # The state *before* this tick's arrival evaluation, not
+                # after: the shaping delta scores the transition into
+                # wherever this move landed, including the final approach
+                # step that lands exactly on the goal -- gating on the
+                # post-transition `active` (already False once arrived)
+                # would silently drop that last, most important delta.
+                goal_active=was_active,
+                just_arrived=just_arrived,
+            )
+        )
+        components["task"] = task_reward
+        blocked = (
+            action.name in _MOVEMENT_ACTION_NAMES and current_position == previous_position
+        )
+        if blocked and self._config.goal_collision_penalty:
+            components["collision"] = -abs(self._config.goal_collision_penalty)
+        self._pending_reward = RewardSignal.from_components(components)
 
     def act(self, action: Action) -> ActionResult:
         error = self._validation_error(action)
@@ -246,6 +348,22 @@ class CrafterWorld(Program):
     def reward(self) -> RewardSignal:
         """Reward for the most recent tick (crafter's own step() reward)."""
         return self._pending_reward
+
+    def oracle_labels(self) -> Optional[Dict[str, Any]]:
+        """Training-only A* oracle labels for the most recent tick (epic
+        #212 §12.4/12.5, issue #239): geodesic distance, next optimal
+        action, legal-action mask, path-progress delta, replan-required, the
+        oracle-planner version and its map-cost assumptions.
+
+        Structurally never reaches the deployed sensory workspace: this
+        method is not part of ``stream_catalog()``/``attach_buses()`` and
+        never calls ``self._sensory_bus.publish(...)`` -- the runtime's own
+        recorder wires it into the per-tick *decision* record instead (see
+        ``runtime.loop``), never onto the sensory bus a policy reads from.
+        ``None`` when goal-conditioned navigation is disabled or no goal has
+        ever been proposed.
+        """
+        return self._pending_oracle_label.as_payload() if self._pending_oracle_label else None
 
     def is_complete(self) -> bool:
         return self._done
@@ -350,6 +468,17 @@ class CrafterWorld(Program):
                 # goal state in place, desyncing internal.goal from the
                 # restored position.
                 self._goal_setter,
+                # The A* oracle writer's previous-distance memory and the
+                # navigation reward tracker's previous-potential/bonus-paid
+                # state (issue #239) are per-episode mutable state for the
+                # same reason: without them, a restored rollout would
+                # recompute `path_progress_delta`/`replan_required`/
+                # `goal_progress` against the *next* episode's history
+                # instead of a fresh one from the restored tick, and could
+                # re-pay the arrival bonus a snapshot taken after arrival had
+                # already spent.
+                self._oracle_writer, self._reward_tracker,
+                self._pending_goal_state, self._pending_oracle_label,
             )
         )
         return snapshot_id
@@ -359,6 +488,8 @@ class CrafterWorld(Program):
             self._env, self._tick, self._dead, self._done, self._last_action,
             self._last_obs, self._last_state, self._achievements_earned,
             self._goal_setter,
+            self._oracle_writer, self._reward_tracker,
+            self._pending_goal_state, self._pending_oracle_label,
         ) = copy.deepcopy(self._snapshots[snapshot_id])
 
     def metadata(self) -> ProgramMetadata:

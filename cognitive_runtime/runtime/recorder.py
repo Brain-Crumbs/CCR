@@ -104,6 +104,16 @@ class DecisionRecord:
     #: The clinic aggregates these records into ``pixel-predictions-v1`` so a
     #: live run is inspectable without a separate offline export.
     live_prediction: Optional[Dict[str, Any]] = None
+    #: Training-only A* oracle navigation labels for this tick (epic #212
+    #: §12.4/12.5, issue #239): geodesic distance, next optimal action,
+    #: legal-action mask, path-progress delta, replan-required, the
+    #: oracle-planner version and its map-cost assumptions --
+    #: ``Program.oracle_labels()`` when the active Program exposes one (e.g.
+    #: ``programs.crafter.adapter.CrafterWorld`` with goal-conditioned
+    #: navigation enabled), else ``None``. Present here, in the *decision*
+    #: record, and never as a sensory-bus stream, is what keeps these labels
+    #: out of the deployed sensory workspace a policy actually reads from.
+    oracle_labels: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
