@@ -373,6 +373,11 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null }
         if (!clinic) return sendJSON(res, 400, { error: "the champion registry requires clinic mode" });
         const organism = url.searchParams.get("organism");
         if (!organism) return sendJSON(res, 400, { error: "select an organism" });
+        // organism is joined into a filesystem path below; require it to
+        // name a catalogued organism (as the sibling /api/runs and
+        // /api/experiments routes already do) rather than trusting client
+        // input, which could otherwise walk outside runsDir (e.g. "../../etc").
+        if (!clinic.catalog().some((entry) => entry.organism === organism)) return sendJSON(res, 404, { error: "unknown organism" });
         return sendJSON(res, 200, registryDocument(clinic.runsDir, organism));
       }
       if (p.length === 2 && p[1] === "sessions") {

@@ -86,4 +86,52 @@ describe("PixelHorizonViewer", () => {
     expect(screen.getByText("move up")).toBeInTheDocument();
     expect(screen.queryByText(/assumed/)).not.toBeInTheDocument();
   });
+
+  it("renders the seen frame in the model's pooled reconstruction shape, not the native episode shape", async () => {
+    // Native frames are 2x2 (4px); the export's reconstruction/target shape
+    // is pooled down to 1x1, as a real joint-cortex export would be.
+    vi.stubGlobal("fetch", vi.fn((url) => Promise.resolve({
+      ok: true,
+      json: () => Promise.resolve(String(url).includes("predictions") ? {
+        format: "pixel-predictions-v2", horizons: [1], prediction_shape: [1, 1, 3],
+        predictions: { 1: { frames: [b64([9, 9, 9]), b64([8, 8, 8])] } },
+        targets: [b64([0, 0, 0]), b64([1, 1, 1]), b64([2, 2, 2])],
+        events: [],
+      } : {
+        shape: [2, 2, 3], dtype: "uint8", n_frames: 3,
+        frames: Array.from({ length: 3 }, (_, i) => ({ i, t: i, tick: i, seq: i, hash: `h${i}`, data: b64(Array(4).fill([i, i, i]).flat()) })),
+      }),
+    })));
+    render(<PixelHorizonViewer framesSrc="/frames" predictionsSrc="/predictions" />);
+    await waitFor(() => expect(screen.getByLabelText("prediction source").value).toBe("model"));
+    const seenCanvas = document.querySelector(".seen-panel canvas");
+    expect(seenCanvas.width).toBe(1);
+    expect(seenCanvas.height).toBe(1);
+  });
+
+  it("stops the previous episode's playback interval once a new episode loads", async () => {
+    const onTickChange = vi.fn();
+    const seriesFor = (n) => framesPayload(n);
+    vi.stubGlobal("fetch", vi.fn((url) => {
+      const isB = String(url).includes("-b");
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve(String(url).includes("predictions") ? predictionsPayload() : seriesFor(isB ? 4 : 3)),
+      });
+    }));
+    const { rerender } = render(<PixelHorizonViewer framesSrc="/frames-a" predictionsSrc="/predictions-a" onTickChange={onTickChange} />);
+    await waitFor(() => expect(screen.getByLabelText("start frame").value).toBe("1"));
+
+    fireEvent.click(screen.getByLabelText("play/pause"));
+    await new Promise((resolve) => setTimeout(resolve, 250)); // let the interval fire a couple of times
+
+    rerender(<PixelHorizonViewer framesSrc="/frames-b" predictionsSrc="/predictions-b" onTickChange={onTickChange} />);
+    await waitFor(() => expect(screen.getByLabelText("play/pause")).toHaveTextContent("▶"));
+    const callsAfterReload = onTickChange.mock.calls.length;
+
+    // A leaked interval from episode A would keep firing on its stale
+    // closure and publish more ticks here even though playback looks stopped.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(onTickChange.mock.calls.length).toBe(callsAfterReload);
+  });
 });

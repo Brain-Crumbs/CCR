@@ -64,6 +64,10 @@ export function PixelHorizonViewer({ framesSrc, predictionsSrc, decisions = [], 
   // than always frame zero.
   useEffect(() => {
     if (data.status !== "ready") return;
+    // A running interval from the previous episode keeps ticking on its old
+    // closure (stale data/maxT) unless explicitly stopped here -- setPlaying
+    // alone only changes the button's label, not the timer.
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
     setSource(data.pred ? "model" : "copy-last");
     const eventful = data.pred?.events?.findIndex((event) => event.entity_entered || event.entity_left || event.blocked_forward || event.semantic_scene_changed);
     const initial = eventful > 0 ? Math.min(eventful, maxT) : 0;
@@ -123,6 +127,10 @@ export function PixelHorizonViewer({ framesSrc, predictionsSrc, decisions = [], 
     ["copy-last", "copy-last baseline"],
     ["mean-frame", "mean-frame baseline"],
   ];
+  // Model targets are pooled to the export's reconstruction shape (e.g.
+  // 16x16 for a native 33x33 episode); a mismatched shape lays the smaller
+  // byte buffer across a larger canvas and corrupts the seen frame.
+  const seen = targetFrame(source, t, ctx);
 
   return (
     <div className="pixel-horizon-viewer">
@@ -143,7 +151,7 @@ export function PixelHorizonViewer({ framesSrc, predictionsSrc, decisions = [], 
       </div>
       <div className="horizons">
         <SeenFramePanel t={t} tick={data.frames[t]?.tick ?? t}
-          bytes={targetFrame(source, t, ctx)?.bytes ?? null} shape={data.shape}
+          bytes={seen?.bytes ?? null} shape={seen?.shape ?? data.shape}
           action={actionByTick.get(data.frames[t]?.tick ?? t) ?? null} />
         {horizons.map((h) => <HorizonPanel key={h} h={h} t={t} source={source} ctx={ctx} />)}
       </div>

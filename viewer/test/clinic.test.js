@@ -122,7 +122,10 @@ test("clinic mode joins a selected organism/run to its cached prediction session
   const registry = await get(port, "/api/registry?organism=Test");
   assert.equal(registry.status, 200);
   assert.equal(registry.body.slots.generic_action_effects_v1.fast["rollout.t+4"].leading_champion, "run-1");
-  assert.deepEqual((await get(port, "/api/registry?organism=Nobody")).body, { format: "model-factory-registry-v1", slots: {} });
+  assert.equal((await get(port, "/api/registry?organism=Nobody")).status, 404);
+  // organism is joined into a filesystem path; an uncatalogued value must
+  // never escape runsDir, even via traversal segments.
+  assert.equal((await get(port, `/api/registry?organism=${encodeURIComponent("../../../../etc")}`)).status, 404);
 });
 
 test("clinic mode uses a run session index to include cached training recordings", async (t) => {
