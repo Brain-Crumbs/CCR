@@ -286,6 +286,12 @@ class CognitiveRuntime:
         self._observe_external_streams = getattr(
             self.program, "observe_external_streams", None
         )
+        #: Optional Program hook (issue #239): training-only A* oracle
+        #: navigation labels for the tick just advanced, wired straight into
+        #: the decision record below -- never onto the sensory bus, so it
+        #: structurally cannot reach the deployed sensory workspace a policy
+        #: reads from. `None` for every Program that doesn't expose it.
+        self._oracle_labels_fn = getattr(self.program, "oracle_labels", None)
         attention_mode = self.config.attention_mode
         if attention_mode not in ATTENTION_MODES:
             raise ValueError(
@@ -736,6 +742,9 @@ class CognitiveRuntime:
             live_prediction_record = (
                 live_prediction_attr() if callable(live_prediction_attr) else None
             )
+            oracle_labels_record = (
+                self._oracle_labels_fn() if callable(self._oracle_labels_fn) else None
+            )
             self.recorder.write_cognitive_tick(
                 sensory_events=window.events,
                 motor_events=motor_events,
@@ -763,6 +772,7 @@ class CognitiveRuntime:
                     arbiter_mode=arbiter_payload,
                     motor_decision=motor_decision_record,
                     live_prediction=live_prediction_record,
+                    oracle_labels=oracle_labels_record,
                 ),
             )
 

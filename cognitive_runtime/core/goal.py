@@ -209,6 +209,15 @@ class GoalTracker:
         return self._goal_position is not None
 
     @property
+    def position(self) -> Optional[Tuple[float, float]]:
+        """The active goal's absolute position, or ``None`` before any goal
+        has been proposed. For the oracle planner (issue #239), which needs
+        the goal's own coordinates -- not the agent-relative view
+        :meth:`state` publishes -- to plan against the simulator's complete
+        map."""
+        return self._goal_position
+
+    @property
     def active(self) -> bool:
         """A goal is active once proposed and until the harness decides it
         has been reached -- never flipped by anything but
