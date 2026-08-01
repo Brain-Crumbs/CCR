@@ -45,6 +45,7 @@ behavior_mixture:
 # held-out generic loss rises by more than the declared 0.05 allowance.
 retention_policy:
   suite: generic_action_effects_v1
+  corpus_id: crafter-generic-action-effects-v1
   metric: heldout_prediction_loss
   max_regression: 0.05
   replay_mixture:

@@ -31,7 +31,7 @@ from cognitive_runtime.training.model_factory.state import (  # noqa: E402
 ORGANISM = "Test"
 
 
-def _build_corpus(root: Path, corpus_id: str = "crafter-tiny-v1"):
+def _build_corpus(root: Path, corpus_id: str = "crafter-tiny-v1", *, world_size: int = 16):
     spec = {
         "root": str(root),
         "organism": ORGANISM,
@@ -40,7 +40,7 @@ def _build_corpus(root: Path, corpus_id: str = "crafter-tiny-v1"):
             "world": "crafter",
             "backend": "crafter",
             "episode_ticks": 24,
-            "world_size": 16,
+            "world_size": world_size,
             # The quality/split-overlap gates are already covered by MF-A5's
             # own tests; disabling the quality gate here keeps this fixture
             # from being sensitive to a real scenario's behavioral
@@ -54,6 +54,39 @@ def _build_corpus(root: Path, corpus_id: str = "crafter-tiny-v1"):
         },
     }
     return build_corpus(spec)
+
+
+def _build_navigation_corpus(root: Path, generic_corpus_id: str):
+    return build_corpus({
+        "root": str(root),
+        "organism": ORGANISM,
+        "corpus_id": "crafter-navigation-tiny-v1",
+        "generator": {
+            "world": "crafter",
+            "backend": "crafter",
+            "episode_ticks": 24,
+            "world_size": 48,
+            "data_quality_gate": False,
+            "navigation_random_action_fraction": 0.25,
+        },
+        "splits": {
+            "train": {"navigate_open_goal": [0, 1]},
+            "validation": {"navigate_open_goal": [1000, 1001]},
+            "test": {},
+        },
+        "behavior_mixture": {"random_action_fraction": 0.25},
+        "retention_policy": {
+            "suite": "generic_action_effects_v1",
+            "corpus_id": generic_corpus_id,
+            "metric": "heldout_prediction_loss",
+            "max_regression": 1.0,
+            "replay_mixture": {
+                "generic_action_effects_v1": 0.25,
+                "goal_navigation_v1": 0.75,
+            },
+        },
+        "quality_policy": {"enabled": False, "expected_pixel_source": "crafter"},
+    })
 
 
 def _spec_dict(corpus_id, *, mode="fresh", parent=None, training_overrides=None):
@@ -182,6 +215,47 @@ def test_fine_tune_mode_continues_weights_under_a_new_training_contract(tmp_path
     assert child.state == "completed"
     assert child.training_contract_hash != parent_result.training_contract_hash
     assert child.architecture_hash == parent_result.architecture_hash
+
+
+def test_navigation_fine_tune_writes_navigation_and_generic_retention_evidence(tmp_path):
+    corpus = _build_corpus(
+        tmp_path / "corpora", "crafter-retention-tiny-v1", world_size=48,
+    )
+    parent_result = _run(
+        _spec_dict(corpus.corpus_id, training_overrides={"epoch_budget": 1}), tmp_path,
+    )
+    navigation_corpus = _build_navigation_corpus(tmp_path / "corpora", corpus.corpus_id)
+    child_spec = _spec_dict(
+        navigation_corpus.corpus_id,
+        mode="fine_tune",
+        parent=_parent_block(parent_result),
+        training_overrides={"epoch_budget": 1},
+    )
+    child_spec["evaluation"]["selection_metric"] = "goal_navigation.success_rate"
+
+    child = _run(child_spec, tmp_path)
+
+    validation = json.loads(
+        (child.directory / "metrics" / "validation.json").read_text(encoding="utf-8")
+    )
+    assert validation["goal_navigation"]["format"] == "goal-navigation-metrics-v1"
+    assert 0.0 <= validation["goal_navigation"]["success_rate"] <= 1.0
+    retention = json.loads(
+        (child.directory / "metrics" / "retention.json").read_text(encoding="utf-8")
+    )
+    assert retention["old_scenario"] == "generic_action_effects_v1"
+    assert retention["new_scenario"] == "goal_navigation_v1"
+    assert retention["corpus_id"] == corpus.corpus_id
+    assert retention["episode_ids"]
+    assert isinstance(retention["retained"], bool)
+    from cognitive_runtime.cli import _factory_population_candidate
+
+    candidate = _factory_population_candidate(
+        child.directory,
+        objective="goal_navigation.success_rate",
+        declared_genome_fields=(),
+    )
+    assert candidate.retention_metric == pytest.approx(retention["forgetting_amount"])
 
 
 def test_resume_continues_an_interrupted_run_to_completion(tmp_path, corpus):

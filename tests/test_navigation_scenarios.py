@@ -8,10 +8,17 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("torch")
+
 from cognitive_runtime.cli import _factory_slot_defaults, cmd_nursery_list
 from cognitive_runtime.training import nursery as nursery_module
 from cognitive_runtime.training.model_factory import corpus as corpus_module
+from cognitive_runtime.training.model_factory.navigation_metrics import evaluate_navigation_sessions
 from cognitive_runtime.training.model_factory.promotion import PromotionPolicy, evaluate_promotion
+from cognitive_runtime.training.model_factory.runner import (
+    _resolve_selection_metric,
+    _selection_metric_mode,
+)
 from cognitive_runtime.training.model_factory.registry import (
     BENCHMARK_FAMILIES,
     GOAL_NAVIGATION_V1,
@@ -166,6 +173,14 @@ def _install_fake_navigation_corpus(monkeypatch, cache: Path) -> None:
             "goal_distribution_policy": {"generator_version": "goal_distribution_v1"},
             "oracle_planner_policy": {"planner_version": "crafter-astar-v1"},
             "goal_reward_policy": {"potential": "linear"},
+            "behavior_mixture": {
+                "expert_policy": "astar",
+                "expert_action_fraction": 0.70,
+                "random_action_fraction": 0.30,
+                "random_action_subset": ["MOVE_UP", "MOVE_DOWN", "MOVE_LEFT", "MOVE_RIGHT"],
+                "schedule": "seeded_stratified_per_active_step",
+                "seed_rule": "episode_seed",
+            },
         }
         (session / "session.json").write_text(json.dumps({
             "session_id": session.name,
@@ -207,8 +222,91 @@ def test_configurable_mixture_and_retention_are_frozen_in_navigation_data_contra
     assert corpus.data_contract.behavior_mixture_policy["random_action_fraction"] == 0.30
     assert corpus.data_contract.behavior_mixture_policy["expert_action_fraction"] == 0.70
     assert corpus.data_contract.retention_policy["suite"] == "generic_action_effects_v1"
+    assert corpus.data_contract.retention_policy["corpus_id"] == "crafter-generic-action-effects-v1"
     assert corpus.data_contract.oracle_planner_policy["planner_version"] == "crafter-astar-v1"
     assert nursery_module.NurseryConfig().navigation_random_action_fraction == 0.25
+
+
+def test_behavior_mixture_rejects_provenance_that_contradicts_recorded_policy(tmp_path, monkeypatch):
+    _install_fake_navigation_corpus(monkeypatch, tmp_path / "recordings")
+    spec = {
+        "root": str(tmp_path / "corpora"),
+        "corpus_id": "false-navigation-provenance-v1",
+        "organism": "Crafter",
+        "generator": {
+            "world": "crafter", "backend": "crafter", "episode_ticks": 8,
+            "train_seeds": [0], "holdout_seeds": [1000],
+            "navigation_random_action_fraction": 0.30,
+        },
+        "splits": {
+            "train": {"navigate_open_goal": [0]},
+            "validation": {"navigate_open_goal": [1000]},
+            "test": {},
+        },
+        "behavior_mixture": {"expert_policy": "dijkstra", "random_action_fraction": 0.30},
+        "retention_policy": {
+            "suite": "generic_action_effects_v1", "max_regression": 0.05,
+            "replay_mixture": {"generic_action_effects_v1": 0.25, "goal_navigation_v1": 0.75},
+        },
+        "quality_policy": {"enabled": False, "expected_pixel_source": "crafter"},
+    }
+    with pytest.raises(ValueError, match="expert_policy.*contradicts"):
+        corpus_module.build_corpus(spec)
+
+
+def _metric_row(*, pre_distance, distance, legal=True, invalidated=False):
+    return {
+        "oracle_labels": {
+            "geodesic_distance": distance,
+            "map_cost_assumptions": {"step_cost": 1.0},
+            "behavior_mixture": {
+                "expert_action": "MOVE_RIGHT",
+                "selected_action": "MOVE_RIGHT",
+                "selected_action_legal": legal,
+                "pre_action_geodesic_distance": pre_distance,
+                "route_invalidated": invalidated,
+            },
+        },
+    }
+
+
+def test_navigation_metrics_are_produced_and_resolve_with_correct_direction(tmp_path):
+    entries = []
+    episodes = {
+        "success": [
+            _metric_row(pre_distance=2.0, distance=1.0),
+            _metric_row(pre_distance=1.0, distance=0.0),
+        ],
+        "failed-replan": [
+            _metric_row(pre_distance=2.0, distance=1.0, invalidated=True),
+            _metric_row(pre_distance=1.0, distance=1.0, legal=False),
+        ],
+    }
+    for session_id, rows in episodes.items():
+        session = tmp_path / session_id
+        session.mkdir()
+        (session / "episode_00000.decisions.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8",
+        )
+        entries.append({
+            "session_id": session_id,
+            "session_path": str(session),
+            "scenario": "replan_after_block" if session_id == "failed-replan" else "navigate_open_goal",
+        })
+
+    report = evaluate_navigation_sessions(entries)
+    assert report["success_rate"] == pytest.approx(0.5)
+    assert report["geodesic_efficiency"] == pytest.approx(0.5)
+    assert report["collision_rate"] == pytest.approx(0.25)
+    assert report["replan_recovery"] == pytest.approx(0.0)
+
+    value, comparison_errors = _resolve_selection_metric(
+        {"goal_navigation": report}, "goal_navigation.success_rate", 1.0,
+    )
+    assert value == pytest.approx(0.5)
+    assert comparison_errors == [0.0, 1.0]
+    assert _selection_metric_mode("goal_navigation.success_rate") == "max"
+    assert _selection_metric_mode("goal_navigation.collision_rate") == "min"
 
 
 def _mark_completed(root: Path, run_id: str) -> None:

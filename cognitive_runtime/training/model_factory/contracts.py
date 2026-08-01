@@ -235,9 +235,10 @@ class DataContract(_ContractMixin):
     #: generic dynamics corpora.
     behavior_mixture_policy: Mapping[str, Any] = field(default_factory=dict)
     #: Navigation fine-tune retention contract (epic #212 Sec 12.1, issue
-    #: #240): the generic benchmark suite that must be re-evaluated, the
-    #: replay mixture used while fine-tuning, and the maximum allowed loss
-    #: regression consumed by ``promotion``'s existing forgetting metric.
+    #: #240): the generic benchmark suite/corpus that must be re-evaluated,
+    #: the replay mixture used while fine-tuning, and the maximum allowed
+    #: loss regression consumed by ``promotion``'s existing forgetting
+    #: metric.
     retention_policy: Mapping[str, Any] = field(default_factory=dict)
 
 

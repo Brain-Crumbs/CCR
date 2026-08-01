@@ -1924,6 +1924,12 @@ def _factory_population_candidate(
         trial_spec = json.load(handle)
     validation, ticks_per_frame = _factory_load_validation(run_directory)
     primary_metric, _ = _resolve_selection_metric(validation, objective, ticks_per_frame)
+    retention_metric = float(primary_metric)
+    retention_path = run_directory / "metrics" / "retention.json"
+    if retention_path.is_file():
+        with retention_path.open(encoding="utf-8") as handle:
+            retention_payload = json.load(handle)
+        retention_metric = float(retention_payload["forgetting_amount"])
     with (run_directory / "metrics" / "budget_report.json").open(encoding="utf-8") as handle:
         budget = json.load(handle)
     return PopulationCandidate(
@@ -1935,9 +1941,10 @@ def _factory_population_candidate(
         },
         primary_metric=float(primary_metric),
         runtime=float(budget.get("total_trial_seconds", budget.get("measured_training_seconds", 0.0))),
-        # The current generic-dynamics stage has no separate retention report;
-        # its fixed validation objective is the retained-performance reading.
-        retention_metric=float(primary_metric),
+        # Generic dynamics has no separate report and retains its validation
+        # objective here. Navigation fine-tunes use the CI-refereed forgetting
+        # amount written by the runner instead.
+        retention_metric=retention_metric,
         ledger=_factory_compute_ledger(run_directory),
         gates=dict(gates or {}),
         completion_status=str(budget.get("completion_status", "completed")),

@@ -303,16 +303,23 @@ def _behavior_mixture_policy(
             "behavior_mixture.random_action_fraction must match generator."
             "navigation_random_action_fraction"
         )
-    return {
-        "expert_policy": str(raw.get("expert_policy", "astar")),
+    implemented = {
+        "expert_policy": "astar",
         "expert_action_fraction": 1.0 - fraction,
         "random_action_fraction": fraction,
-        "random_action_subset": list(raw.get("random_action_subset") or (
+        "random_action_subset": [
             "MOVE_UP", "MOVE_DOWN", "MOVE_LEFT", "MOVE_RIGHT",
-        )),
-        "schedule": str(raw.get("schedule", "seeded_stratified_per_active_step")),
-        "seed_rule": str(raw.get("seed_rule", "episode_seed")),
+        ],
+        "schedule": "seeded_stratified_per_active_step",
+        "seed_rule": "episode_seed",
     }
+    for key, value in raw.items():
+        if key in implemented and value != implemented[key]:
+            raise ValueError(
+                f"behavior_mixture.{key}={value!r} contradicts the recorded "
+                f"navigation policy {implemented[key]!r}"
+            )
+    return implemented
 
 
 def _retention_policy(spec: Mapping[str, Any], splits: Mapping[str, Any]) -> Dict[str, Any]:
@@ -344,9 +351,18 @@ def _retention_policy(spec: Mapping[str, Any], splits: Mapping[str, Any]) -> Dic
         sum(replay_mixture.values()), 1.0, abs_tol=1e-6
     ):
         raise ValueError("retention_policy.replay_mixture values must be non-negative and sum to 1.0")
+    metric = str(raw.get("metric", "heldout_prediction_loss"))
+    if metric != "heldout_prediction_loss":
+        raise ValueError(
+            "navigation retention_policy.metric must be 'heldout_prediction_loss'"
+        )
+    corpus_id = str(raw.get("corpus_id", "crafter-generic-action-effects-v1"))
+    if not corpus_id:
+        raise ValueError("navigation retention_policy.corpus_id must not be empty")
     return {
         "suite": suite,
-        "metric": str(raw.get("metric", "heldout_prediction_loss")),
+        "corpus_id": corpus_id,
+        "metric": metric,
         "max_regression": max_regression,
         "replay_mixture": replay_mixture,
         "forgetting_metric": "sleep.forgetting.compute_forgetting_metric",
@@ -564,6 +580,15 @@ def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapp
         # bounds, not just post-hoc aggregate counts.
         program_config["scenario_generator_evidence"] = generator_evidence
     is_crafter = generator["world"] == "crafter"
+    behavior_mixture_policy = dict(spec.get("behavior_mixture_policy") or {})
+    recorded_behavior_mixture = _navigation_contract_policy(
+        generator_evidence, "behavior_mixture",
+    )
+    if behavior_mixture_policy and recorded_behavior_mixture != behavior_mixture_policy:
+        raise ValueError(
+            "navigation session behavior_mixture evidence does not match the corpus declaration: "
+            f"recorded={recorded_behavior_mixture!r}, declared={behavior_mixture_policy!r}"
+        )
     return DataContract(
         world=str(generator["world"]),
         backend=str(generator["backend"]),
@@ -602,7 +627,7 @@ def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapp
         goal_reward_policy=_navigation_contract_policy(
             generator_evidence, "goal_reward_policy",
         ),
-        behavior_mixture_policy=dict(spec.get("behavior_mixture_policy") or {}),
+        behavior_mixture_policy=recorded_behavior_mixture,
         retention_policy=dict(spec.get("retention_policy") or {}),
     )
 

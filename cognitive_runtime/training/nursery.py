@@ -1452,12 +1452,14 @@ class _NavigationBehaviorPolicy(SingleActionPolicy):
         if self._program is None:
             raise RuntimeError("navigation policy was not bound to its Crafter program")
         dynamic = self.layout.get("dynamic_block")
+        route_invalidated = False
         if (
             dynamic
             and not self._invalidation_applied
             and self._tick == int(dynamic["invalidation_tick"])
         ):
             self._invalidate_current_route()
+            route_invalidated = True
 
         labels = self._program.oracle_labels() or {}
         expert_name = labels.get("next_action")
@@ -1476,11 +1478,18 @@ class _NavigationBehaviorPolicy(SingleActionPolicy):
         else:
             action = NULL_ACTION
             source = "goal_complete"
+        legal_action_mask = labels.get("legal_action_mask") or {}
         self.latest_navigation_behavior = {
             "source": source,
             "injected": bool(injected),
             "expert_action": expert_name,
             "selected_action": action.key(),
+            "pre_action_geodesic_distance": labels.get("geodesic_distance"),
+            "selected_action_legal": (
+                bool(legal_action_mask.get(action.key()))
+                if action.key() in legal_action_mask else None
+            ),
+            "route_invalidated": route_invalidated,
             "random_action_fraction": self.random_action_fraction,
             "schedule": "seeded_stratified_per_active_step",
         }
@@ -1533,6 +1542,7 @@ def _crafter_navigation(seed: int, cfg: NurseryConfig, scenario_name: str) -> Sc
             "random_action_fraction": cfg.navigation_random_action_fraction,
             "random_action_subset": [action.key() for action in _NAVIGATION_ACTIONS],
             "schedule": "seeded_stratified_per_active_step",
+            "seed_rule": "episode_seed",
         },
         "goal_distribution_policy": GoalDistributionConfig(
             min_initial_distance=4.0,
