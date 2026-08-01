@@ -27,7 +27,7 @@ from __future__ import annotations
 import heapq
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, Optional, Tuple
 
 import numpy as np
 
@@ -136,27 +136,33 @@ def _in_bounds(pos: Position, world_size: Tuple[int, int]) -> bool:
     return 0 <= pos[0] < width and 0 <= pos[1] < height
 
 
-def astar_path(
-    walkable: np.ndarray, start: Position, goal: Position, world_size: Tuple[int, int],
+def _astar_search(
+    walkable: np.ndarray, start: Position, goal_cells: FrozenSet[Position],
+    world_size: Tuple[int, int],
 ) -> Optional[List[Position]]:
-    """Shortest 4-connected, unit-cost path from ``start`` to ``goal``
-    (inclusive of both endpoints), or ``None`` if no path exists.
+    """Shared 4-connected, unit-cost search: shortest path from ``start`` to
+    the *nearest* cell in ``goal_cells`` (inclusive of both endpoints), or
+    ``None`` if none is reachable. ``astar_path`` (one target cell) and
+    ``astar_path_to_region`` (an arrival-radius acceptance region) are both
+    thin wrappers around this -- a single-element ``goal_cells`` reproduces
+    exactly one target.
 
     ``start`` is always a valid path origin regardless of its own
     walkability (the agent's actual current cell, e.g. it stepped onto lava
-    this tick) -- only cells *entered* along the path must be walkable,
-    matching how ``goal`` itself must be walkable too (this planner does not
-    special-case an unwalkable goal cell into "adjacent counts"; a goal
+    this tick); every other cell entered along the path, including whichever
+    goal cell the path ends at, must be walkable -- this planner does not
+    special-case an unwalkable goal cell into "adjacent counts", a goal
     sampled onto a wall is honestly reported as unreachable rather than
-    silently redefined).
+    silently redefined, and a walkable-but-otherwise-eligible cell simply
+    never gets explored if it's outside ``goal_cells``.
     """
-    if not _in_bounds(start, world_size) or not _in_bounds(goal, world_size):
+    if not goal_cells or not _in_bounds(start, world_size):
         return None
-    if start == goal:
+    if start in goal_cells:
         return [start]
 
     def heuristic(pos: Position) -> int:
-        return abs(pos[0] - goal[0]) + abs(pos[1] - goal[1])
+        return min(abs(pos[0] - gx) + abs(pos[1] - gy) for gx, gy in goal_cells)
 
     counter = 0  # heap tie-breaker: positions aren't orderable against each other
     open_heap: List[Tuple[int, int, int, Position]] = [(heuristic(start), 0, counter, start)]
@@ -168,7 +174,7 @@ def astar_path(
         _, g, _, current = heapq.heappop(open_heap)
         if current in closed:
             continue
-        if current == goal:
+        if current in goal_cells:
             path = [current]
             while path[-1] != start:
                 path.append(came_from[path[-1]])
@@ -190,6 +196,56 @@ def astar_path(
     return None
 
 
+def astar_path(
+    walkable: np.ndarray, start: Position, goal: Position, world_size: Tuple[int, int],
+) -> Optional[List[Position]]:
+    """Shortest 4-connected, unit-cost path from ``start`` to ``goal``
+    (inclusive of both endpoints), or ``None`` if no path exists. A thin
+    single-target wrapper around :func:`_astar_search` -- see its docstring
+    for the shared start/walkability rules."""
+    if not _in_bounds(goal, world_size):
+        return None
+    return _astar_search(walkable, start, frozenset({goal}), world_size)
+
+
+def compute_goal_region(
+    goal_position: Tuple[float, float], arrival_radius: float, world_size: Tuple[int, int],
+) -> FrozenSet[Position]:
+    """Every in-bounds integer cell within ``arrival_radius`` (inclusive) of
+    the continuous ``goal_position`` -- the same Euclidean acceptance region
+    ``GoalTracker.evaluate_arrival``'s own check uses (issue #238), so the
+    oracle's search target agrees with the harness's actual arrival
+    decision. A goal sampled onto a wall or resource (``goals.py``'s sampler
+    is not solvability-checked) can still be genuinely reachable through an
+    adjacent walkable cell inside this region, even when the single nearest
+    (rounded) cell is not -- :func:`astar_path_to_region` filters this
+    region down to whichever cells are actually walkable.
+    """
+    gx, gy = goal_position
+    width, height = world_size
+    x_lo = max(0, int(math.floor(gx - arrival_radius)))
+    x_hi = min(width - 1, int(math.ceil(gx + arrival_radius)))
+    y_lo = max(0, int(math.floor(gy - arrival_radius)))
+    y_hi = min(height - 1, int(math.ceil(gy + arrival_radius)))
+    region = set()
+    for x in range(x_lo, x_hi + 1):
+        for y in range(y_lo, y_hi + 1):
+            if math.hypot(x - gx, y - gy) <= arrival_radius:
+                region.add((x, y))
+    return frozenset(region)
+
+
+def astar_path_to_region(
+    walkable: np.ndarray, start: Position, goal_cells: FrozenSet[Position],
+    world_size: Tuple[int, int],
+) -> Optional[List[Position]]:
+    """Shortest path from ``start`` to the nearest cell in ``goal_cells``
+    (e.g. an arrival-radius acceptance region from :func:`compute_goal_region`)
+    -- see :func:`_astar_search` for the shared mechanics :func:`astar_path`
+    (a single target) also uses."""
+    return _astar_search(walkable, start, goal_cells, world_size)
+
+
 def compute_legal_action_mask(
     walkable: np.ndarray, position: Position, world_size: Tuple[int, int],
 ) -> Dict[str, bool]:
@@ -207,8 +263,10 @@ def compute_legal_action_mask(
 class OracleLabel:
     """One tick's training-only oracle labels (epic #212 §12.4)."""
 
-    #: Shortest-path distance in grid steps; ``None`` when the goal is
-    #: currently unreachable from the agent's position.
+    #: Shortest-path cost (grid steps scaled by ``OracleMapCostAssumptions.
+    #: step_cost``) to the nearest walkable cell inside the goal's arrival
+    #: region -- not necessarily the goal's own single cell; ``None`` when
+    #: no such cell is currently reachable from the agent's position.
     geodesic_distance: Optional[float]
     #: The action that begins the shortest path; ``None`` at the goal itself
     #: or when unreachable.
@@ -248,20 +306,35 @@ class OracleLabelWriter:
     a wall the player places or a tree they chop is reflected immediately.
     """
 
-    def __init__(self, assumptions: OracleMapCostAssumptions = DEFAULT_MAP_COST_ASSUMPTIONS):
+    def __init__(
+        self, assumptions: OracleMapCostAssumptions = DEFAULT_MAP_COST_ASSUMPTIONS,
+        arrival_radius: float = 0.0,
+    ):
         self.assumptions = assumptions
+        #: The same Euclidean acceptance radius ``GoalDistributionConfig.
+        #: arrival_radius``/``GoalTracker.evaluate_arrival`` use (issue
+        #: #238): the oracle plans to the nearest *walkable* cell inside
+        #: this region around the goal, not the goal's single (possibly
+        #: unwalkable, since caregiver goals aren't solvability-checked)
+        #: rounded cell -- so ``geodesic_distance`` reaches zero exactly
+        #: when the harness's own arrival decision fires, not some tick
+        #: later (or never, for a goal that rounds onto a wall).
+        self.arrival_radius = arrival_radius
         self._previous_distance: Optional[float] = None
 
     def reset(self) -> None:
         self._previous_distance = None
 
     def label(
-        self, *, semantic: np.ndarray, position: Position, goal_position: Position,
-        world_size: Tuple[int, int],
+        self, *, semantic: np.ndarray, position: Position,
+        goal_position: Tuple[float, float], world_size: Tuple[int, int],
     ) -> OracleLabel:
         walkable = build_walkable_grid(semantic, self.assumptions)
-        path = astar_path(walkable, position, goal_position, world_size)
-        distance: Optional[float] = float(len(path) - 1) if path is not None else None
+        goal_cells = compute_goal_region(goal_position, self.arrival_radius, world_size)
+        path = astar_path_to_region(walkable, position, goal_cells, world_size)
+        distance: Optional[float] = (
+            (len(path) - 1) * self.assumptions.step_cost if path is not None else None
+        )
 
         next_action: Optional[str] = None
         if path is not None and len(path) > 1:
@@ -301,6 +374,8 @@ __all__ = [
     "DEFAULT_MAP_COST_ASSUMPTIONS",
     "build_walkable_grid",
     "astar_path",
+    "astar_path_to_region",
+    "compute_goal_region",
     "compute_legal_action_mask",
     "OracleLabel",
     "OracleLabelWriter",

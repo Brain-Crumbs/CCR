@@ -34,7 +34,9 @@ from cognitive_runtime.programs.crafter.oracle import (
     OracleLabelWriter,
     OracleMapCostAssumptions,
     astar_path,
+    astar_path_to_region,
     build_walkable_grid,
+    compute_goal_region,
     compute_legal_action_mask,
 )
 from cognitive_runtime.programs.crafter.streams import SEMANTIC_LEGEND_NAMES
@@ -225,6 +227,116 @@ def test_oracle_label_writer_flags_replan_required_when_a_wall_appears():
     )
     assert second.geodesic_distance is None
     assert second.replan_required is True
+
+
+# --------------------------------------------- arrival-region reachability
+
+
+def test_compute_goal_region_matches_goal_trackers_own_euclidean_check():
+    """The oracle's acceptance region must be exactly the set of cells
+    ``GoalTracker.evaluate_arrival`` would itself accept -- not a
+    superset/subset that could disagree with the harness's own arrival
+    decision."""
+    region = compute_goal_region((2.0, 2.0), 1.0, (5, 5))
+    assert region == {(2, 2), (1, 2), (3, 2), (2, 1), (2, 3)}  # a Euclidean disk of radius 1
+    for cell in region:
+        assert math.hypot(cell[0] - 2.0, cell[1] - 2.0) <= 1.0 + 1e-9
+
+
+def test_compute_goal_region_clamps_to_world_bounds():
+    region = compute_goal_region((0.0, 0.0), 2.0, (5, 5))
+    assert all(0 <= x < 5 and 0 <= y < 5 for x, y in region)
+    assert (0, 0) in region
+
+
+def test_compute_goal_region_zero_radius_on_an_integer_point_is_a_single_cell():
+    assert compute_goal_region((2.0, 0.0), 0.0, (4, 1)) == {(2, 0)}
+
+
+def test_astar_path_to_region_reaches_the_nearest_walkable_cell_in_the_region():
+    grid = _grid([["grass", "grass", "grass", "grass", "grass"]])
+    walkable = build_walkable_grid(grid)
+    region = frozenset({(4, 0), (2, 0)})
+    path = astar_path_to_region(walkable, (0, 0), region, (5, 1))
+    assert path is not None
+    assert path[-1] == (2, 0)  # closer of the two acceptance cells
+
+
+def test_oracle_plans_to_the_arrival_region_not_only_the_exact_rounded_goal_cell():
+    """Regression (P1, PR #272 review): a goal sampled onto a non-walkable
+    cell (water/stone/tree -- ``goals.py``'s sampler is not
+    solvability-checked) must still be reachable through an adjacent
+    walkable cell inside ``arrival_radius``, matching ``GoalTracker.
+    evaluate_arrival``'s own Euclidean acceptance -- not reported as
+    unreachable just because the single rounded goal cell itself is a wall.
+    """
+    grid = _grid([
+        ["grass", "grass", "grass", "grass", "grass"],
+        ["grass", "grass", "grass", "grass", "grass"],
+        ["grass", "grass", "water", "grass", "grass"],
+        ["grass", "grass", "grass", "grass", "grass"],
+    ])
+    goal_position = (2.0, 2.0)  # sits exactly on the water cell
+
+    unreachable = OracleLabelWriter(arrival_radius=0.0)
+    assert unreachable.label(
+        semantic=grid, position=(0, 0), goal_position=goal_position, world_size=(5, 4)
+    ).geodesic_distance is None
+
+    reachable = OracleLabelWriter(arrival_radius=1.0)
+    label = reachable.label(
+        semantic=grid, position=(0, 0), goal_position=goal_position, world_size=(5, 4)
+    )
+    assert label.geodesic_distance == 3.0  # walks to an adjacent grass cell, not onto the water
+    assert label.next_action is not None
+
+
+def test_oracle_geodesic_distance_reaches_zero_exactly_when_inside_the_arrival_radius():
+    """The reward's terminal potential (``Phi(s) = -strength *
+    geodesic_distance``) must hit its maximum exactly when
+    ``GoalTracker.evaluate_arrival`` fires -- not a tick later because the
+    oracle kept planning to the goal's exact center cell."""
+    grid = _grid([["grass", "grass", "grass"]])
+    writer = OracleLabelWriter(arrival_radius=1.0)
+    # Standing one cell short of the exact goal center, but already inside
+    # its arrival radius.
+    label = writer.label(
+        semantic=grid, position=(1, 0), goal_position=(2.0, 0.0), world_size=(3, 1)
+    )
+    assert label.geodesic_distance == 0.0
+
+
+# ------------------------------------------------------------- step cost
+
+
+def test_oracle_label_writer_scales_geodesic_distance_by_the_declared_step_cost():
+    """Regression (P2, PR #272 review): a non-default ``step_cost`` must
+    actually change the reported distance -- otherwise two planners with
+    different declared map-cost models would produce byte-identical labels
+    and reward shaping while their ``DataContract`` entries claim
+    otherwise."""
+    grid = _grid([["grass", "grass", "grass"]])
+    unit_cost = OracleLabelWriter(OracleMapCostAssumptions(step_cost=1.0))
+    scaled_cost = OracleLabelWriter(OracleMapCostAssumptions(step_cost=2.5))
+    unit_label = unit_cost.label(
+        semantic=grid, position=(0, 0), goal_position=(2.0, 0.0), world_size=(3, 1)
+    )
+    scaled_label = scaled_cost.label(
+        semantic=grid, position=(0, 0), goal_position=(2.0, 0.0), world_size=(3, 1)
+    )
+    assert unit_label.geodesic_distance == 2.0
+    assert scaled_label.geodesic_distance == 5.0
+
+
+def test_oracle_label_writer_step_cost_scaling_is_consistent_in_progress_delta():
+    grid = _grid([["grass", "grass", "grass", "grass"]])
+    writer = OracleLabelWriter(OracleMapCostAssumptions(step_cost=2.0))
+    writer.label(semantic=grid, position=(0, 0), goal_position=(3.0, 0.0), world_size=(4, 1))
+    second = writer.label(
+        semantic=grid, position=(1, 0), goal_position=(3.0, 0.0), world_size=(4, 1)
+    )
+    # One cell of progress at step_cost=2.0 is a delta of 2.0, not 1.0.
+    assert second.path_progress_delta == pytest.approx(2.0)
 
 
 def test_oracle_label_writer_reset_clears_previous_distance_memory():

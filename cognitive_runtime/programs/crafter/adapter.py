@@ -144,7 +144,10 @@ class CrafterWorld(Program):
             if self._config.goal_enabled
             else None
         )
-        self._oracle_writer = OracleLabelWriter() if self._config.goal_enabled else None
+        self._oracle_writer = (
+            OracleLabelWriter(arrival_radius=self._config.goal_arrival_radius)
+            if self._config.goal_enabled else None
+        )
         self._reward_tracker = (
             NavigationRewardTracker(self._config.goal_reward_config())
             if self._config.goal_enabled
@@ -269,14 +272,17 @@ class CrafterWorld(Program):
         if goal_position is None:
             return None
         current = self._position_tuple()
-        # The caregiver goal is sampled at a continuous point
-        # (`sample_caregiver_goal`'s rejection sampling over a bounding
-        # box); the A* grid works in integer cells, so the oracle plans to
-        # the goal's nearest cell.
+        # `goal_position` stays a continuous point here (not rounded to a
+        # cell): `OracleLabelWriter.label` plans to the walkable cells
+        # within `arrival_radius` of it, matching `GoalTracker.
+        # evaluate_arrival`'s own Euclidean check exactly (issue #239's
+        # fix -- a rounded single target cell could report "unreachable"
+        # for a goal sampled onto a wall even though an adjacent cell
+        # satisfies arrival).
         return self._oracle_writer.label(
             semantic=self._env._sem_view(),
             position=(int(round(current[0])), int(round(current[1]))),
-            goal_position=(int(round(goal_position[0])), int(round(goal_position[1]))),
+            goal_position=goal_position,
             world_size=self._config.area,
         )
 
