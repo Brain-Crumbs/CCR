@@ -1,0 +1,25 @@
+{
+  "name": "ccr-clinic-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "React presentation layer for the CCR clinic: served build artifacts are read by viewer/server.js from ../public.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/react": "^16.3.2",
+    "@vitejs/plugin-react": "^6.0.5",
+    "jsdom": "^30.0.1",
+    "vite": "^8.2.0",
+    "vitest": "^4.1.10"
+  }
+}

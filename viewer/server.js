@@ -179,6 +179,35 @@ function runSummary(entry) {
   };
 }
 
+const ARTIFACT_FILES = [
+  "experiment.json", "trial_spec.json", "contracts.json", "lineage.json",
+  "data_manifest.json", "execution.json", "experiment_report.json",
+];
+const METRIC_FILES = ["validation.json", "test.json", "comparison.json"];
+
+/** Every Model Factory manifest recorded for one run (epic #212 §7), read
+ * as-is with no reshaping -- the clinic surfaces the factory's own contracts
+ * rather than re-deriving them. Missing files are reported as null so a run
+ * that predates a given manifest still renders the rest. */
+function runArtifacts(dir) {
+  const present = (file) => fs.existsSync(path.join(dir, file));
+  const manifests = Object.fromEntries(
+    ARTIFACT_FILES.map((file) => [file.replace(/\.json$/, ""), present(file) ? readJSON(path.join(dir, file), null) : null])
+  );
+  const metrics = Object.fromEntries(
+    METRIC_FILES.map((file) => {
+      const full = path.join(dir, "metrics", file);
+      return [file.replace(/\.json$/, ""), fs.existsSync(full) ? readJSON(full, null) : null];
+    })
+  );
+  return { ...manifests, metrics };
+}
+
+function registryDocument(runsDir, organism) {
+  const file = path.join(runsDir, organism, "registry.json");
+  return fs.existsSync(file) ? readJSON(file, null) : { format: "model-factory-registry-v1", slots: {} };
+}
+
 function exportedCacheSessions(cacheDir, experimentId) {
   if (!fs.existsSync(cacheDir)) return [];
   return sessionIdsBelow(cacheDir).flatMap((id) => {
@@ -333,6 +362,19 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null }
         if (!entry) return sendJSON(res, 404, { error: "unknown organism or run" });
         return sendJSON(res, 200, runSummary(entry));
       }
+      if (p.length === 2 && p[1] === "experiments") {
+        if (!clinic) return sendJSON(res, 400, { error: "experiment manifests require clinic mode" });
+        const organism = url.searchParams.get("organism"), run = url.searchParams.get("run");
+        const entry = clinic.catalog().find((candidate) => candidate.organism === organism && candidate.run === run);
+        if (!entry) return sendJSON(res, 404, { error: "unknown organism or run" });
+        return sendJSON(res, 200, runArtifacts(entry.dir));
+      }
+      if (p.length === 2 && p[1] === "registry") {
+        if (!clinic) return sendJSON(res, 400, { error: "the champion registry requires clinic mode" });
+        const organism = url.searchParams.get("organism");
+        if (!organism) return sendJSON(res, 400, { error: "select an organism" });
+        return sendJSON(res, 200, registryDocument(clinic.runsDir, organism));
+      }
       if (p.length === 2 && p[1] === "sessions") {
         const activeStore = selectedStore(url);
         if (!activeStore) return sendJSON(res, 400, { error: "select organism and run" });
@@ -387,4 +429,4 @@ if (require.main === module) {
   const args = parseArgs(process.argv);
   createServer(args).listen(args.port, () => console.log(`CCR clinic: http://localhost:${args.port}  (${args.dataDir ? `Record: ${args.dataDir}` : `Runs: ${args.runsDir}; cache: ${args.episodeCacheDir}`})`));
 }
-module.exports = { createServer, livePredictionsFromDecisions, makeStore, makeClinicStore, runSummary };
+module.exports = { createServer, livePredictionsFromDecisions, makeStore, makeClinicStore, runSummary, runArtifacts, registryDocument };
