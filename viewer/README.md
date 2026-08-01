@@ -10,9 +10,17 @@ lineage/contract/champion evidence.
 ## Run
 
 ```bash
-node viewer/server.js                       # serves runs + episode_cache on :8787
+node viewer/server.js                       # serves runs + episode_cache + corpora on :8787
 node viewer/server.js --data-dir /path/to/sessions --port 9000
+node viewer/server.js --runs-dir runs --episode-cache-dir episode_cache --corpus-root corpora
 ```
+
+`--corpus-root` (default `<repo>/corpora`) is where a run's
+`clinic_sessions.json` may point for frozen Model Factory corpus sessions
+(`cognitive_runtime.training.model_factory.corpus`'s own default root),
+mounted under a `corpus/` id prefix alongside the existing `run/`/`cache/`
+recordings -- the same containment discipline as those two roots applies:
+only a session inside one of the three configured roots is ever served.
 
 Open http://localhost:8787 -- pick an organism, run, recording, and episode.
 
@@ -48,11 +56,22 @@ Per selected organism/run, tabbed by concern:
   precision), the promotion verdict and its reasons, and -- when this run is
   a clone/fine_tune -- its paired comparison against its parent (mean delta,
   win rate, bootstrap/permutation confidence intervals).
-- **Champions** -- the organism's champion registry: every
-  (family, tier, objective) slot's leading champion and retained
-  population, with a metrics table (often horizon-scoped, e.g.
-  `rollout.t+4.model_mse`) so you can compare model outputs across the whole
-  retained population at a glance, plus promote/hold history.
+- **Factory** -- the organism-wide state of the Factory build
+  (`/api/factory-runs`: every run's mode, `state.json` state/reason, and
+  last-updated time, whether or not it was ever promoted) above the
+  champion registry: every (family, tier, objective) slot's leading
+  champion and retained population, with a metrics table (often
+  horizon-scoped, e.g. `rollout.t+4.model_mse`) so you can compare model
+  outputs across the whole retained population at a glance, plus
+  promote/hold history.
+- **Compare** -- two runs' predictions for the same session/episode, side
+  by side: pick Run A and Run B (scoped to the current organism), a shared
+  session/episode picker (from Run A's recordings), and a shared tick
+  cursor across both `PixelHorizonViewer` strips. Works fully when both
+  runs trained against the same frozen corpus (the common clone/fine_tune
+  case), since their prediction exports land in the same session
+  directories; otherwise the side without a matching export falls back to
+  baselines.
 
 Each recording also shows its `record/quality.py` green/amber/red verdict
 before you ever train on it.
@@ -85,7 +104,13 @@ viewer/
   the nursery checkpoint only persists the pixel *encoder* -- predicted
   frames are unrecoverable after the run unless exported. `nursery run
   --out-dir` also saves `<scenario>-full.pt`, a full encoder+decoder+predictor
-  bundle for re-exporting later.
+  bundle for re-exporting later. `ccr factory baseline`/`ccr factory clone`
+  (`model_factory.runner.run_trial`) export the same way for up to 3
+  validation episodes from the promoted checkpoint by default
+  (`--export-predictions-max N` / `--no-export-predictions`) -- written into
+  the frozen corpus session's own directory (`<experiment_id>-predictions_
+  <episode>.json`), which is what lets the Compare tab show two runs
+  trained against the same corpus side by side.
 
 Live `CortexWorldModel` runs also place decoded horizon frames in each
 `DecisionRecord`. When no offline export exists, the clinic assembles those
@@ -129,6 +154,7 @@ compatibility mode instead.
 | `GET /api/runs?organism=&run=` | the run's experiment_report.json header slice (model, training, evaluation, promotion) |
 | `GET /api/experiments?organism=&run=` | the run's Model Factory manifests as-is: `trial_spec`, `contracts`, `lineage`, `data_manifest`, `execution`, `experiment_report`, and `metrics.{validation,test,comparison}` |
 | `GET /api/registry?organism=` | the organism's champion registry (`registry.json`) |
+| `GET /api/factory-runs?organism=` | every run under the organism with its lineage mode, `state.json` state/reason/updated_at, and promotion outcome -- queued/running/completed/failed across the whole Factory build, not just promoted runs |
 | `GET /api/sessions?organism=&run=&name=&...filters` | recordings for the selected run, with quality verdicts |
 | `GET /api/sessions/:id` | one session's streams, decisions, exports, and quality verdict |
 | `GET /api/sessions/:id/episodes/:eid/{streams,decisions,frames,predictions}` | per-episode records; `predictions` accepts `?kind=dream` and `?experiment=` |

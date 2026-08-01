@@ -23,6 +23,7 @@ export const api = {
   runSummary: (organism, run) => getJSON(`/api/runs${qs({ organism, run })}`),
   experimentArtifacts: (organism, run) => getJSON(`/api/experiments${qs({ organism, run })}`),
   registry: (organism) => getJSON(`/api/registry${qs({ organism })}`),
+  factoryRuns: (organism) => getJSON(`/api/factory-runs${qs({ organism })}`),
   sessions: (organism, run, filters = {}) => getJSON(`/api/sessions${qs({ organism, run, ...filters })}`).then((x) => x.sessions),
   session: (sessionId, organism, run) => getJSON(`/api/sessions/${encodeURIComponent(sessionId)}${qs({ organism, run })}`),
   streams: (sessionId, episodeId, organism, run) =>

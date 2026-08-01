@@ -322,6 +322,85 @@ def _evaluate(
     return result
 
 
+def _write_clinic_session_index(
+    directory: Path,
+    train_entries: Sequence[Mapping[str, Any]],
+    validation_entries: Sequence[Mapping[str, Any]],
+) -> None:
+    """Bind a factory run to the frozen corpus sessions it trained/validated
+    against, mirroring ``nursery._write_clinic_session_index``'s
+    ``clinic-session-index-v1`` format.
+
+    Written as soon as the run directory exists -- well before training
+    finishes -- so the clinic can show a still-running trial's complete
+    train/validation session set (including EEG/attention/action data,
+    which lives in each session's own streams/decisions files independent
+    of any prediction export) immediately, not only once a checkpoint has
+    been promoted.
+    """
+    entries = [
+        {"scenario": str(entry["scenario"]), "split": split, "session_dir": str(Path(str(entry["session_path"])).resolve())}
+        for split, group in (("train", train_entries), ("evaluation", validation_entries))
+        for entry in group
+    ]
+    atomic_write_json(directory / "clinic_sessions.json", {"format": "clinic-session-index-v1", "sessions": entries})
+
+
+def _clinic_prediction_mode(selection_metric: str) -> str:
+    """Derive the clinic export's rollout/direct mode from a selection
+    metric, mirroring ``_resolve_selection_metric``'s own prefix parsing.
+    A goal-navigation metric carries no rollout/direct prefix -- rollout is
+    the only mode goal-navigation trials actually train with.
+    """
+    match = _SELECTION_METRIC_RE.match(selection_metric)
+    return str(match.group("report")) if match else "rollout"
+
+
+def _export_clinic_predictions(
+    resolved_spec: ExperimentSpec,
+    checkpoint_path: Path,
+    validation_dataset: Any,
+    experiment: Any,
+    training_stats: Mapping[str, Any],
+    *,
+    max_episodes: int,
+) -> None:
+    """Best-effort clinic (viewer/) prediction export for the promoted
+    checkpoint's validation episodes (issue: auto-export Model Factory
+    predictions).
+
+    Reloads the checkpoint that was actually selected/promoted rather than
+    reusing the last in-memory training chunk, so the export reflects the
+    weights the run actually reports. Diagnostic-only, matching the clinic's
+    existing discipline that it never gates or affects training: a bad
+    export -- per-episode or for the whole call -- is swallowed rather than
+    raised, and must never fail the trial.
+    """
+    try:
+        prediction_mode = _clinic_prediction_mode(resolved_spec.evaluation["selection_metric"])
+        ticks = tuple(int(tick) for tick in resolved_spec.data["horizons_ticks"])
+        awm = _action_world_model_module()
+        horizon_frames = (
+            awm.horizons_ticks_to_frames(ticks, validation_dataset.ticks_per_frame)
+            if prediction_mode == "rollout" else list(ticks)
+        )
+        loaded = load_factory_checkpoint(str(checkpoint_path))
+        from cognitive_runtime.training.prediction_export import export_cortex_session_predictions
+
+        for episode in validation_dataset.episodes[:max_episodes]:
+            try:
+                export_cortex_session_predictions(
+                    loaded.model, validation_dataset, episode.session_dir, episode.episode_id,
+                    horizon_frames=horizon_frames, prediction_mode=prediction_mode,
+                    checkpoint_path=str(checkpoint_path), experiment=experiment,
+                    training_stats=training_stats,
+                )
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+
 def _selection_metric_mode(selection_metric: str) -> str:
     """Best-checkpoint direction for one supported selection path."""
     if selection_metric in (
@@ -505,6 +584,8 @@ def run_trial(
     naming_seed: Optional[Union[str, int]] = None,
     trace_dir: Optional[Union[str, Path]] = None,
     heartbeat_timeout_seconds: Optional[float] = None,
+    export_predictions: bool = True,
+    export_predictions_max_episodes: int = 3,
 ) -> TrialResult:
     """Execute one fresh/clone/resume/fine_tune Model Factory trial.
 
@@ -518,6 +599,14 @@ def run_trial(
     ``clone``/``fine_tune`` writes ``metrics/comparison.json``. Every run
     writes ``experiment_report.json``. Never writes ``metrics/test.json`` -- that
     is reserved for an explicit final-test action (MF-C5, issue #227).
+
+    Also writes ``clinic_sessions.json`` (a fresh/clone/fine_tune launch
+    only) and, unless ``export_predictions`` is false, best-effort exports
+    up to ``export_predictions_max_episodes`` validation episodes'
+    predictions from the promoted checkpoint -- presentation tooling for
+    the clinic's Episode tab (viewer/), not part of the experiment's
+    identity/reproducibility contract, so neither is spec-declared or
+    contract-hashed.
     """
     resolved_spec = spec if isinstance(spec, ExperimentSpec) else resolve_spec(spec)
     validate_spec(resolved_spec)
@@ -641,6 +730,7 @@ def run_trial(
             root, resolved_spec, architecture_contract, corpus.data_contract, training_contract,
             run_id=run_id, naming_seed=naming_seed,
         )
+        _write_clinic_session_index(artifacts.directory, train_entries, validation_entries)
 
     device = str(resolved_spec.training["device"])
     devices: Tuple[str, ...] = () if device in ("cpu", "auto") else (device,)
@@ -834,6 +924,12 @@ def run_trial(
             if "goal_navigation" in best_eval:
                 validation_payload["goal_navigation"] = best_eval["goal_navigation"]
             atomic_write_json(artifacts.metrics_dir / "validation.json", validation_payload)
+
+            if export_predictions:
+                _export_clinic_predictions(
+                    resolved_spec, checkpoint_path, validation_dataset, artifacts.experiment,
+                    training_stats, max_episodes=export_predictions_max_episodes,
+                )
 
             if retention_dataset is not None and retention_before_eval is not None:
                 from sleep.forgetting import compute_forgetting_metric

@@ -163,6 +163,74 @@ def test_fresh_trial_completes_and_writes_artifacts(tmp_path, corpus):
     assert report["training_stats"]["completion_status"] == "completed"
 
 
+def test_fresh_trial_writes_clinic_session_index_and_exports_validation_predictions(tmp_path, corpus):
+    """The auto-export the clinic (viewer/) relies on: every train/validation
+    session is indexed for the Episode tab, and the promoted checkpoint's
+    predictions land next to a validation session's own stream log --
+    inside the frozen corpus, not the run directory (so a sibling run
+    against the same corpus can be compared against it later)."""
+    result = _run(_spec_dict(corpus.corpus_id), tmp_path)
+
+    index_path = result.directory / "clinic_sessions.json"
+    assert index_path.is_file()
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert index["format"] == "clinic-session-index-v1"
+    train_entries = corpus.manifest["sessions"]["train"]
+    validation_entries = corpus.manifest["sessions"]["validation"]
+    assert len(index["sessions"]) == len(train_entries) + len(validation_entries)
+    by_split = {"train": set(), "evaluation": set()}
+    for entry in index["sessions"]:
+        by_split[entry["split"]].add(entry["session_dir"])
+    assert by_split["train"] == {str(Path(entry["session_path"]).resolve()) for entry in train_entries}
+    assert by_split["evaluation"] == {str(Path(entry["session_path"]).resolve()) for entry in validation_entries}
+
+    exported = [
+        path for entry in validation_entries
+        for path in Path(entry["session_path"]).glob(f"{result.run_id}-predictions_*.json")
+    ]
+    assert exported, "expected at least one clinic prediction export for a validation episode"
+    payload = json.loads(exported[0].read_text(encoding="utf-8"))
+    assert payload["format"] == "pixel-predictions-v2"
+    assert payload["experiment"]["experiment_id"] == result.run_id
+    assert payload["prediction_mode"] == "rollout"
+
+
+def test_export_predictions_failure_does_not_fail_the_trial(tmp_path, corpus, monkeypatch):
+    """The clinic export is diagnostic-only: it must never gate or break
+    training, even if every episode's export blows up."""
+    import cognitive_runtime.training.prediction_export as prediction_export_module
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated export failure")
+
+    monkeypatch.setattr(prediction_export_module, "export_cortex_session_predictions", _boom)
+
+    result = _run(_spec_dict(corpus.corpus_id), tmp_path)
+
+    assert result.state == "completed"
+    validation_entries = corpus.manifest["sessions"]["validation"]
+    exported = [
+        path for entry in validation_entries
+        for path in Path(entry["session_path"]).glob(f"{result.run_id}-predictions_*.json")
+    ]
+    assert not exported
+
+
+def test_no_export_predictions_flag_skips_the_export_but_keeps_the_session_index(tmp_path, corpus):
+    result = run_trial(
+        _spec_dict(corpus.corpus_id), root=str(tmp_path / "runs"), corpus_root=str(tmp_path / "corpora"),
+        export_predictions=False,
+    )
+
+    assert (result.directory / "clinic_sessions.json").is_file()
+    validation_entries = corpus.manifest["sessions"]["validation"]
+    exported = [
+        path for entry in validation_entries
+        for path in Path(entry["session_path"]).glob(f"{result.run_id}-predictions_*.json")
+    ]
+    assert not exported
+
+
 def test_two_clone_siblings_share_identical_data_manifest_and_report_comparison(tmp_path, corpus):
     parent_result = _run(_spec_dict(corpus.corpus_id), tmp_path)
     parent = _parent_block(parent_result)
