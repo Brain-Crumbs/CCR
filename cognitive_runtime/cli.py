@@ -1113,7 +1113,7 @@ def cmd_nursery_list(args: argparse.Namespace) -> None:
     except ImportError as exc:  # torch not installed
         sys.exit(f"the nursery suite needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
     scenarios = _scenarios_for_world(getattr(args, "world", "minecraft"))
-    for name in sorted(scenarios):
+    for name in scenarios:
         scenario = scenarios[name]
         tag = " [+entity-persistence metric]" if scenario.entity_persistence_metric else ""
         print(f"{name}{tag}: {scenario.description}")
@@ -1149,7 +1149,7 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
             f"unknown nursery scenario {args.scenario!r} for --world {world!r}; choices: "
             f"{sorted(scenarios)} or 'all'"
         )
-    scenario_names = sorted(scenarios) if args.scenario == "all" else [args.scenario]
+    scenario_names = list(scenarios) if args.scenario == "all" else [args.scenario]
 
     train_seeds = list(range(args.train_seeds))
     holdout_seeds = list(range(args.train_seeds, args.train_seeds + args.holdout_seeds))
@@ -1174,6 +1174,7 @@ def cmd_nursery_run(args: argparse.Namespace) -> None:
         data_quality_gate=not args.skip_data_quality_gate,
         export_predictions=not args.no_export_predictions,
         name=args.name,
+        navigation_random_action_fraction=args.navigation_random_action_fraction,
     )
     backend_note = f"backend={config.backend}" if world == "minecraft" else f"world={world}"
     print(
@@ -1322,6 +1323,7 @@ def cmd_nursery_joint(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         seed=args.seed,
         data_quality_gate=not args.skip_data_quality_gate,
+        navigation_random_action_fraction=args.navigation_random_action_fraction,
     )
     model_config = ActionWorldModelConfig(
         latent_width=args.latent_width,
@@ -1827,6 +1829,20 @@ def _factory_slot_defaults(run_directory: Path, trial_spec: Mapping[str, Any]) -
     proposal's own terse workflow examples: family defaults to the run's
     organism, tier to whatever ``build_budget_report`` recorded for it."""
     family = str(trial_spec["organism"])
+    contracts_path = run_directory / "contracts.json"
+    if contracts_path.is_file():
+        with contracts_path.open(encoding="utf-8") as handle:
+            data_contract = (json.load(handle).get("data_contract") or {})
+        retention = data_contract.get("retention_policy") or {}
+        behavior_mixture = data_contract.get("behavior_mixture_policy") or {}
+        if (
+            retention.get("suite") == "generic_action_effects_v1"
+            and behavior_mixture.get("expert_policy") == "astar"
+        ):
+            # Issue #240: a navigation fine-tune defaults into its own
+            # champion namespace.  It can never overwrite the generic
+            # world-dynamics champion merely because --family was omitted.
+            family = "goal_navigation_v1"
     tier: Optional[str] = None
     budget_report_path = run_directory / "metrics" / "budget_report.json"
     if budget_report_path.is_file():
@@ -2078,9 +2094,9 @@ def cmd_factory_compare(args: argparse.Namespace) -> None:
 
 def cmd_factory_promote(args: argparse.Namespace) -> None:
     """``ccr factory promote <run>`` (issue #228): gate a run against
-    ``promotion.evaluate_promotion``'s seven promotion conditions (data
+    ``promotion.evaluate_promotion``'s promotion conditions (data
     quality, split overlap, rollout health, primary-metric margin, safety,
-    training-time budget, and -- with ``--durable`` -- sealed-test
+    navigation retention, training-time budget, and -- with ``--durable`` -- sealed-test
     confirmation), then record it as a champion-population member of one
     ``(family, tier, objective)`` registry slot only if every gate passes.
     A candidate that fails any gate is refused and recorded as a hold
@@ -2099,6 +2115,7 @@ def cmd_factory_promote(args: argparse.Namespace) -> None:
         evaluate_promotion,
     )
     from cognitive_runtime.training.model_factory.registry import (
+        GOAL_NAVIGATION_V1,
         RegistryError,
         hold,
         leading_champion,
@@ -2176,10 +2193,19 @@ def cmd_factory_promote(args: argparse.Namespace) -> None:
         )
 
     policy = PromotionPolicy(minimum_practical_margin=args.minimum_practical_margin)
+    retention_report = None
+    if family == GOAL_NAVIGATION_V1.name:
+        retention_path = run_directory / "metrics" / "retention.json"
+        if retention_path.is_file():
+            with retention_path.open(encoding="utf-8") as handle:
+                retention_report = json.load(handle)
     verdict = evaluate_promotion(
         policy=policy, candidate_run_id=args.run, experiment_report=experiment_report,
         data_quality=data_quality, split_overlap=split_overlap, has_champion=has_champion,
         comparison=comparison, durable=args.durable, test_confirmation=test_confirmation,
+        target_family=family,
+        retention_report=retention_report,
+        retention_policy=dict(corpus.data_contract.retention_policy),
     )
     for gate in verdict.gates:
         status = "PASS" if gate.passed else ("N/A" if not gate.applicable else "FAIL")
@@ -2809,6 +2835,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_run.add_argument("--holdout-seeds", type=int, default=2,
                                help="number of held-out-seed episodes (seeds N..N+M-1, never trained on)")
     p_nursery_run.add_argument("--episode-ticks", type=int, default=400)
+    p_nursery_run.add_argument(
+        "--navigation-random-action-fraction", type=float, default=0.25,
+        help="navigate_* only: seeded random-cardinal injection probability; "
+             "the goal_navigation_v1 default is 0.25 (epic starting band 0.20-0.30)",
+    )
     p_nursery_run.add_argument("--world-size", type=int, default=48)
     p_nursery_run.add_argument("--backend", default=_default_nursery_backend(),
                                choices=sorted(MINECRAFT_BACKEND_NAMES),
@@ -2866,6 +2897,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_nursery_joint.add_argument("--train-seeds", type=int, default=6)
     p_nursery_joint.add_argument("--holdout-seeds", type=int, default=2)
     p_nursery_joint.add_argument("--episode-ticks", type=int, default=400)
+    p_nursery_joint.add_argument(
+        "--navigation-random-action-fraction", type=float, default=0.25,
+        help="navigate_* only: seeded random-cardinal injection probability; "
+             "the goal_navigation_v1 default is 0.25 (epic starting band 0.20-0.30)",
+    )
     p_nursery_joint.add_argument("--world-size", type=int, default=48)
     p_nursery_joint.add_argument("--backend", default=_default_nursery_backend(),
                                  choices=sorted(MINECRAFT_BACKEND_NAMES))

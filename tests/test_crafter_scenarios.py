@@ -58,6 +58,8 @@ def test_registry_has_every_crafter_scenario():
     assert set(CRAFTER_SCENARIOS) == {
         "walk_forward_short", "blocked_forward", "turn", "object_permanence",
         "approach_entity", "motor_babbling_open", "motor_babbling_walls",
+        "navigate_open_goal", "navigate_single_wall", "navigate_two_wall",
+        "replan_after_block",
     }
 
 

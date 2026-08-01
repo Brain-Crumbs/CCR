@@ -81,12 +81,14 @@ class CaregiverGoalSetter:
         spawn_position: Tuple[float, float],
         world_size: Tuple[int, int],
         seed: int,
+        fixed_offset: Tuple[float, float] | None = None,
     ) -> None:
-        """Propose a fresh episode goal, deterministic in ``seed`` alone (a
-        fresh ``random.Random`` every reset, matching ``CrafterWorld``'s own
-        "one seed, one fully determined episode" contract -- see
-        ``adapter.py:reset``'s docstring on why a new ``crafter.Env`` is
-        built per reset rather than reusing one).
+        """Propose a fresh episode goal, deterministic in ``seed`` and the
+        optional ``fixed_offset``. Without an offset, a fresh
+        ``random.Random`` every reset matches ``CrafterWorld``'s own "one
+        seed, one fully determined episode" contract -- see
+        ``adapter.py:reset``'s docstring on why a new ``crafter.Env`` is built
+        per reset rather than reusing one.
 
         A fresh ``GoalTracker`` every episode, not the same one reused: the
         commitment horizon (epic #212 §12.4) guards goal swaps *within* one
@@ -97,9 +99,21 @@ class CaregiverGoalSetter:
         """
         self.tracker = GoalTracker(self.config)
         rng = random.Random(seed)
-        goal_position = sample_caregiver_goal(
-            spawn_position=spawn_position, world_size=world_size, config=self.config, rng=rng,
-        )
+        if fixed_offset is None:
+            goal_position = sample_caregiver_goal(
+                spawn_position=spawn_position, world_size=world_size, config=self.config, rng=rng,
+            )
+        else:
+            goal_position = (
+                spawn_position[0] + float(fixed_offset[0]),
+                spawn_position[1] + float(fixed_offset[1]),
+            )
+            width, height = world_size
+            if not (0 <= goal_position[0] < width and 0 <= goal_position[1] < height):
+                raise ValueError(
+                    f"fixed caregiver goal {goal_position} from offset {fixed_offset} is outside "
+                    f"world bounds {world_size}"
+                )
         rejection = self.tracker.propose(
             goal_position=goal_position,
             current_position=spawn_position,
@@ -107,7 +121,7 @@ class CaregiverGoalSetter:
             source=CAREGIVER_SOURCE,
         )
         assert rejection is None, (
-            f"sample_caregiver_goal violated its own distance floor: {rejection}"
+            f"caregiver goal violated its declared distance/commitment policy: {rejection}"
         )
 
     def tick(self, *, current_position: Tuple[float, float]) -> GoalState:

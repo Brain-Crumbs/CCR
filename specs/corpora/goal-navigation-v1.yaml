@@ -1,0 +1,59 @@
+# goal_navigation_v1 corpus (epic #212 Sec 12.1, 12.4--12.6; issue #240).
+#
+# The four stages stay in curriculum order.  Every generated layout is
+# preflighted with the same A* map-cost assumptions used for training labels;
+# ``navigate_two_wall`` additionally draws validation/test layouts from a
+# longer-chicane family that is outside the training generator's support.
+corpus_id: crafter-goal-navigation-v1
+organism: Crafter
+scenario_code_version: goal-navigation-layouts-v1
+generator:
+  world: crafter
+  backend: crafter
+  episode_ticks: 48
+  world_size: 48
+  horizons: [1, 4, 8]
+  train_seeds: [0, 1, 2, 3]
+  # Both routine validation and the sealed test draw from the holdout layout
+  # distribution; their episode seeds remain disjoint below.
+  holdout_seeds: [1000, 1001, 2000, 2001]
+  navigation_random_action_fraction: 0.25
+splits:
+  train:
+    navigate_open_goal: [0, 1, 2, 3]
+    navigate_single_wall: [0, 1, 2, 3]
+    navigate_two_wall: [0, 1, 2, 3]
+    replan_after_block: [0, 1, 2, 3]
+  validation:
+    navigate_open_goal: [1000, 1001]
+    navigate_single_wall: [1000, 1001]
+    navigate_two_wall: [1000, 1001]
+    replan_after_block: [1000, 1001]
+  test:
+    navigate_open_goal: [2000, 2001]
+    navigate_single_wall: [2000, 2001]
+    navigate_two_wall: [2000, 2001]
+    replan_after_block: [2000, 2001]
+behavior_mixture:
+  expert_policy: astar
+  random_action_fraction: 0.25
+  random_action_subset: [MOVE_UP, MOVE_DOWN, MOVE_LEFT, MOVE_RIGHT]
+  schedule: seeded_stratified_per_active_step
+  seed_rule: episode_seed
+# A navigation fine-tune must rehearse generic dynamics and then pass the
+# existing CI-refereed forgetting metric on this suite.  Promotion fails when
+# held-out generic loss rises by more than the declared 0.05 allowance.
+retention_policy:
+  suite: generic_action_effects_v1
+  metric: heldout_prediction_loss
+  max_regression: 0.05
+  replay_mixture:
+    generic_action_effects_v1: 0.25
+    goal_navigation_v1: 0.75
+split_roles:
+  train: navigation_training
+  validation: validation
+  test: sealed_test
+quality_policy:
+  enabled: true
+  expected_pixel_source: crafter

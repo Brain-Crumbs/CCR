@@ -58,6 +58,20 @@ class ForgettingReport:
         it improved."""
         return self.after.mean - self.before.mean
 
+    def to_dict(self) -> dict:
+        """Persistable promotion evidence for navigation retention gates."""
+        return {
+            "format": "forgetting-report-v1",
+            "old_scenario": self.old_scenario,
+            "new_scenario": self.new_scenario,
+            "before": self.before.to_dict(),
+            "after": self.after.to_dict(),
+            "comparison": self.comparison.to_dict(),
+            "tolerance": self.tolerance,
+            "forgetting_amount": self.forgetting_amount,
+            "retained": self.retained,
+        }
+
 
 def compute_forgetting_metric(
     old_scenario_losses_before: Sequence[float],

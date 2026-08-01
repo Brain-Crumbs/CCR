@@ -59,6 +59,46 @@ from cognitive_runtime.training.model_factory.state import (
 REGISTRY_FORMAT = "model-factory-registry-v1"
 LINEAGE_MANIFEST_NAME = "lineage.json"
 
+
+@dataclasses.dataclass(frozen=True)
+class BenchmarkFamily:
+    """A named benchmark/champion namespace and its promotion evidence."""
+
+    name: str
+    purpose: str
+    promotion_metrics: Tuple[str, ...]
+
+
+GENERIC_ACTION_EFFECTS_V1 = BenchmarkFamily(
+    name="generic_action_effects_v1",
+    purpose="general action-conditioned world dynamics",
+    promotion_metrics=(
+        "one_step_prediction", "multi_step_prediction", "action_effects",
+        "local_grid", "rollout_health",
+    ),
+)
+GOAL_NAVIGATION_V1 = BenchmarkFamily(
+    name="goal_navigation_v1",
+    purpose="goal-conditioned choice and replanning",
+    promotion_metrics=(
+        "success_rate", "geodesic_efficiency", "collision_rate", "replan_recovery",
+    ),
+)
+BENCHMARK_FAMILIES: Mapping[str, BenchmarkFamily] = {
+    family.name: family for family in (GENERIC_ACTION_EFFECTS_V1, GOAL_NAVIGATION_V1)
+}
+
+
+def benchmark_family(name: str) -> BenchmarkFamily:
+    """Resolve a registered family without restricting extension slots."""
+    try:
+        return BENCHMARK_FAMILIES[name]
+    except KeyError as exc:
+        raise RegistryError(
+            f"unknown registered benchmark family {name!r}; expected one of "
+            f"{sorted(BENCHMARK_FAMILIES)}"
+        ) from exc
+
 DECISION_PROMOTE = "promote"
 DECISION_HOLD = "hold"
 DECISION_TEST_USE = "record_test_use"
@@ -632,6 +672,11 @@ def lineage_graph(root: Union[str, Path], run_id: str) -> LineageGraph:
 
 
 __all__ = [
+    "BenchmarkFamily",
+    "GENERIC_ACTION_EFFECTS_V1",
+    "GOAL_NAVIGATION_V1",
+    "BENCHMARK_FAMILIES",
+    "benchmark_family",
     "REGISTRY_FORMAT",
     "LINEAGE_MANIFEST_NAME",
     "DECISION_PROMOTE",

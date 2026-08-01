@@ -229,6 +229,16 @@ class DataContract(_ContractMixin):
     #: "discount": 1.0, "success_radius": 1.5, "success_bonus": 1.0}``.
     #: Empty for any run that doesn't use goal-conditioned reward shaping.
     goal_reward_policy: Mapping[str, Any] = field(default_factory=dict)
+    #: Expert/random navigation-demonstration schedule (epic #212 Sec
+    #: 12.5/12.6, issue #240), including the A* share, injected-cardinal
+    #: share/action subset, schedule identity and seed rule.  Empty for
+    #: generic dynamics corpora.
+    behavior_mixture_policy: Mapping[str, Any] = field(default_factory=dict)
+    #: Navigation fine-tune retention contract (epic #212 Sec 12.1, issue
+    #: #240): the generic benchmark suite that must be re-evaluated, the
+    #: replay mixture used while fine-tuning, and the maximum allowed loss
+    #: regression consumed by ``promotion``'s existing forgetting metric.
+    retention_policy: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
