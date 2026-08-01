@@ -10,7 +10,8 @@ lineage/contract/champion evidence.
 ## Run
 
 ```bash
-node viewer/server.js                       # serves runs + episode_cache on :8787
+node viewer/server.js                       # serves runs + episode_cache + corpora on :8787
+node viewer/server.js --runs-dir runs --corpus-root corpora   # match wherever `ccr factory ...` writes
 node viewer/server.js --data-dir /path/to/sessions --port 9000
 ```
 
@@ -48,11 +49,20 @@ Per selected organism/run, tabbed by concern:
   precision), the promotion verdict and its reasons, and -- when this run is
   a clone/fine_tune -- its paired comparison against its parent (mean delta,
   win rate, bootstrap/permutation confidence intervals).
-- **Champions** -- the organism's champion registry: every
-  (family, tier, objective) slot's leading champion and retained
-  population, with a metrics table (often horizon-scoped, e.g.
+- **Factory** -- every run launched for the organism and its
+  `state.json` position (queued/running/checkpointing/completed/
+  budget_exceeded/failed/cancelled), not just promoted ones -- click a row
+  to select that run everywhere else in the clinic -- plus the champion
+  registry: every (family, tier, objective) slot's leading champion and
+  retained population, with a metrics table (often horizon-scoped, e.g.
   `rollout.t+4.model_mse`) so you can compare model outputs across the whole
   retained population at a glance, plus promote/hold history.
+- **Compare** -- two runs' predictions on the same session, side by side,
+  each with its own run summary and tick-synced horizon strips -- "inspect
+  models against each other" rather than one at a time. Works fully when
+  both runs were evaluated against the same frozen corpus (the normal case
+  for a clone/fine_tune lineage); a run missing an export for the chosen
+  session just falls back to the baselines in that column.
 
 Each recording also shows its `record/quality.py` green/amber/red verdict
 before you ever train on it.
@@ -78,14 +88,19 @@ viewer/
 - **copy-last** and **mean-frame** work on any recorded session with pixel
   frames (`--record-frames`); they are exactly the baselines
   `evaluate_ego_motion_holdout` benchmarks the model against.
-- **model** appears when a `predictions_<episode>.json` file sits next to the
-  episode's stream log. `run_nursery_scenario` (and `ccr nursery run`) writes
-  these for every recorded session by default
-  (`NurseryConfig.export_predictions` / `--no-export-predictions`), because
-  the nursery checkpoint only persists the pixel *encoder* -- predicted
-  frames are unrecoverable after the run unless exported. `nursery run
-  --out-dir` also saves `<scenario>-full.pt`, a full encoder+decoder+predictor
-  bundle for re-exporting later.
+- **model** appears when a `<id>-predictions_<episode>.json` file exists for
+  the selected experiment. Two pipelines write these automatically:
+  - `run_nursery_scenario` (and `ccr nursery run`) exports one for every
+    recorded session by default (`NurseryConfig.export_predictions` /
+    `--no-export-predictions`), next to the episode's stream log, because
+    the nursery checkpoint only persists the pixel *encoder* -- predicted
+    frames are unrecoverable after the run unless exported. `nursery run
+    --out-dir` also saves `<scenario>-full.pt`, a full
+    encoder+decoder+predictor bundle for re-exporting later.
+  - `ccr factory baseline`/`ccr factory clone` export from the selected
+    checkpoint for up to `--export-predictions-max N` validation episodes
+    (default 3; `--no-export-predictions` to skip) -- see
+    [Model Factory exports](#model-factory-exports) below.
 
 Live `CortexWorldModel` runs also place decoded horizon frames in each
 `DecisionRecord`. When no offline export exists, the clinic assembles those
@@ -112,6 +127,36 @@ save_full_visual_model(model, "walk_forward-full.pt")
 (`viewer/export_predictions.py` remains as a shim re-exporting the same
 functions.)
 
+## Model Factory exports
+
+`run_trial` (`cognitive_runtime/training/model_factory/runner.py`) does two
+things automatically, before and after training, purely for the clinic --
+neither is required for the trial itself, and a failure in either never
+fails the trial:
+
+- Writes `clinic_sessions.json` into the run directory as soon as it's
+  allocated (before training starts), listing every train/validation
+  session from the frozen corpus. This is what makes a run's recordings
+  browsable in the clinic immediately -- including while the trial is still
+  `running` -- since EEG/attention/action data lives in each session's own
+  streams/decisions files, independent of any prediction export.
+- Exports pixel predictions from the selected (`best-validation.pt`)
+  checkpoint for up to `--export-predictions-max` validation episodes,
+  **into the run's own `predictions/` directory** -- deliberately not into
+  the validation session's directory. A frozen corpus session's content
+  hash (`corpus.py`'s `_session_hash`) covers every file in that directory;
+  writing a prediction export there would silently break every later
+  trial's reuse of the same corpus (`resolve_corpus` would see a "modified"
+  session and refuse it). `viewer/server.js`'s predictions endpoint already
+  resolves the currently-selected run's directory from `?run=`, so it
+  checks there too, alongside the session's own directory (which is still
+  where a nursery/`episode_cache` export legitimately lives).
+
+Because each run's export lives in its own directory rather than the
+shared corpus, two runs trained against the same corpus never collide --
+each is independently addressable by `?experiment=<run_id>`, which is what
+the **Compare** tab uses to fetch two runs' predictions for one session.
+
 Model predictions live in the decoder's downsampled reconstruction space
 (default 16x16), the same space the training losses and holdout PSNR/SSIM
 use; the export bundles the identically pooled actual targets so the
@@ -120,8 +165,9 @@ viewer's model-mode numbers match the harness.
 ## API
 
 Read-only JSON, all under `/api`. Clinic mode (default) joins a selected
-organism/run to its recordings; pass `--data-dir` for the single-session-tree
-compatibility mode instead.
+organism/run to its recordings under `--runs-dir`, `--episode-cache-dir`
+(nursery recordings), and `--corpus-root` (frozen Model Factory corpora);
+pass `--data-dir` for the single-session-tree compatibility mode instead.
 
 | Route | Returns |
 | --- | --- |
@@ -129,6 +175,7 @@ compatibility mode instead.
 | `GET /api/runs?organism=&run=` | the run's experiment_report.json header slice (model, training, evaluation, promotion) |
 | `GET /api/experiments?organism=&run=` | the run's Model Factory manifests as-is: `trial_spec`, `contracts`, `lineage`, `data_manifest`, `execution`, `experiment_report`, and `metrics.{validation,test,comparison}` |
 | `GET /api/registry?organism=` | the organism's champion registry (`registry.json`) |
+| `GET /api/factory-runs?organism=` | every run's `state.json` position, lineage mode, and promotion verdict |
 | `GET /api/sessions?organism=&run=&name=&...filters` | recordings for the selected run, with quality verdicts |
 | `GET /api/sessions/:id` | one session's streams, decisions, exports, and quality verdict |
 | `GET /api/sessions/:id/episodes/:eid/{streams,decisions,frames,predictions}` | per-episode records; `predictions` accepts `?kind=dream` and `?experiment=` |

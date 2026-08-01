@@ -11,14 +11,15 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 const REPO_DIR = path.join(__dirname, "..");
 
 function parseArgs(argv) {
-  const args = { dataDir: null, runsDir: null, episodeCacheDir: null, port: 8787 };
+  const args = { dataDir: null, runsDir: null, episodeCacheDir: null, corpusRoot: null, port: 8787 };
   for (let i = 2; i < argv.length; i++) {
     if (argv[i] === "--data-dir") args.dataDir = argv[++i];
     else if (argv[i] === "--runs-dir") args.runsDir = argv[++i];
     else if (argv[i] === "--episode-cache-dir") args.episodeCacheDir = argv[++i];
+    else if (argv[i] === "--corpus-root") args.corpusRoot = argv[++i];
     else if (argv[i] === "--port") args.port = Number(argv[++i]);
     else if (argv[i] === "--help" || argv[i] === "-h") {
-      console.log("usage: node server.js [--runs-dir <runs dir>] [--episode-cache-dir <cache dir>] [--data-dir <sessions dir>] [--port 8787]");
+      console.log("usage: node server.js [--runs-dir <runs dir>] [--episode-cache-dir <cache dir>] [--corpus-root <corpora dir>] [--data-dir <sessions dir>] [--port 8787]");
       process.exit(0);
     }
   }
@@ -29,6 +30,10 @@ function parseArgs(argv) {
   else {
     args.runsDir = path.resolve(args.runsDir || path.join(REPO_DIR, "notebooks", "runs"));
     args.episodeCacheDir = path.resolve(args.episodeCacheDir || path.join(REPO_DIR, "notebooks", "episode_cache"));
+    // Model Factory's own default (cognitive_runtime/cli.py's
+    // _FACTORY_CORPORA_ROOT_DEFAULT) -- a run's clinic_sessions.json points
+    // into here, not into runsDir/episodeCacheDir, so it needs its own root.
+    args.corpusRoot = path.resolve(args.corpusRoot || path.join(REPO_DIR, "corpora"));
   }
   return args;
 }
@@ -179,6 +184,24 @@ function runSummary(entry) {
   };
 }
 
+/** One run's position in the factory's state machine (state.py's
+ * queued/running/checkpointing/completed/budget_exceeded/failed/cancelled)
+ * plus its lineage mode and promotion verdict -- the "what's in flight,
+ * what finished, what failed" view the champion registry alone can't give,
+ * since the registry only ever holds promoted runs. */
+function factoryRunStatus(entry) {
+  const state = readJSON(path.join(entry.dir, "state.json"), null);
+  const lineage = readJSON(path.join(entry.dir, "lineage.json"), null);
+  return {
+    run: entry.run,
+    mode: lineage?.mode ?? null,
+    state: state?.state ?? null,
+    state_reason: state?.reason ?? null,
+    updated_at: state?.updated_at ?? null,
+    promoted: runSummary(entry).promotion.promoted,
+  };
+}
+
 const ARTIFACT_FILES = [
   "experiment.json", "trial_spec.json", "contracts.json", "lineage.json",
   "data_manifest.json", "execution.json", "experiment_report.json",
@@ -217,33 +240,35 @@ function exportedCacheSessions(cacheDir, experimentId) {
   });
 }
 
-function manifestSessions(runDir, cacheDir) {
+function manifestSessions(runDir, cacheDir, corpusRoot) {
   const index = readJSON(path.join(runDir, "clinic_sessions.json"), null);
   if (!index || index.format !== "clinic-session-index-v1" || !Array.isArray(index.sessions)) return [];
   return index.sessions.flatMap((entry) => {
     if (typeof entry.session_dir !== "string") return [];
     const dir = path.resolve(entry.session_dir);
-    // A run index may only mount its own recordings or the configured cache.
-    if (!inside(runDir, dir) && !inside(cacheDir, dir)) return [];
-    const prefix = inside(cacheDir, dir) ? "cache" : "run";
-    const root = prefix === "cache" ? cacheDir : runDir;
+    // A run index may only mount its own recordings, the configured cache,
+    // or the Model Factory's frozen corpus root -- never an arbitrary path.
+    if (!inside(runDir, dir) && !inside(cacheDir, dir) && !(corpusRoot && inside(corpusRoot, dir))) return [];
+    const prefix = inside(cacheDir, dir) ? "cache" : (corpusRoot && inside(corpusRoot, dir)) ? "corpus" : "run";
+    const root = prefix === "cache" ? cacheDir : prefix === "corpus" ? corpusRoot : runDir;
     return isSessionDir(dir) ? [{ id: `${prefix}/${path.relative(root, dir).split(path.sep).join("/")}`, dir }] : [];
   });
 }
 
-function makeClinicStore(runsDir, episodeCacheDir) {
+function makeClinicStore(runsDir, episodeCacheDir, corpusRoot) {
   runsDir = path.resolve(runsDir); episodeCacheDir = path.resolve(episodeCacheDir);
+  corpusRoot = corpusRoot ? path.resolve(corpusRoot) : null;
   function catalog() { return runCatalog(runsDir); }
   function selected(organism, run) {
     const entry = catalog().find((candidate) => candidate.organism === organism && candidate.run === run);
     if (!entry) return null;
     const direct = fs.existsSync(entry.dir) ? sessionIdsBelow(entry.dir).map((id) => ({ id: `run/${id}`, dir: path.join(entry.dir, ...id.split("/")) })) : [];
-    const indexed = manifestSessions(entry.dir, episodeCacheDir);
+    const indexed = manifestSessions(entry.dir, episodeCacheDir, corpusRoot);
     const fallback = indexed.length ? [] : exportedCacheSessions(episodeCacheDir, entry.run);
     const mounts = [...new Map([...direct, ...indexed, ...fallback].map((item) => [item.id, item])).values()];
     return { entry, store: makeStore(entry.dir, { sessionDirectories: mounts }) };
   }
-  return { runsDir, episodeCacheDir, catalog, selected };
+  return { runsDir, episodeCacheDir, corpusRoot, catalog, selected };
 }
 
 function loadFrameIndex(dir) {
@@ -335,16 +360,22 @@ function serveStatic(res, urlPath) {
   fs.readFile(file, (err, data) => { if (err) return sendJSON(res, 404, { error: "not found" }); res.writeHead(200, { "Content-Type": MIME[path.extname(file)] || "application/octet-stream" }); res.end(data); });
 }
 
-function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null }) {
+function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, corpusRoot = null }) {
   const clinic = dataDir ? null : makeClinicStore(
     runsDir || path.join(REPO_DIR, "notebooks", "runs"),
     episodeCacheDir || path.join(REPO_DIR, "notebooks", "episode_cache"),
+    corpusRoot || path.join(REPO_DIR, "corpora"),
   );
   const store = clinic ? null : makeStore(dataDir);
   function selectedStore(url) {
     if (!clinic) return store;
     const organism = url.searchParams.get("organism"), run = url.searchParams.get("run");
     return organism && run ? clinic.selected(organism, run)?.store : null;
+  }
+  function selectedEntry(url) {
+    if (!clinic) return null;
+    const organism = url.searchParams.get("organism"), run = url.searchParams.get("run");
+    return organism && run ? clinic.selected(organism, run)?.entry : null;
   }
   return http.createServer((req, res) => {
     const url = new URL(req.url, "http://localhost"), p = url.pathname.split("/").filter(Boolean);
@@ -380,6 +411,14 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null }
         if (!clinic.catalog().some((entry) => entry.organism === organism)) return sendJSON(res, 404, { error: "unknown organism" });
         return sendJSON(res, 200, registryDocument(clinic.runsDir, organism));
       }
+      if (p.length === 2 && p[1] === "factory-runs") {
+        if (!clinic) return sendJSON(res, 400, { error: "factory run status requires clinic mode" });
+        const organism = url.searchParams.get("organism");
+        if (!organism) return sendJSON(res, 400, { error: "select an organism" });
+        const runs = clinic.catalog().filter((entry) => entry.organism === organism).map(factoryRunStatus)
+          .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
+        return sendJSON(res, 200, { organism, runs });
+      }
       if (p.length === 2 && p[1] === "sessions") {
         const activeStore = selectedStore(url);
         if (!activeStore) return sendJSON(res, 400, { error: "select organism and run" });
@@ -406,15 +445,21 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null }
           // v2 files are experiment-prefixed. Never merge stale exports: an
           // explicit experiment selects one, while an ambiguous directory is
           // rejected instead of guessing which model the clinic should show.
+          // A Model Factory run's export lives in its own run directory, not
+          // the (frozen, hash-verified) session directory -- so a run
+          // selected via ?run= is searched too, alongside the session itself.
           if (!file && kind === "predictions") {
             const experiment = url.searchParams.get("experiment");
-            const v2 = fs.readdirSync(dir).filter((name) =>
-              name.endsWith(`-predictions_${p[4]}.json`) &&
-              (!experiment || name.startsWith(`${experiment}-`))
-            );
-            if (v2.length === 1) file = path.join(dir, v2[0]);
+            const runEntry = selectedEntry(url);
+            const runPredictionsDir = runEntry ? path.join(runEntry.dir, "predictions") : null;
+            const searchDirs = [dir, ...(runPredictionsDir && fs.existsSync(runPredictionsDir) ? [runPredictionsDir] : [])];
+            const matches = (searchDir) => fs.readdirSync(searchDir).filter((name) =>
+              name.endsWith(`-predictions_${p[4]}.json`) && (!experiment || name.startsWith(`${experiment}-`))
+            ).map((name) => path.join(searchDir, name));
+            const v2 = searchDirs.flatMap(matches);
+            if (v2.length === 1) file = v2[0];
             if (v2.length > 1) return sendJSON(res, 409, {
-              error: "multiple experiment exports; pass ?experiment=<experiment-id>", experiments: v2,
+              error: "multiple experiment exports; pass ?experiment=<experiment-id>", experiments: v2.map((f) => path.basename(f)),
             });
           }
           if (file) return sendJSON(res, 200, readJSON(file));
@@ -432,6 +477,6 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null }
 
 if (require.main === module) {
   const args = parseArgs(process.argv);
-  createServer(args).listen(args.port, () => console.log(`CCR clinic: http://localhost:${args.port}  (${args.dataDir ? `Record: ${args.dataDir}` : `Runs: ${args.runsDir}; cache: ${args.episodeCacheDir}`})`));
+  createServer(args).listen(args.port, () => console.log(`CCR clinic: http://localhost:${args.port}  (${args.dataDir ? `Record: ${args.dataDir}` : `Runs: ${args.runsDir}; cache: ${args.episodeCacheDir}; corpora: ${args.corpusRoot}`})`));
 }
-module.exports = { createServer, livePredictionsFromDecisions, makeStore, makeClinicStore, runSummary, runArtifacts, registryDocument };
+module.exports = { createServer, livePredictionsFromDecisions, makeStore, makeClinicStore, runSummary, runArtifacts, registryDocument, factoryRunStatus };

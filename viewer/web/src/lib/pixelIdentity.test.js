@@ -29,6 +29,14 @@ describe("identityText", () => {
     expect(text).toContain("actions on, workspace off");
   });
 
+  it("recognizes the Model Factory corpus's train/validation/test split vocabulary", () => {
+    const text = identityText({
+      format: "pixel-predictions-v2", evaluation_source: "corpora/Test/crafter-tiny-v1/recordings/walk_forward_short-validation-100/episode_00000",
+      experiment: {}, model: {},
+    });
+    expect(text).toContain("Split validation");
+  });
+
   it("flags a legacy export as not comparable", () => {
     expect(identityText({ format: "pixel-predictions-v1" })).toMatch(/not comparable/);
   });

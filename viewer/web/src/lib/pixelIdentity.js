@@ -16,7 +16,9 @@ export function identityText(pred) {
   }
   const experiment = pred.experiment || {}, model = pred.model || {};
   const source = pred.evaluation_source || "unknown";
-  const split = /-(train|holdout)-/.exec(source)?.[1] || "unknown";
+  // "holdout" is the legacy nursery vocabulary; the Model Factory corpus
+  // uses train/validation/test (corpus.py's frozen splits).
+  const split = /-(train|validation|test|holdout)-/.exec(source)?.[1] || "unknown";
   return `Experiment ${experiment.experiment_id || "unknown"} · Trace ${experiment.trace_id || "unknown"} · `
     + `Checkpoint hash ${(model.checkpoint_sha256 || "unknown").slice(0, 12)} · Model type ${model.model_type || "unknown"} · `
     + `Backbone ${model.backbone || "unknown"} · Objective ${model.training_objective || "unknown"} · `

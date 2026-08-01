@@ -13,12 +13,15 @@ import { DevelopmentPanel } from "./components/DevelopmentPanel.jsx";
 import { ExperimentDetail } from "./components/ExperimentDetail.jsx";
 import { PairedComparisonPanel } from "./components/PairedComparisonPanel.jsx";
 import { ChampionRegistryPanel } from "./components/ChampionRegistryPanel.jsx";
+import { FactoryRunsPanel } from "./components/FactoryRunsPanel.jsx";
+import { CompareView } from "./components/CompareView.jsx";
 
 const TABS = [
   ["episode", "Episode"],
   ["development", "Development"],
   ["experiment", "Experiment"],
-  ["champions", "Champions"],
+  ["factory", "Factory"],
+  ["compare", "Compare"],
 ];
 
 /**
@@ -39,6 +42,7 @@ export function App() {
   const [summary, setSummary] = useState(null);
   const [artifacts, setArtifacts] = useState(null);
   const [registry, setRegistry] = useState(null);
+  const [factoryRuns, setFactoryRuns] = useState(null);
   const [sessionDetail, setSessionDetail] = useState(null);
   const [tick, setTick] = useState(null);
   const [tab, setTab] = useState("episode");
@@ -83,6 +87,7 @@ export function App() {
     if (!organism) return;
     let cancelled = false;
     api.registry(organism).then((r) => !cancelled && setRegistry(r), () => !cancelled && setRegistry(null));
+    api.factoryRuns(organism).then((r) => !cancelled && setFactoryRuns(r), () => !cancelled && setFactoryRuns(null));
     return () => { cancelled = true; };
   }, [organism]);
 
@@ -125,43 +130,51 @@ export function App() {
       <p className="run-name">{organism} / {run}{sessionId ? ` / ${sessionId}` : ""}</p>
       <RunSummary summary={summary} />
 
-      {!sessions ? (
-        <p className="empty">Loading sessions…</p>
-      ) : !sessions.length ? (
-        <p className="empty">No recordings are associated with this run yet.</p>
-      ) : (
-        <>
-          <div className="session-row">
-            <SessionList sessions={sessions} selectedId={sessionId} onSelect={(id) => {
-              const next = sessions.find((s) => s.id === id);
-              setSessionId(id);
-              setEpisode(next?.episodes[0] ?? null);
-            }} />
-            {sessionDetail?.session?.episodes?.length > 1 && (
-              <Picker label="Episode" ariaLabel="Episode" value={episode} options={sessionDetail.session.episodes} onChange={setEpisode} />
+      <Tabs tabs={TABS} active={tab} onChange={setTab} />
+
+      {(tab === "episode" || tab === "development") && (
+        !sessions ? (
+          <p className="empty">Loading sessions…</p>
+        ) : !sessions.length ? (
+          <p className="empty">No recordings are associated with this run yet.</p>
+        ) : (
+          <>
+            <div className="session-row">
+              <SessionList sessions={sessions} selectedId={sessionId} onSelect={(id) => {
+                const next = sessions.find((s) => s.id === id);
+                setSessionId(id);
+                setEpisode(next?.episodes[0] ?? null);
+              }} />
+              {sessionDetail?.session?.episodes?.length > 1 && (
+                <Picker label="Episode" ariaLabel="Episode" value={episode} options={sessionDetail.session.episodes} onChange={setEpisode} />
+              )}
+            </div>
+
+            {tab === "episode" && urls && (
+              <>
+                <PixelHorizonViewer framesSrc={urls.frames} predictionsSrc={urls.predictions} decisions={decisions} tick={tick} onTickChange={setTick} />
+                <ActionTimeline decisions={decisions} tick={tick} onTickChange={setTick} />
+                <EEGPanel records={records} decisions={decisions} tick={tick} onTickChange={setTick} />
+                <AttentionPanel records={records} decisions={decisions} tick={tick} onTickChange={setTick} />
+              </>
             )}
-          </div>
-
-          <Tabs tabs={TABS} active={tab} onChange={setTab} />
-
-          {tab === "episode" && urls && (
-            <>
-              <PixelHorizonViewer framesSrc={urls.frames} predictionsSrc={urls.predictions} decisions={decisions} tick={tick} onTickChange={setTick} />
-              <ActionTimeline decisions={decisions} tick={tick} onTickChange={setTick} />
-              <EEGPanel records={records} decisions={decisions} tick={tick} onTickChange={setTick} />
-              <AttentionPanel records={records} decisions={decisions} tick={tick} onTickChange={setTick} />
-            </>
-          )}
-          {tab === "development" && <DevelopmentPanel session={sessionDetail?.session || {}} />}
-          {tab === "experiment" && (
-            <>
-              <ExperimentDetail artifacts={artifacts} summary={summary} />
-              <PairedComparisonPanel comparison={artifacts?.metrics?.comparison} />
-            </>
-          )}
-          {tab === "champions" && <ChampionRegistryPanel registry={registry} />}
+            {tab === "development" && <DevelopmentPanel session={sessionDetail?.session || {}} />}
+          </>
+        )
+      )}
+      {tab === "experiment" && (
+        <>
+          <ExperimentDetail artifacts={artifacts} summary={summary} />
+          <PairedComparisonPanel comparison={artifacts?.metrics?.comparison} />
         </>
       )}
+      {tab === "factory" && (
+        <>
+          <FactoryRunsPanel runs={factoryRuns} selectedRun={run} onSelectRun={setRun} />
+          <ChampionRegistryPanel registry={registry} />
+        </>
+      )}
+      {tab === "compare" && <CompareView organism={organism} runs={runsForOrganism} defaultRun={run} />}
     </main>
   );
 }

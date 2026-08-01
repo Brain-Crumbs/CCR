@@ -1988,6 +1988,7 @@ def cmd_factory_baseline(args: argparse.Namespace) -> None:
 
         result = run_trial(
             resolved, root=args.root, corpus_root=args.corpus_root, naming_seed=args.naming_seed,
+            export_predictions=not args.no_export_predictions, export_predictions_max_episodes=args.export_predictions_max,
         )
     except ImportError as exc:
         sys.exit(f"'ccr factory baseline' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
@@ -2045,6 +2046,7 @@ def cmd_factory_clone(args: argparse.Namespace) -> None:
 
         result = run_trial(
             resolved, root=args.root, corpus_root=args.corpus_root, naming_seed=args.naming_seed,
+            export_predictions=not args.no_export_predictions, export_predictions_max_episodes=args.export_predictions_max,
         )
     except ImportError as exc:
         sys.exit(f"'ccr factory clone' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
@@ -3083,6 +3085,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_factory_baseline.add_argument("--naming-seed", default=None,
                                     help="seed the run's cosmetic display name deterministically "
                                          "(default: a fresh random seed)")
+    p_factory_baseline.add_argument("--export-predictions-max", type=int, default=3, metavar="N",
+                                    help="export pixel predictions (for the clinic) from up to N validation "
+                                         "episodes (default: 3)")
+    p_factory_baseline.add_argument("--no-export-predictions", action="store_true",
+                                    help="skip the clinic's pixel-prediction export entirely")
     p_factory_baseline.set_defaults(func=cmd_factory_baseline)
 
     p_factory_clone = factory_sub.add_parser(
@@ -3106,6 +3113,11 @@ def build_parser() -> argparse.ArgumentParser:
                                  help=f"corpora root directory (default: {_FACTORY_CORPORA_ROOT_DEFAULT!r})")
     p_factory_clone.add_argument("--naming-seed", default=None,
                                  help="seed the child's cosmetic display name deterministically")
+    p_factory_clone.add_argument("--export-predictions-max", type=int, default=3, metavar="N",
+                                 help="export pixel predictions (for the clinic) from up to N validation "
+                                      "episodes (default: 3)")
+    p_factory_clone.add_argument("--no-export-predictions", action="store_true",
+                                 help="skip the clinic's pixel-prediction export entirely")
     p_factory_clone.set_defaults(func=cmd_factory_clone)
 
     p_factory_compare = factory_sub.add_parser(

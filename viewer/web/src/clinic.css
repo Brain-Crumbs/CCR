@@ -12,6 +12,8 @@
   --bad-fg: #8a3d2e;
   --amber-bg: #fbf1dd;
   --amber-fg: #8a611c;
+  --active-bg: #e2ecf9;
+  --active-fg: #29527e;
   font-family: Inter, ui-sans-serif, system-ui, sans-serif;
   background: var(--surface-1);
   color: var(--text-primary);
@@ -30,6 +32,8 @@
     --bad-fg: #e39c8a;
     --amber-bg: #332a12;
     --amber-fg: #e0b356;
+    --active-bg: #17273b;
+    --active-fg: #8fb6e6;
   }
 }
 
@@ -79,10 +83,23 @@ button { cursor: pointer; }
 .quality-badge--amber { background: var(--amber-bg); color: var(--amber-fg); }
 .quality-badge--red { background: var(--bad-bg); color: var(--bad-fg); }
 
+/* Factory run state badges */
+.state-badge { padding: 1px 8px; border-radius: 999px; font-size: .7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .03em; white-space: nowrap; }
+.state-badge--neutral { background: var(--surface-3); color: var(--text-secondary); }
+.state-badge--active { background: var(--active-bg); color: var(--active-fg); }
+.state-badge--good { background: var(--good-bg); color: var(--good-fg); }
+.state-badge--warn { background: var(--amber-bg); color: var(--amber-fg); }
+.state-badge--bad { background: var(--bad-bg); color: var(--bad-fg); }
+
 /* Tabs */
 .tabs { display: flex; gap: 4px; margin: 20px 0 16px; border-bottom: 1px solid var(--line); }
 .tab { background: transparent; border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 8px 4px; margin-right: 16px; color: var(--text-secondary); font-weight: 600; }
 .tab.is-active { color: var(--text-primary); border-bottom-color: var(--text-primary); }
+
+/* Compare */
+.compare-view p { color: var(--text-secondary); margin: 0 0 10px; font-size: .85rem; }
+.compare-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 20px; align-items: start; }
+.compare-column h4 { margin: 0 0 8px; font-size: .9rem; text-transform: none; letter-spacing: normal; color: var(--text-primary); }
 
 /* Shared "diagnostic" panel shell (EEG / attention / development / actions / experiment / registry) */
 .diagnostic { margin-top: 18px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); }

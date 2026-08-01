@@ -496,6 +496,104 @@ def _build_comparison(
     return payload
 
 
+def _write_clinic_session_index(
+    run_directory: Path, train_entries: Sequence[Mapping[str, Any]], validation_entries: Sequence[Mapping[str, Any]],
+) -> None:
+    """Bind this run to the frozen corpus sessions it consumed, in the same
+    ``clinic-session-index-v1`` format ``training/nursery.py`` already
+    writes for its own recordings (the clinic's ``viewer/server.js`` reads
+    either one identically). Written as soon as the run directory exists --
+    before training starts -- so every train/validation session (and its
+    EEG/attention/action data, which lives in the session's own
+    streams/decisions files regardless of any prediction export) is visible
+    in the clinic immediately, including while the trial is still running.
+    """
+    entries = [
+        {"scenario": str(entry.get("scenario", "")), "split": split, "session_dir": str(Path(entry["session_path"]).resolve())}
+        for split, group in (("train", train_entries), ("validation", validation_entries))
+        for entry in group
+    ]
+    atomic_write_json(run_directory / "clinic_sessions.json", {"format": "clinic-session-index-v1", "sessions": entries})
+
+
+def _export_clinic_predictions(
+    *,
+    artifacts: RunArtifacts,
+    checkpoint_path: Path,
+    dataset: Any,
+    validation_entries: Sequence[Mapping[str, Any]],
+    training_stats: Mapping[str, Any],
+    selection_metric: str,
+    horizons_ticks: Sequence[int],
+    ticks_per_frame: float,
+    max_episodes: int,
+) -> None:
+    """Best-effort pixel-prediction export for the clinic: writes
+    ``<run_id>-predictions_<episode_id>.json`` into up to ``max_episodes``
+    validation sessions via the existing
+    :func:`~cognitive_runtime.training.prediction_export.export_cortex_session_predictions`
+    -- the same export filename convention ``viewer/server.js`` already
+    matches on. Written into this run's own ``predictions/`` directory,
+    *not* the validation session's directory: a frozen corpus session's
+    content hash (``corpus.py``'s ``_session_hash``) covers every file in
+    that directory, so writing there would silently break every later
+    trial's reuse of the same corpus (``resolve_corpus`` would see a
+    modified session and refuse it). Each run's own directory is safe --
+    nothing re-verifies it -- and keeps every run's artifacts self-contained
+    like its other manifests. The clinic (``viewer/server.js``) already
+    resolves the currently-selected run's directory from ``?run=``, so it
+    only needs to also look there for a matching prediction file.
+
+    Never allowed to fail the trial: a bad export here is a missing clinic
+    panel, not a training defect, so every failure mode here is caught and
+    skipped rather than raised.
+    """
+    if max_episodes <= 0:
+        return
+    from cognitive_runtime.runtime.replay import list_episodes
+    from cognitive_runtime.training.prediction_export import export_cortex_session_predictions
+
+    match = _SELECTION_METRIC_RE.match(selection_metric)
+    prediction_mode = match.group("report") if match else "rollout"
+    ticks = [int(h) for h in horizons_ticks]
+    horizon_frames = (
+        ticks if prediction_mode == "direct"
+        else _action_world_model_module().horizons_ticks_to_frames(tuple(ticks), ticks_per_frame)
+    )
+
+    try:
+        checkpoint = load_factory_checkpoint(str(checkpoint_path))
+    except Exception:
+        return
+
+    predictions_dir = artifacts.directory / "predictions"
+    predictions_dir.mkdir(exist_ok=True)
+
+    exported = 0
+    for entry in validation_entries:
+        if exported >= max_episodes:
+            break
+        session_dir = str(entry["session_path"])
+        try:
+            episode_ids = list_episodes(session_dir)
+        except Exception:
+            continue
+        for episode_id in episode_ids:
+            if exported >= max_episodes:
+                break
+            try:
+                export_cortex_session_predictions(
+                    checkpoint.model, dataset, session_dir, episode_id,
+                    horizon_frames=horizon_frames, prediction_mode=prediction_mode,
+                    checkpoint_path=str(checkpoint_path), experiment=artifacts.experiment,
+                    training_stats=training_stats,
+                    out_path=str(predictions_dir / f"{artifacts.run_id}-predictions_{episode_id}.json"),
+                )
+                exported += 1
+            except Exception:
+                continue
+
+
 def run_trial(
     spec: Union[Mapping[str, Any], ExperimentSpec],
     *,
@@ -505,6 +603,8 @@ def run_trial(
     naming_seed: Optional[Union[str, int]] = None,
     trace_dir: Optional[Union[str, Path]] = None,
     heartbeat_timeout_seconds: Optional[float] = None,
+    export_predictions: bool = True,
+    export_predictions_max_episodes: int = 3,
 ) -> TrialResult:
     """Execute one fresh/clone/resume/fine_tune Model Factory trial.
 
@@ -516,8 +616,16 @@ def run_trial(
     ``metrics/validation.json`` and ``metrics/budget_report.json``; a
     navigation continuation also writes ``metrics/retention.json``, while
     ``clone``/``fine_tune`` writes ``metrics/comparison.json``. Every run
-    writes ``experiment_report.json``. Never writes ``metrics/test.json`` -- that
+    writes ``experiment_report.json`` and (unconditionally, before training
+    starts) ``clinic_sessions.json``. Never writes ``metrics/test.json`` -- that
     is reserved for an explicit final-test action (MF-C5, issue #227).
+
+    ``export_predictions`` (default on) additionally exports pixel
+    predictions from the selected checkpoint for up to
+    ``export_predictions_max_episodes`` validation sessions -- presentation
+    tooling for the clinic (epic #212's read-only front end), never
+    required for the trial itself to complete; see
+    ``_export_clinic_predictions``.
     """
     resolved_spec = spec if isinstance(spec, ExperimentSpec) else resolve_spec(spec)
     validate_spec(resolved_spec)
@@ -641,6 +749,7 @@ def run_trial(
             root, resolved_spec, architecture_contract, corpus.data_contract, training_contract,
             run_id=run_id, naming_seed=naming_seed,
         )
+    _write_clinic_session_index(artifacts.directory, train_entries, validation_entries)
 
     device = str(resolved_spec.training["device"])
     devices: Tuple[str, ...] = () if device in ("cpu", "auto") else (device,)
@@ -834,6 +943,15 @@ def run_trial(
             if "goal_navigation" in best_eval:
                 validation_payload["goal_navigation"] = best_eval["goal_navigation"]
             atomic_write_json(artifacts.metrics_dir / "validation.json", validation_payload)
+
+            if export_predictions:
+                _export_clinic_predictions(
+                    artifacts=artifacts, checkpoint_path=checkpoint_path, dataset=validation_dataset,
+                    validation_entries=validation_entries, training_stats=training_stats,
+                    selection_metric=resolved_spec.evaluation["selection_metric"],
+                    horizons_ticks=resolved_spec.data["horizons_ticks"], ticks_per_frame=train_dataset.ticks_per_frame,
+                    max_episodes=export_predictions_max_episodes,
+                )
 
             if retention_dataset is not None and retention_before_eval is not None:
                 from sleep.forgetting import compute_forgetting_metric

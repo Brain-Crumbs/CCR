@@ -440,6 +440,81 @@ def test_routine_trial_never_writes_metrics_test_json(tmp_path, corpus):
     assert not (result.directory / "metrics" / "test.json").exists()
 
 
+def test_fresh_trial_writes_a_clinic_session_index_before_training(tmp_path, corpus):
+    result = _run(_spec_dict(corpus.corpus_id), tmp_path)
+
+    index = json.loads((result.directory / "clinic_sessions.json").read_text(encoding="utf-8"))
+    assert index["format"] == "clinic-session-index-v1"
+    splits = {entry["split"] for entry in index["sessions"]}
+    assert splits == {"train", "validation"}
+    for entry in index["sessions"]:
+        assert Path(entry["session_dir"]).is_dir()
+        assert entry["scenario"] == "walk_forward_short"
+
+
+def test_fresh_trial_exports_pixel_predictions_into_its_own_run_directory(tmp_path, corpus):
+    result = _run(_spec_dict(corpus.corpus_id), tmp_path)
+
+    predictions_dir = result.directory / "predictions"
+    exported = sorted(predictions_dir.glob(f"{result.run_id}-predictions_*.json"))
+    assert exported, "expected at least one exported prediction file"
+    payload = json.loads(exported[0].read_text(encoding="utf-8"))
+    assert payload["format"] == "pixel-predictions-v2"
+    assert payload["experiment"]["experiment_id"] == result.run_id
+    assert payload["prediction_mode"] == "rollout"  # _spec_dict's selection_metric is "rollout.t+1..."
+
+    # A frozen validation session's content hash must never change -- a
+    # prediction export landing there would silently break every later
+    # trial's reuse of the same corpus (corpus.py's _session_hash covers
+    # every file in the session directory).
+    index = json.loads((result.directory / "clinic_sessions.json").read_text(encoding="utf-8"))
+    for entry in index["sessions"]:
+        if entry["split"] != "validation":
+            continue
+        stray = list(Path(entry["session_dir"]).glob("*-predictions_*.json"))
+        assert stray == [], f"prediction export leaked into the frozen session: {stray}"
+
+
+def test_two_runs_against_the_same_corpus_each_keep_their_own_export(tmp_path, corpus):
+    result_a = _run(_spec_dict(corpus.corpus_id), tmp_path, run_id="run-a")
+    result_b = _run(_spec_dict(corpus.corpus_id), tmp_path, run_id="run-b")
+
+    assert list((result_a.directory / "predictions").glob("run-a-predictions_*.json"))
+    assert list((result_b.directory / "predictions").glob("run-b-predictions_*.json"))
+    assert not list((result_a.directory / "predictions").glob("run-b-predictions_*.json"))
+
+    # The shared corpus must still resolve cleanly after both runs -- proof
+    # neither run's export touched the frozen session directories.
+    from cognitive_runtime.training.model_factory.corpus import resolve_corpus
+
+    resolve_corpus(corpus.corpus_id, allow_record=False, root=str(tmp_path / "corpora"), organism=ORGANISM)
+
+
+def test_export_predictions_can_be_disabled(tmp_path, corpus):
+    result = run_trial(
+        _spec_dict(corpus.corpus_id), root=str(tmp_path / "runs"), corpus_root=str(tmp_path / "corpora"),
+        export_predictions=False,
+    )
+    assert not (result.directory / "predictions").exists()
+    assert (result.directory / "clinic_sessions.json").is_file()  # unconditional, unlike the export itself
+
+
+def test_a_broken_prediction_export_does_not_fail_the_trial(tmp_path, corpus, monkeypatch):
+    import cognitive_runtime.training.model_factory.runner as runner_module
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated export failure")
+
+    monkeypatch.setattr(runner_module, "load_factory_checkpoint", _boom)
+
+    result = _run(_spec_dict(corpus.corpus_id), tmp_path)
+
+    assert result.state == "completed"
+    predictions_dir = result.directory / "predictions"
+    if predictions_dir.exists():
+        assert not list(predictions_dir.glob("*.json"))
+
+
 def test_corpus_cache_miss_fails_before_training_and_creates_no_run_directory(tmp_path, corpus):
     doc = _spec_dict("this-corpus-does-not-exist")
 

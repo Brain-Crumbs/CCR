@@ -144,6 +144,86 @@ test("clinic mode uses a run session index to include cached training recordings
   assert.deepEqual(listed.body.sessions.map((session) => session.id), ["cache/seed-21"]);
 });
 
+test("clinic mode mounts a Model Factory run's corpus-rooted sessions, and predictions fall back to the run's own directory", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-corpus-"));
+  const runsDir = path.join(root, "runs"), cacheDir = path.join(root, "episode_cache"), corpusRoot = path.join(root, "corpora");
+  const runDir = path.join(runsDir, "Test", "run-3"), corpusSession = path.join(corpusRoot, "Test", "crafter-tiny-v1", "walk_forward_short-validation-100");
+  fs.mkdirSync(runDir, { recursive: true }); fs.mkdirSync(corpusSession, { recursive: true });
+  fs.writeFileSync(path.join(runDir, "experiment.json"), JSON.stringify({ organism: "Test", experiment_id: "run-3" }));
+  fs.writeFileSync(path.join(runDir, "clinic_sessions.json"), JSON.stringify({
+    format: "clinic-session-index-v1",
+    sessions: [{ split: "validation", scenario: "walk_forward_short", session_dir: corpusSession }],
+  }));
+  fs.writeFileSync(path.join(corpusSession, "session.json"), JSON.stringify({ name: "Test" }));
+  fs.writeFileSync(path.join(corpusSession, "episode_00000.streams.jsonl"), "");
+  // The prediction export lives in the run's own directory -- corpus session
+  // directories are frozen/content-hashed and must never be written to.
+  const predictionsDir = path.join(runDir, "predictions");
+  fs.mkdirSync(predictionsDir, { recursive: true });
+  fs.writeFileSync(path.join(predictionsDir, "run-3-predictions_episode_00000.json"), JSON.stringify({
+    format: "pixel-predictions-v2", experiment: { experiment_id: "run-3" }, marker: "from-run-directory",
+  }));
+
+  const server = createServer({ runsDir, episodeCacheDir: cacheDir, corpusRoot });
+  await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+  const port = server.address().port;
+
+  const listed = await get(port, "/api/sessions?organism=Test&run=run-3");
+  assert.equal(listed.body.sessions.length, 1);
+  const sessionId = listed.body.sessions[0].id;
+  assert.match(sessionId, /^corpus\//);
+
+  const query = `?organism=Test&run=run-3&experiment=run-3`;
+  const prediction = await get(port, `/api/sessions/${encodeURIComponent(sessionId)}/episodes/episode_00000/predictions${query}`);
+  assert.equal(prediction.status, 200);
+  assert.equal(prediction.body.marker, "from-run-directory");
+});
+
+test("a clinic_sessions.json entry outside runs/cache/corpus roots is rejected", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-corpus-escape-"));
+  const runsDir = path.join(root, "runs"), cacheDir = path.join(root, "episode_cache"), corpusRoot = path.join(root, "corpora");
+  const runDir = path.join(runsDir, "Test", "run-4"), outside = path.join(root, "outside-session");
+  fs.mkdirSync(runDir, { recursive: true }); fs.mkdirSync(outside, { recursive: true });
+  fs.writeFileSync(path.join(runDir, "experiment.json"), JSON.stringify({ organism: "Test", experiment_id: "run-4" }));
+  fs.writeFileSync(path.join(runDir, "clinic_sessions.json"), JSON.stringify({
+    format: "clinic-session-index-v1", sessions: [{ split: "validation", session_dir: outside }],
+  }));
+  fs.writeFileSync(path.join(outside, "session.json"), JSON.stringify({ name: "Test" }));
+
+  const server = createServer({ runsDir, episodeCacheDir: cacheDir, corpusRoot });
+  await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+  const listed = await get(server.address().port, "/api/sessions?organism=Test&run=run-4");
+  assert.deepEqual(listed.body.sessions, []);
+});
+
+test("/api/factory-runs reports each run's trial-state, lineage mode, and promotion", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-factory-runs-"));
+  const runsDir = path.join(root, "runs"), cacheDir = path.join(root, "episode_cache");
+  const runDir = path.join(runsDir, "Test", "run-5");
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(path.join(runDir, "experiment.json"), JSON.stringify({ organism: "Test", experiment_id: "run-5" }));
+  fs.writeFileSync(path.join(runDir, "lineage.json"), JSON.stringify({ mode: "clone" }));
+  fs.writeFileSync(path.join(runDir, "state.json"), JSON.stringify({
+    format: "model-factory-trial-state-v1", state: "completed", reason: "completed", updated_at: "2026-01-01T00:00:00Z",
+  }));
+  fs.writeFileSync(path.join(runDir, "experiment_report.json"), JSON.stringify({
+    promotion_verdict: { promoted: true, reasons: ["beats champion"] },
+  }));
+
+  const server = createServer({ runsDir, episodeCacheDir: cacheDir });
+  await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+  const port = server.address().port;
+
+  const result = await get(port, "/api/factory-runs?organism=Test");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.runs, [{
+    run: "run-5", mode: "clone", state: "completed", state_reason: "completed",
+    updated_at: "2026-01-01T00:00:00Z", promoted: true,
+  }]);
+  assert.equal((await get(port, "/api/factory-runs?organism=Nobody")).body.runs.length, 0);
+  assert.equal((await get(port, "/api/factory-runs")).status, 400);
+});
+
 test("service discovers sessions nested below the configured runs directory", async (t) => {
   const root = fixture();
   const outer = path.join(root, "Test", "run-1"); fs.mkdirSync(outer, { recursive: true });

@@ -112,6 +112,16 @@ execution environment, display name, lineage, and initial state are written
 before training begins. The important identities are `run_id`, the three
 contract hashes, and checkpoint SHA; `display_name` is cosmetic.
 
+`clinic_sessions.json` is written at that same point too -- before training
+begins -- so the run's train/validation sessions are already browsable in
+the clinic (`node viewer/server.js`) while the trial is still running. Once
+training completes, up to `--export-predictions-max` (default 3) validation
+episodes get pixel predictions exported from the selected checkpoint into
+`predictions/`, for the clinic's Episode and Compare tabs; pass
+`--no-export-predictions` to skip it. See `viewer/README.md`'s "Model
+Factory exports" for why the export lands in the run directory rather than
+the frozen corpus session.
+
 ## 4. Create a controlled A/B comparison
 
 Change one training-contract field at a time:
@@ -226,4 +236,7 @@ Then inspect:
   evidence;
 - `checkpoints/last.pt` for resumable partial work and
   `checkpoints/best-validation.pt` for the selected candidate state;
-- `experiment_report.json` for the resolved training/evaluation summary.
+- `experiment_report.json` for the resolved training/evaluation summary;
+- `clinic_sessions.json` and `predictions/` for what the clinic
+  (`node viewer/server.js`) shows for this run -- browsable recordings and
+  exported pixel predictions, respectively.
