@@ -348,6 +348,37 @@ Trainer publication is atomic. Monotonic `training_ticks` doubles as the
 snapshot version. Concurrent actors subscribe to a separate EMA snapshot; the
 raw checkpoint remains the true resume trajectory.
 
+### 13.1 Model Factory experiment contract
+
+The Model Factory wraps the Cortex checkpoint with immutable experiment and
+evidence identities. Its authoritative boundaries are:
+
+- `trial_spec.json`: the fully resolved experiment configuration;
+- `contracts.json`: canonical architecture, data, and training payloads plus
+  their SHA-256 hashes;
+- `data_manifest.json`: the exact frozen session content hashes consumed by
+  the run;
+- `lineage.json`: parent checkpoint SHA, mode, configuration parents, weight
+  donor, and genome provenance;
+- `execution.json`: source commit/dirty state, environment, device, precision,
+  and determinism policy;
+- `state.json`: the locked, atomic trial state machine;
+- `action-world-model-factory-v1`: model, optimizer, scheduler, trainer, RNG,
+  contract, lineage, and training-stat state needed for exact resume;
+- `registry.json`: champion/population references and sealed-test-use budget,
+  never copied model weights.
+
+`resume` requires identical architecture, data, and training contracts and
+restores the optimizer/RNG trajectory. `clone` and `fine_tune` require
+compatible architecture/input contracts, restore weights, and create a new
+training trajectory. A controlled run consumes a pre-built corpus; a missing
+or changed session is an error, not permission to record replacement data.
+
+Operational details are in the
+[Model Factory guide](../how-to/using-model-factory.md); verified implementation
+coverage and known gaps are in the
+[implementation audit](model-factory-implementation-audit.md).
+
 ## 14. Record contract (`streams-v2`)
 
 Session layout:

@@ -1,10 +1,14 @@
 # Proposal — Model Factory: Reproducible Checkpoint Lineage and Budgeted Experiments
 
-> **Status:** design proposal. This extends the Predictive Cortex training
-> workflow described in [phase 2](phases/phase-2-predictive-cortex.md) and
-> complements the project-wide checkpoint contract in
-> [contracts and data flow](04-contracts-and-data-flow.md). It does not alter
-> the organism-development promotion ladder.
+> **Status (2026-08-01):** implemented design with remaining operator/CI gaps.
+> This document preserves the design contract. Use the
+> [operator guide](../how-to/using-model-factory.md) for current commands and
+> the [implementation audit](model-factory-implementation-audit.md) for
+> criterion-level evidence and open findings. The implementation extends the
+> Predictive Cortex training workflow described in
+> [phase 2](phases/phase-2-predictive-cortex.md) and complements the
+> project-wide [contracts and data flow](04-contracts-and-data-flow.md). It
+> does not alter the organism-development promotion ladder.
 
 ## 1. Decision
 
@@ -980,25 +984,21 @@ compare it against random search under the same total compute budget.
 
 ```text
 # Establish a fully recorded, fresh baseline.
-factory baseline specs/crafter-baseline.yaml
+ccr factory baseline specs/crafter-baseline.yaml
 
 # Create controlled siblings from the selected checkpoint.
-factory clone crafter-baseline-0001 \
-  --set training.closed_loop_pixel_loss_weight=0.125
-factory clone crafter-baseline-0001 \
-  --set training.closed_loop_pixel_loss_weight=0.50
+ccr factory clone crafter-baseline-0001 \
+  --set training.loss_weights.closed_loop_pixel_loss_weight=0.125
+ccr factory clone crafter-baseline-0001 \
+  --set training.loss_weights.closed_loop_pixel_loss_weight=0.50
 
 # Compare validation evidence and promote only if gates pass.
-factory compare crafter-baseline-0001 child-a child-b
-factory promote child-b
+ccr factory compare crafter-baseline-0001 child-a child-b
+ccr factory promote child-b
 
-# Run a bounded search after baseline and contracts are stable.
-factory search specs/crafter-rollout-search.yaml --max-trials 8 --budget 50,150,500
-
-# Breed a configuration child from two retained fast-tier population members.
-factory breed generic_action_effects_v1 --tier fast \
-  --configuration-parents crafter-rollout-0018,crafter-rollout-0021 \
-  --weight-donor crafter-rollout-0021
+# Bounded search and breeding are currently Python APIs rather than CLI
+# subcommands. See docs/how-to/using-model-factory.md for propose(),
+# run_successive_halving(), breed(), and confirm_across_seeds().
 ```
 
 The notebook remains a useful visualization and diagnosis surface. The factory

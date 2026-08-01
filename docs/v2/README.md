@@ -35,6 +35,12 @@ For onboarding and presentation:
    training run while it runs (progress logging with ETA) and reading it back
    afterwards (`ccr trace show`: phase timings, loss curves, config, git
    commit), plus how to instrument new code.
+9. [**Model Factory operator guide**](../how-to/using-model-factory.md) — build
+   frozen corpora; launch, compare, resume, promote, and inspect reproducible
+   Cortex experiments; understand which advanced operations are Python-only.
+10. [**Model Factory implementation audit**](model-factory-implementation-audit.md)
+    — criterion-level evidence for epic #212, test results, revision scope,
+    and the remaining implementation/CI gaps.
 
 **Design commitments** (the choices these docs are built on): re-architect +
 rename rather than rewrite; predict in latent space but always decode to the

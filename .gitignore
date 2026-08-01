@@ -13,3 +13,4 @@ sessions/
 node_modules/
 package-lock.json
 **/episode_cache/
+**/corpora/

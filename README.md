@@ -121,7 +121,14 @@ node viewer/server.js --data-dir notebooks/runs
 | `ccr factory corpus build <spec>` | Record/reuse episodes, gate them, and freeze a Model Factory corpus |
 | `ccr factory test <run>` | The sealed-test final action: evaluate a seed-confirmed candidate against the sealed test split |
 
-Run `ccr <command> --help` for full option details.
+Search, successive halving, breeding, and independent training-seed
+confirmation currently use Python APIs; they do not yet have `ccr factory`
+subcommands. See the
+[Model Factory operator guide](docs/how-to/using-model-factory.md) for the
+complete lifecycle and the
+[implementation audit](docs/v2/model-factory-implementation-audit.md) for
+verified coverage and known gaps. Run `ccr <command> --help` for full option
+details.
 
 ## Watching a run (logging & tracing)
 

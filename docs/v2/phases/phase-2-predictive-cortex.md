@@ -8,6 +8,14 @@
 > sleep, motor, the ladder, the clinic) is only worth building once this clears its
 > bar. See [decision log #10](../direction-and-critique-response.md).
 
+> **Current experiment layer:** Cortex training now has a Model Factory for
+> frozen corpora, immutable resolved specs, resumable checkpoints, paired
+> validation, bounded search, lineage, and champion registries. See the
+> [operator guide](../../how-to/using-model-factory.md), the
+> [design proposal](../proposal-model-factory.md), and the
+> [implementation audit](../model-factory-implementation-audit.md). The audit
+> distinguishes implemented research APIs from the remaining CLI/CI gaps.
+
 ## Dependencies
 
 - **Phase 1** — a deterministic Crafter world with recorded scenarios and quality
