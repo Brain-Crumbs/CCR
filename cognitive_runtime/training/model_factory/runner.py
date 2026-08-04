@@ -267,6 +267,38 @@ def _parent_checkpoint_path(root: Union[str, Path], spec: ExperimentSpec) -> Pat
     return Path(root) / spec.organism / str(parent["run_id"]) / "checkpoints" / str(parent["checkpoint"])
 
 
+def _reference_checkpoint_path(root: Union[str, Path], spec: ExperimentSpec) -> Path:
+    reference_run = spec.evaluation.get("reference_run") or {}
+    return Path(root) / spec.organism / str(reference_run["run_id"]) / "checkpoints" / str(reference_run["checkpoint"])
+
+
+def _load_reference_model(root: Union[str, Path], spec: ExperimentSpec) -> Optional[Any]:
+    """Load ``evaluation.reference_run``'s checkpoint for read-only
+    comparison, or ``None`` if the spec declares none.
+
+    Unlike a ``parent`` weight donor, a reference model is never loaded
+    against the candidate's own architecture/data/training contracts --
+    ``load_factory_checkpoint`` with no ``mode``/``model`` given just
+    reconstructs the model the checkpoint itself declares (the same
+    "plain inspect" call other read-only reloads in this module use, e.g.
+    ``best_eval``'s reconstruction fallback below), matching the docstring
+    at spec.py's ``REFERENCE_RUN_KEYS``: read-only comparison, never a
+    weight donor.
+    """
+    reference_run = spec.evaluation.get("reference_run")
+    if reference_run is None:
+        return None
+    reference_path = str(_reference_checkpoint_path(root, spec))
+    declared_sha = str(reference_run["sha256"])
+    actual_sha = read_factory_checkpoint_metadata(reference_path).get("checkpoint_sha256")
+    if actual_sha != declared_sha:
+        raise ValueError(
+            f"reference_run checkpoint sha256 mismatch for {reference_run.get('run_id')!r}: "
+            f"spec declares {declared_sha!r}, file is {actual_sha!r}"
+        )
+    return load_factory_checkpoint(reference_path).model
+
+
 def _load_existing_run_artifacts(root: Union[str, Path], organism: str, run_id: str) -> RunArtifacts:
     """Reopen an already-allocated run directory for a resume trial.
 
@@ -313,11 +345,12 @@ def _evaluate(
     cfg: Any,
     *,
     navigation_metrics: Optional[Mapping[str, Any]] = None,
+    reference_model: Optional[Any] = None,
 ) -> Dict[str, Any]:
     awm = _action_world_model_module()
     result = awm.evaluate_action_world_model_milestone(
         model, dataset, tuple(int(tick) for tick in spec.data["horizons_ticks"]),
-        warmup_frames=cfg.warmup_frames,
+        warmup_frames=cfg.warmup_frames, reference_model=reference_model,
     )
     if navigation_metrics is not None:
         result["goal_navigation"] = dict(navigation_metrics)
@@ -794,8 +827,12 @@ def run_trial(
                 target_encoder_state_dict=trainer_state.get("target_encoder_state_dict"),
             )
 
+    reference_model = _load_reference_model(root, resolved_spec)
+
     if retention_dataset is not None:
-        retention_before_eval = _evaluate(model, retention_dataset, resolved_spec, cfg)
+        retention_before_eval = _evaluate(
+            model, retention_dataset, resolved_spec, cfg, reference_model=reference_model,
+        )
 
     if resolved_spec.mode == "resume":
         artifacts = _load_existing_run_artifacts(root, resolved_spec.organism, run_id)
@@ -846,7 +883,7 @@ def run_trial(
             if resolved_spec.mode in ("clone", "fine_tune"):
                 baseline_eval = _evaluate(
                     model, validation_dataset, resolved_spec, cfg,
-                    navigation_metrics=navigation_evaluation,
+                    navigation_metrics=navigation_evaluation, reference_model=reference_model,
                 )
 
             total_epochs = int(resolved_spec.training.get("epoch_budget") or DEFAULT_EPOCH_BUDGET)
@@ -925,7 +962,7 @@ def run_trial(
 
                 eval_result = _evaluate(
                     model, validation_dataset, resolved_spec, cfg,
-                    navigation_metrics=navigation_evaluation,
+                    navigation_metrics=navigation_evaluation, reference_model=reference_model,
                 )
                 metric_value, _ = _resolve_selection_metric(
                     eval_result, resolved_spec.evaluation["selection_metric"], train_dataset.ticks_per_frame,
@@ -966,7 +1003,7 @@ def run_trial(
                 existing_best = load_factory_checkpoint(str(artifacts.checkpoints_dir / "best-validation.pt"))
                 best_eval = _evaluate(
                     existing_best.model, validation_dataset, resolved_spec, cfg,
-                    navigation_metrics=navigation_evaluation,
+                    navigation_metrics=navigation_evaluation, reference_model=reference_model,
                 )
             total_trial_seconds = time.monotonic() - trial_started
             budget_report = build_budget_report(
@@ -1007,6 +1044,7 @@ def run_trial(
                 best_checkpoint = load_factory_checkpoint(str(checkpoint_path))
                 retention_after_eval = _evaluate(
                     best_checkpoint.model, retention_dataset, resolved_spec, cfg,
+                    reference_model=reference_model,
                 )
                 forgetting = compute_forgetting_metric(
                     _per_episode_retention_losses(retention_before_eval),

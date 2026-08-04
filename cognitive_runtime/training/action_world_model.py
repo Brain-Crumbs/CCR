@@ -2549,21 +2549,26 @@ def evaluate_action_world_model_milestone(
     horizons_ticks: Sequence[int],
     *,
     warmup_frames: int = 3,
+    reference_model: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Evaluate both prediction paths and select the trained path as primary.
 
     Compatibility aliases (``horizons`` and ``per_episode_model_mse``) point
     at the primary report; consumers which need an unambiguous artifact use
-    ``direct``/``rollout`` and ``primary_mode``.
+    ``direct``/``rollout`` and ``primary_mode``. ``reference_model``, if
+    given, is forwarded to both passes, so ``reference_mse``/
+    ``model_over_reference_mse``/``beats_reference`` appear in every
+    horizon entry of both ``direct`` and ``rollout`` (see
+    :func:`evaluate_action_world_model_direct`'s docstring).
     """
     direct = evaluate_action_world_model_direct(
-        model, dataset, horizons_ticks, warmup_frames=warmup_frames
+        model, dataset, horizons_ticks, warmup_frames=warmup_frames, reference_model=reference_model,
     )
     # Rollout has one prediction per *frame* step, whereas direct heads keep
     # every tick identity even when two heads target the same recorded frame.
     frames = sorted(set(direct["horizons_frames"]))
     rollout = evaluate_action_world_model(
-        model, dataset, frames, warmup_frames=warmup_frames
+        model, dataset, frames, warmup_frames=warmup_frames, reference_model=reference_model,
     )
     primary_mode: PredictionMode = (
         "direct" if getattr(model, "training_objective", None) == "autoregressive" else "rollout"

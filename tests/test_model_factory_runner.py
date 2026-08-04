@@ -292,6 +292,45 @@ def test_two_clone_siblings_share_identical_data_manifest_and_report_comparison(
         assert clone.comparison == payload
 
 
+def test_reference_run_adds_comparison_metrics_to_the_validation_report(tmp_path, corpus):
+    """evaluation.reference_run (clinic redesign: a configurable comparison
+    baseline, not just copy-last-frame) makes it into the persisted
+    validation report once it names a real checkpoint."""
+    champion = _run(_spec_dict(corpus.corpus_id), tmp_path, run_id="champion-run")
+
+    doc = _spec_dict(corpus.corpus_id)
+    doc["evaluation"]["reference_run"] = _parent_block(champion)
+    result = _run(doc, tmp_path, run_id="candidate-run")
+
+    validation = json.loads((result.directory / "metrics" / "validation.json").read_text(encoding="utf-8"))
+    for entry in validation["rollout"]["horizons"].values():
+        assert entry["reference_mse"] is not None and entry["reference_mse"] > 0.0
+        assert entry["model_over_reference_mse"] is not None
+        assert isinstance(entry["beats_reference"], bool)
+    for entry in validation["direct"]["horizons"].values():
+        assert entry["reference_mse"] is not None and entry["reference_mse"] > 0.0
+
+
+def test_no_reference_run_omits_comparison_metrics_from_the_validation_report(tmp_path, corpus):
+    result = _run(_spec_dict(corpus.corpus_id), tmp_path)
+
+    validation = json.loads((result.directory / "metrics" / "validation.json").read_text(encoding="utf-8"))
+    for entry in validation["rollout"]["horizons"].values():
+        assert "reference_mse" not in entry
+
+
+def test_reference_run_sha256_mismatch_is_a_clear_error(tmp_path, corpus):
+    champion = _run(_spec_dict(corpus.corpus_id), tmp_path, run_id="champion-run")
+
+    doc = _spec_dict(corpus.corpus_id)
+    doc["evaluation"]["reference_run"] = {
+        "run_id": champion.run_id, "checkpoint": "best-validation.pt", "sha256": "0" * 64,
+    }
+
+    with pytest.raises(ValueError, match="reference_run checkpoint sha256 mismatch"):
+        _run(doc, tmp_path, run_id="candidate-run")
+
+
 def test_fine_tune_mode_continues_weights_under_a_new_training_contract(tmp_path, corpus):
     parent_result = _run(_spec_dict(corpus.corpus_id), tmp_path)
     parent = _parent_block(parent_result)
