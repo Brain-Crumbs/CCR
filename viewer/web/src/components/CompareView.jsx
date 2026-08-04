@@ -5,6 +5,10 @@ import { SessionList } from "./SessionList.jsx";
 import { RunSummary } from "./RunSummary.jsx";
 import { PixelHorizonViewer } from "./PixelHorizonViewer.jsx";
 
+//: The reference picker's "none selected" sentinel -- Picker renders each
+//: option's value as its own display text, so this doubles as the label.
+const NO_REFERENCE = "(none)";
+
 /**
  * Two trained checkpoints' predictions, side by side, for the same
  * session/episode.
@@ -26,6 +30,7 @@ export function CompareView({ catalog, organism, defaultRunA }) {
   );
   const [runA, setRunA] = useState(defaultRunA ?? null);
   const [runB, setRunB] = useState(null);
+  const [referenceRun, setReferenceRun] = useState(NO_REFERENCE);
   const [summaryA, setSummaryA] = useState(null);
   const [summaryB, setSummaryB] = useState(null);
   const [sessions, setSessions] = useState(null);
@@ -47,6 +52,13 @@ export function CompareView({ catalog, organism, defaultRunA }) {
     if (!runsForOrganism.length) return;
     setRunB((current) => (current && runsForOrganism.includes(current) ? current : runsForOrganism.find((r) => r !== runA) || runsForOrganism[0]));
   }, [runsForOrganism, runA]);
+
+  // The reference baseline defaults to none selected; if the organism
+  // changes and the current pick no longer belongs to it, fall back to
+  // none rather than silently pointing at an unrelated run.
+  useEffect(() => {
+    setReferenceRun((current) => (current === NO_REFERENCE || runsForOrganism.includes(current) ? current : NO_REFERENCE));
+  }, [runsForOrganism]);
 
   // Run A's session list is the shared session/episode picker for both sides.
   useEffect(() => {
@@ -91,6 +103,18 @@ export function CompareView({ catalog, organism, defaultRunA }) {
     () => (sessionId && episode && runA && runB ? episodeUrls(sessionId, episode, { organism, run: runA, experiment: runB }) : null),
     [sessionId, episode, organism, runA, runB],
   );
+  // A configurable comparison baseline (clinic redesign): any run in the
+  // catalog, not just the client-computed copy-last/mean-frame ones. Its
+  // session resolves through runA exactly like runB's does above (either
+  // run works when both share a corpus); `experiment` is what actually
+  // selects whose predictions get read.
+  const hasReference = referenceRun !== NO_REFERENCE;
+  const referenceUrls = useMemo(
+    () => (hasReference && sessionId && episode && runA
+      ? episodeUrls(sessionId, episode, { organism, run: runA, experiment: referenceRun })
+      : null),
+    [hasReference, sessionId, episode, organism, runA, referenceRun],
+  );
 
   if (!runsForOrganism.length) return <p className="empty">No runs to compare for this organism.</p>;
 
@@ -100,11 +124,16 @@ export function CompareView({ catalog, organism, defaultRunA }) {
       <p>
         Two runs&apos; predictions for the same session and episode, side by side. Comparison is exact when both
         runs share a corpus (the common case for clone/fine_tune lineages under one organism); otherwise the side
-        without a matching export falls back to baselines.
+        without a matching export falls back to baselines. Optionally pick a third run as a reference baseline --
+        available in each side&apos;s own prediction-source dropdown alongside copy-last/mean-frame.
       </p>
       <div className="pickers">
         <Picker label="Run A" ariaLabel="Run A" value={runA} options={runsForOrganism} onChange={setRunA} />
         <Picker label="Run B" ariaLabel="Run B" value={runB} options={runsForOrganism} onChange={setRunB} />
+        <Picker
+          label="Reference (baseline)" ariaLabel="Reference baseline run" value={referenceRun}
+          options={[NO_REFERENCE, ...runsForOrganism]} onChange={setReferenceRun}
+        />
       </div>
 
       {!sessions ? (
@@ -122,11 +151,23 @@ export function CompareView({ catalog, organism, defaultRunA }) {
 
           <h4>Run A — {runA}</h4>
           <RunSummary summary={summaryA} />
-          {urlsA && <PixelHorizonViewer framesSrc={urlsA.frames} predictionsSrc={urlsA.predictions} tick={tick} onTickChange={setTick} />}
+          {urlsA && (
+            <PixelHorizonViewer
+              framesSrc={urlsA.frames} predictionsSrc={urlsA.predictions}
+              referencePredictionsSrc={referenceUrls?.predictions} referenceLabel={hasReference ? referenceRun : null}
+              tick={tick} onTickChange={setTick}
+            />
+          )}
 
           <h4>Run B — {runB}</h4>
           <RunSummary summary={summaryB} />
-          {urlsB && <PixelHorizonViewer framesSrc={urlsB.frames} predictionsSrc={urlsB.predictions} tick={tick} onTickChange={setTick} />}
+          {urlsB && (
+            <PixelHorizonViewer
+              framesSrc={urlsB.frames} predictionsSrc={urlsB.predictions}
+              referencePredictionsSrc={referenceUrls?.predictions} referenceLabel={hasReference ? referenceRun : null}
+              tick={tick} onTickChange={setTick}
+            />
+          )}
         </>
       )}
     </section>

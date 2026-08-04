@@ -39,9 +39,18 @@ export function actualBytes(frames, i) {
   return null;
 }
 
+/** "model" reads `ctx.pred` (this viewer's own run); "reference" reads
+ * `ctx.referencePred` -- a second, independently picked run's predictions
+ * for the same session/episode -- the same way, so any run in the catalog
+ * can stand in as a configurable comparison baseline alongside the
+ * client-computed copy-last/mean-frame ones. */
+const PRED_FIELD_BY_SOURCE = { model: "pred", reference: "referencePred" };
+
 /** {bytes, shape} predicted for target index t+h from source at t, or null. */
-export function predictedFrame(source, t, h, { frames, pred, meanFrame, shape }) {
-  if (source === "model") {
+export function predictedFrame(source, t, h, { frames, meanFrame, shape, ...ctx }) {
+  const predField = PRED_FIELD_BY_SOURCE[source];
+  if (predField) {
+    const pred = ctx[predField];
     const seq = pred?.decoded?.[String(h)];
     if (!seq || t >= seq.length) return null;
     return { bytes: seq[t], shape: pred.prediction_shape };
@@ -51,9 +60,11 @@ export function predictedFrame(source, t, h, { frames, pred, meanFrame, shape })
   return bytes ? { bytes, shape } : null;
 }
 
-/** Actual frame in the prediction's space (model targets are pooled by the exporter). */
-export function targetFrame(source, i, { frames, pred, shape }) {
-  if (source === "model" && pred?.decodedTargets) return { bytes: pred.decodedTargets[i], shape: pred.prediction_shape };
+/** Actual frame in the prediction's space (model/reference targets are pooled by the exporter). */
+export function targetFrame(source, i, { frames, shape, ...ctx }) {
+  const predField = PRED_FIELD_BY_SOURCE[source];
+  const pred = predField ? ctx[predField] : null;
+  if (pred?.decodedTargets) return { bytes: pred.decodedTargets[i], shape: pred.prediction_shape };
   const bytes = actualBytes(frames, i);
   return bytes ? { bytes, shape } : null;
 }

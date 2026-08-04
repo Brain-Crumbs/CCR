@@ -109,6 +109,51 @@ describe("PixelHorizonViewer", () => {
     expect(seenCanvas.height).toBe(1);
   });
 
+  it("offers a reference baseline option that reads a second run's own predictions, independent of the model's", async () => {
+    function referencePredictionsPayload() {
+      return {
+        format: "pixel-predictions-v2", source: "export", prediction_mode: "rollout", horizons: [1],
+        prediction_shape: [1, 1, 3], evaluation_source: "s/nursery-x-holdout-1/episode_0",
+        experiment: { experiment_id: "exp-reference" }, model: { checkpoint_sha256: "reference12345", uses_actions: true, uses_workspace: true },
+        // Distinct bytes from predictionsPayload()'s own [1,1,1]/[2,2,2] so a
+        // wrong wire-up (e.g. reference silently reading the model's own
+        // pred) is visible as the wrong pixel values, not just a missing option.
+        predictions: { 1: { frames: [b64([9, 9, 9]), b64([7, 7, 7])] } },
+        targets: [b64([0, 0, 0]), b64([1, 1, 1]), b64([2, 2, 2])],
+        events: [{}, { entity_entered: true }, {}],
+      };
+    }
+    vi.stubGlobal("fetch", vi.fn((url) => {
+      const href = String(url);
+      const payload = href.includes("reference-predictions") ? referencePredictionsPayload()
+        : href.includes("predictions") ? predictionsPayload()
+        : framesPayload(3);
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(payload) });
+    }));
+
+    render(
+      <PixelHorizonViewer
+        framesSrc="/frames" predictionsSrc="/predictions"
+        referencePredictionsSrc="/reference-predictions" referenceLabel="champion-run-7"
+      />,
+    );
+    await waitFor(() => expect(screen.getByLabelText("prediction source").value).toBe("model"));
+
+    const options = [...screen.getByLabelText("prediction source").options].map((o) => o.value);
+    expect(options).toContain("reference");
+    expect(screen.getByText(/reference: champion-run-7/)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("prediction source"), { target: { value: "reference" } });
+    await waitFor(() => expect(screen.getByText(/reference prediction t\+1/)).toBeInTheDocument());
+  });
+
+  it("omits the reference option entirely when no referencePredictionsSrc is given", async () => {
+    render(<PixelHorizonViewer framesSrc="/frames" predictionsSrc="/predictions" />);
+    await waitFor(() => expect(screen.getByLabelText("prediction source").value).toBe("model"));
+    const options = [...screen.getByLabelText("prediction source").options].map((o) => o.value);
+    expect(options).not.toContain("reference");
+  });
+
   it("stops the previous episode's playback interval once a new episode loads", async () => {
     const onTickChange = vi.fn();
     const seriesFor = (n) => framesPayload(n);
