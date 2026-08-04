@@ -13,6 +13,7 @@ lineage/contract/champion evidence.
 node viewer/server.js                       # serves runs + episode_cache + corpora on :8787
 node viewer/server.js --data-dir /path/to/sessions --port 9000
 node viewer/server.js --runs-dir runs --episode-cache-dir episode_cache --corpus-root corpora
+node viewer/server.js --host 0.0.0.0 --max-concurrent-jobs 4   # see Security below first
 ```
 
 `--corpus-root` (default `<repo>/corpora`) is where a run's
@@ -34,6 +35,27 @@ cd viewer/web && npm install && npm run dev   # http://localhost:5173
 `npm run build` (from `viewer/` or `viewer/web/`) writes the production
 bundle into `viewer/public/`, which `server.js` serves as static files
 alongside its API -- the clinic is still one deployable.
+
+## Security
+
+The clinic's job-launch API (`POST /api/jobs/*`, `POST /api/preview/*`,
+`POST /api/jobs/:id/cancel`) is **unauthenticated** -- anyone who can reach
+the server can launch, preview, or cancel Model Factory training. There is
+no login, no token, no per-route access control.
+
+The mitigation is network exposure, not authentication: `--host` defaults to
+`127.0.0.1`, so a plain `node viewer/server.js` is reachable only from the
+same machine. Passing `--host 0.0.0.0` (or any other non-loopback address)
+puts the job-launch API on that network with no further protection -- do
+this only on a trusted network (e.g. behind your own firewall/VPN), never on
+a network you don't control. Read-only clinic mode carries the same
+consideration if you'd rather not share run contents broadly either.
+
+`--max-concurrent-jobs` (default `2`) caps how many launched jobs may be
+`running` at once -- a `POST /api/jobs/*` beyond the cap is refused with
+`409`, since the training backend itself has no cross-run throttling for
+concurrent CPU/`auto`-device trials (only per-file and per-device locks
+exist). This bounds accidental pile-up, not malicious use.
 
 ## What it shows
 
@@ -144,9 +166,11 @@ viewer's model-mode numbers match the harness.
 
 ## API
 
-Read-only JSON, all under `/api`. Clinic mode (default) joins a selected
-organism/run to its recordings; pass `--data-dir` for the single-session-tree
-compatibility mode instead.
+JSON, all under `/api`. Clinic mode (default) joins a selected organism/run
+to its recordings; pass `--data-dir` for the single-session-tree
+compatibility mode instead. Every route below `GET` reads; the `POST` routes
+launch, preview, or cancel Model Factory jobs and are unauthenticated --
+see Security above before exposing them beyond localhost.
 
 | Route | Returns |
 | --- | --- |
@@ -158,6 +182,13 @@ compatibility mode instead.
 | `GET /api/sessions?organism=&run=&name=&...filters` | recordings for the selected run, with quality verdicts |
 | `GET /api/sessions/:id` | one session's streams, decisions, exports, and quality verdict |
 | `GET /api/sessions/:id/episodes/:eid/{streams,decisions,frames,predictions}` | per-episode records; `predictions` accepts `?kind=dream` and `?experiment=` |
+| `POST /api/jobs/{baseline,clone,resume,search,breed}` | launches `ccr factory <kind> ...` as a detached subprocess; body shape per kind in `viewer/lib/jobs.js`'s `buildLaunch`. `409` past `--max-concurrent-jobs` |
+| `GET /api/jobs?organism=` | every launched job (registry entry) plus each precomputed run's live `state.json`/heartbeat |
+| `GET /api/jobs/:id/log?offset=` | the job's combined stdout+stderr log, tailed from a byte offset |
+| `POST /api/jobs/:id/cancel` | asks every one of the job's runs to stop gracefully, then `SIGTERM`s the subprocess |
+| `GET /api/corpora?organism=` | frozen Model Factory corpora under `--corpus-root` (id, data contract hash, session counts per split) |
+| `POST /api/preview/{search,breed}` | the same CLI invocation a launch would use, plus `--dry-run` -- candidate specs or the resolved child + lineage, no run allocated |
+| `GET /api/factory-meta` | the factory's own declared modes/objectives/genome schema versions/backbones (`ccr factory meta`), so a form can source its options from the backend instead of duplicating them |
 
 ## Reusing PixelHorizonViewer
 

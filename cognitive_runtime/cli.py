@@ -2206,6 +2206,30 @@ def cmd_factory_reconcile(args: argparse.Namespace) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+def cmd_factory_meta(args: argparse.Namespace) -> None:
+    """``ccr factory meta``: dump the factory's own declared enums as JSON --
+    valid spec modes, training objectives, genome schema versions, and
+    backbone choices -- so a caller (the clinic control plane, in
+    particular) can source its form options from the one place each is
+    actually declared instead of duplicating them. Pure Python, no torch
+    import, no run directory touched.
+    """
+    from cognitive_runtime.training.model_factory.genome import GENOME_SCHEMAS, OBJECTIVES
+    from cognitive_runtime.training.model_factory.spec import VALID_MODES
+
+    payload = {
+        "modes": list(VALID_MODES),
+        "objectives": list(OBJECTIVES),
+        "genome_schemas": sorted(GENOME_SCHEMAS),
+        # Mirrors the choices already declared for `ccr nursery joint/bench`
+        # (ActionWorldModelConfig.backbone, issue #93) -- not centralized as
+        # a shared constant there, so named again here rather than reaching
+        # into that parser's local list.
+        "backbones": ["gru", "dilated_conv", "transformer"],
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
 def cmd_factory_breed(args: argparse.Namespace) -> None:
     """Breed two compatible completed runs and optionally launch the child.
 
@@ -3455,6 +3479,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_factory_reconcile.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
                                      help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
     p_factory_reconcile.set_defaults(func=cmd_factory_reconcile)
+
+    p_factory_meta = factory_sub.add_parser(
+        "meta", help="dump the factory's declared modes/objectives/genome schemas/backbones as JSON"
+    )
+    p_factory_meta.set_defaults(func=cmd_factory_meta)
 
     p_factory_breed = factory_sub.add_parser(
         "breed", help="breed two compatible completed runs and launch one explicit-lineage child"

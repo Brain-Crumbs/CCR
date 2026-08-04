@@ -37,6 +37,27 @@ function get(port, route) { return new Promise((resolve, reject) => http.get({ p
   let body = ""; res.on("data", (x) => body += x); res.on("end", () => resolve({ status: res.statusCode, body: JSON.parse(body) }));
 }).on("error", reject)); }
 
+function post(port, route, payload) { return new Promise((resolve, reject) => {
+  const data = Buffer.from(JSON.stringify(payload ?? {}));
+  const req = http.request({
+    port, path: route, method: "POST",
+    headers: { "Content-Type": "application/json", "Content-Length": data.length },
+  }, (res) => {
+    let body = ""; res.on("data", (x) => body += x); res.on("end", () => resolve({ status: res.statusCode, body: JSON.parse(body) }));
+  });
+  req.on("error", reject); req.end(data);
+}); }
+
+async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 20 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await predicate();
+    if (value) return value;
+    if (Date.now() > deadline) throw new Error("waitFor timed out");
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
 test("service lists by organism and returns streams, exports, and verdict", async (t) => {
   const server = createServer({ dataDir: fixture() }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
   const port = server.address().port;
@@ -264,4 +285,238 @@ test("dream strip endpoint serves the Phase 4 export independently per episode",
 test("web front-end source has no public-internet runtime dependency", () => {
   const html = fs.readFileSync(path.join(__dirname, "../web/index.html"), "utf8");
   assert.doesNotMatch(html, /https?:\/\//);
+});
+
+// The job-launch API (Model Factory clinic redesign, control-plane
+// foundation): POST /api/jobs/*, /api/preview/*, GET /api/corpora,
+// GET /api/factory-meta. Every subtest below shells out to
+// test/fixtures/fake-python.sh (never a real ccr/torch invocation), scoped
+// to just this outer test via t.before/t.after so the pre-existing tests
+// above -- several of which rely on a real python3 for quality_cli, or on
+// its absence degrading gracefully -- are never affected by which python
+// these subtests see.
+const FAKE_PYTHON = path.join(__dirname, "fixtures", "fake-python.sh");
+
+test("job-launch API", async (t) => {
+  let originalPython;
+  t.before(() => { originalPython = process.env.PYTHON; process.env.PYTHON = FAKE_PYTHON; });
+  t.after(() => { process.env.PYTHON = originalPython; });
+
+  function fixtureRunsDir() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-jobs-api-"));
+    const runsDir = path.join(root, "runs");
+    for (const run of ["run-a", "run-b"]) {
+      const dir = path.join(runsDir, "Test", run);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "experiment.json"), JSON.stringify({ organism: "Test", experiment_id: run }));
+    }
+    return runsDir;
+  }
+
+  await t.test("POST /api/jobs/:kind validates method, kind, organism, and referenced run ids", async (t) => {
+    const runsDir = fixtureRunsDir();
+    const server = createServer({ runsDir }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+    const port = server.address().port;
+
+    assert.equal((await get(port, "/api/jobs/baseline")).status, 405);
+    assert.equal((await post(port, "/api/jobs/not-a-kind", { organism: "Test" })).status, 404);
+    assert.equal((await post(port, "/api/jobs/baseline", { organism: "Nobody", spec: {} })).status, 404);
+    assert.equal((await post(port, "/api/jobs/baseline", {})).status, 400);
+    assert.equal((await post(port, "/api/jobs/clone", { organism: "Test", run: "no-such-run" })).status, 404);
+    assert.equal(
+      (await post(port, "/api/jobs/breed", { organism: "Test", parent_a: "run-a", parent_b: "no-such-run" })).status,
+      404,
+    );
+    // run_id/run_id_prefix name something that doesn't exist yet (nothing to
+    // check against a catalog), so a path-traversal-shaped value must still
+    // be rejected on its character class alone.
+    const traversal = await post(port, "/api/jobs/baseline", { organism: "Test", spec: {}, run_id: "../../evil" });
+    assert.equal(traversal.status, 400);
+    const traversalPrefix = await post(port, "/api/jobs/search", {
+      organism: "Test", spec: {}, options: { run_id_prefix: "../../evil" },
+    });
+    assert.equal(traversalPrefix.status, 400);
+  });
+
+  await t.test("a launched job is registered, completes, and is visible via GET /api/jobs with live run state", async (t) => {
+    const runsDir = fixtureRunsDir();
+    const server = createServer({ runsDir }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+    const port = server.address().port;
+
+    const launch = await post(port, "/api/jobs/baseline", { organism: "Test", spec: { organism: "Test", mode: "fresh" } });
+    assert.equal(launch.status, 200);
+    assert.equal(launch.body.organism, "Test");
+    assert.equal(launch.body.run_ids.length, 1);
+    const [jobId, runId] = [launch.body.job_id, launch.body.run_ids[0]];
+    assert.match(launch.body.argv.join(" "), /factory baseline .*\.spec\.json --root/);
+
+    // The run itself has started producing state -- written directly here,
+    // exactly like a real trial's runner.run_trial would, to confirm
+    // GET /api/jobs augments the registry entry with it rather than only
+    // ever reporting what it launched.
+    fs.mkdirSync(path.join(runsDir, "Test", runId), { recursive: true });
+    fs.writeFileSync(path.join(runsDir, "Test", runId, "state.json"), JSON.stringify({
+      state: "running", reason: null, updated_at: "2026-01-01T00:00:00Z",
+    }));
+    fs.writeFileSync(path.join(runsDir, "Test", runId, "heartbeat.json"), JSON.stringify({
+      format: "model-factory-trial-heartbeat-v1", run_id: runId, heartbeat_seconds: 12345.6,
+    }));
+
+    const listed = await get(port, "/api/jobs?organism=Test");
+    assert.equal(listed.status, 200);
+    assert.equal(listed.body.jobs.length, 1);
+    assert.equal(listed.body.jobs[0].job_id, jobId);
+    assert.deepEqual(listed.body.jobs[0].runs, [{
+      run_id: runId, state: "running", state_reason: null,
+      updated_at: "2026-01-01T00:00:00Z", heartbeat_seconds: 12345.6,
+    }]);
+    assert.equal((await get(port, "/api/jobs?organism=Nobody")).body.jobs.length, 0);
+
+    const finished = await waitFor(async () => {
+      const current = await get(port, "/api/jobs?organism=Test");
+      return current.body.jobs[0].status !== "running" ? current.body.jobs[0] : null;
+    });
+    assert.equal(finished.status, "completed");
+  });
+
+  await t.test("GET /api/jobs/:id/log tails output; unknown and traversal-shaped ids 404, not 500", async (t) => {
+    const runsDir = fixtureRunsDir();
+    const server = createServer({ runsDir }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+    const port = server.address().port;
+
+    const launch = await post(port, "/api/jobs/clone", { organism: "Test", run: "run-a" });
+    assert.equal(launch.status, 200);
+    const jobId = launch.body.job_id;
+
+    await waitFor(async () => {
+      const current = await get(port, "/api/jobs?organism=Test");
+      return current.body.jobs[0].status !== "running" ? current.body.jobs[0] : null;
+    });
+
+    assert.equal((await post(port, `/api/jobs/${jobId}/log`, {})).status, 405);
+    const first = await get(port, `/api/jobs/${jobId}/log?offset=0`);
+    assert.equal(first.status, 200);
+    assert.match(first.body.text, /factory clone run-a/);
+    assert.ok(first.body.next_offset > 0);
+    const second = await get(port, `/api/jobs/${jobId}/log?offset=${first.body.next_offset}`);
+    assert.equal(second.body.text, "");
+
+    assert.equal((await get(port, "/api/jobs/no-such-job/log")).status, 404);
+    assert.equal((await get(port, `/api/jobs/${encodeURIComponent("../../etc/passwd")}/log`)).status, 404);
+  });
+
+  await t.test("POST /api/jobs/:id/cancel stops a running job; unknown ids 404, wrong method 405", async (t) => {
+    const runsDir = fixtureRunsDir();
+    const server = createServer({ runsDir }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+    const port = server.address().port;
+
+    assert.equal((await get(port, "/api/jobs/some-id/cancel")).status, 405);
+    assert.equal((await post(port, "/api/jobs/no-such-job/cancel", {})).status, 404);
+
+    process.env.FAKE_PYTHON_DELAY_MS = "2000";
+    try {
+      const launch = await post(port, "/api/jobs/clone", { organism: "Test", run: "run-a" });
+      await waitFor(async () => {
+        const current = await get(port, "/api/jobs?organism=Test");
+        return current.body.jobs[0].pid ? current.body.jobs[0] : null;
+      });
+      const cancelled = await post(port, `/api/jobs/${launch.body.job_id}/cancel`, {});
+      assert.equal(cancelled.status, 200);
+      const finished = await waitFor(async () => {
+        const current = await get(port, "/api/jobs?organism=Test");
+        return current.body.jobs[0].status !== "running" ? current.body.jobs[0] : null;
+      });
+      // SIGTERM with no handler in the fake script kills it outright --
+      // never "completed", the exit code a graceful stop would report.
+      assert.notEqual(finished.status, "completed");
+    } finally {
+      delete process.env.FAKE_PYTHON_DELAY_MS;
+    }
+  });
+
+  await t.test("POST /api/jobs/:kind refuses beyond --max-concurrent-jobs with 409", async (t) => {
+    const runsDir = fixtureRunsDir();
+    const server = createServer({ runsDir, maxConcurrentJobs: 1 });
+    await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+    const port = server.address().port;
+
+    process.env.FAKE_PYTHON_DELAY_MS = "2000";
+    try {
+      const first = await post(port, "/api/jobs/clone", { organism: "Test", run: "run-a" });
+      assert.equal(first.status, 200);
+      const second = await post(port, "/api/jobs/clone", { organism: "Test", run: "run-b" });
+      assert.equal(second.status, 409);
+    } finally {
+      delete process.env.FAKE_PYTHON_DELAY_MS;
+    }
+  });
+
+  await t.test("GET /api/corpora lists frozen corpora, skips a corrupt manifest, and rejects a traversal-shaped organism", async (t) => {
+    const runsDir = fixtureRunsDir();
+    const corpusRoot = path.join(path.dirname(runsDir), "corpora");
+    const good = path.join(corpusRoot, "Test", "corpus-1"); fs.mkdirSync(good, { recursive: true });
+    fs.writeFileSync(path.join(good, "corpus_manifest.json"), JSON.stringify({
+      format: "model-factory-corpus-manifest-v1", corpus_id: "corpus-1", data_contract_hash: "hash-1",
+      sessions: { train: [1, 2, 3], validation: [1], test: [] },
+    }));
+    const corrupt = path.join(corpusRoot, "Test", "corpus-2"); fs.mkdirSync(corrupt, { recursive: true });
+    fs.writeFileSync(path.join(corrupt, "corpus_manifest.json"), "not json{{{");
+
+    const server = createServer({ runsDir, corpusRoot }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+    const port = server.address().port;
+
+    const listed = await get(port, "/api/corpora?organism=Test");
+    assert.equal(listed.status, 200);
+    assert.deepEqual(listed.body.corpora, [{
+      corpus_id: "corpus-1", organism: "Test", data_contract_hash: "hash-1",
+      session_counts: { train: 3, validation: 1, test: 0 },
+    }]);
+    assert.equal((await get(port, "/api/corpora")).body.corpora.length, 1);
+    assert.equal((await get(port, `/api/corpora?organism=${encodeURIComponent("../../etc")}`)).status, 400);
+  });
+
+  await t.test("POST /api/preview/{search,breed} dry-runs via the CLI, validates like a launch, and cleans up its temp spec", async (t) => {
+    const runsDir = fixtureRunsDir();
+    const server = createServer({ runsDir }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+    const port = server.address().port;
+
+    assert.equal((await post(port, "/api/preview/baseline", { organism: "Test", spec: {} })).status, 404);
+    assert.equal((await get(port, "/api/preview/search")).status, 405);
+    assert.equal((await post(port, "/api/preview/search", { organism: "Nobody", spec: {} })).status, 404);
+    assert.equal(
+      (await post(port, "/api/preview/breed", { organism: "Test", parent_a: "run-a", parent_b: "no-such-run" })).status,
+      404,
+    );
+
+    const searchPreview = await post(port, "/api/preview/search", { organism: "Test", spec: { organism: "Test" } });
+    assert.equal(searchPreview.status, 200);
+    assert.equal(searchPreview.body.marker, "fake-dry-run");
+    const breedPreview = await post(port, "/api/preview/breed", { organism: "Test", parent_a: "run-a", parent_b: "run-b" });
+    assert.equal(breedPreview.status, 200);
+    assert.equal(breedPreview.body.marker, "fake-dry-run");
+
+    // Neither preview kept a job identity: no "preview-*" registry entry,
+    // and search's temp spec sidecar (breed's buildLaunch writes none) was
+    // removed right after the dry-run call returned.
+    assert.equal((await get(port, "/api/jobs?organism=Test")).body.jobs.length, 0);
+    const jobsDirEntries = fs.existsSync(path.join(runsDir, ".clinic-jobs"))
+      ? fs.readdirSync(path.join(runsDir, ".clinic-jobs"))
+      : [];
+    assert.deepEqual(jobsDirEntries.filter((name) => name.endsWith(".spec.json")), []);
+  });
+
+  await t.test("GET /api/factory-meta returns the factory's declared modes/objectives/genome schemas/backbones", async (t) => {
+    const runsDir = fixtureRunsDir();
+    const server = createServer({ runsDir }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+    const port = server.address().port;
+
+    const result = await get(port, "/api/factory-meta");
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body, {
+      modes: ["fresh", "clone", "resume", "fine_tune"],
+      objectives: ["windowed_rollout", "autoregressive"],
+      genome_schemas: ["generic_action_effects_v1"],
+      backbones: ["gru", "dilated_conv", "transformer"],
+    });
+  });
 });

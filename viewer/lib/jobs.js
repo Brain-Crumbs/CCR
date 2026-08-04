@@ -151,15 +151,35 @@ function buildLaunch(kind, body, { runsDir, jobId }) {
   }
 }
 
+/** Refused when launching would push the number of "running" jobs at or
+ * past a configured cap -- distinguished from launchJob's other thrown
+ * Errors (all client-request problems, a 400) so the route handler can
+ * answer 409 instead. */
+class ConcurrencyLimitError extends Error {}
+
 /** Launch `ccr factory <kind> ...` as a detached subprocess, register it,
  * and return the registry entry immediately (the caller never waits for
- * training to finish -- a single call can run for hours). */
-function launchJob(kind, body, { runsDir }) {
+ * training to finish -- a single call can run for hours).
+ *
+ * `maxConcurrent`, when given, refuses a launch that would exceed it --
+ * the backend itself has no cross-run throttling for concurrent CPU/
+ * "auto"-device trials (only per-file and per-device locks exist), so
+ * without this a control plane could pile up more simultaneous trainings
+ * than the host can actually run well. */
+function launchJob(kind, body, { runsDir, maxConcurrent = null }) {
   if (!JOB_KINDS.includes(kind)) {
     throw new Error(`unknown job kind ${JSON.stringify(kind)}; expected one of ${JOB_KINDS.join(", ")}`);
   }
   if (!body || typeof body.organism !== "string" || !body.organism) {
     throw new Error("organism is required");
+  }
+  if (maxConcurrent !== null && maxConcurrent !== undefined) {
+    const running = listJobs(runsDir).filter((entry) => entry.status === "running").length;
+    if (running >= maxConcurrent) {
+      throw new ConcurrencyLimitError(
+        `refusing to launch: ${running} job(s) already running, at the configured limit of ${maxConcurrent}`,
+      );
+    }
   }
   const jobId = crypto.randomUUID();
   const { argv, runIds } = buildLaunch(kind, body, { runsDir, jobId });
@@ -208,7 +228,13 @@ function launchJob(kind, body, { runsDir }) {
  * rather than left silently stale. */
 function getJob(runsDir, jobId) {
   const entry = readJSON(jobPath(runsDir, jobId));
-  if (!entry) return null;
+  // Guards against more than just a missing file: a "baseline"/"search"
+  // launch also writes a `<jobId>.spec.json` sidecar into this same
+  // directory (see writeTempSpec) for the CLI to read as its positional
+  // spec argument -- without this format check, listJobs' *.json glob
+  // would (and, before this fix, did) misread that spec document as a job
+  // registry entry with no run_ids of its own.
+  if (!entry || entry.format !== JOB_FORMAT) return null;
   if (entry.status === "running" && !isAlive(entry.pid)) {
     const reconciled = { ...entry, status: "unknown" };
     writeJSONAtomic(jobPath(runsDir, jobId), reconciled);
@@ -221,7 +247,13 @@ function getJob(runsDir, jobId) {
 function listJobs(runsDir, { organism = null } = {}) {
   const dir = jobsDir(runsDir);
   if (!fs.existsSync(dir)) return [];
-  const ids = fs.readdirSync(dir).filter((name) => name.endsWith(".json")).map((name) => name.slice(0, -".json".length));
+  // Excludes "*.spec.json" up front so a launch's own spec sidecar is never
+  // even read as a candidate registry entry (getJob's format check below is
+  // the structural backstop; this just skips the wasted read for the one
+  // sidecar kind known to collide with the plain "*.json" glob).
+  const ids = fs.readdirSync(dir)
+    .filter((name) => name.endsWith(".json") && !name.endsWith(".spec.json"))
+    .map((name) => name.slice(0, -".json".length));
   return ids
     .map((jobId) => getJob(runsDir, jobId))
     .filter((entry) => entry && (!organism || entry.organism === organism))
@@ -253,7 +285,13 @@ function cancelJob(runsDir, jobId) {
  * repeated polling for a live log view without ever re-sending what the
  * caller already has. */
 function readJobLog(runsDir, jobId, { offset = 0 } = {}) {
-  const entry = readJSON(jobPath(runsDir, jobId));
+  // Goes through getJob (not a direct readJSON(jobPath(...))) specifically
+  // for its JOB_FORMAT check -- otherwise a jobId of "<real-job-id>.spec"
+  // would resolve to that job's own spec.json sidecar (same directory, same
+  // ".json" suffix) and be misread as a job entry with no log_path, quietly
+  // answering "empty log" for something that isn't a job at all instead of
+  // 404ing like an unknown id should.
+  const entry = getJob(runsDir, jobId);
   if (!entry) return null;
   if (!fs.existsSync(entry.log_path)) return { text: "", next_offset: 0, size: 0 };
   const size = fs.statSync(entry.log_path).size;
@@ -271,6 +309,7 @@ function readJobLog(runsDir, jobId, { offset = 0 } = {}) {
 
 module.exports = {
   JOB_KINDS,
+  ConcurrencyLimitError,
   flagsFromOptions,
   buildLaunch,
   launchJob,
@@ -279,4 +318,6 @@ module.exports = {
   cancelJob,
   readJobLog,
   jobsDir,
+  jobSpecPath,
+  pythonCommand,
 };
