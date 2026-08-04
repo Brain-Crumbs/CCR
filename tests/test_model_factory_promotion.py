@@ -46,6 +46,7 @@ ALL_GATE_NAMES = {
     "split_overlap",
     "representation",
     "rollout_beats_copy_last",
+    "reference_comparison",
     "rollout_health",
     "event_stratified_evaluability",
     "metric_schema",
@@ -73,7 +74,10 @@ def _comparison(*, delta, n=8, margin_confidence=0.95):
     return compare_paired_episodes(candidate, baseline, confidence=margin_confidence)
 
 
-def _rollout_metrics(*, model_mse=0.5, copy_last_mse=1.0, health_state="healthy", include_raw=True):
+def _rollout_metrics(
+    *, model_mse=0.5, copy_last_mse=1.0, health_state="healthy", include_raw=True,
+    reference_mse=None, include_reference_raw=True,
+):
     horizon_entry = {
         "beats_copy_last": model_mse < copy_last_mse,
     }
@@ -83,6 +87,16 @@ def _rollout_metrics(*, model_mse=0.5, copy_last_mse=1.0, health_state="healthy"
         horizon_entry["model_over_copy_last_mse"] = model_mse / copy_last_mse
     else:
         horizon_entry["model_over_copy_last_mse"] = model_mse / copy_last_mse
+    # None (the default) means no evaluation.reference_run was declared for
+    # this trial -- the horizon entry then carries no reference_* keys at
+    # all, exactly what a real report looks like without one.
+    if reference_mse is not None:
+        horizon_entry["beats_reference"] = model_mse < reference_mse
+        if include_reference_raw:
+            horizon_entry["reference_mse"] = reference_mse
+            horizon_entry["model_over_reference_mse"] = model_mse / reference_mse
+        else:
+            horizon_entry["model_over_reference_mse"] = model_mse / reference_mse
     return {
         "horizons": {4: horizon_entry},
         "rollout_health": {"state": health_state},
@@ -373,6 +387,37 @@ def test_rollout_beats_copy_last_gate_blocks_when_worse_than_copy_last():
     assert not _gate(verdict, "rollout_beats_copy_last").passed
 
 
+# --------------------------------------------------------------------- AC: reference_run comparison
+
+
+def test_reference_comparison_gate_is_not_applicable_when_no_reference_run_was_declared():
+    verdict = evaluate_promotion(**_base_kwargs())
+    gate = _gate(verdict, "reference_comparison")
+    assert gate.passed
+    assert not gate.applicable
+
+
+def test_reference_comparison_gate_passes_when_the_candidate_beats_its_reference():
+    report = _experiment_report(
+        metrics={"rollout": _rollout_metrics(model_mse=0.5, copy_last_mse=1.0, reference_mse=0.8)},
+    )
+    verdict = evaluate_promotion(**_base_kwargs(experiment_report=report))
+    gate = _gate(verdict, "reference_comparison")
+    assert gate.passed
+    assert gate.applicable
+
+
+def test_reference_comparison_gate_blocks_when_worse_than_the_declared_reference():
+    report = _experiment_report(
+        metrics={"rollout": _rollout_metrics(model_mse=1.2, copy_last_mse=1.0, reference_mse=0.8)},
+    )
+    verdict = evaluate_promotion(**_base_kwargs(experiment_report=report))
+    assert not verdict.promoted
+    gate = _gate(verdict, "reference_comparison")
+    assert not gate.passed
+    assert "4" in gate.reason
+
+
 # --------------------------------------------------------------------- AC: versioned metric schema
 
 
@@ -383,6 +428,17 @@ def test_metric_schema_gate_blocks_a_copy_last_ratio_without_raw_errors():
     gate = _gate(verdict, "metric_schema")
     assert not gate.passed
     assert "model_over_copy_last_mse" in gate.reason
+
+
+def test_metric_schema_gate_blocks_a_reference_ratio_without_raw_errors():
+    report = _experiment_report(
+        metrics={"rollout": _rollout_metrics(reference_mse=0.8, include_reference_raw=False)},
+    )
+    verdict = evaluate_promotion(**_base_kwargs(experiment_report=report))
+    assert not verdict.promoted
+    gate = _gate(verdict, "metric_schema")
+    assert not gate.passed
+    assert "model_over_reference_mse" in gate.reason
 
 
 def test_metric_schema_gate_blocks_an_event_rate_without_raw_counts():
