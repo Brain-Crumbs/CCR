@@ -38,11 +38,13 @@ import datetime as dt
 import json
 import math
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from cognitive_runtime.training.model_factory.artifacts import LINEAGE_FORMAT, atomic_write_json
 from cognitive_runtime.training.model_factory.budget import BUDGET_TIERS
+from cognitive_runtime.training.model_factory import genome as _genome_module
 from cognitive_runtime.training.model_factory.population import (
+    ComputeLedger,
     PopulationCandidate,
     PopulationDecision,
     PopulationPolicy,
@@ -55,6 +57,13 @@ from cognitive_runtime.training.model_factory.state import (
     require_completed_for_promotion,
     state_path,
 )
+
+#: The genome schema (bounded training-only genes) used by
+#: :func:`assemble_population_candidates` when a caller does not declare its
+#: own -- module-qualified rather than a same-name import, because this
+#: module already defines its own unrelated ``GENERIC_ACTION_EFFECTS_V1``
+#: (a :class:`BenchmarkFamily`, not a genome schema) below.
+_DEFAULT_GENOME_SCHEMA = _genome_module.GENERIC_ACTION_EFFECTS_V1
 
 REGISTRY_FORMAT = "model-factory-registry-v1"
 LINEAGE_MANIFEST_NAME = "lineage.json"
@@ -478,6 +487,173 @@ def population(
     return tuple(ChampionEntry.from_dict(item) for item in slot_payload.get("population", []))
 
 
+def _compute_ledger(run_directory: Path, *, seen: Optional[set[str]] = None) -> ComputeLedger:
+    """Recover inclusive compute cost along one checkpoint-donor lineage."""
+    seen = set() if seen is None else set(seen)
+    run_id = run_directory.name
+    if run_id in seen:
+        raise ValueError(f"cycle while recovering compute lineage for {run_id!r}")
+    seen.add(run_id)
+    with (run_directory / "metrics" / "budget_report.json").open(encoding="utf-8") as handle:
+        budget = json.load(handle)
+    trial_compute = float(budget.get("total_trial_seconds", budget.get("measured_training_seconds", 0.0)))
+    lineage_path = run_directory / "lineage.json"
+    if not lineage_path.is_file():
+        return ComputeLedger.fresh(trial_compute)
+    with lineage_path.open(encoding="utf-8") as handle:
+        lineage = json.load(handle)
+    donor_run_id = lineage.get("weight_donor") or (lineage.get("parent") or {}).get("run_id")
+    if not donor_run_id:
+        return ComputeLedger.fresh(trial_compute)
+    return ComputeLedger.child(
+        trial_compute, _compute_ledger(run_directory.parent / str(donor_run_id), seen=seen),
+    )
+
+
+def _genome_value(training: Mapping[str, Any], dotted_path: str) -> Any:
+    """Read one declared genome field from a resolved training block."""
+    value: Any = training
+    for part in dotted_path.split("."):
+        if not isinstance(value, Mapping) or part not in value:
+            raise ValueError(f"resolved training block is missing declared genome field {dotted_path!r}")
+        value = value[part]
+    return value
+
+
+def _present_genome_fields(training: Mapping[str, Any], declared_fields: Sequence[str]) -> Tuple[str, ...]:
+    """Keep only schema-declared paths represented by this spec generation.
+
+    A schema can contain an inactive or not-yet-materialized optional
+    field; it is not a diversity dimension for a run that has no resolved
+    value for it. The retained fields are still declared schema fields,
+    never runtime state or an inferred implementation detail.
+    """
+    present = []
+    for field in declared_fields:
+        try:
+            _genome_value(training, field)
+        except ValueError:
+            continue
+        present.append(field)
+    if not present:
+        raise ValueError("no declared genome fields are present in the resolved training specification")
+    return tuple(present)
+
+
+def _load_validation_for_candidate(run_directory: Path) -> Tuple[Dict[str, Any], float]:
+    """Load one run's ``metrics/validation.json`` plus its data contract's
+    ``ticks_per_frame``, restoring the ``rollout``/``direct``/
+    ``per_episode_model_mse`` horizon keys from JSON's string coercion back
+    to ``int`` so the payload matches the shape
+    ``runner._resolve_selection_metric`` expects."""
+    with (run_directory / "metrics" / "validation.json").open(encoding="utf-8") as handle:
+        payload: Dict[str, Any] = json.load(handle)
+    with (run_directory / "contracts.json").open(encoding="utf-8") as handle:
+        contracts = json.load(handle)
+    ticks_per_frame = float(contracts["data_contract"]["ticks_per_frame"])
+    for report_name in ("rollout", "direct"):
+        report = payload.get(report_name)
+        if not isinstance(report, dict):
+            continue
+        if isinstance(report.get("horizons"), dict):
+            report["horizons"] = {int(key): value for key, value in report["horizons"].items()}
+        if isinstance(report.get("per_episode_model_mse"), dict):
+            report["per_episode_model_mse"] = {
+                int(key): value for key, value in report["per_episode_model_mse"].items()
+            }
+    per_episode = payload.get("per_episode_model_mse")
+    if isinstance(per_episode, dict):
+        payload["per_episode_model_mse"] = {int(key): value for key, value in per_episode.items()}
+    return payload, ticks_per_frame
+
+
+def _population_candidate(
+    run_directory: Path,
+    *,
+    objective: str,
+    declared_genome_fields: Sequence[str],
+    gates: Optional[Mapping[str, bool]] = None,
+) -> PopulationCandidate:
+    """Build a validation-only population candidate from persisted run artifacts."""
+    from cognitive_runtime.training.model_factory.runner import _resolve_selection_metric
+
+    with (run_directory / "trial_spec.json").open(encoding="utf-8") as handle:
+        trial_spec = json.load(handle)
+    validation, ticks_per_frame = _load_validation_for_candidate(run_directory)
+    primary_metric, _ = _resolve_selection_metric(validation, objective, ticks_per_frame)
+    retention_metric = float(primary_metric)
+    retention_path = run_directory / "metrics" / "retention.json"
+    if retention_path.is_file():
+        with retention_path.open(encoding="utf-8") as handle:
+            retention_payload = json.load(handle)
+        retention_metric = float(retention_payload["forgetting_amount"])
+    with (run_directory / "metrics" / "budget_report.json").open(encoding="utf-8") as handle:
+        budget = json.load(handle)
+    return PopulationCandidate(
+        run_id=run_directory.name,
+        resolved_spec={key: value for key, value in trial_spec.items() if key != "format"},
+        genome={field: _genome_value(trial_spec["training"], field) for field in declared_genome_fields},
+        primary_metric=float(primary_metric),
+        runtime=float(budget.get("total_trial_seconds", budget.get("measured_training_seconds", 0.0))),
+        # Generic dynamics has no separate report and retains its validation
+        # objective here. Navigation fine-tunes use the CI-refereed forgetting
+        # amount written by the runner instead.
+        retention_metric=retention_metric,
+        ledger=_compute_ledger(run_directory),
+        gates=dict(gates or {}),
+        completion_status=str(budget.get("completion_status", "completed")),
+    )
+
+
+def assemble_population_candidates(
+    root: Union[str, Path],
+    *,
+    family: str,
+    tier: str,
+    objective: str,
+    new_run_directory: Path,
+    new_run_id: str,
+    new_run_gates: Optional[Mapping[str, bool]] = None,
+    genome_schema: Any = _DEFAULT_GENOME_SCHEMA,
+) -> Tuple[PopulationPolicy, Tuple[PopulationCandidate, ...]]:
+    """Assemble one slot's full candidate population, including a new run,
+    ready for :func:`promote`'s ``population_policy``/``population_candidates``.
+
+    Reads every existing population member's persisted validation/budget/
+    retention/lineage artifacts (:func:`population`, then one
+    :func:`_population_candidate` per member) plus ``new_run_directory``'s
+    own -- appended last, tagged with ``new_run_gates`` (typically the
+    promotion verdict's gate results) if given. This is exactly the
+    assembly ``ccr factory promote`` needs before calling :func:`promote`
+    with a population decision, factored out so a caller other than the CLI
+    (a web control-plane endpoint, in particular) does not have to
+    reimplement it.
+
+    The returned candidates are ordered with the new run last: a caller
+    that needs its ledger specifically (as ``promote``'s ``metrics``
+    payload does) can always take ``candidates[-1]``.
+    """
+    with (Path(new_run_directory) / "trial_spec.json").open(encoding="utf-8") as handle:
+        new_trial_spec = json.load(handle)
+    population_policy = PopulationPolicy(
+        declared_genome_fields=_present_genome_fields(new_trial_spec["training"], genome_schema.gene_names),
+    )
+    existing_members = population(root, family=family, tier=tier, objective=objective)
+    candidates = [
+        _population_candidate(
+            Path(root) / entry.run_id, objective=objective,
+            declared_genome_fields=population_policy.declared_genome_fields,
+        )
+        for entry in existing_members if entry.run_id != new_run_id
+    ]
+    candidates.append(_population_candidate(
+        Path(new_run_directory), objective=objective,
+        declared_genome_fields=population_policy.declared_genome_fields,
+        gates=new_run_gates,
+    ))
+    return population_policy, tuple(candidates)
+
+
 def record_test_use(
     root: Union[str, Path],
     *,
@@ -694,6 +870,7 @@ __all__ = [
     "hold",
     "leading_champion",
     "population",
+    "assemble_population_candidates",
     "record_test_use",
     "lineage_graph",
 ]

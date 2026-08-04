@@ -19,6 +19,7 @@ from cognitive_runtime.training.model_factory.registry import (
     REGISTRY_FORMAT,
     LineageCycleError,
     RegistryError,
+    assemble_population_candidates,
     hold,
     leading_champion,
     lineage_graph,
@@ -157,6 +158,91 @@ def test_policy_backed_promotion_replaces_the_persisted_population_atomically(tm
     assert [member.run_id for member in slot.population] == ["leader"]
     assert slot.leading_champion == "leader"
     assert slot.history[-1]["retained"] is False
+
+
+# --------------------------------------------------------------------- population assembly
+
+
+def _write_population_run_artifacts(root, run_id, *, metric_value=0.1, runtime=10.0, ticks_per_frame=1.0):
+    """The minimal on-disk artifacts assemble_population_candidates reads
+    for one run: trial_spec.json (only the two genome fields this test's
+    minimal schema declares need be present -- absent schema fields are
+    skipped, not required), contracts.json (for ticks_per_frame),
+    metrics/validation.json, metrics/budget_report.json."""
+    directory = root / run_id
+    (directory / "metrics").mkdir(parents=True, exist_ok=True)
+    (directory / "trial_spec.json").write_text(json.dumps({
+        "training": {"optimizer": {"lr": 0.001}, "scheduled_sampling_p": 0.25},
+    }), encoding="utf-8")
+    (directory / "contracts.json").write_text(json.dumps({
+        "data_contract": {"ticks_per_frame": ticks_per_frame},
+    }), encoding="utf-8")
+    (directory / "metrics" / "validation.json").write_text(json.dumps({
+        "rollout": {"horizons": {}, "per_episode_model_mse": {}},
+        "direct": {
+            "horizons": {"4": {"model_mse": metric_value}},
+            "per_episode_model_mse": {"4": [metric_value]},
+        },
+        "per_episode_model_mse": {"4": [metric_value]},
+    }), encoding="utf-8")
+    (directory / "metrics" / "budget_report.json").write_text(json.dumps({
+        "total_trial_seconds": runtime, "completion_status": "completed",
+    }), encoding="utf-8")
+
+
+def test_assemble_population_candidates_merges_existing_members_with_a_new_run(tmp_path):
+    objective = "direct.t+4.model_mse"
+    for run_id in ("existing-a", "existing-b", "new-run"):
+        _mark_completed(tmp_path, run_id)
+        _write_population_run_artifacts(tmp_path, run_id)
+    for run_id in ("existing-a", "existing-b"):
+        promote(
+            tmp_path, family="f", tier="fast", objective=objective, run_id=run_id,
+            checkpoint_path="p", checkpoint_sha256="a" * 64, metrics={}, as_leading=False,
+        )
+
+    policy, candidates = assemble_population_candidates(
+        tmp_path, family="f", tier="fast", objective=objective,
+        new_run_directory=tmp_path / "new-run", new_run_id="new-run",
+        new_run_gates={"rollout_health": True},
+    )
+
+    assert set(policy.declared_genome_fields) == {"optimizer.lr", "scheduled_sampling_p"}
+    assert [candidate.run_id for candidate in candidates][-1] == "new-run"
+    assert {candidate.run_id for candidate in candidates} == {"existing-a", "existing-b", "new-run"}
+    by_id = {candidate.run_id: candidate for candidate in candidates}
+    assert by_id["new-run"].gates == {"rollout_health": True}
+    # An existing member's candidate is rebuilt from its own persisted
+    # artifacts, not carried over with whatever gates it happened to record
+    # at its own original promotion time.
+    assert by_id["existing-a"].gates == {}
+    assert by_id["existing-a"].genome == {"optimizer.lr": 0.001, "scheduled_sampling_p": 0.25}
+
+
+def test_assemble_population_candidates_excludes_the_new_run_from_the_existing_pass(tmp_path):
+    """Re-promoting an already-registered run must rebuild it once (as the
+    new run, with fresh gates), never twice."""
+    objective = "direct.t+4.model_mse"
+    for run_id in ("already-in-population",):
+        _mark_completed(tmp_path, run_id)
+        _write_population_run_artifacts(tmp_path, run_id, metric_value=0.2)
+    promote(
+        tmp_path, family="f", tier="fast", objective=objective, run_id="already-in-population",
+        checkpoint_path="p", checkpoint_sha256="a" * 64, metrics={},
+    )
+    # Overwrite its artifacts as if it were re-evaluated with a better metric
+    # before this second promotion call.
+    _write_population_run_artifacts(tmp_path, "already-in-population", metric_value=0.05)
+
+    _, candidates = assemble_population_candidates(
+        tmp_path, family="f", tier="fast", objective=objective,
+        new_run_directory=tmp_path / "already-in-population", new_run_id="already-in-population",
+        new_run_gates={"rollout_health": True},
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].gates == {"rollout_health": True}
+    assert candidates[0].primary_metric == pytest.approx(0.05)
 
 
 def test_unknown_tier_is_rejected(tmp_path):

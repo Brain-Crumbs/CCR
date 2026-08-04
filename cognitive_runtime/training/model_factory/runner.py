@@ -53,6 +53,7 @@ from cognitive_runtime.training.model_factory.artifacts import (
 from cognitive_runtime.training.model_factory.budget import (
     BUDGET_TIERS,
     STATUS_BUDGET_EXCEEDED,
+    STATUS_CANCELLED,
     STATUS_COMPLETED,
     EpochTimer,
     TrainingBudget,
@@ -78,9 +79,11 @@ from cognitive_runtime.training.model_factory.spec import validate as validate_s
 from cognitive_runtime.training.model_factory.state import (
     ACTIVE_STATES,
     STATE_BUDGET_EXCEEDED,
+    STATE_CANCELLED,
     STATE_COMPLETED,
     STATE_FAILED,
     STATE_RUNNING,
+    cancellation_requested,
     create_state,
     heartbeat_path,
     is_stale,
@@ -954,8 +957,15 @@ def run_trial(
                     )
                     best_eval = eval_result
 
-                if decision.should_stop_now:
-                    completion_status = STATUS_BUDGET_EXCEEDED
+                # A cancellation request is honored at this same checkpoint
+                # boundary as a graceful budget-exceeded stop: the chunk
+                # just completed is still evaluated and checkpointed above,
+                # only the next chunk never starts. Cancellation takes
+                # priority in the unlikely event both fire on the same
+                # chunk -- it is the more specific, deliberate request.
+                cancelled = cancellation_requested(artifacts.directory)
+                if decision.should_stop_now or cancelled:
+                    completion_status = STATUS_CANCELLED if cancelled else STATUS_BUDGET_EXCEEDED
                     break
 
             if best_eval is None:
@@ -1046,7 +1056,11 @@ def run_trial(
             report_path = str(artifacts.directory / "experiment_report.json")
             _statistical_evaluation_module().write_experiment_report(report_path, experiment_report)
 
-        final_state = STATE_COMPLETED if completion_status == STATUS_COMPLETED else STATE_BUDGET_EXCEEDED
+        final_state = {
+            STATUS_COMPLETED: STATE_COMPLETED,
+            STATUS_BUDGET_EXCEEDED: STATE_BUDGET_EXCEEDED,
+            STATUS_CANCELLED: STATE_CANCELLED,
+        }[completion_status]
         transition(trial_state_path, final_state, reason=completion_status)
     except Exception as exc:
         transition(trial_state_path, STATE_FAILED, reason=f"{type(exc).__name__}: {exc}")

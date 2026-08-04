@@ -1862,106 +1862,6 @@ def _factory_slot_defaults(run_directory: Path, trial_spec: Mapping[str, Any]) -
     return family, tier
 
 
-def _factory_genome_value(training: Mapping[str, Any], dotted_path: str) -> Any:
-    """Read one declared genome field from a resolved training block."""
-    value: Any = training
-    for part in dotted_path.split("."):
-        if not isinstance(value, Mapping) or part not in value:
-            raise ValueError(f"resolved training block is missing declared genome field {dotted_path!r}")
-        value = value[part]
-    return value
-
-
-def _factory_present_genome_fields(
-    training: Mapping[str, Any], declared_fields: Sequence[str],
-) -> Tuple[str, ...]:
-    """Keep only schema-declared paths represented by this spec generation.
-
-    A schema can contain an inactive or not-yet-materialized optional field;
-    it is not a diversity dimension for a run that has no resolved value for
-    it.  The retained fields are still declared schema fields, never runtime
-    state or an inferred implementation detail.
-    """
-    present = []
-    for field in declared_fields:
-        try:
-            _factory_genome_value(training, field)
-        except ValueError:
-            continue
-        present.append(field)
-    if not present:
-        raise ValueError("no declared genome fields are present in the resolved training specification")
-    return tuple(present)
-
-
-def _factory_compute_ledger(run_directory: Path, *, seen: Optional[set[str]] = None) -> Any:
-    """Recover inclusive compute cost along the one checkpoint-donor lineage."""
-    from cognitive_runtime.training.model_factory.population import ComputeLedger
-
-    seen = set() if seen is None else set(seen)
-    run_id = run_directory.name
-    if run_id in seen:
-        raise ValueError(f"cycle while recovering compute lineage for {run_id!r}")
-    seen.add(run_id)
-    with (run_directory / "metrics" / "budget_report.json").open(encoding="utf-8") as handle:
-        budget = json.load(handle)
-    trial_compute = float(budget.get("total_trial_seconds", budget.get("measured_training_seconds", 0.0)))
-    lineage_path = run_directory / "lineage.json"
-    if not lineage_path.is_file():
-        return ComputeLedger.fresh(trial_compute)
-    with lineage_path.open(encoding="utf-8") as handle:
-        lineage = json.load(handle)
-    donor_run_id = lineage.get("weight_donor") or (lineage.get("parent") or {}).get("run_id")
-    if not donor_run_id:
-        return ComputeLedger.fresh(trial_compute)
-    return ComputeLedger.child(
-        trial_compute,
-        _factory_compute_ledger(run_directory.parent / str(donor_run_id), seen=seen),
-    )
-
-
-def _factory_population_candidate(
-    run_directory: Path,
-    *,
-    objective: str,
-    declared_genome_fields: Sequence[str],
-    gates: Optional[Mapping[str, bool]] = None,
-) -> Any:
-    """Build a validation-only D5 candidate from persisted run artifacts."""
-    from cognitive_runtime.training.model_factory.population import PopulationCandidate
-    from cognitive_runtime.training.model_factory.runner import _resolve_selection_metric
-
-    with (run_directory / "trial_spec.json").open(encoding="utf-8") as handle:
-        trial_spec = json.load(handle)
-    validation, ticks_per_frame = _factory_load_validation(run_directory)
-    primary_metric, _ = _resolve_selection_metric(validation, objective, ticks_per_frame)
-    retention_metric = float(primary_metric)
-    retention_path = run_directory / "metrics" / "retention.json"
-    if retention_path.is_file():
-        with retention_path.open(encoding="utf-8") as handle:
-            retention_payload = json.load(handle)
-        retention_metric = float(retention_payload["forgetting_amount"])
-    with (run_directory / "metrics" / "budget_report.json").open(encoding="utf-8") as handle:
-        budget = json.load(handle)
-    return PopulationCandidate(
-        run_id=run_directory.name,
-        resolved_spec={key: value for key, value in trial_spec.items() if key != "format"},
-        genome={
-            field: _factory_genome_value(trial_spec["training"], field)
-            for field in declared_genome_fields
-        },
-        primary_metric=float(primary_metric),
-        runtime=float(budget.get("total_trial_seconds", budget.get("measured_training_seconds", 0.0))),
-        # Generic dynamics has no separate report and retains its validation
-        # objective here. Navigation fine-tunes use the CI-refereed forgetting
-        # amount written by the runner instead.
-        retention_metric=retention_metric,
-        ledger=_factory_compute_ledger(run_directory),
-        gates=dict(gates or {}),
-        completion_status=str(budget.get("completion_status", "completed")),
-    )
-
-
 def _print_trial_result(result: Any) -> None:
     print(f"run_id: {result.run_id}")
     print(f"display_name: {result.display_name}")
@@ -2172,6 +2072,80 @@ def cmd_factory_clone(args: argparse.Namespace) -> None:
     _print_trial_result(result)
 
 
+def _factory_build_resume_spec(
+    parent_directory: Path, run_id: str, checkpoint: str = "last.pt",
+) -> Dict[str, Any]:
+    """Build a ``mode: resume`` spec that reopens ``run_id``'s own interrupted run.
+
+    Copies ``organism``/``data``/``model``/``training``/``evaluation``
+    verbatim from the run's own ``trial_spec.json`` -- resume must be an
+    exact continuation of the same architecture/data/training contracts,
+    never a modified sibling (``run_trial`` rebuilds the model from these
+    blocks and checks it against the checkpoint's own recorded contracts) --
+    and points ``parent`` at the run's own last checkpoint: ``last.pt``
+    carries the resumable trainer state (epoch, optimizer, RNG);
+    ``best-validation.pt`` does not, so resume never defaults to it.
+    """
+    with (parent_directory / "trial_spec.json").open(encoding="utf-8") as handle:
+        original_spec = json.load(handle)
+
+    from cognitive_runtime.training.model_factory.checkpoint import read_factory_checkpoint_metadata
+
+    checkpoint_path = parent_directory / "checkpoints" / checkpoint
+    try:
+        checkpoint_meta = read_factory_checkpoint_metadata(str(checkpoint_path))
+    except OSError as exc:
+        sys.exit(f"cannot read checkpoint metadata at {checkpoint_path}: {exc}")
+
+    return {
+        "organism": original_spec["organism"],
+        "mode": "resume",
+        "data": original_spec["data"],
+        "model": original_spec["model"],
+        "training": original_spec["training"],
+        "evaluation": original_spec["evaluation"],
+        "parent": {
+            "run_id": run_id,
+            "checkpoint": checkpoint,
+            "sha256": checkpoint_meta.get("checkpoint_sha256"),
+        },
+    }
+
+
+def cmd_factory_resume(args: argparse.Namespace) -> None:
+    """``ccr factory resume <run>``: reopen an interrupted run's own directory
+    and continue training from its last checkpoint.
+
+    Unlike clone/fine_tune, a resume is not a new run: it appends to the
+    same ``run_id``, and none of its immutable manifests (``trial_spec.json``
+    included) are rewritten -- only read back (epic #212 Sec 11/16).
+    ``run_trial`` itself is what decides whether this run is a legitimate
+    resume target (an active state with a stale heartbeat); this command
+    does not duplicate that check, it only lets the error surface.
+    """
+    parent_directory = _factory_run_directory(args.root, args.run, args.organism)
+    resume_doc = _factory_build_resume_spec(parent_directory, args.run)
+
+    from cognitive_runtime.training.model_factory.spec import SpecError, resolve
+
+    try:
+        resolved = resolve(resume_doc)
+    except SpecError as exc:
+        sys.exit(f"invalid resume: {exc}")
+
+    try:
+        from cognitive_runtime.training.model_factory.runner import run_trial
+
+        result = run_trial(
+            resolved, root=args.root, corpus_root=args.corpus_root,
+            export_predictions=not args.no_export_predictions,
+            export_predictions_max_episodes=args.export_predictions_max,
+        )
+    except ImportError as exc:
+        sys.exit(f"'ccr factory resume' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+    _print_trial_result(result)
+
+
 def cmd_factory_breed(args: argparse.Namespace) -> None:
     """Breed two compatible completed runs and optionally launch the child.
 
@@ -2328,8 +2302,6 @@ def cmd_factory_promote(args: argparse.Namespace) -> None:
     selection metric."""
     from cognitive_runtime.training.model_factory.checkpoint import read_factory_checkpoint_metadata
     from cognitive_runtime.training.model_factory.corpus import resolve_corpus
-    from cognitive_runtime.training.model_factory.genome import GENERIC_ACTION_EFFECTS_V1
-    from cognitive_runtime.training.model_factory.population import PopulationPolicy
     from cognitive_runtime.training.model_factory.promotion import (
         PromotionPolicy,
         TestConfirmation,
@@ -2338,9 +2310,9 @@ def cmd_factory_promote(args: argparse.Namespace) -> None:
     from cognitive_runtime.training.model_factory.registry import (
         GOAL_NAVIGATION_V1,
         RegistryError,
+        assemble_population_candidates,
         hold,
         leading_champion,
-        population,
         promote,
     )
     from cognitive_runtime.training.model_factory.runner import _resolve_selection_metric
@@ -2446,26 +2418,11 @@ def cmd_factory_promote(args: argparse.Namespace) -> None:
         checkpoint_meta = read_factory_checkpoint_metadata(str(checkpoint_path))
         validation_payload, ticks_per_frame = _factory_load_validation(run_directory)
         metric_value, _ = _resolve_selection_metric(validation_payload, objective, ticks_per_frame)
-        population_policy = PopulationPolicy(declared_genome_fields=_factory_present_genome_fields(
-            trial_spec["training"], GENERIC_ACTION_EFFECTS_V1.gene_names,
-        ))
-        existing_members = population(
+        population_policy, candidates = assemble_population_candidates(
             registry_root, family=family, tier=tier, objective=objective,
+            new_run_directory=run_directory, new_run_id=args.run,
+            new_run_gates={gate.name: gate.passed for gate in verdict.gates},
         )
-        candidates = [
-            _factory_population_candidate(
-                registry_root / entry.run_id,
-                objective=objective,
-                declared_genome_fields=population_policy.declared_genome_fields,
-            )
-            for entry in existing_members if entry.run_id != args.run
-        ]
-        candidates.append(_factory_population_candidate(
-            run_directory,
-            objective=objective,
-            declared_genome_fields=population_policy.declared_genome_fields,
-            gates={gate.name: gate.passed for gate in verdict.gates},
-        ))
         candidate_ledger = candidates[-1].ledger
         slot = promote(
             registry_root, family=family, tier=tier, objective=objective, run_id=args.run,
@@ -3380,6 +3337,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_factory_clone.add_argument("--no-export-predictions", action="store_true",
                                  help="skip the clinic prediction export")
     p_factory_clone.set_defaults(func=cmd_factory_clone)
+
+    p_factory_resume = factory_sub.add_parser(
+        "resume", help="reopen an interrupted run's own directory and continue training "
+                       "from its last checkpoint"
+    )
+    p_factory_resume.add_argument("run", help="run id to resume (must be active with a stale heartbeat)")
+    p_factory_resume.add_argument("--organism", default=None,
+                                  help="run's organism, only needed if the run id is ambiguous "
+                                       "across organisms under --root")
+    p_factory_resume.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                  help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_resume.add_argument("--corpus-root", default=None,
+                                  help=f"corpora root directory (default: {_FACTORY_CORPORA_ROOT_DEFAULT!r})")
+    p_factory_resume.add_argument("--export-predictions-max", type=int, default=3, metavar="N",
+                                  help="clinic (viewer/) prediction export: up to N validation episodes "
+                                       "from the promoted checkpoint (default: 3)")
+    p_factory_resume.add_argument("--no-export-predictions", action="store_true",
+                                  help="skip the clinic prediction export")
+    p_factory_resume.set_defaults(func=cmd_factory_resume)
 
     p_factory_breed = factory_sub.add_parser(
         "breed", help="breed two compatible completed runs and launch one explicit-lineage child"

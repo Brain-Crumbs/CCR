@@ -28,12 +28,17 @@ from cognitive_runtime.training.model_factory.state import (
     IllegalTransitionError,
     IncompleteRunError,
     StateError,
+    cancel_request_path,
+    cancellation_requested,
     create_state,
     heartbeat_path,
     is_stale,
     load_state,
+    reconcile_after_kill,
+    reconcile_stale_runs,
     recover_stale_worker,
     release_devices,
+    request_cancellation,
     require_completed_for_promotion,
     reserve_devices,
     retry_failed_run,
@@ -381,6 +386,129 @@ def test_a_sigkilled_worker_is_classified_stale_by_the_watchdog_and_never_comple
 
     with pytest.raises(IllegalTransitionError):
         transition(state_file, STATE_COMPLETED)
+
+
+# --------------------------------------------------------------------- stale-run sweep
+
+
+def _make_active_run(root, organism, run_id, *, heartbeat_age_seconds=0.0, timeout_seconds=300.0):
+    directory = root / organism / run_id
+    path = state_path(directory)
+    create_state(path, run_id, heartbeat_timeout_seconds=timeout_seconds)
+    transition(path, STATE_RUNNING)
+    write_heartbeat(heartbeat_path(directory), run_id=run_id, clock=lambda: time.time() - heartbeat_age_seconds)
+    return directory
+
+
+def test_reconcile_stale_runs_fails_only_the_stale_ones_across_an_organism(tmp_path):
+    root = tmp_path / "runs"
+    stale_dir = _make_active_run(root, "Org", "stale-run", heartbeat_age_seconds=10_000, timeout_seconds=300.0)
+    fresh_dir = _make_active_run(root, "Org", "fresh-run", heartbeat_age_seconds=0.0, timeout_seconds=300.0)
+
+    # A queued run (no worker expected yet) and a run directory with no
+    # state.json at all (not yet allocated) must never be touched, and must
+    # never make the sweep raise.
+    queued_path = state_path(root / "Org" / "queued-run")
+    create_state(queued_path, "queued-run", heartbeat_timeout_seconds=300.0)
+    (root / "Org" / "not-a-run-yet").mkdir(parents=True)
+
+    recovered = reconcile_stale_runs(root, "Org")
+
+    assert [state.run_id for state in recovered] == ["stale-run"]
+    assert load_state(state_path(stale_dir)).state == STATE_FAILED
+    assert load_state(state_path(stale_dir)).reason == "stale_worker_watchdog_timeout"
+    assert load_state(state_path(fresh_dir)).state == STATE_RUNNING
+    assert load_state(queued_path).state == STATE_QUEUED
+
+
+def test_reconcile_stale_runs_is_a_no_op_for_an_organism_with_no_runs_yet(tmp_path):
+    assert reconcile_stale_runs(tmp_path / "runs", "NoSuchOrganism") == ()
+
+
+def test_reconcile_stale_runs_is_idempotent(tmp_path):
+    root = tmp_path / "runs"
+    _make_active_run(root, "Org", "stale-run", heartbeat_age_seconds=10_000, timeout_seconds=300.0)
+
+    first_pass = reconcile_stale_runs(root, "Org")
+    second_pass = reconcile_stale_runs(root, "Org")
+
+    assert [state.run_id for state in first_pass] == ["stale-run"]
+    # Already-failed by the first pass: the second pass finds nothing left
+    # to recover, exactly recover_stale_worker's own no-op-on-terminal rule.
+    assert second_pass == ()
+
+
+# --------------------------------------------------------------------- cancellation
+
+
+def test_cancellation_is_not_requested_until_asked(tmp_path):
+    assert cancellation_requested(tmp_path) is False
+
+
+def test_request_cancellation_writes_a_flag_the_run_directory_can_be_polled_for(tmp_path):
+    request_cancellation(tmp_path, reason="operator requested stop")
+    assert cancellation_requested(tmp_path) is True
+    assert cancel_request_path(tmp_path).is_file()
+
+    payload = json.loads(cancel_request_path(tmp_path).read_text())
+    assert payload["reason"] == "operator requested stop"
+    assert payload["requested_at"]
+
+
+def test_request_cancellation_is_idempotent(tmp_path):
+    request_cancellation(tmp_path, reason="first")
+    first_payload = json.loads(cancel_request_path(tmp_path).read_text())
+    request_cancellation(tmp_path, reason="second")
+    second_payload = json.loads(cancel_request_path(tmp_path).read_text())
+
+    assert cancellation_requested(tmp_path) is True
+    assert first_payload["reason"] == "first"
+    assert second_payload["reason"] == "second"
+
+
+def test_reconcile_after_kill_fails_a_running_trial_by_default(tmp_path):
+    path = state_path(tmp_path)
+    create_state(path, "run-a")
+    transition(path, STATE_RUNNING)
+
+    reconciled = reconcile_after_kill(path)
+
+    assert reconciled is not None
+    assert reconciled.state == STATE_FAILED
+    assert reconciled.reason == "killed_by_operator"
+
+
+def test_reconcile_after_kill_can_target_cancelled_to_enforce_a_prior_request(tmp_path):
+    path = state_path(tmp_path)
+    create_state(path, "run-a")
+    transition(path, STATE_RUNNING)
+    transition(path, STATE_CHECKPOINTING)
+
+    reconciled = reconcile_after_kill(path, to_state=STATE_CANCELLED, reason="cancel_requested_forced")
+
+    assert reconciled is not None
+    assert reconciled.state == STATE_CANCELLED
+    assert reconciled.reason == "cancel_requested_forced"
+
+
+def test_reconcile_after_kill_is_a_no_op_for_a_non_active_run(tmp_path):
+    path = state_path(tmp_path)
+    create_state(path, "run-a")
+    transition(path, STATE_RUNNING)
+    transition(path, STATE_COMPLETED)
+
+    assert reconcile_after_kill(path) is None
+    # A no-op must never disturb the terminal record it declined to touch.
+    assert load_state(path).state == STATE_COMPLETED
+
+
+def test_reconcile_after_kill_rejects_a_non_terminal_target_state(tmp_path):
+    path = state_path(tmp_path)
+    create_state(path, "run-a")
+    transition(path, STATE_RUNNING)
+
+    with pytest.raises(StateError):
+        reconcile_after_kill(path, to_state=STATE_RUNNING)
 
 
 # --------------------------------------------------------------------- AC3: concurrent writers

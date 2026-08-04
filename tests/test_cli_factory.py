@@ -195,6 +195,7 @@ FACTORY_DISPATCH = [
     (["factory", "baseline", "spec.yaml"], "cmd_factory_baseline"),
     (["factory", "search", "spec.yaml"], "cmd_factory_search"),
     (["factory", "clone", "some-run"], "cmd_factory_clone"),
+    (["factory", "resume", "some-run"], "cmd_factory_resume"),
     (["factory", "breed", "parent-a", "parent-b"], "cmd_factory_breed"),
     (["factory", "compare", "run-a", "run-b"], "cmd_factory_compare"),
     (["factory", "promote", "some-run"], "cmd_factory_promote"),
@@ -218,6 +219,7 @@ HELP_ARGVS = [
     ["factory", "baseline", "--help"],
     ["factory", "search", "--help"],
     ["factory", "clone", "--help"],
+    ["factory", "resume", "--help"],
     ["factory", "breed", "--help"],
     ["factory", "compare", "--help"],
     ["factory", "promote", "--help"],
@@ -484,6 +486,52 @@ def test_factory_clone_rejects_unknown_nested_field_with_nearest_match(tmp_path)
         ])
     assert "corpus_i" in str(excinfo.value)
     assert "corpus_id" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------- resume
+
+
+def test_factory_build_resume_spec_reopens_the_same_run_from_its_last_checkpoint(tmp_path):
+    from cognitive_runtime.cli import _factory_build_resume_spec
+
+    root = tmp_path / "runs"
+    spec = _spec()
+    artifacts = _make_run(root, "crafter-baseline-0001", spec, state=STATE_RUNNING)
+    _write_checkpoint_metadata(artifacts, sha256="b" * 64, name="last.pt")
+
+    resume_doc = _factory_build_resume_spec(artifacts.directory, "crafter-baseline-0001")
+
+    assert resume_doc["mode"] == "resume"
+    assert resume_doc["organism"] == spec.organism
+    assert resume_doc["parent"] == {
+        "run_id": "crafter-baseline-0001", "checkpoint": "last.pt", "sha256": "b" * 64,
+    }
+
+    # The resume doc must itself resolve/validate cleanly -- run_trial calls
+    # resolve() on exactly this shape before it ever checks state.json -- and,
+    # once resolved, its data/model/training/evaluation blocks must be
+    # byte-identical to the original run's: resume requires an exact
+    # continuation of the same architecture/data/training contracts, never a
+    # modified sibling (run_trial rebuilds the model from these blocks and
+    # checks it against the checkpoint's own recorded contracts).
+    resolved = resolve(resume_doc)
+    assert resolved.mode == "resume"
+    assert resolved.parent == {"run_id": "crafter-baseline-0001", "checkpoint": "last.pt", "sha256": "b" * 64}
+    assert resolved.data == spec.data
+    assert resolved.model == spec.model
+    assert resolved.training == spec.training
+    assert resolved.evaluation == spec.evaluation
+
+
+def test_factory_resume_missing_last_checkpoint_is_a_concise_cli_error(tmp_path):
+    root = tmp_path / "runs"
+    _make_run(root, "crafter-baseline-0001", _spec(), state=STATE_RUNNING)
+    # No checkpoints/last.pt.json written -- only a genuinely interrupted
+    # run (one that reached at least one checkpoint chunk) is resumable.
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["factory", "resume", "--root", str(root), "crafter-baseline-0001", "--no-trace"])
+    assert "last.pt" in str(excinfo.value)
 
 
 # --------------------------------------------------------------------- compare / promote
