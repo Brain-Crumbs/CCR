@@ -1023,9 +1023,11 @@ def list_corpora(
             try:
                 with manifest_path.open(encoding="utf-8") as handle:
                     manifest = json.load(handle)
-                if manifest.get("format") != CORPUS_MANIFEST_FORMAT:
+                if not isinstance(manifest, Mapping) or manifest.get("format") != CORPUS_MANIFEST_FORMAT:
                     continue
-                sessions = manifest.get("sessions") or {}
+                sessions = manifest.get("sessions")
+                if not isinstance(sessions, Mapping):
+                    sessions = {}
                 corpora.append({
                     "corpus_id": str(manifest.get("corpus_id", corpus_dir.name)),
                     "organism": organism_dir.name,
@@ -1035,7 +1037,12 @@ def list_corpora(
                         for split in ("train", "validation", "test")
                     },
                 })
-            except (json.JSONDecodeError, OSError):
+            # A manifest that is valid JSON but the wrong shape (e.g. a
+            # top-level list, or a non-list session entry) must be skipped
+            # like any other corrupt/partial corpus directory, not abort
+            # the whole listing and hide every other corpus (Codex review,
+            # PR #277).
+            except (json.JSONDecodeError, OSError, TypeError, AttributeError):
                 continue
     return corpora
 

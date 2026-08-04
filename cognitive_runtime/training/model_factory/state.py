@@ -496,6 +496,53 @@ def recover_stale_worker(
         return updated
 
 
+def claim_stale_worker(
+    path: Union[str, Path],
+    heartbeat_file: Union[str, Path],
+    *,
+    run_id: str,
+    timeout_seconds: Optional[float] = None,
+    clock: Callable[[], float] = time.time,
+) -> TrialState:
+    """Atomically verify a run is a legitimate resume target and claim it
+    by writing a fresh heartbeat, all under one lock -- a resume path's
+    one write path, mirroring :func:`recover_stale_worker`'s locked
+    read-validate-write for the opposite outcome (claiming instead of
+    failing).
+
+    A resume must never check staleness and then write the claiming
+    heartbeat as two separate, unlocked steps: two concurrent resume
+    attempts could both observe the same stale heartbeat and both proceed
+    to train against the same run directory, corrupting it with
+    concurrent checkpoint/metrics writes. Locking the check and the claim
+    into one critical section closes that race -- whichever caller's claim
+    lands second re-validates staleness against the *first* claimant's
+    just-written heartbeat and is correctly refused here, never silently
+    doubled up downstream.
+
+    Raises :class:`StateError` if the run is not active, or if its
+    heartbeat has not actually gone stale (the original worker, or a
+    concurrent resume attempt, may still be alive). ``timeout_seconds``
+    follows :func:`is_stale`'s declared-timeout rule.
+    """
+    target = Path(path)
+    with _locked(_lock_path_for(target)):
+        current = load_state(target)
+        if current.state not in ACTIVE_STATES:
+            raise StateError(
+                f"cannot resume run {current.run_id!r}: trial state is {current.state!r}, "
+                "not an active (interrupted) run"
+            )
+        if not is_stale(current, heartbeat_file, timeout_seconds=timeout_seconds, clock=clock):
+            raise StateError(
+                f"cannot resume run {current.run_id!r}: its heartbeat is still current, so the "
+                "original worker (or a concurrent resume attempt) may still be running; wait for "
+                "its watchdog timeout (or fail it explicitly via recover_stale_worker) before resuming"
+            )
+        write_heartbeat(heartbeat_file, run_id=run_id, clock=clock)
+        return current
+
+
 def reconcile_stale_runs(
     root: Union[str, Path], organism: str, *, clock: Callable[[], float] = time.time,
 ) -> Tuple[TrialState, ...]:
@@ -685,6 +732,7 @@ __all__ = [
     "heartbeat_age_seconds",
     "is_stale",
     "recover_stale_worker",
+    "claim_stale_worker",
     "reconcile_stale_runs",
     "reconcile_after_kill",
     "require_completed_for_promotion",

@@ -77,17 +77,16 @@ from cognitive_runtime.training.model_factory.spec import ExperimentSpec
 from cognitive_runtime.training.model_factory.spec import resolve as resolve_spec
 from cognitive_runtime.training.model_factory.spec import validate as validate_spec
 from cognitive_runtime.training.model_factory.state import (
-    ACTIVE_STATES,
     STATE_BUDGET_EXCEEDED,
     STATE_CANCELLED,
     STATE_COMPLETED,
     STATE_FAILED,
     STATE_RUNNING,
+    StateError,
     cancellation_requested,
+    claim_stale_worker,
     create_state,
     heartbeat_path,
-    is_stale,
-    load_state,
     release_devices,
     reserve_devices,
     state_path,
@@ -821,30 +820,19 @@ def run_trial(
         # for a resume to pick back up (epic #212 §16; state.py's own
         # module docstring: a stale/failed record is never silently
         # reopened, only a still-active one is a legitimate resume target).
-        existing_state = load_state(trial_state_path)
-        if existing_state.state not in ACTIVE_STATES:
-            raise ValueError(
-                f"cannot resume run {artifacts.run_id!r}: trial state is "
-                f"{existing_state.state!r}, not an active (interrupted) run"
-            )
-        # An active state alone does not distinguish an interrupted worker
-        # from one that is still training: a fresh heartbeat means the
-        # original worker is (or very recently was) alive, and racing it
-        # with a second resumed worker would let both write the same
-        # checkpoints/state concurrently. Only a heartbeat that has actually
-        # exceeded its declared watchdog timeout is a legitimate resume
-        # target (mirrors what recover_stale_worker checks before failing
-        # a run, just without writing that failed transition itself).
-        if not is_stale(existing_state, trial_heartbeat_path):
-            raise ValueError(
-                f"cannot resume run {artifacts.run_id!r}: its heartbeat is still current, "
-                "so the original worker may still be running; wait for its watchdog "
-                "timeout (or fail it explicitly via recover_stale_worker) before resuming"
-            )
+        # claim_stale_worker checks staleness and claims the run (by
+        # writing a fresh heartbeat) as one locked critical section, so two
+        # concurrent resume attempts can never both pass the check and both
+        # proceed to train against the same run directory (Codex review,
+        # PR #277).
+        try:
+            claim_stale_worker(trial_state_path, trial_heartbeat_path, run_id=artifacts.run_id)
+        except StateError as exc:
+            raise ValueError(str(exc)) from exc
     else:
         create_state(trial_state_path, artifacts.run_id, heartbeat_timeout_seconds=resolved_heartbeat_timeout)
         transition(trial_state_path, STATE_RUNNING)
-    write_heartbeat(trial_heartbeat_path, run_id=artifacts.run_id)
+        write_heartbeat(trial_heartbeat_path, run_id=artifacts.run_id)
 
     try:
         if devices:

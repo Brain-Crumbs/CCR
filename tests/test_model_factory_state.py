@@ -30,6 +30,7 @@ from cognitive_runtime.training.model_factory.state import (
     StateError,
     cancel_request_path,
     cancellation_requested,
+    claim_stale_worker,
     create_state,
     heartbeat_path,
     is_stale,
@@ -511,6 +512,47 @@ def test_reconcile_after_kill_rejects_a_non_terminal_target_state(tmp_path):
         reconcile_after_kill(path, to_state=STATE_RUNNING)
 
 
+# --------------------------------------------------------------------- claim_stale_worker (resume)
+
+
+def test_claim_stale_worker_rejects_a_non_active_run(tmp_path):
+    path = state_path(tmp_path)
+    heartbeat_file = heartbeat_path(tmp_path)
+    create_state(path, "run-a")
+
+    with pytest.raises(StateError, match="not an active"):
+        claim_stale_worker(path, heartbeat_file, run_id="run-a")
+
+
+def test_claim_stale_worker_rejects_a_run_whose_heartbeat_is_still_current(tmp_path):
+    path = state_path(tmp_path)
+    heartbeat_file = heartbeat_path(tmp_path)
+    create_state(path, "run-a", heartbeat_timeout_seconds=300.0)
+    transition(path, STATE_RUNNING)
+    write_heartbeat(heartbeat_file, run_id="run-a")
+
+    with pytest.raises(StateError, match="still current"):
+        claim_stale_worker(path, heartbeat_file, run_id="run-a")
+    # A refused claim must never itself refresh the heartbeat -- that would
+    # let a second, equally-unentitled caller believe it just claimed a
+    # live run.
+    assert is_stale(load_state(path), heartbeat_file, timeout_seconds=300.0) is False
+
+
+def test_claim_stale_worker_claims_a_genuinely_stale_run_by_refreshing_its_heartbeat(tmp_path):
+    path = state_path(tmp_path)
+    heartbeat_file = heartbeat_path(tmp_path)
+    create_state(path, "run-a", heartbeat_timeout_seconds=300.0)
+    transition(path, STATE_RUNNING)
+    write_heartbeat(heartbeat_file, run_id="run-a", clock=lambda: time.time() - 10_000)
+    assert is_stale(load_state(path), heartbeat_file, timeout_seconds=300.0) is True
+
+    claimed = claim_stale_worker(path, heartbeat_file, run_id="run-a")
+
+    assert claimed.state == STATE_RUNNING
+    assert is_stale(claimed, heartbeat_file, timeout_seconds=300.0) is False
+
+
 # --------------------------------------------------------------------- AC3: concurrent writers
 
 
@@ -599,6 +641,94 @@ def test_concurrent_transition_from_two_real_subprocesses_is_serialized(tmp_path
     assert final.state == STATE_RUNNING
     transitions_to_running = [e for e in final.history if e["to"] == STATE_RUNNING]
     assert len(transitions_to_running) == 1
+
+
+_CLAIM_RACE_WORKER_SCRIPT = textwrap.dedent(
+    """
+    import sys, time
+    sys.path.insert(0, {path!r})
+    from cognitive_runtime.training.model_factory.state import claim_stale_worker
+
+    state_file = {state_file!r}
+    heartbeat_file = {heartbeat_file!r}
+    ready_file = {ready_file!r}
+    go_file = {go_file!r}
+    out_file = {out_file!r}
+
+    with open(ready_file, "w") as handle:
+        handle.write("ready")
+    deadline = time.monotonic() + 30.0
+    while not __import__("os").path.exists(go_file):
+        if time.monotonic() > deadline:
+            raise SystemExit("timed out waiting for go file")
+        pass
+
+    result = {{}}
+    try:
+        claim_stale_worker(state_file, heartbeat_file, run_id="run-a")
+        result["ok"] = True
+    except Exception as exc:  # noqa: BLE001
+        result["ok"] = False
+        result["error"] = f"{{type(exc).__name__}}: {{exc}}"
+
+    import json
+    with open(out_file, "w") as handle:
+        json.dump(result, handle)
+    """
+)
+
+
+def test_concurrent_resume_claims_from_two_real_subprocesses_only_one_wins(tmp_path):
+    """Codex review (PR #277): two operators resuming the same stale run at
+    the same time must not both proceed to train against it -- the
+    check-then-claim (verify staleness, then write the claiming heartbeat)
+    must be one atomic, locked operation, never two separate unlocked
+    steps a second racer could slip between."""
+    repo_root = str(__import__("pathlib").Path(__file__).resolve().parents[1])
+    state_file = tmp_path / "state.json"
+    heartbeat_file = tmp_path / "heartbeat.json"
+    create_state(state_file, "run-a", heartbeat_timeout_seconds=300.0)
+    transition(state_file, STATE_RUNNING)
+    write_heartbeat(heartbeat_file, run_id="run-a", clock=lambda: time.time() - 10_000)
+
+    procs = []
+    outcomes = []
+    for label in ("a", "b"):
+        ready_file = tmp_path / f"claim-ready-{label}"
+        go_file = tmp_path / "claim-go"
+        out_file = tmp_path / f"claim-out-{label}.json"
+        script = _CLAIM_RACE_WORKER_SCRIPT.format(
+            path=repo_root, state_file=str(state_file), heartbeat_file=str(heartbeat_file),
+            ready_file=str(ready_file), go_file=str(go_file), out_file=str(out_file),
+        )
+        proc = subprocess.Popen([sys.executable, "-c", script])
+        procs.append(proc)
+        outcomes.append((ready_file, out_file))
+
+    deadline = time.monotonic() + 30.0
+    for ready_file, _out_file in outcomes:
+        while not ready_file.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    (tmp_path / "claim-go").write_text("go", encoding="utf-8")
+
+    for proc in procs:
+        assert proc.wait(timeout=30) == 0
+
+    results = []
+    for _ready_file, out_file in outcomes:
+        assert out_file.exists()
+        results.append(json.loads(out_file.read_text(encoding="utf-8")))
+
+    successes = [r for r in results if r["ok"]]
+    failures = [r for r in results if not r["ok"]]
+    assert len(successes) == 1, results
+    assert len(failures) == 1, results
+    assert "StateError" in failures[0]["error"], results
+
+    # The claimed run is still running, ready for exactly one resumed
+    # worker to train it -- the loser must never have touched state.json.
+    assert load_state(state_file).state == STATE_RUNNING
 
 
 def test_concurrent_create_state_is_also_serialized(tmp_path):
