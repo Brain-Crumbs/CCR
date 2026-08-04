@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -33,13 +34,17 @@ import pytest
 from cognitive_runtime.cli import build_parser, main
 from cognitive_runtime.training.model_factory.artifacts import RunArtifacts, allocate_run_artifacts
 from cognitive_runtime.training.model_factory.contracts import ArchitectureContract, DataContract, TrainingContract
-from cognitive_runtime.training.model_factory.spec import ExperimentSpec, resolve
+from cognitive_runtime.training.model_factory.spec import ExperimentSpec, dump_canonical_json, resolve
 from cognitive_runtime.training.model_factory.state import (
     STATE_COMPLETED,
     STATE_RUNNING,
+    cancel_request_path,
     create_state,
+    heartbeat_path,
+    load_state,
     state_path,
     transition,
+    write_heartbeat,
 )
 
 
@@ -391,6 +396,112 @@ def test_factory_breed_dry_run_prints_explicit_parent_and_weight_donor_lineage(t
     ]
 
 
+def _fake_trial_result(run_id, directory):
+    """A run_trial() stand-in shaped just enough for _print_trial_result --
+    used to test CLI wiring (argument threading) without importing torch."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        run_id=run_id, display_name="fake-display", mode="fresh", state="completed", directory=directory,
+        architecture_hash="a" * 8, data_contract_hash="b" * 8, training_contract_hash="c" * 8,
+        checkpoint_path=str(directory / "checkpoints" / "best-validation.pt"), checkpoint_sha256="d" * 64,
+        training_stats={}, evaluation={}, budget_report={}, comparison=None, experiment_report_path=None,
+    )
+
+
+def test_factory_baseline_passes_an_explicit_run_id_through_to_run_trial(tmp_path, capsys, monkeypatch):
+    """--run-id (added alongside Phase 2's job registry, which must be able
+    to precompute a launched job's run id before run_trial's own
+    auto-naming would otherwise decide it) threads straight through."""
+    import cognitive_runtime.training.model_factory.runner as runner_module
+
+    captured = {}
+
+    def fake_run_trial(spec, **kwargs):
+        captured.update(kwargs)
+        return _fake_trial_result(kwargs.get("run_id") or "auto-named", tmp_path)
+
+    monkeypatch.setattr(runner_module, "run_trial", fake_run_trial)
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_bytes(dump_canonical_json(_spec()))
+
+    main(["factory", "baseline", str(spec_path), "--factory-run-id", "explicit-run-7", "--no-trace"])
+
+    assert captured["run_id"] == "explicit-run-7"
+    assert "run_id: explicit-run-7" in capsys.readouterr().out
+
+
+def test_factory_clone_passes_an_explicit_run_id_through_to_run_trial(tmp_path, monkeypatch):
+    import cognitive_runtime.training.model_factory.runner as runner_module
+
+    root = tmp_path / "runs"
+    artifacts = _make_run(root, "crafter-baseline-0001", _spec())
+    _write_checkpoint_metadata(artifacts)
+    captured = {}
+
+    def fake_run_trial(spec, **kwargs):
+        captured.update(kwargs)
+        return _fake_trial_result(kwargs.get("run_id") or "auto-named", tmp_path)
+
+    monkeypatch.setattr(runner_module, "run_trial", fake_run_trial)
+
+    main([
+        "factory", "clone", "--root", str(root), "crafter-baseline-0001",
+        "--factory-run-id", "clone-child-1", "--no-trace",
+    ])
+
+    assert captured["run_id"] == "clone-child-1"
+
+
+def test_factory_breed_passes_an_explicit_run_id_through_to_run_trial(tmp_path, monkeypatch):
+    import cognitive_runtime.training.model_factory.runner as runner_module
+
+    root = tmp_path / "runs"
+    base_doc = _spec().to_dict()
+    base_doc["training"] = dict(base_doc["training"])
+    base_doc["training"].update({
+        "max_training_seconds": 600.0,
+        "scheduled_sampling_p": 0.1,
+        "loss_weights": {
+            "closed_loop_pixel_loss_weight": 0.2,
+            "closed_loop_latent_loss_weight": 0.3,
+        },
+        "transition_balance_policy": {"stationary_cap": 0.4},
+    })
+    parent_a = _make_run(root, "parent-a", resolve(base_doc))
+    base_doc["training"]["optimizer"] = {"name": "adamw", "lr": 0.001, "weight_decay": 0.00001}
+    base_doc["training"]["scheduled_sampling_p"] = 0.4
+    parent_b = _make_run(root, "parent-b", resolve(base_doc))
+    for artifacts, sha in ((parent_a, "a" * 64), (parent_b, "b" * 64)):
+        _write_checkpoint_metadata(artifacts, sha256=sha)
+        _write_budget_report(artifacts, tier="fast")
+    captured = {}
+
+    def fake_run_trial(spec, **kwargs):
+        captured.update(kwargs)
+        run_id = kwargs.get("run_id") or "auto-named"
+        # cmd_factory_breed enriches lineage.json right after run_trial
+        # returns (record_breeding_lineage); a real run_trial call would
+        # have allocated it via allocate_run_artifacts, so this stand-in
+        # writes the same minimal stub.
+        child_directory = tmp_path / run_id
+        child_directory.mkdir(parents=True, exist_ok=True)
+        (child_directory / "lineage.json").write_text(json.dumps({
+            "format": "model-factory-lineage-v1", "mode": "clone", "parent": None,
+            "configuration_parents": ["parent-a", "parent-b"], "weight_donor": "parent-b",
+        }))
+        return _fake_trial_result(run_id, child_directory)
+
+    monkeypatch.setattr(runner_module, "run_trial", fake_run_trial)
+
+    main([
+        "factory", "breed", "parent-a", "parent-b", "--root", str(root),
+        "--seed", "19", "--weight-donor", "parent-b", "--factory-run-id", "bred-child-1", "--no-trace",
+    ])
+
+    assert captured["run_id"] == "bred-child-1"
+
+
 # --------------------------------------------------------------------- show
 
 
@@ -585,6 +696,57 @@ def test_factory_resume_missing_last_checkpoint_is_a_concise_cli_error(tmp_path)
     with pytest.raises(SystemExit) as excinfo:
         main(["factory", "resume", "--root", str(root), "crafter-baseline-0001", "--no-trace"])
     assert "last.pt" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------- cancel / reconcile
+
+
+def test_factory_cancel_writes_the_cancellation_flag(tmp_path, capsys):
+    root = tmp_path / "runs"
+    artifacts = _make_run(root, "crafter-baseline-0001", _spec(), state=STATE_RUNNING)
+
+    main(["factory", "cancel", "--root", str(root), "crafter-baseline-0001", "--reason", "operator requested"])
+
+    payload = json.loads(cancel_request_path(artifacts.directory).read_text())
+    assert payload["reason"] == "operator requested"
+    assert "cancellation requested" in capsys.readouterr().out
+
+
+def test_factory_cancel_unknown_run_is_a_concise_cli_error(tmp_path):
+    root = tmp_path / "runs"
+    with pytest.raises(SystemExit, match="run 'missing' was not found"):
+        main(["factory", "cancel", "--root", str(root), "missing"])
+
+
+def test_factory_reconcile_reports_recovered_runs_as_json(tmp_path, capsys):
+    root = tmp_path / "runs"
+    run_directory = root / "Crafter" / "stale-run"
+    run_directory.mkdir(parents=True)
+    create_state(state_path(run_directory), "stale-run", heartbeat_timeout_seconds=300.0)
+    transition(state_path(run_directory), STATE_RUNNING)
+    write_heartbeat(heartbeat_path(run_directory), run_id="stale-run", clock=lambda: time.time() - 10_000)
+
+    main(["factory", "reconcile", "--root", str(root), "Crafter"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["organism"] == "Crafter"
+    assert payload["recovered"] == [{"run_id": "stale-run", "reason": "stale_worker_watchdog_timeout"}]
+    assert load_state(state_path(run_directory)).state == "failed"
+
+
+def test_factory_reconcile_reports_nothing_when_no_run_is_stale(tmp_path, capsys):
+    root = tmp_path / "runs"
+    run_directory = root / "Crafter" / "fresh-run"
+    run_directory.mkdir(parents=True)
+    create_state(state_path(run_directory), "fresh-run", heartbeat_timeout_seconds=300.0)
+    transition(state_path(run_directory), STATE_RUNNING)
+    write_heartbeat(heartbeat_path(run_directory), run_id="fresh-run")
+
+    main(["factory", "reconcile", "--root", str(root), "Crafter"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["recovered"] == []
+    assert load_state(state_path(run_directory)).state == "running"
 
 
 # --------------------------------------------------------------------- compare / promote

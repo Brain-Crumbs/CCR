@@ -1899,6 +1899,7 @@ def cmd_factory_baseline(args: argparse.Namespace) -> None:
 
         result = run_trial(
             resolved, root=args.root, corpus_root=args.corpus_root, naming_seed=args.naming_seed,
+            run_id=args.factory_run_id,
             export_predictions=not args.no_export_predictions,
             export_predictions_max_episodes=args.export_predictions_max,
         )
@@ -2084,6 +2085,7 @@ def cmd_factory_clone(args: argparse.Namespace) -> None:
 
         result = run_trial(
             resolved, root=args.root, corpus_root=args.corpus_root, naming_seed=args.naming_seed,
+            run_id=args.factory_run_id,
             export_predictions=not args.no_export_predictions,
             export_predictions_max_episodes=args.export_predictions_max,
         )
@@ -2164,6 +2166,44 @@ def cmd_factory_resume(args: argparse.Namespace) -> None:
     except ImportError as exc:
         sys.exit(f"'ccr factory resume' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
     _print_trial_result(result)
+
+
+def cmd_factory_cancel(args: argparse.Namespace) -> None:
+    """``ccr factory cancel <run>``: ask a running/checkpointing trial to
+    stop gracefully at its next checkpoint boundary.
+
+    A plain flag file (``state.request_cancellation``) -- the trial's own
+    training loop is what notices it and transitions to ``cancelled``; this
+    command never touches ``state.json`` directly, and is a no-op (not an
+    error) even if the run has already finished, since a terminal run never
+    reads the flag again. Pure Python, no torch import, so this always
+    works even without the ``neural`` extra installed.
+    """
+    from cognitive_runtime.training.model_factory.state import request_cancellation
+
+    run_directory = _factory_run_directory(args.root, args.run, args.organism)
+    request_cancellation(run_directory, reason=args.reason)
+    print(f"cancellation requested for {args.run!r}; it will stop at its next checkpoint boundary")
+
+
+def cmd_factory_reconcile(args: argparse.Namespace) -> None:
+    """``ccr factory reconcile <organism>``: sweep every run under
+    ``<organism>`` and fail any whose worker has gone stale -- a heartbeat
+    past its declared watchdog timeout (``state.reconcile_stale_runs``).
+
+    Exposed as its own command so a control plane (or a cron-style sweep)
+    can trigger this opportunistically without reimplementing the
+    staleness check itself. A no-op for every run whose heartbeat is still
+    current, so calling this liberally is cheap and safe.
+    """
+    from cognitive_runtime.training.model_factory.state import reconcile_stale_runs
+
+    recovered = reconcile_stale_runs(args.root, args.organism)
+    payload = {
+        "organism": args.organism,
+        "recovered": [{"run_id": state.run_id, "reason": state.reason} for state in recovered],
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def cmd_factory_breed(args: argparse.Namespace) -> None:
@@ -2248,7 +2288,7 @@ def cmd_factory_breed(args: argparse.Namespace) -> None:
 
         result = run_trial(
             breeding.child_spec, root=args.root, corpus_root=args.corpus_root,
-            naming_seed=args.naming_seed,
+            naming_seed=args.naming_seed, run_id=args.factory_run_id,
             export_predictions=not args.no_export_predictions,
             export_predictions_max_episodes=args.export_predictions_max,
         )
@@ -3280,6 +3320,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_factory_baseline.add_argument("--naming-seed", default=None,
                                     help="seed the run's cosmetic display name deterministically "
                                          "(default: a fresh random seed)")
+    p_factory_baseline.add_argument("--factory-run-id", default=None,
+                                    help="explicit Model Factory run id (default: auto-generated) -- "
+                                         "distinct from the global --run-id, which only names this "
+                                         "invocation's trace directory. Lets a caller that must know the "
+                                         "run id before launch completes -- e.g. the clinic control plane "
+                                         "-- precompute it")
     p_factory_baseline.add_argument("--export-predictions-max", type=int, default=3, metavar="N",
                                     help="clinic (viewer/) prediction export: up to N validation episodes "
                                          "from the promoted checkpoint (default: 3)")
@@ -3358,6 +3404,11 @@ def build_parser() -> argparse.ArgumentParser:
                                  help=f"corpora root directory (default: {_FACTORY_CORPORA_ROOT_DEFAULT!r})")
     p_factory_clone.add_argument("--naming-seed", default=None,
                                  help="seed the child's cosmetic display name deterministically")
+    p_factory_clone.add_argument("--factory-run-id", default=None,
+                                 help="explicit Model Factory run id (default: auto-generated) -- distinct "
+                                      "from the global --run-id, which only names this invocation's trace "
+                                      "directory. Lets a caller that must know the run id before launch "
+                                      "completes -- e.g. the clinic control plane -- precompute it")
     p_factory_clone.add_argument("--export-predictions-max", type=int, default=3, metavar="N",
                                  help="clinic (viewer/) prediction export: up to N validation episodes "
                                       "from the promoted checkpoint (default: 3)")
@@ -3383,6 +3434,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_factory_resume.add_argument("--no-export-predictions", action="store_true",
                                   help="skip the clinic prediction export")
     p_factory_resume.set_defaults(func=cmd_factory_resume)
+
+    p_factory_cancel = factory_sub.add_parser(
+        "cancel", help="ask a running/checkpointing trial to stop gracefully at its next checkpoint boundary"
+    )
+    p_factory_cancel.add_argument("run", help="run id to cancel")
+    p_factory_cancel.add_argument("--organism", default=None,
+                                  help="run's organism, only needed if the run id is ambiguous "
+                                       "across organisms under --root")
+    p_factory_cancel.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                  help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_cancel.add_argument("--reason", default=None,
+                                  help="optional operator-facing reason recorded in the cancellation flag")
+    p_factory_cancel.set_defaults(func=cmd_factory_cancel)
+
+    p_factory_reconcile = factory_sub.add_parser(
+        "reconcile", help="sweep an organism's runs and fail any whose worker has gone stale"
+    )
+    p_factory_reconcile.add_argument("organism", help="organism to sweep")
+    p_factory_reconcile.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                     help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_reconcile.set_defaults(func=cmd_factory_reconcile)
 
     p_factory_breed = factory_sub.add_parser(
         "breed", help="breed two compatible completed runs and launch one explicit-lineage child"
@@ -3421,6 +3493,11 @@ def build_parser() -> argparse.ArgumentParser:
                                  help=f"corpora root directory (default: {_FACTORY_CORPORA_ROOT_DEFAULT!r})")
     p_factory_breed.add_argument("--naming-seed", default=None,
                                  help="seed the child's cosmetic display name deterministically")
+    p_factory_breed.add_argument("--factory-run-id", default=None,
+                                 help="explicit Model Factory run id (default: auto-generated) -- distinct "
+                                      "from the global --run-id, which only names this invocation's trace "
+                                      "directory. Lets a caller that must know the run id before launch "
+                                      "completes -- e.g. the clinic control plane -- precompute it")
     p_factory_breed.add_argument("--export-predictions-max", type=int, default=3, metavar="N",
                                  help="clinic prediction export episode limit (default: 3)")
     p_factory_breed.add_argument("--no-export-predictions", action="store_true",
