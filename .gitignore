@@ -14,4 +14,6 @@ node_modules/
 package-lock.json
 **/episode_cache/
 **/corpora/
+!specs/corpora/
+!specs/corpora/*.yaml
 *_worktrees/

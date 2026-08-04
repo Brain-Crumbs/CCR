@@ -346,6 +346,61 @@ def _write_clinic_session_index(
     atomic_write_json(directory / "clinic_sessions.json", {"format": "clinic-session-index-v1", "sessions": entries})
 
 
+def _validate_temporal_capability(
+    dataset: Any,
+    horizons_ticks: Sequence[int],
+    *,
+    warmup_frames: int,
+    rollout_frames: int = 0,
+    purpose: str,
+) -> None:
+    """Reject recorded sequences that cannot support a trial's time offsets.
+
+    The corpus owns frames, recorded tick values, and episode boundaries. The
+    experiment owns horizons. This check joins those facts after dataset load,
+    without requiring the corpus to advertise the same horizon topology.
+    """
+    horizons = tuple(int(value) for value in horizons_ticks)
+    if not dataset.episodes:
+        raise ValueError(f"{purpose} corpus contains no recorded episodes")
+    horizon_frames = _action_world_model_module().horizons_ticks_to_frames(
+        horizons, dataset.ticks_per_frame,
+    )
+    max_horizon_ticks = max(horizons)
+    max_horizon_frames = max(horizon_frames)
+    too_short: list[str] = []
+    invalid_ticks: list[str] = []
+    for episode in dataset.episodes:
+        source = f"{episode.session_dir}/{episode.episode_id}"
+        frame_count = len(episode.frames)
+        if len(episode.ticks) != frame_count or any(
+            right < left for left, right in zip(episode.ticks, episode.ticks[1:])
+        ):
+            invalid_ticks.append(source)
+            continue
+        tick_span = episode.ticks[-1] - episode.ticks[0] if len(episode.ticks) >= 2 else 0
+        required_frames = warmup_frames + max_horizon_frames
+        if purpose == "training":
+            required_frames = max(required_frames, warmup_frames + rollout_frames)
+        # Evaluators/trainers use a strict `n > offset + warmup` window so
+        # equality still supplies no valid starting index.
+        if frame_count <= required_frames or tick_span < max_horizon_ticks:
+            too_short.append(
+                f"{source} (frames={frame_count}, tick_span={tick_span})"
+            )
+    if invalid_ticks:
+        raise ValueError(
+            f"{purpose} corpus has missing or non-monotonic recorded tick indexes: "
+            + ", ".join(invalid_ticks)
+        )
+    if too_short:
+        raise ValueError(
+            f"{purpose} corpus cannot support trial horizons {list(horizons)!r} ticks "
+            f"with warmup={warmup_frames} and rollout={rollout_frames}: "
+            + "; ".join(too_short)
+        )
+
+
 def _clinic_prediction_mode(selection_metric: str) -> str:
     """Derive the clinic export's rollout/direct mode from a selection
     metric, mirroring ``_resolve_selection_metric``'s own prefix parsing.
@@ -621,6 +676,7 @@ def run_trial(
         resolved_spec.data["corpus_id"], allow_record=False,
         root=corpus_root, organism=resolved_spec.organism,
     )
+    trial_horizons = tuple(int(value) for value in resolved_spec.data["horizons_ticks"])
     train_entries = corpus.manifest["sessions"]["train"]
     validation_entries = corpus.manifest["sessions"]["validation"]
     if not train_entries:
@@ -640,6 +696,17 @@ def run_trial(
     )
     validation_dataset = awm.build_action_sequence_dataset(
         [entry["session_path"] for entry in validation_entries], action_keys=vocabulary,
+    )
+    _validate_temporal_capability(
+        train_dataset, trial_horizons,
+        warmup_frames=int(resolved_spec.training["warmup_frames"]),
+        rollout_frames=int(resolved_spec.training["rollout_frames"]),
+        purpose="training",
+    )
+    _validate_temporal_capability(
+        validation_dataset, trial_horizons,
+        warmup_frames=int(resolved_spec.training["warmup_frames"]),
+        purpose="validation",
     )
 
     retention_policy = dict(corpus.data_contract.retention_policy)
@@ -666,6 +733,11 @@ def run_trial(
         retention_episode_ids = [str(entry["session_id"]) for entry in retention_entries]
         retention_dataset = awm.build_action_sequence_dataset(
             [entry["session_path"] for entry in retention_entries], action_keys=vocabulary,
+        )
+        _validate_temporal_capability(
+            retention_dataset, trial_horizons,
+            warmup_frames=int(resolved_spec.training["warmup_frames"]),
+            purpose="retention validation",
         )
 
     cfg = _action_world_model_config(resolved_spec)

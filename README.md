@@ -113,7 +113,9 @@ node viewer/server.js --data-dir notebooks/runs
 | `ccr review --session <path>` | Post-run session review with baseline comparison |
 | `ccr trace list` / `ccr trace show` | Inspect run traces: phase timings, loss curves, config, git commit |
 | `ccr factory baseline <spec>` | Resolve a spec and launch one fresh/clone/resume/fine_tune Model Factory trial |
+| `ccr factory search <spec>` | Evolve candidate populations through quality filtering, prediction-quality ranking, and breeding |
 | `ccr factory clone <run> --set path=value` | Build a clone/fine_tune child spec from an existing run and launch it |
+| `ccr factory breed <parent-a> <parent-b>` | Preview or launch a configuration-bred child with one explicit weight donor |
 | `ccr factory compare <run> <run>...` | Pair each candidate's validation evidence against a baseline run |
 | `ccr factory promote <run>` | Gate a run against `evaluate_promotion`'s promotion gates and, if all pass, record it as a champion-population member of a registry slot |
 | `ccr factory show [run]` | Print a run's complete effective config, contract hashes, display name, and completion status |
@@ -121,9 +123,10 @@ node viewer/server.js --data-dir notebooks/runs
 | `ccr factory corpus build <spec>` | Record/reuse episodes, gate them, and freeze a Model Factory corpus |
 | `ccr factory test <run>` | The sealed-test final action: evaluate a seed-confirmed candidate against the sealed test split |
 
-Search, successive halving, breeding, and independent training-seed
-confirmation currently use Python APIs; they do not yet have `ccr factory`
-subcommands. See the
+Independent training-seed confirmation currently uses a Python API. Population
+search and breeding are available from `ccr factory`; legacy successive-halving
+campaigns remain reproducible by explicitly passing `factory search --budgets`.
+See the
 [Model Factory operator guide](docs/how-to/using-model-factory.md) for the
 complete lifecycle and the
 [implementation audit](docs/v2/model-factory-implementation-audit.md) for

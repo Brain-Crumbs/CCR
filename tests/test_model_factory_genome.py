@@ -232,6 +232,17 @@ def test_repair_accepts_warmup_plus_rollout_within_min_episode_length():
     assert result["warmup_frames"] + result["rollout_frames"] <= 20
 
 
+def test_repair_rejects_window_equal_to_episode_length_because_target_frame_is_required():
+    genome = default_genome(GENERIC_ACTION_EFFECTS_V1)
+    genome["warmup_frames"] = 1
+    genome["rollout_frames"] = 16
+    with pytest.raises(GenomeRepairError, match="leaves no target frame"):
+        repair(
+            GENERIC_ACTION_EFFECTS_V1, genome,
+            objective="windowed_rollout", min_episode_length=17,
+        )
+
+
 def test_repair_without_min_episode_length_is_a_noop_for_that_check():
     genome = default_genome(GENERIC_ACTION_EFFECTS_V1)
     genome["warmup_frames"] = 8

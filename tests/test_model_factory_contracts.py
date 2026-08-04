@@ -250,6 +250,21 @@ def test_changing_a_validation_session_hash_changes_data_contract_hash():
     assert baseline.hash != changed.hash
 
 
+def test_data_contract_does_not_hash_prediction_horizons():
+    baseline = _make_data(horizons_ticks=(1, 4, 8))
+    changed = _make_data(horizons_ticks=(1, 2, 3, 4))
+
+    assert "horizons_ticks" not in baseline.to_dict()
+    assert baseline.hash == changed.hash
+
+
+def test_temporal_coverage_changes_data_contract_hash():
+    baseline = _make_data(temporal_coverage={"sessions": {"s1": {"frame_count": 20}}})
+    changed = _make_data(temporal_coverage={"sessions": {"s1": {"frame_count": 21}}})
+
+    assert baseline.hash != changed.hash
+
+
 _HASH_STABILITY_SCRIPT = """
 import sys
 sys.path.insert(0, {path!r})

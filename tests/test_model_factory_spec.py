@@ -369,6 +369,15 @@ def test_configuration_parents_as_a_two_key_mapping_is_rejected():
         resolve(raw)
 
 
+def test_selection_metric_horizon_must_be_declared_by_trial_data():
+    raw = _minimal_raw()
+    raw["data"]["horizons_ticks"] = [1, 2]
+    raw["evaluation"]["selection_metric"] = "rollout.t+4.model_over_copy_last_mse"
+
+    with pytest.raises(SpecError, match=r"requires horizon tick.*4.*horizons_ticks.*1, 2"):
+        resolve(raw)
+
+
 # --------------------------------------------------------------------- training_contract_hash
 
 

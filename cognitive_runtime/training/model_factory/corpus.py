@@ -21,6 +21,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Union
 import yaml
 
 from cognitive_runtime.record.quality import SplitOverlapReport, audit_split_overlap
+from cognitive_runtime.runtime.replay import iter_cognitive_ticks, list_episodes
 from cognitive_runtime.training.action_effect_taxonomy import ACTION_EFFECT_LABEL_VERSION
 from cognitive_runtime.training.model_factory.artifacts import atomic_write_json
 from cognitive_runtime.training.model_factory.contracts import DataContract, contract_hash
@@ -66,7 +67,6 @@ class CorpusNurseryConfig:
     world: str = "crafter"
     backend: str = "crafter"
     realtime: bool = False
-    horizons: Sequence[int] = (1, 10, 100)
     latent_width: int = 32
     hidden_dim: int = 64
     reconstruction_size: int = 16
@@ -149,14 +149,21 @@ def _config_from_spec(spec: Mapping[str, Any]) -> CorpusNurseryConfig:
     # torch-dependent defining module here.  Both config classes have the
     # same public field shape and the recorder treats them structurally.
     if dataclasses.is_dataclass(supplied) and not isinstance(supplied, type):
-        return CorpusNurseryConfig(**_ordinary(supplied))
+        values = _ordinary(supplied)
+        values.pop("horizons", None)
+        return CorpusNurseryConfig(**values)
     if not isinstance(supplied, Mapping):
         raise TypeError("corpus spec generator must be a mapping or NurseryConfig")
+    supplied = dict(supplied)
+    # Compatibility with v1 corpus declarations. Horizons never affected the
+    # recorder or its episode-cache identity, so accepting and discarding this
+    # old training/evaluation knob preserves the meaning of those specs.
+    supplied.pop("horizons", None)
     allowed = {field.name for field in dataclasses.fields(CorpusNurseryConfig)}
     unknown = set(supplied) - allowed
     if unknown:
         raise ValueError(f"unknown NurseryConfig fields in corpus generator: {sorted(unknown)!r}")
-    return CorpusNurseryConfig(**dict(supplied))
+    return CorpusNurseryConfig(**supplied)
 
 
 def _split_assignments(spec: Mapping[str, Any], cfg: CorpusNurseryConfig) -> Dict[str, Dict[str, tuple[int, ...]]]:
@@ -427,6 +434,66 @@ def _corpus_spec_payload(spec: Mapping[str, Any], cfg: CorpusNurseryConfig, spli
     return payload
 
 
+def _recorded_temporal_coverage(
+    sessions: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> tuple[Dict[str, Any], float]:
+    """Summarize sequence boundaries and tick/frame coverage from the logs.
+
+    This is derived evidence, not a requested prediction topology. Keeping it
+    in the DataContract lets a runner decide whether an arbitrary experiment
+    horizon is supported without making corpus identity depend on that choice.
+    """
+    by_session: Dict[str, Any] = {}
+    rates: list[float] = []
+    for split in ("train", "validation", "test"):
+        for entry in sessions[split]:
+            session_id = str(entry["session_id"])
+            session_path = str(entry["session_path"])
+            episodes: Dict[str, Any] = {}
+            for episode_id in list_episodes(session_path):
+                ticks: list[int] = []
+                for decision, sensory, _motor in iter_cognitive_ticks(session_path, episode_id):
+                    tick = int(decision.get("tick_index", len(ticks)))
+                    ticks.extend(
+                        tick for record in sensory
+                        if record.get("stream_id") == "vision.frame.pixels"
+                    )
+                span = max(ticks[-1] - ticks[0], 0) if len(ticks) >= 2 else 0
+                ticks_per_frame = span / (len(ticks) - 1) if len(ticks) >= 2 else 1.0
+                if len(ticks) >= 2:
+                    rates.append(max(ticks_per_frame, 1e-9))
+                episodes[str(episode_id)] = {
+                    "frame_count": len(ticks),
+                    "first_tick": ticks[0] if ticks else None,
+                    "last_tick": ticks[-1] if ticks else None,
+                    "tick_span": span,
+                    "ticks_per_frame": max(ticks_per_frame, 1e-9),
+                }
+            by_session[session_id] = {"split": split, "episodes": episodes}
+    rates.sort()
+    if not rates:
+        aggregate_rate = 1.0
+    elif len(rates) % 2:
+        aggregate_rate = rates[len(rates) // 2]
+    else:
+        midpoint = len(rates) // 2
+        aggregate_rate = 0.5 * (rates[midpoint - 1] + rates[midpoint])
+    return {
+        "unit": "recorded_tick",
+        "sequence_boundary": "episode",
+        "sessions": by_session,
+    }, aggregate_rate
+
+
+def _spec_without_legacy_horizons(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalize old frozen specs for declaration-equivalence checks."""
+    normalized = _ordinary(payload)
+    generator = dict(normalized.get("generator") or {})
+    generator.pop("horizons", None)
+    normalized["generator"] = generator
+    return normalized
+
+
 def _corpus_directory(corpus_id: str, *, root: str | Path | None = None, organism: str | None = None) -> Path:
     direct = Path(corpus_id)
     if direct.is_dir():
@@ -631,6 +698,7 @@ def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapp
             "navigation session behavior_mixture evidence does not match the corpus declaration: "
             f"recorded={recorded_behavior_mixture!r}, declared={behavior_mixture_policy!r}"
         )
+    temporal_coverage, ticks_per_frame = _recorded_temporal_coverage(sessions)
     return DataContract(
         world=str(generator["world"]),
         backend=str(generator["backend"]),
@@ -652,8 +720,8 @@ def _data_contract(spec: Mapping[str, Any], sessions: Mapping[str, Sequence[Mapp
             _nursery_module().SEMANTIC_VOCABULARY_VERSION if is_crafter else "none"
         ),
         preprocessing_version=str(spec["preprocessing_version"]),
-        horizons_ticks=tuple(int(value) for value in generator["horizons"]),
-        ticks_per_frame=1.0,
+        ticks_per_frame=ticks_per_frame,
+        temporal_coverage=temporal_coverage,
         quality_policy=quality_policy,
         split_overlap_policy=spec["split_overlap_policy"],
         scenario_generators=_scenario_generator_summary(generator_evidence),
@@ -760,7 +828,7 @@ def build_corpus(spec: Mapping[str, Any]) -> ResolvedCorpus:
     if spec_path.exists():
         with spec_path.open(encoding="utf-8") as handle:
             existing = json.load(handle)
-        if existing != frozen_spec:
+        if _spec_without_legacy_horizons(existing) != _spec_without_legacy_horizons(frozen_spec):
             raise ValueError(
                 f"corpus id {spec['corpus_id']!r} already has a different generator declaration; "
                 "choose a new corpus_id"
@@ -887,11 +955,16 @@ def resolve_corpus(
     if manifest.get("format") != CORPUS_MANIFEST_FORMAT:
         raise ValueError(f"not a {CORPUS_MANIFEST_FORMAT} manifest: {manifest_path}")
     try:
-        data_contract = DataContract(**manifest["data_contract"])
+        raw_data_contract = dict(manifest["data_contract"])
+        # Authenticate the exact historical/new payload before normalizing
+        # the legacy horizon field out of the in-memory contract.
+        if contract_hash(raw_data_contract) != manifest.get("data_contract_hash"):
+            raise ValueError(
+                f"corpus {corpus_id!r} data contract hash does not match its frozen manifest"
+            )
+        data_contract = DataContract(**raw_data_contract)
     except (KeyError, TypeError) as exc:
         raise ValueError(f"corpus {corpus_id!r} has an invalid data contract") from exc
-    if data_contract.hash != manifest.get("data_contract_hash"):
-        raise ValueError(f"corpus {corpus_id!r} data contract hash does not match its frozen manifest")
     sessions = _verify_manifest_sessions(corpus_id, manifest.get("sessions"), data_contract)
     for split, entries in sessions.items():
         for entry in entries:
@@ -907,6 +980,13 @@ def resolve_corpus(
                     f"corpus {corpus_id!r} session {session_id!r} content hash changed "
                     f"(expected {entry.get('sha256')}, got {actual})"
                 )
+    if not data_contract.temporal_coverage:
+        temporal_coverage, ticks_per_frame = _recorded_temporal_coverage(sessions)
+        data_contract = dataclasses.replace(
+            data_contract,
+            ticks_per_frame=ticks_per_frame,
+            temporal_coverage=temporal_coverage,
+        )
     return ResolvedCorpus(str(manifest.get("corpus_id", corpus_id)), directory, manifest, data_contract)
 
 

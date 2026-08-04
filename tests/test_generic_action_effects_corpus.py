@@ -164,6 +164,14 @@ def test_generic_action_effects_yaml_declares_the_epic_mix():
     assert set(splits["train"]) == set(SCENARIOS)
 
 
+def test_corpus_recording_config_ignores_legacy_horizons():
+    raw = load_corpus_spec(CORPUS_SPEC_PATH)
+    cfg = corpus_module._config_from_spec(raw)
+
+    assert raw["generator"]["horizons"] == [1, 10, 100]
+    assert not hasattr(cfg, "horizons")
+
+
 def test_scenario_recording_config_treats_sealed_test_seeds_as_held_out():
     """A corpus's test split is not a third layout regime: scripted
     generators must use their held-out schedule for it, just as validation

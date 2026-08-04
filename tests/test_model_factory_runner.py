@@ -139,6 +139,29 @@ def _run(spec_doc, tmp_path, *, run_id=None):
     )
 
 
+def test_run_trial_reuses_corpus_with_different_experiment_horizons(tmp_path):
+    corpus = _build_corpus(tmp_path / "corpora")
+    spec = _spec_dict(corpus.corpus_id)
+    spec["data"]["horizons_ticks"] = [1]
+    spec["evaluation"]["selection_metric"] = "rollout.t+1.model_over_copy_last_mse"
+
+    result = _run(spec, tmp_path)
+
+    assert result.state == "completed"
+
+
+def test_run_trial_rejects_horizon_beyond_recorded_temporal_coverage(tmp_path):
+    corpus = _build_corpus(tmp_path / "corpora")
+    spec = _spec_dict(corpus.corpus_id)
+    spec["data"]["horizons_ticks"] = [50]
+    spec["evaluation"]["selection_metric"] = "rollout.t+50.model_over_copy_last_mse"
+
+    with pytest.raises(ValueError, match=r"cannot support trial horizons \[50\].*tick_span"):
+        _run(spec, tmp_path)
+
+    assert not (tmp_path / "runs").exists()
+
+
 def test_fresh_trial_completes_and_writes_artifacts(tmp_path, corpus):
     result = _run(_spec_dict(corpus.corpus_id), tmp_path)
 

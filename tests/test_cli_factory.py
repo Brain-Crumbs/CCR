@@ -193,7 +193,9 @@ def _build_passing_corpus(tmp_path: Path, monkeypatch, *, organism: str, corpus_
 
 FACTORY_DISPATCH = [
     (["factory", "baseline", "spec.yaml"], "cmd_factory_baseline"),
+    (["factory", "search", "spec.yaml"], "cmd_factory_search"),
     (["factory", "clone", "some-run"], "cmd_factory_clone"),
+    (["factory", "breed", "parent-a", "parent-b"], "cmd_factory_breed"),
     (["factory", "compare", "run-a", "run-b"], "cmd_factory_compare"),
     (["factory", "promote", "some-run"], "cmd_factory_promote"),
     (["factory", "show"], "cmd_factory_show"),
@@ -214,7 +216,9 @@ def test_factory_subcommand_parses_and_dispatches(argv, expected_func):
 HELP_ARGVS = [
     ["factory", "--help"],
     ["factory", "baseline", "--help"],
+    ["factory", "search", "--help"],
     ["factory", "clone", "--help"],
+    ["factory", "breed", "--help"],
     ["factory", "compare", "--help"],
     ["factory", "promote", "--help"],
     ["factory", "show", "--help"],
@@ -241,6 +245,97 @@ def test_factory_command_is_a_registered_top_level_choice():
     assert args.factory_command == "show"
 
 
+def test_factory_search_dry_run_prints_stable_candidate_specs_without_training(capsys):
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    main([
+        "factory", "search", str(spec_path), "--candidates", "2", "--seed", "13",
+        "--budgets", "1", "2", "--run-id-prefix", "preview-13", "--dry-run", "--no-trace",
+        "--set", "evaluation.selection_metric=rollout.t+2.model_over_copy_last_mse",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["campaign_id"] == "preview-13"
+    assert payload["dry_run"] is True
+    assert payload["budgets"] == [1, 2]
+    assert [candidate["run_id"] for candidate in payload["candidates"]] == [
+        "preview-13-r0-c0", "preview-13-r0-c1",
+    ]
+    assert all(candidate["spec"]["data"]["corpus_id"] == "crafter-generic-action-effects-v1"
+               for candidate in payload["candidates"])
+
+
+def test_factory_search_defaults_to_evolutionary_populations(capsys):
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    main([
+        "factory", "search", str(spec_path), "--population-size", "4", "--populations", "2",
+        "--seed", "13", "--run-id-prefix", "preview-13", "--dry-run", "--no-trace",
+        "--set", "evaluation.selection_metric=rollout.t+2.model_over_copy_last_mse",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["workflow"] == "evolutionary"
+    assert payload["population_size"] == 4
+    assert payload["population_count"] == 2
+    assert "budgets" not in payload
+    assert [candidate["run_id"] for candidate in payload["candidates"]] == [
+        "preview-13-p0-c0", "preview-13-p0-c1", "preview-13-p0-c2", "preview-13-p0-c3",
+    ]
+
+
+def test_factory_search_dry_run_rejects_invalid_budget_schedule():
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    with pytest.raises(SystemExit, match="strictly increasing"):
+        main([
+            "factory", "search", str(spec_path), "--budgets", "2", "2",
+            "--dry-run", "--no-trace",
+        ])
+
+
+def test_factory_search_missing_spec_is_a_concise_cli_error(tmp_path):
+    missing = tmp_path / "missing.yaml"
+    with pytest.raises(SystemExit) as excinfo:
+        main(["factory", "search", str(missing), "--dry-run", "--no-trace"])
+    message = str(excinfo.value)
+    assert message.startswith("invalid factory search:")
+    assert str(missing) in message
+
+
+def test_factory_breed_dry_run_prints_explicit_parent_and_weight_donor_lineage(tmp_path, capsys):
+    root = tmp_path / "runs"
+    base_doc = _spec().to_dict()
+    base_doc["training"] = dict(base_doc["training"])
+    base_doc["training"].update({
+        "max_training_seconds": 600.0,
+        "scheduled_sampling_p": 0.1,
+        "loss_weights": {
+            "closed_loop_pixel_loss_weight": 0.2,
+            "closed_loop_latent_loss_weight": 0.3,
+        },
+        "transition_balance_policy": {"stationary_cap": 0.4},
+    })
+    parent_a = _make_run(root, "parent-a", resolve(base_doc))
+    base_doc["training"]["optimizer"] = {"name": "adamw", "lr": 0.001, "weight_decay": 0.00001}
+    base_doc["training"]["scheduled_sampling_p"] = 0.4
+    parent_b = _make_run(root, "parent-b", resolve(base_doc))
+    for artifacts, sha in ((parent_a, "a" * 64), (parent_b, "b" * 64)):
+        _write_checkpoint_metadata(artifacts, sha256=sha)
+        _write_budget_report(artifacts, tier="fast")
+
+    main([
+        "factory", "breed", "parent-a", "parent-b", "--root", str(root),
+        "--seed", "19", "--weight-donor", "parent-b", "--dry-run", "--no-trace",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["child_spec"]["mode"] == "clone"
+    assert payload["child_spec"]["parent"]["run_id"] == "parent-b"
+    assert payload["breeding_lineage"]["parent_a_run_id"] == "parent-a"
+    assert payload["breeding_lineage"]["parent_b_run_id"] == "parent-b"
+    assert payload["breeding_lineage"]["weight_donor_run_id"] == "parent-b"
+    assert sorted(path.name for path in (root / "crafter-baseline").iterdir() if path.is_dir()) == [
+        "parent-a", "parent-b",
+    ]
+
+
 # --------------------------------------------------------------------- show
 
 
@@ -259,6 +354,10 @@ def test_factory_show_prints_config_hashes_name_and_status(tmp_path, capsys):
     assert contracts["architecture_hash"] in out
     assert contracts["data_contract_hash"] in out
     assert contracts["training_contract_hash"] in out
+    assert "trial_horizons_ticks: [1, 4]" in out
+    assert "model_horizons_ticks: [1, 4]" in out
+    assert "horizons_aligned: True" in out
+    assert "corpus_temporal_coverage: legacy/unavailable" in out
     # The complete effective config: every resolved spec field must appear,
     # not just a summary (epic #212 success criterion 5).
     with (artifacts.directory / "trial_spec.json").open() as handle:

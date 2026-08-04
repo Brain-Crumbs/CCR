@@ -632,12 +632,12 @@ def repair(
         min_episode_length is not None
         and warmup is not None
         and rollout is not None
-        and warmup + rollout > min_episode_length
+        and warmup + rollout >= min_episode_length
     ):
         raise GenomeRepairError(
             "'warmup_frames' + 'rollout_frames' "
-            f"({warmup} + {rollout} = {warmup + rollout}) exceeds the corpus's "
-            f"minimum episode length ({min_episode_length})"
+            f"({warmup} + {rollout} = {warmup + rollout}) leaves no target frame in the "
+            f"corpus's minimum episode length ({min_episode_length})"
         )
 
     if stage_budget_seconds is not None:

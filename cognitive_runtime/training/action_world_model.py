@@ -656,6 +656,16 @@ def _workspace_loss(model: Any, predicted: Any, targets: Dict[str, Any]) -> Any:
     return torch.stack(terms).mean()
 
 
+def _require_finite_training_loss(loss: Any) -> None:
+    """Fail one unstable trial before NaNs can poison its model or CUDA context."""
+    torch, _F = _torch()
+    if not bool(torch.isfinite(loss.detach()).all()):
+        raise FloatingPointError(
+            "training loss became non-finite; candidate is numerically unstable "
+            "(commonly an excessive learning rate or autoregressive loss weight)"
+        )
+
+
 def _spatial_pixel_loss(model: Any, predicted: Any, reference: Any, target: Any, cfg: ActionWorldModelConfig,
                         reference_spatial: Optional[Any] = None,
                         decoded: Optional[Dict[str, Any]] = None) -> Tuple[Any, Any, Dict[str, Any]]:
@@ -711,13 +721,18 @@ def _spatial_pixel_loss(model: Any, predicted: Any, reference: Any, target: Any,
 
     positive = target_change.bool()
     negative = ~positive
+    # CUDA's probability-form BCE uses a device assertion for NaN/Inf inputs.
+    # Sanitizing only the BCE view prevents that assertion from poisoning the
+    # process; the original mask still contributes to the aggregate loss, and
+    # `_require_finite_training_loss` rejects the candidate before backward.
+    bce_mask = torch.nan_to_num(predicted_mask, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     mask_terms = []
     # Balance positives and negatives per batch/window.  Ordinary BCE makes
     # an all-zero gate attractive whenever motion occupies few pixels.
     if bool(positive.any()):
-        mask_terms.append(F.binary_cross_entropy(predicted_mask[positive], torch.ones_like(predicted_mask[positive])))
+        mask_terms.append(F.binary_cross_entropy(bce_mask[positive], torch.ones_like(bce_mask[positive])))
     if bool(negative.any()):
-        mask_terms.append(F.binary_cross_entropy(predicted_mask[negative], torch.zeros_like(predicted_mask[negative])))
+        mask_terms.append(F.binary_cross_entropy(bce_mask[negative], torch.zeros_like(bce_mask[negative])))
     mask_supervision = torch.stack(mask_terms).mean() if mask_terms else vision.new_zeros(())
     dynamic_error = pixel_error[positive].mean() if bool(positive.any()) else vision.new_zeros(())
     static_error = pixel_error[negative].mean() if bool(negative.any()) else vision.new_zeros(())
@@ -1034,6 +1049,7 @@ def _train_autoregressive_objective(
                 + cfg.semantic_loss_weight * semantic_loss
                 + closed_loop_loss
             )
+            _require_finite_training_loss(total)
             total.backward()
             optimizer.step()
             if target_encoder is not None:
@@ -1792,6 +1808,7 @@ def train_action_world_model(
                     + cfg.change_mask_supervision_weight * direct_mask_supervision_loss
                 )
             )
+            _require_finite_training_loss(total)
             total.backward()
             optimizer.step()
             if target_encoder is not None:

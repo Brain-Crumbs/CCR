@@ -18,7 +18,7 @@ data:
   validation_sessions: []
   test_sessions: []
   expected_pixel_source: crafter
-  horizons_ticks: [1, 2, 3, 4]
+  horizons_ticks: [1, 2]
 model:
   backbone: transformer
   latent_width: 128

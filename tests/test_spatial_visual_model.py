@@ -8,6 +8,7 @@ from brain.cortex.predictive import PredictiveCortex, PredictiveCortexConfig
 from cognitive_runtime.neural.pixel_stream_encoder import SpatialVisualEncoder
 from cognitive_runtime.training.action_world_model import (
     ActionWorldModelConfig,
+    _require_finite_training_loss,
     _spatial_pixel_loss,
     load_action_world_model,
     save_action_world_model,
@@ -143,6 +144,29 @@ def test_spatial_loss_reuses_an_existing_decoder_result(monkeypatch):
         decoded=visual,
     )
     assert loss > 0
+
+
+def test_nonfinite_change_mask_fails_cleanly_without_probability_bce_assertion():
+    model = PredictiveCortex(
+        (8, 8, 3), ["wait"],
+        PredictiveCortexConfig(latent_width=4, reconstruction_size=8),
+    )
+    reference = torch.zeros(1, 3, 8, 8)
+    decoded = {
+        "vision": reference.clone(),
+        "change_mask": torch.full((1, 1, 8, 8), float("nan")),
+        "residual_delta": reference.clone(),
+    }
+
+    pixel_loss, mask_mean, result = _spatial_pixel_loss(
+        model, torch.zeros(1, 4), reference, reference,
+        ActionWorldModelConfig(), decoded=decoded,
+    )
+
+    assert torch.isfinite(result["mask_supervision_loss"])
+    assert torch.isnan(mask_mean)
+    with pytest.raises(FloatingPointError, match="numerically unstable"):
+        _require_finite_training_loss(pixel_loss + mask_mean)
 
 
 def test_legacy_global_pool_checkpoint_has_actionable_error(tmp_path):

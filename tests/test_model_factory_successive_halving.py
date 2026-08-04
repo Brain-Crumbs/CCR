@@ -335,6 +335,38 @@ def test_a_candidate_that_exceeds_its_training_time_budget_is_eliminated(tmp_pat
     assert "did not complete" in truncated.reason
 
 
+def test_a_candidate_trial_error_is_eliminated_without_aborting_the_search(tmp_path, corpus, monkeypatch):
+    budgets = (1, 2)
+    n = 4
+    failed_run_id = "sh-r0-c0"
+    _permissive_controls(monkeypatch, _expected_run_ids(budgets, n))
+    controlled_run_trial = search_module.run_trial
+    attempted_run_ids = []
+
+    def _one_bad_run(spec, *, run_id=None, **kwargs):
+        attempted_run_ids.append(run_id)
+        if run_id == failed_run_id:
+            raise ValueError("training corpus cannot support this sampled window")
+        return controlled_run_trial(spec, run_id=run_id, **kwargs)
+
+    monkeypatch.setattr(search_module, "run_trial", _one_bad_run)
+
+    report = _run_halving(_base_spec(corpus.corpus_id), tmp_path, budgets=budgets, n=n, seed=4)
+
+    failed = next(result for result in report.rungs[0].results if result.run_id == failed_run_id)
+    assert failed.state == "failed"
+    assert failed.epochs_executed == 0
+    assert failed.metric_value is None
+    assert failed.gates == ()
+    assert failed.gate_passed is False
+    assert failed.advanced is False
+    assert "ValueError" in failed.reason
+    assert "cannot support this sampled window" in failed.reason
+    assert "sh-r0-c1" in attempted_run_ids
+    assert failed.candidate_index not in report.rungs[0].survivor_indices
+    assert len(report.rungs) == 2
+
+
 # --------------------------------------------------------------------------- AC: deterministic elimination order
 
 

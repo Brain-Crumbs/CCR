@@ -419,6 +419,7 @@ def validate(spec: ExperimentSpec) -> None:
     _validate_training(spec.training)
     _validate_warmup_rollout_fits_corpus(spec)
     _validate_evaluation(spec.evaluation)
+    _validate_evaluation_horizons(spec)
     _validate_evolution(spec.evolution)
 
 
@@ -494,10 +495,10 @@ def _validate_warmup_rollout_fits_corpus(spec: ExperimentSpec) -> None:
         return
     warmup = spec.training.get("warmup_frames", 0) or 0
     rollout = spec.training.get("rollout_frames", 0) or 0
-    if warmup + rollout > min_episode_length:
+    if warmup + rollout >= min_episode_length:
         raise SpecError(
             "'training.warmup_frames' + 'training.rollout_frames' "
-            f"({warmup + rollout}) exceeds 'data.quality_policy."
+            f"({warmup + rollout}) leaves no target frame within 'data.quality_policy."
             f"min_episode_length' ({min_episode_length})"
         )
 
@@ -512,6 +513,19 @@ def _validate_evaluation(evaluation: Mapping[str, Any]) -> None:
             f"'evaluation.selection_metric' {selection_metric!r} does not "
             "parse into a resolvable metric path (e.g. "
             "'rollout.t+4.model_over_copy_last_mse')"
+        )
+
+
+def _validate_evaluation_horizons(spec: ExperimentSpec) -> None:
+    """Every ``t+N`` metric must name a horizon the trial actually builds."""
+    selection_metric = str(spec.evaluation["selection_metric"])
+    requested = tuple(int(value) for value in re.findall(r"t\+(\d+)", selection_metric))
+    declared = tuple(int(value) for value in spec.data["horizons_ticks"])
+    missing = tuple(value for value in requested if value not in declared)
+    if missing:
+        raise SpecError(
+            f"'evaluation.selection_metric' {selection_metric!r} requires horizon tick(s) "
+            f"{list(missing)!r}, but 'data.horizons_ticks' is {list(declared)!r}"
         )
 
 

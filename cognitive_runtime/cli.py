@@ -1743,8 +1743,8 @@ def cmd_trace_show(args: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------- model factory (ccr factory ...)
 #
 # issue #228 (MF-C6, epic #212 §20): a thin dispatcher over
-# cognitive_runtime.training.model_factory's runner/registry/promotion/
-# corpus/confirmation modules -- argument parsing plus one call into the
+# cognitive_runtime.training.model_factory's runner/search/breeding/registry/
+# promotion/corpus/confirmation modules -- argument parsing plus one call into the
 # domain layer, no orchestration logic here. Every Model Factory submodule
 # except the actual neural trainer stays torch-free at import time (each
 # defers its own `import torch` to the function that needs it), so most
@@ -1754,6 +1754,17 @@ def cmd_trace_show(args: argparse.Namespace) -> None:
 
 _FACTORY_RUNS_ROOT_DEFAULT = "runs"
 _FACTORY_CORPORA_ROOT_DEFAULT = "corpora"
+
+
+def _factory_json_ready(value: Any) -> Any:
+    """Recursively thaw immutable spec mappings for CLI JSON output."""
+    if isinstance(value, Mapping):
+        return {str(key): _factory_json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_factory_json_ready(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
 
 
 def _factory_run_directory(root: str, run_id: str, organism: Optional[str] = None) -> Path:
@@ -1996,6 +2007,112 @@ def cmd_factory_baseline(args: argparse.Namespace) -> None:
     _print_trial_result(result)
 
 
+def cmd_factory_search(args: argparse.Namespace) -> None:
+    """Preview or run one bounded evolutionary factory campaign.
+
+    ``--dry-run`` is deliberately torch-free: it resolves the exact candidate
+    specs and prints them without resolving a corpus or launching training.
+    Supplying the deprecated ``--budgets`` option explicitly retains the old
+    successive-halving workflow for reproducibility of existing campaigns.
+    """
+    from cognitive_runtime.training.model_factory.genome import get_schema
+    from cognitive_runtime.training.model_factory.search import (
+        propose,
+        run_evolutionary_search,
+        run_successive_halving,
+    )
+    from cognitive_runtime.training.model_factory.spec import SpecError, apply_overrides, load_spec, resolve
+
+    try:
+        raw = load_spec(args.spec)
+        if args.set:
+            raw = apply_overrides(raw, args.set)
+        legacy_halving = args.budgets is not None
+        budgets = tuple(args.budgets or ())
+        if legacy_halving:
+            if any(budget <= 0 for budget in budgets) or list(budgets) != sorted(set(budgets)):
+                raise ValueError(f"budgets must be positive, strictly increasing epoch counts; got {budgets!r}")
+            if args.halving_factor < 2:
+                raise ValueError(f"halving_factor must be at least 2; got {args.halving_factor!r}")
+        if args.population_size < 2:
+            raise ValueError(f"population_size must be at least 2; got {args.population_size!r}")
+        if args.population_count < 1:
+            raise ValueError(f"population_count must be at least 1; got {args.population_count!r}")
+        if not 0.0 <= args.mutation_rate <= 1.0:
+            raise ValueError(f"mutation_rate must be in [0, 1]; got {args.mutation_rate!r}")
+        base_spec = resolve(raw)
+        schema = get_schema(args.schema)
+        proposals = (
+            propose(
+                base_spec, schema, args.population_size, args.seed, method=args.method,
+                min_episode_length=args.min_episode_length,
+                stage_budget_seconds=args.stage_budget_seconds,
+            )
+            if args.dry_run else ()
+        )
+    except FileNotFoundError:
+        sys.exit(f"invalid factory search: spec file not found: {args.spec}")
+    except (OSError, SpecError, ValueError) as exc:
+        sys.exit(f"invalid factory search: {exc}")
+
+    campaign_id = args.run_id_prefix or (f"sh{args.seed}" if legacy_halving else f"evo{args.seed}")
+    if args.dry_run:
+        payload = {
+            "campaign_id": campaign_id,
+            "dry_run": True,
+            "workflow": "successive_halving" if legacy_halving else "evolutionary",
+            "schema": schema.version,
+            "schema_hash": schema.content_hash,
+            "method": args.method,
+            "seed": args.seed,
+            "population_size": args.population_size,
+            "population_count": args.population_count,
+            "mutation_rate": args.mutation_rate,
+            "candidates": [
+                {
+                    "candidate_index": index,
+                    "run_id": (
+                        f"{campaign_id}-r0-c{index}" if legacy_halving
+                        else f"{campaign_id}-p0-c{index}"
+                    ),
+                    "spec": spec.to_dict(),
+                }
+                for index, spec in enumerate(proposals)
+            ],
+        }
+        if legacy_halving:
+            payload["budgets"] = list(budgets)
+        print(json.dumps(_factory_json_ready(payload), indent=2, sort_keys=True))
+        return
+
+    try:
+        if legacy_halving:
+            report = run_successive_halving(
+                base_spec, schema, budgets, args.population_size, args.seed,
+                method=args.method, halving_factor=args.halving_factor,
+                root=args.root, corpus_root=args.corpus_root, run_id_prefix=campaign_id,
+                naming_seed=args.naming_seed, champion_run_id=args.champion,
+                min_episode_length=args.min_episode_length,
+                stage_budget_seconds=args.stage_budget_seconds,
+            )
+        else:
+            report = run_evolutionary_search(
+                base_spec, schema, args.population_size, args.population_count, args.seed,
+                method=args.method, mutation_rate=args.mutation_rate,
+                root=args.root, corpus_root=args.corpus_root, run_id_prefix=campaign_id,
+                naming_seed=args.naming_seed, champion_run_id=args.champion,
+                min_episode_length=args.min_episode_length,
+                stage_budget_seconds=args.stage_budget_seconds,
+            )
+    except ImportError as exc:
+        sys.exit(f"'ccr factory search' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+    payload = report.to_dict()
+    payload["campaign_id"] = campaign_id
+    payload["schema"] = schema.version
+    payload["schema_hash"] = schema.content_hash
+    print(json.dumps(_factory_json_ready(payload), indent=2, sort_keys=True))
+
+
 def cmd_factory_clone(args: argparse.Namespace) -> None:
     """``ccr factory clone <run> --set path=value`` (issue #228): build a
     clone/fine_tune child spec from an existing run's persisted
@@ -2053,6 +2170,99 @@ def cmd_factory_clone(args: argparse.Namespace) -> None:
     except ImportError as exc:
         sys.exit(f"'ccr factory clone' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
     _print_trial_result(result)
+
+
+def cmd_factory_breed(args: argparse.Namespace) -> None:
+    """Breed two compatible completed runs and optionally launch the child.
+
+    Configuration is crossed and mutated through the declared genome schema;
+    exactly one parent remains the checkpoint weight donor. ``--dry-run``
+    previews the fully resolved child and complete breeding lineage without
+    allocating a run or importing torch.
+    """
+    from cognitive_runtime.training.model_factory.breeding import (
+        breed,
+        load_parent,
+        record_breeding_lineage,
+    )
+    from cognitive_runtime.training.model_factory.genome import get_schema
+
+    parent_a_directory = _factory_run_directory(args.root, args.parent_a, args.organism)
+    parent_b_directory = _factory_run_directory(args.root, args.parent_b, args.organism)
+    if parent_a_directory.parent != parent_b_directory.parent:
+        sys.exit(
+            "invalid factory breed: both parents must belong to the same organism; "
+            f"found {parent_a_directory.parent.name!r} and {parent_b_directory.parent.name!r}"
+        )
+    organism = parent_a_directory.parent.name
+
+    with (parent_a_directory / "trial_spec.json").open(encoding="utf-8") as handle:
+        parent_a_spec = json.load(handle)
+    with (parent_b_directory / "trial_spec.json").open(encoding="utf-8") as handle:
+        parent_b_spec = json.load(handle)
+
+    _, inferred_tier_a = _factory_slot_defaults(parent_a_directory, parent_a_spec)
+    _, inferred_tier_b = _factory_slot_defaults(parent_b_directory, parent_b_spec)
+    tier = args.tier or inferred_tier_a
+    if tier is None:
+        sys.exit("invalid factory breed: pass --tier because parent A has no metrics/budget_report.json tier")
+    if args.tier is None and inferred_tier_b != tier:
+        sys.exit(
+            "invalid factory breed: parent budget tiers do not match "
+            f"({inferred_tier_a!r} != {inferred_tier_b!r}); pass compatible parents"
+        )
+
+    schema = get_schema(args.schema)
+    objective = args.objective or str(parent_a_spec["training"]["objective"])
+    parent_generations = [
+        int((spec.get("evolution") or {}).get("generation") or 0)
+        for spec in (parent_a_spec, parent_b_spec)
+    ]
+    generation = args.generation if args.generation is not None else max(parent_generations) + 1
+
+    try:
+        parent_a = load_parent(
+            args.root, organism, args.parent_a, schema,
+            tier=tier, checkpoint_name=args.checkpoint_a,
+        )
+        parent_b = load_parent(
+            args.root, organism, args.parent_b, schema,
+            tier=tier, checkpoint_name=args.checkpoint_b,
+        )
+        breeding = breed(
+            parent_a, parent_b, schema, objective=objective,
+            generation=generation, seed=args.seed, mutation_rate=args.mutation_rate,
+            weight_donor=args.weight_donor,
+            min_episode_length=args.min_episode_length,
+            stage_budget_seconds=args.stage_budget_seconds,
+        )
+    except (OSError, KeyError, ValueError) as exc:
+        sys.exit(f"invalid factory breed: {exc}")
+
+    if args.dry_run:
+        print(json.dumps(_factory_json_ready({
+            "dry_run": True,
+            "schema": schema.version,
+            "schema_hash": schema.content_hash,
+            "child_spec": breeding.child_spec.to_dict(),
+            "breeding_lineage": breeding.lineage.to_dict(),
+        }), indent=2, sort_keys=True))
+        return
+
+    try:
+        from cognitive_runtime.training.model_factory.runner import run_trial
+
+        result = run_trial(
+            breeding.child_spec, root=args.root, corpus_root=args.corpus_root,
+            naming_seed=args.naming_seed,
+            export_predictions=not args.no_export_predictions,
+            export_predictions_max_episodes=args.export_predictions_max,
+        )
+    except ImportError as exc:
+        sys.exit(f"'ccr factory breed' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+    lineage_path = record_breeding_lineage(result.directory, breeding.lineage)
+    _print_trial_result(result)
+    print(f"breeding_lineage: {lineage_path}")
 
 
 def cmd_factory_compare(args: argparse.Namespace) -> None:
@@ -2305,6 +2515,13 @@ def cmd_factory_show(args: argparse.Namespace) -> None:
     print(f"architecture_hash: {contracts['architecture_hash']}")
     print(f"data_contract_hash: {contracts['data_contract_hash']}")
     print(f"training_contract_hash: {contracts['training_contract_hash']}")
+    trial_horizons = list((trial_spec.get("data") or {}).get("horizons_ticks") or [])
+    model_horizons = list((contracts.get("architecture_contract") or {}).get("horizons_ticks") or [])
+    temporal_coverage = (contracts.get("data_contract") or {}).get("temporal_coverage") or {}
+    print(f"trial_horizons_ticks: {trial_horizons}")
+    print(f"model_horizons_ticks: {model_horizons}")
+    print(f"horizons_aligned: {trial_horizons == model_horizons}")
+    print(f"corpus_temporal_coverage: {'available' if temporal_coverage else 'legacy/unavailable'}")
 
     validation_path = directory / "metrics" / "validation.json"
     if validation_path.is_file():
@@ -2489,7 +2706,7 @@ _UNTRACED_COMMANDS = frozenset({
 
 
 def _should_trace(args: argparse.Namespace, name: str) -> bool:
-    if getattr(args, "no_trace", False):
+    if getattr(args, "no_trace", False) or getattr(args, "dry_run", False):
         return False
     return args.command not in _UNTRACED_COMMANDS and name not in _UNTRACED_COMMANDS
 
@@ -3067,9 +3284,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_factory = sub.add_parser(
         "factory",
-        help="issue #228 (Model Factory, epic #212): baseline/clone/compare/promote "
-             "reproducible checkpoint lineage, plus lineage/config inspection and the "
-             "sealed final-test action",
+        help="Model Factory: baseline/search/breed/compare/promote reproducible "
+             "checkpoint lineage, plus config inspection and sealed final testing",
     )
     factory_sub = p_factory.add_subparsers(dest="factory_command", required=True)
 
@@ -3093,6 +3309,49 @@ def build_parser() -> argparse.ArgumentParser:
     p_factory_baseline.add_argument("--no-export-predictions", action="store_true",
                                     help="skip the clinic prediction export")
     p_factory_baseline.set_defaults(func=cmd_factory_baseline)
+
+    p_factory_search = factory_sub.add_parser(
+        "search", help="evolve candidate populations through quality filtering, selection, and breeding"
+    )
+    p_factory_search.add_argument("spec", help="base experiment spec file (.yaml/.yml/.json)")
+    p_factory_search.add_argument("--schema", default="generic_action_effects_v1",
+                                  help="versioned genome schema (default: generic_action_effects_v1)")
+    p_factory_search.add_argument("--population-size", "--candidates", "-n", dest="population_size",
+                                  type=int, default=8,
+                                  help="candidate count maintained in each population (default: 8)")
+    p_factory_search.add_argument("--populations", "--generations", dest="population_count",
+                                  type=int, default=3,
+                                  help="number of populations to evaluate, including the initial one (default: 3)")
+    p_factory_search.add_argument("--mutation-rate", type=float, default=0.2,
+                                  help="per-active-gene mutation probability for offspring (default: 0.2)")
+    p_factory_search.add_argument("--seed", type=int, default=7,
+                                  help="proposal/campaign random seed (default: 7)")
+    p_factory_search.add_argument("--method", choices=["random", "lhs"], default="lhs",
+                                  help="proposal sampler (default: lhs)")
+    p_factory_search.add_argument("--budgets", type=int, nargs="+", default=None,
+                                  metavar="EPOCHS",
+                                  help="deprecated: run legacy successive halving with these epoch rungs")
+    p_factory_search.add_argument("--halving-factor", type=int, default=2,
+                                  help="candidate reduction factor per rung (default: 2)")
+    p_factory_search.add_argument("--run-id-prefix", default=None,
+                                  help="stable campaign/run prefix (default: evo<seed>)")
+    p_factory_search.add_argument("--champion", default=None,
+                                  help="optional champion run id for the final paired comparison")
+    p_factory_search.add_argument("--stage-budget-seconds", type=float, default=None,
+                                  help="optional wall-clock cap for the whole campaign")
+    p_factory_search.add_argument("--min-episode-length", type=int, default=None,
+                                  help="optional genome repair constraint")
+    p_factory_search.add_argument("--set", action="append", metavar="dotted.path=value", default=None,
+                                  help="override the resolved base spec before proposing (repeatable)")
+    p_factory_search.add_argument("--dry-run", action="store_true",
+                                  help="print candidate specs without resolving a corpus or training")
+    p_factory_search.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                  help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_search.add_argument("--corpus-root", default=None,
+                                  help=f"corpora root directory (default: {_FACTORY_CORPORA_ROOT_DEFAULT!r})")
+    p_factory_search.add_argument("--naming-seed", default=None,
+                                  help="seed candidate display names deterministically")
+    p_factory_search.set_defaults(func=cmd_factory_search)
 
     p_factory_clone = factory_sub.add_parser(
         "clone", help="build a clone/fine_tune child spec from an existing run and launch it"
@@ -3121,6 +3380,49 @@ def build_parser() -> argparse.ArgumentParser:
     p_factory_clone.add_argument("--no-export-predictions", action="store_true",
                                  help="skip the clinic prediction export")
     p_factory_clone.set_defaults(func=cmd_factory_clone)
+
+    p_factory_breed = factory_sub.add_parser(
+        "breed", help="breed two compatible completed runs and launch one explicit-lineage child"
+    )
+    p_factory_breed.add_argument("parent_a", help="first configuration parent run id")
+    p_factory_breed.add_argument("parent_b", help="second configuration parent run id")
+    p_factory_breed.add_argument("--schema", default="generic_action_effects_v1",
+                                 help="versioned genome schema (default: generic_action_effects_v1)")
+    p_factory_breed.add_argument("--tier", default=None,
+                                 help="shared budget tier (default: infer from both budget reports)")
+    p_factory_breed.add_argument("--objective", default=None,
+                                 help="training objective for active genes (default: parent A's objective)")
+    p_factory_breed.add_argument("--generation", type=int, default=None,
+                                 help="child generation (default: max parent generation + 1)")
+    p_factory_breed.add_argument("--seed", type=int, default=7,
+                                 help="crossover/mutation seed (default: 7)")
+    p_factory_breed.add_argument("--mutation-rate", type=float, default=0.2,
+                                 help="per-active-gene mutation probability (default: 0.2)")
+    p_factory_breed.add_argument("--weight-donor", default=None,
+                                 help="one of the two parent run ids (default: seeded choice)")
+    p_factory_breed.add_argument("--checkpoint-a", default="best-validation.pt",
+                                 help="parent A checkpoint name (default: best-validation.pt)")
+    p_factory_breed.add_argument("--checkpoint-b", default="best-validation.pt",
+                                 help="parent B checkpoint name (default: best-validation.pt)")
+    p_factory_breed.add_argument("--stage-budget-seconds", type=float, default=None,
+                                 help="optional genome repair compute cap")
+    p_factory_breed.add_argument("--min-episode-length", type=int, default=None,
+                                 help="optional genome repair constraint")
+    p_factory_breed.add_argument("--dry-run", action="store_true",
+                                 help="print the child spec and lineage without training")
+    p_factory_breed.add_argument("--organism", default=None,
+                                 help="parent organism, only needed if a run id is ambiguous")
+    p_factory_breed.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                 help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_breed.add_argument("--corpus-root", default=None,
+                                 help=f"corpora root directory (default: {_FACTORY_CORPORA_ROOT_DEFAULT!r})")
+    p_factory_breed.add_argument("--naming-seed", default=None,
+                                 help="seed the child's cosmetic display name deterministically")
+    p_factory_breed.add_argument("--export-predictions-max", type=int, default=3, metavar="N",
+                                 help="clinic prediction export episode limit (default: 3)")
+    p_factory_breed.add_argument("--no-export-predictions", action="store_true",
+                                 help="skip the clinic prediction export")
+    p_factory_breed.set_defaults(func=cmd_factory_breed)
 
     p_factory_compare = factory_sub.add_parser(
         "compare", help="pair each candidate's validation evidence against a baseline run (MF-C1)"

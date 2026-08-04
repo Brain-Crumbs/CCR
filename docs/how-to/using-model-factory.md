@@ -25,18 +25,19 @@ The implemented CLI commands are:
 | --- | --- |
 | `ccr factory corpus build <spec>` | Build and freeze a quality-gated train/validation/test corpus. |
 | `ccr factory baseline <spec>` | Resolve and launch any `fresh`, `clone`, `resume`, or `fine_tune` spec. |
+| `ccr factory search <spec>` | Evaluate, filter, retain, and breed candidate populations. |
 | `ccr factory clone <run> --set path=value` | Create a controlled clone or fine-tune child from an existing run. |
+| `ccr factory breed <parent-a> <parent-b>` | Breed two compatible completed runs and launch the explicit-lineage child. |
 | `ccr factory compare <baseline> <candidate>...` | Produce paired validation comparisons. |
 | `ccr factory promote <run>` | Apply promotion gates and update a registry slot. |
 | `ccr factory test <run>` | Perform the one-time sealed-test action after seed confirmation. |
 | `ccr factory show [run]` | Show the resolved spec, hashes, name, and terminal status. |
 | `ccr factory lineage [run]` | Show configuration parents and weight-donor ancestry. |
 
-Search proposal generation, successive halving, breeding, and independent
-training-seed confirmation are implemented as Python APIs, but do not yet have
-CLI subcommands. In particular, `ccr factory test` requires a prior successful
-`confirm_across_seeds(...)` Python call. This is tracked as `AUD-212-05` in the
-implementation audit.
+Independent training-seed confirmation remains a Python API. In particular,
+`ccr factory test` requires a prior successful `confirm_across_seeds(...)`
+call. The remaining CLI gap is tracked as `AUD-212-05` in the implementation
+audit.
 
 ## 1. Build a frozen corpus
 
@@ -66,24 +67,32 @@ completed corpus is immutable: change its declaration only by choosing a new
 `corpus_id`. Controlled trials fail on a missing or modified session rather
 than silently recording replacement evidence.
 
+Historical v1 declarations contain a `generator.horizons` key, but it never
+affected recording or the episode-cache identity. It is accepted as legacy
+input and omitted from new corpus contracts. Existing v1 recordings can be
+reused by experiments with any horizon set their recorded temporal coverage
+can support.
+
 ## 2. Validate the experiment template
 
 Start from `specs/crafter-baseline.yaml`. Before spending GPU time, ensure:
 
 - `data.corpus_id` resolves to the frozen corpus;
-- every `rollout.t+N` or `direct.t+N` selection metric has `N` in
-  `data.horizons_ticks`;
+- the trial `data.horizons_ticks` and built model use the same ordered horizon
+  set;
+- every frozen train/validation episode has enough recorded frames and tick
+  span for the requested horizons and training window;
+- every `rollout.t+N` or `direct.t+N` selection metric has `N` in that set;
 - `training.device` is `auto`, `cpu`, or a valid PyTorch device such as
   `cuda`;
 - the selection metric direction and promotion margins match the objective;
 - train, validation, and sealed-test sessions remain disjoint.
 
-The horizon/selection-metric relationship is not yet rejected by spec
-validation (`AUD-212-01`), so this manual check is currently important.
-Corpus `generator.horizons` and trial `data.horizons_ticks` are separate today:
-the former is persisted in the frozen `DataContract`, while the latter builds
-the model's horizon heads and controls trial evaluation. Neither is inherited
-from the other.
+Both relationships are enforced before GPU work: spec resolution rejects a
+selection metric whose `t+N` is absent from the experiment horizons, and trial
+launch checks the loaded recordings' frame counts and recorded tick spans.
+`ccr factory show` reports trial/model horizon alignment and whether the corpus
+contract includes temporal-coverage metadata.
 
 Loss-weight keys must use the complete `ActionWorldModelConfig` field name,
 such as `closed_loop_pixel_loss_weight`, `pixel_loss_weight`, or
@@ -173,7 +182,52 @@ The registry records the leading champion, retained population, decisions,
 lineage references, and sealed-test-use budget. It stores checkpoint references
 rather than copied weights.
 
-## 7. Search and breeding Python APIs
+## 7. Search and breeding
+
+Preview the exact resolved proposals without loading a corpus or starting
+PyTorch:
+
+```bash
+ccr factory search specs/crafter-baseline.yaml \
+  --schema generic_action_effects_v1 \
+  --population-size 8 --populations 4 --mutation-rate 0.2 \
+  --seed 7 --run-id-prefix crafter-evo-7 --dry-run
+```
+
+Remove `--dry-run` to launch the evolutionary campaign. The initial population
+uses the selected random/LHS sampler. Each population then:
+
+1. evaluates every new candidate on the fixed validation split;
+2. removes incomplete candidates and candidates that fail the rollout quality filters;
+3. sorts the remainder by `evaluation.selection_metric` and retains at most the best half;
+4. carries those checkpoints forward without retraining and breeds children until the next population reaches `--population-size`.
+
+`--populations` counts the initial population. One survivor is allowed to
+self-breed with mutation; zero survivors ends the campaign. The JSON report
+records every quality-filter and retention decision, offspring IDs, total
+trials/epochs, final survivors, and the optional champion comparison. Candidate
+run IDs are stable under the chosen prefix:
+`crafter-evo-7-p<population>-c<candidate>`.
+
+For reproducibility of an older campaign, explicitly passing
+`--budgets 50 150 500` selects the legacy successive-halving engine.
+
+Breed two compatible completed parents after inspecting the child first:
+
+```bash
+ccr factory breed <parent-a> <parent-b> \
+  --schema generic_action_effects_v1 --seed 19 --dry-run
+ccr factory breed <parent-a> <parent-b> \
+  --schema generic_action_effects_v1 --seed 19
+```
+
+The tier is inferred from both parents' budget reports. Use `--tier fast` only
+when the reports are unavailable. The launched child records two configuration
+parents, exactly one checkpoint weight donor, the genome diff, mutations,
+repairs, generation, and seed. The retained population tracks the associated
+compute ledger separately. Breeding never averages weights.
+
+The same operations remain available as Python APIs:
 
 The bounded search implementation lives in
 `cognitive_runtime.training.model_factory.search`:
@@ -183,25 +237,50 @@ from cognitive_runtime.training.model_factory import load_spec, resolve
 from cognitive_runtime.training.model_factory.genome import get_schema
 from cognitive_runtime.training.model_factory.search import (
     propose,
-    run_successive_halving,
+    run_evolutionary_search,
 )
 
 schema = get_schema("generic_action_effects_v1")
 base_spec = resolve(load_spec("specs/crafter-baseline.yaml"))
 proposals = propose(base_spec, schema, 8, seed=7, method="lhs")
-report = run_successive_halving(
+report = run_evolutionary_search(
     base_spec,
     schema,
-    n=8,
+    population_size=8,
+    population_count=4,
     seed=7,
-    budgets=(50, 150, 500),
+    mutation_rate=0.2,
 )
 ```
 
-Genetic configuration breeding lives in
-`cognitive_runtime.training.model_factory.breeding`. It records two
-configuration parents, one explicit weight donor, the genome diff, mutations,
-repairs, generation, seed, and compute ledger. It does not average weights.
+The breeding API can likewise be composed directly with the trial runner:
+
+```python
+from cognitive_runtime.training.model_factory import (
+    breed,
+    get_schema,
+    load_parent,
+    record_breeding_lineage,
+    run_trial,
+)
+
+schema = get_schema("generic_action_effects_v1")
+parent_a = load_parent("runs", "Crafter", "<parent-a>", schema, tier="fast")
+parent_b = load_parent("runs", "Crafter", "<parent-b>", schema, tier="fast")
+bred = breed(
+    parent_a,
+    parent_b,
+    schema,
+    objective="windowed_rollout",
+    generation=1,
+    seed=19,
+)
+trial = run_trial(bred.child_spec)
+record_breeding_lineage(trial.directory, bred.lineage)
+```
+
+The notebook remains the visualization and diagnosis surface; factory specs,
+CLI/API campaigns, lineage, execution, and promotion are the source of truth.
 
 ## Artifact and failure triage
 

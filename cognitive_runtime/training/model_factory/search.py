@@ -1,4 +1,11 @@
-"""Bounded random and Latin-hypercube trial proposals (epic #212, Phase D
+"""Candidate generation and population-based Model Factory search.
+
+The default :func:`run_evolutionary_search` workflow generates an initial
+population, applies quality filters, retains the best half, and breeds back to
+the configured size. Successive halving remains available for explicitly
+requested legacy campaigns.
+
+Bounded random and Latin-hypercube trial proposals (epic #212, Phase D
 step 1, §13.1, issue #230), plus checkpoint-based successive halving
 (Phase D step 2, §13.2, issue #231, :func:`run_successive_halving`).
 
@@ -63,10 +70,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from cognitive_runtime.training.model_factory.checkpoint import read_factory_checkpoint_metadata
+from cognitive_runtime.training.model_factory.breeding import (
+    BreedingLineage,
+    ParentRecord,
+    breed,
+    record_breeding_lineage,
+)
 from cognitive_runtime.training.model_factory.comparison import compare_paired_episodes
 from cognitive_runtime.training.model_factory.corpus import resolve_corpus
 from cognitive_runtime.training.model_factory.genome import (
     Gene,
+    GenomeRepairError,
     GenomeSchema,
     project_cost_seconds,
     repair,
@@ -79,8 +93,10 @@ from cognitive_runtime.training.model_factory.population import DuplicateSpecCac
 from cognitive_runtime.training.model_factory.runner import (
     RUNS_ROOT_DEFAULT,
     _resolve_selection_metric,
+    _selection_metric_mode,
     run_trial,
 )
+from cognitive_runtime.training.model_factory.state import STATE_FAILED
 from cognitive_runtime.training.model_factory.spec import (
     ExperimentSpec,
     _thaw,
@@ -314,6 +330,7 @@ def propose(
 
 
 SUCCESSIVE_HALVING_FORMAT = "model-factory-successive-halving-v1"
+EVOLUTIONARY_SEARCH_FORMAT = "model-factory-evolutionary-search-v1"
 
 #: successive_halving's own gate set (epic #212 §13.2): a candidate that
 #: fails either one is eliminated at that rung regardless of its primary
@@ -340,11 +357,12 @@ class RungCandidateResult:
     (``budget_report["epochs_recorded"]``) -- the physical number of epochs
     trained this rung, never the rung's cumulative target. ``metric_value``
     and ``gates`` are only populated when ``state == "completed"``: a
-    candidate that ran out of its training-time budget mid-rung (``state ==
-    "budget_exceeded"``), or was never launched because the campaign's own
-    ``stage_budget_seconds`` was already spent (``state ==
-    "not_attempted"``, see :data:`STATE_NOT_ATTEMPTED`), has no trustworthy
-    validation reading to rank or gate on, so it is eliminated outright.
+    candidate whose trial raises (``state == "failed"``), runs out of its
+    training-time budget mid-rung (``state == "budget_exceeded"``), or was
+    never launched because the campaign's own ``stage_budget_seconds`` was
+    already spent (``state == "not_attempted"``, see
+    :data:`STATE_NOT_ATTEMPTED`), has no trustworthy validation reading to
+    rank or gate on, so it is eliminated outright.
     """
 
     candidate_index: int
@@ -458,6 +476,240 @@ class _CandidateTrack:
         self.last_metric_value: Optional[float] = None
 
 
+@dataclass(frozen=True)
+class EvolutionCandidateResult:
+    """One member's quality evidence within an evolutionary population."""
+
+    candidate_index: int
+    run_id: str
+    origin_population: int
+    mode: str
+    state: str
+    epochs_executed: int
+    metric_value: Optional[float]
+    gates: Tuple[Dict[str, Any], ...]
+    quality_passed: bool
+    retained: bool
+    carried: bool
+    configuration_parents: Tuple[str, ...]
+    reason: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "candidate_index": self.candidate_index,
+            "run_id": self.run_id,
+            "origin_population": self.origin_population,
+            "mode": self.mode,
+            "state": self.state,
+            "epochs_executed": self.epochs_executed,
+            "metric_value": self.metric_value,
+            "gates": [dict(gate) for gate in self.gates],
+            "quality_passed": self.quality_passed,
+            "retained": self.retained,
+            "carried": self.carried,
+            "configuration_parents": list(self.configuration_parents),
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class PopulationReport:
+    """Filtering, ranking, and breeding decisions for one population."""
+
+    population_index: int
+    results: Tuple[EvolutionCandidateResult, ...]
+    survivor_run_ids: Tuple[str, ...]
+    offspring_run_ids: Tuple[str, ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "population_index": self.population_index,
+            "results": [result.to_dict() for result in self.results],
+            "survivor_run_ids": list(self.survivor_run_ids),
+            "offspring_run_ids": list(self.offspring_run_ids),
+        }
+
+
+@dataclass(frozen=True)
+class EvolutionarySearchReport:
+    """The complete record of a candidate/filter/select/breed campaign."""
+
+    format: str
+    seed: int
+    method: str
+    population_size: int
+    population_count: int
+    mutation_rate: float
+    populations: Tuple[PopulationReport, ...]
+    total_trials_started: int
+    total_epochs_executed: int
+    stage_budget_exceeded: bool
+    final_survivor_run_ids: Tuple[str, ...]
+    best_run_id: Optional[str]
+    best_metric_value: Optional[float]
+    champion_comparison: Optional[Mapping[str, Any]]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "format": self.format,
+            "seed": self.seed,
+            "method": self.method,
+            "population_size": self.population_size,
+            "population_count": self.population_count,
+            "mutation_rate": self.mutation_rate,
+            "populations": [population.to_dict() for population in self.populations],
+            "total_trials_started": self.total_trials_started,
+            "total_epochs_executed": self.total_epochs_executed,
+            "stage_budget_exceeded": self.stage_budget_exceeded,
+            "final_survivor_run_ids": list(self.final_survivor_run_ids),
+            "best_run_id": self.best_run_id,
+            "best_metric_value": self.best_metric_value,
+            "champion_comparison": dict(self.champion_comparison) if self.champion_comparison is not None else None,
+        }
+
+
+@dataclass
+class _EvolutionMember:
+    """Internal candidate state carried between populations without retraining."""
+
+    spec: ExperimentSpec
+    origin_population: int
+    evaluation: Optional[EvolutionCandidateResult] = None
+    parent_record: Optional[ParentRecord] = None
+    breeding_lineage: Optional[BreedingLineage] = None
+
+
+def _training_value(training: Mapping[str, Any], dotted_path: str) -> Any:
+    cursor: Any = training
+    for part in dotted_path.split("."):
+        if not isinstance(cursor, Mapping) or part not in cursor:
+            raise SearchError(f"training block is missing genome gene path {dotted_path!r}")
+        cursor = cursor[part]
+    return cursor
+
+
+def _minimum_episode_frame_count(corpus: Any, *, split: str = "train") -> Optional[int]:
+    """Return the shortest recorded episode in ``split``, when available."""
+    coverage = getattr(corpus.data_contract, "temporal_coverage", {}) or {}
+    sessions = coverage.get("sessions", {}) if isinstance(coverage, Mapping) else {}
+    lengths: List[int] = []
+    for session in sessions.values():
+        if not isinstance(session, Mapping) or session.get("split") != split:
+            continue
+        for episode in (session.get("episodes") or {}).values():
+            if isinstance(episode, Mapping) and episode.get("frame_count") is not None:
+                lengths.append(int(episode["frame_count"]))
+    return min(lengths) if lengths else None
+
+
+def _window_fits(spec: ExperimentSpec, min_episode_frames: Optional[int]) -> bool:
+    if min_episode_frames is None:
+        return True
+    warmup = int(spec.training.get("warmup_frames") or 0)
+    rollout = int(spec.training.get("rollout_frames") or 0)
+    # The trainer needs at least one target frame after the complete window.
+    return warmup + rollout < min_episode_frames
+
+
+def _propose_valid_population(
+    base_spec: ExperimentSpec,
+    genome_schema: GenomeSchema,
+    population_size: int,
+    seed: int,
+    *,
+    method: str,
+    min_episode_frames: Optional[int],
+    stage_budget_seconds: Optional[float],
+    cost_model: Callable[[Mapping[str, Any]], float],
+) -> List[ExperimentSpec]:
+    """Sample deterministically until one corpus-compatible population exists.
+
+    Joint warmup/rollout constraints cannot be represented by either gene's
+    independent LHS strata. We therefore keep the valid members of each
+    deterministic batch and draw another batch when necessary.
+    """
+    accepted: List[ExperimentSpec] = []
+    seen: set[str] = set()
+    for attempt in range(64):
+        batch = propose(
+            base_spec,
+            genome_schema,
+            population_size,
+            seed + attempt * 104_729,
+            method=method,
+            # Filtering below handles the joint constraint without allowing
+            # one invalid LHS member to reject the entire population.
+            min_episode_length=None,
+            stage_budget_seconds=stage_budget_seconds,
+            cost_model=cost_model,
+        )
+        for candidate in batch:
+            if not _window_fits(candidate, min_episode_frames):
+                continue
+            identity = json.dumps(_thaw(candidate.to_dict()), sort_keys=True, separators=(",", ":"))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            accepted.append(candidate)
+            if len(accepted) == population_size:
+                return accepted
+    raise SearchError(
+        f"could not sample {population_size} distinct candidates whose warmup+rollout window "
+        f"fits the corpus minimum of {min_episode_frames!r} frame(s)"
+    )
+
+
+def _parent_record_from_result(
+    result: Any, spec: ExperimentSpec, genome_schema: GenomeSchema,
+) -> ParentRecord:
+    checkpoint_path = Path(result.checkpoint_path)
+    checkpoint_sha = result.checkpoint_sha256
+    if not checkpoint_sha:
+        checkpoint_sha = read_factory_checkpoint_metadata(str(checkpoint_path))["checkpoint_sha256"]
+    return ParentRecord(
+        run_id=result.run_id,
+        genome_schema_version=genome_schema.version,
+        architecture_hash=result.architecture_hash,
+        data_contract_hash=result.data_contract_hash,
+        corpus_id=spec.data.get("corpus_id"),
+        tier="evolutionary-search",
+        evaluation_contract=dict(spec.evaluation),
+        genome={name: _training_value(spec.training, name) for name in genome_schema.genes},
+        checkpoint_name=checkpoint_path.name,
+        checkpoint_sha256=checkpoint_sha,
+        spec=spec,
+    )
+
+
+def _champion_comparison(
+    *, root: Union[str, Path], organism: str, champion_run_id: Optional[str],
+    candidate_run_id: Optional[str], selection_metric: str, ticks_per_frame: float,
+) -> Optional[Dict[str, Any]]:
+    if champion_run_id is None or candidate_run_id is None:
+        return None
+    organism_root = Path(root) / organism
+    with (organism_root / champion_run_id / "metrics" / "validation.json").open(encoding="utf-8") as handle:
+        champion_validation = _restore_numeric_keys(json.load(handle))
+    with (organism_root / candidate_run_id / "metrics" / "validation.json").open(encoding="utf-8") as handle:
+        candidate_validation = _restore_numeric_keys(json.load(handle))
+    _, candidate_per_episode = _resolve_selection_metric(candidate_validation, selection_metric, ticks_per_frame)
+    _, champion_per_episode = _resolve_selection_metric(champion_validation, selection_metric, ticks_per_frame)
+    comparison = compare_paired_episodes(
+        dict(zip(candidate_validation["episode_ids"], candidate_per_episode)),
+        dict(zip(champion_validation["episode_ids"], champion_per_episode)),
+        primary_metric=selection_metric,
+        minimum_episode_count=1,
+    )
+    payload = comparison.to_dict()
+    payload["champion_run_id"] = champion_run_id
+    payload["decision"] = (
+        "candidate_improves"
+        if comparison.status == "evaluable" and comparison.mean_delta is not None and comparison.mean_delta < 0
+        else "hold"
+    )
+    return payload
+
+
 def _restore_numeric_keys(value: Any) -> Any:
     """Undo the ``str(key)`` coercion a JSON round-trip applies to a
     validation report's horizon-keyed mappings.
@@ -500,6 +752,358 @@ def _validate_budgets(budgets: Sequence[int]) -> Tuple[int, ...]:
             f"budgets must be strictly increasing (each rung trains more epochs than the last); got {resolved!r}"
         )
     return resolved
+
+
+def run_evolutionary_search(
+    base_spec: ExperimentSpec,
+    genome_schema: GenomeSchema,
+    population_size: int,
+    population_count: int,
+    seed: int,
+    *,
+    method: str = "lhs",
+    mutation_rate: float = 0.2,
+    root: Union[str, Path] = RUNS_ROOT_DEFAULT,
+    corpus_root: Optional[Union[str, Path]] = None,
+    run_id_prefix: Optional[str] = None,
+    naming_seed: Optional[Union[str, int]] = None,
+    trace_dir: Optional[Union[str, Path]] = None,
+    heartbeat_timeout_seconds: Optional[float] = None,
+    champion_run_id: Optional[str] = None,
+    min_episode_length: Optional[int] = None,
+    stage_budget_seconds: Optional[float] = None,
+    cost_model: Callable[[Mapping[str, Any]], float] = project_cost_seconds,
+) -> EvolutionarySearchReport:
+    """Run a bounded evolutionary Model Factory campaign.
+
+    Population zero is sampled with :func:`propose`. Each new member is
+    trained exactly once and evaluated on the corpus's fixed validation set.
+    In each population, incomplete trials and candidates that fail either
+    rollout quality gate are removed first. The remaining candidates are
+    sorted by the configured model-prediction metric in its supported
+    min/max direction, and at most the best half are retained. Retained models
+    carry their existing evidence and checkpoint forward without being
+    retrained; configuration
+    crossover plus mutation fills the next population back to
+    ``population_size``.
+
+    When only one candidate survives it self-breeds, which keeps the search
+    able to recover through mutation while preserving that survivor as the
+    sole checkpoint donor. No survivors ends the campaign. ``population_count``
+    counts the initial sampled population, so a value of one evaluates the
+    initial candidates and performs no breeding.
+    """
+    if population_size < 2:
+        raise SearchError(f"population_size must be at least 2; got {population_size!r}")
+    if population_count < 1:
+        raise SearchError(f"population_count must be at least 1; got {population_count!r}")
+    if not 0.0 <= mutation_rate <= 1.0:
+        raise SearchError(f"mutation_rate must be in [0, 1]; got {mutation_rate!r}")
+    if min_episode_length is not None and min_episode_length < 2:
+        raise SearchError(
+            f"min_episode_length must leave room for an input and target frame; got {min_episode_length!r}"
+        )
+
+    corpus = resolve_corpus(
+        base_spec.data["corpus_id"], allow_record=False, root=corpus_root, organism=base_spec.organism,
+    )
+    corpus_min_episode_frames = _minimum_episode_frame_count(corpus)
+    effective_min_episode_frames = corpus_min_episode_frames
+    if min_episode_length is not None:
+        effective_min_episode_frames = (
+            min_episode_length
+            if effective_min_episode_frames is None
+            else min(min_episode_length, effective_min_episode_frames)
+        )
+    initial_specs = _propose_valid_population(
+        base_spec,
+        genome_schema,
+        population_size,
+        seed,
+        method=method,
+        min_episode_frames=effective_min_episode_frames,
+        stage_budget_seconds=stage_budget_seconds,
+        cost_model=cost_model,
+    )
+    members = [
+        _EvolutionMember(spec=replace(spec, mode="fresh", parent=None), origin_population=0)
+        for spec in initial_specs
+    ]
+
+    ticks_per_frame = float(corpus.data_contract.ticks_per_frame)
+    selection_metric = base_spec.evaluation["selection_metric"]
+    selection_mode = _selection_metric_mode(selection_metric)
+    prefix = run_id_prefix or f"evo{seed}"
+    reports: List[PopulationReport] = []
+    final_survivors: List[_EvolutionMember] = []
+    reference_episode_ids: Optional[Tuple[str, ...]] = None
+    trial_cache = DuplicateSpecCache()
+    stage_started = time.monotonic()
+    stage_budget_exceeded = False
+    total_trials_started = 0
+    total_epochs_executed = 0
+
+    for population_index in range(population_count):
+        evaluated: List[_EvolutionMember] = []
+        displayed_results: List[EvolutionCandidateResult] = []
+
+        for candidate_index, member in enumerate(members):
+            if member.evaluation is not None:
+                carried = replace(
+                    member.evaluation,
+                    candidate_index=candidate_index,
+                    retained=False,
+                    carried=True,
+                    epochs_executed=0,
+                    reason="carried forward from the preceding population without retraining",
+                )
+                member.evaluation = carried
+                evaluated.append(member)
+                displayed_results.append(carried)
+                continue
+
+            run_id = f"{prefix}-p{population_index}-c{candidate_index}"
+            if stage_budget_seconds is not None and (time.monotonic() - stage_started) >= stage_budget_seconds:
+                stage_budget_exceeded = True
+                skipped = EvolutionCandidateResult(
+                    candidate_index=candidate_index,
+                    run_id=run_id,
+                    origin_population=member.origin_population,
+                    mode=member.spec.mode,
+                    state=STATE_NOT_ATTEMPTED,
+                    epochs_executed=0,
+                    metric_value=None,
+                    gates=(),
+                    quality_passed=False,
+                    retained=False,
+                    carried=False,
+                    configuration_parents=tuple((member.spec.evolution or {}).get("configuration_parents") or ()),
+                    reason=(
+                        f"skipped: the campaign's stage_budget_seconds ({stage_budget_seconds!r}) was "
+                        "already exhausted before this candidate could be attempted"
+                    ),
+                )
+                member.evaluation = skipped
+                evaluated.append(member)
+                displayed_results.append(skipped)
+                continue
+
+            try:
+                trial_result, reused = trial_cache.reuse_or_run(
+                    member.spec.to_dict(),
+                    lambda: run_trial(
+                        member.spec,
+                        root=root,
+                        corpus_root=corpus_root,
+                        run_id=run_id,
+                        naming_seed=naming_seed,
+                        trace_dir=trace_dir,
+                        heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+                    ),
+                )
+            except Exception as exc:
+                failed = EvolutionCandidateResult(
+                    candidate_index=candidate_index,
+                    run_id=run_id,
+                    origin_population=member.origin_population,
+                    mode=member.spec.mode,
+                    state=STATE_FAILED,
+                    epochs_executed=0,
+                    metric_value=None,
+                    gates=(),
+                    quality_passed=False,
+                    retained=False,
+                    carried=False,
+                    configuration_parents=tuple((member.spec.evolution or {}).get("configuration_parents") or ()),
+                    reason=f"candidate trial failed with {type(exc).__name__}: {exc}",
+                )
+                member.evaluation = failed
+                evaluated.append(member)
+                displayed_results.append(failed)
+                continue
+
+            actual_run_id = trial_result.run_id
+            if not reused:
+                total_trials_started += 1
+                total_epochs_executed += int(trial_result.budget_report.get("epochs_recorded") or 0)
+                if member.breeding_lineage is not None:
+                    record_breeding_lineage(trial_result.directory, member.breeding_lineage)
+
+            validation_path = Path(trial_result.directory) / "metrics" / "validation.json"
+            with validation_path.open(encoding="utf-8") as handle:
+                validation_payload = json.load(handle)
+            episode_ids = tuple(validation_payload["episode_ids"])
+            if reference_episode_ids is None:
+                reference_episode_ids = episode_ids
+            elif episode_ids != reference_episode_ids:
+                raise SearchError(
+                    "evolutionary search requires the identical validation episode set for every candidate; "
+                    f"population {population_index} candidate {candidate_index} ({actual_run_id!r}) evaluated "
+                    f"{episode_ids!r}, expected {reference_episode_ids!r}"
+                )
+
+            completed = trial_result.state == "completed"
+            gate_dicts: Tuple[Dict[str, Any], ...] = ()
+            metric_value: Optional[float] = None
+            quality_passed = False
+            if completed:
+                rollout_metrics = trial_result.evaluation["rollout"]
+                gate_results = tuple(gate(rollout_metrics) for gate in _HALVING_GATES)
+                gate_dicts = tuple(gate.to_dict() for gate in gate_results)
+                quality_passed = all(gate.passed for gate in gate_results)
+                metric_value, _ = _resolve_selection_metric(
+                    trial_result.evaluation, selection_metric, ticks_per_frame,
+                )
+                reason = (
+                    "passed all quality filters"
+                    if quality_passed
+                    else "; ".join(gate.reason for gate in gate_results if not gate.passed)
+                )
+            else:
+                reason = f"trial is not eligible for selection (state={trial_result.state!r})"
+            if reused:
+                reason = "duplicate resolved spec: reused prior result; " + reason
+
+            candidate_result = EvolutionCandidateResult(
+                candidate_index=candidate_index,
+                run_id=actual_run_id,
+                origin_population=member.origin_population,
+                mode=member.spec.mode,
+                state=trial_result.state,
+                epochs_executed=(0 if reused else int(trial_result.budget_report.get("epochs_recorded") or 0)),
+                metric_value=metric_value,
+                gates=gate_dicts,
+                quality_passed=quality_passed,
+                retained=False,
+                carried=False,
+                configuration_parents=tuple((member.spec.evolution or {}).get("configuration_parents") or ()),
+                reason=reason,
+            )
+            member.evaluation = candidate_result
+            if quality_passed:
+                member.parent_record = _parent_record_from_result(trial_result, member.spec, genome_schema)
+            evaluated.append(member)
+            displayed_results.append(candidate_result)
+
+        # Reused duplicate specs point at the same immutable trained run. Keep
+        # that model eligible once so duplicates cannot consume multiple
+        # survivor slots or masquerade as genetic diversity.
+        eligible_by_run_id: Dict[str, _EvolutionMember] = {}
+        for member in evaluated:
+            if member.evaluation and member.evaluation.quality_passed:
+                eligible_by_run_id.setdefault(member.evaluation.run_id, member)
+        eligible = sorted(
+            eligible_by_run_id.values(),
+            key=lambda member: (
+                member.evaluation.metric_value
+                if selection_mode == "min" else -member.evaluation.metric_value,
+                member.evaluation.run_id,
+            ),
+        )
+        survivor_limit = min(max(1, len(eligible) // 2), max(1, population_size // 2)) if eligible else 0
+        survivors = eligible[:survivor_limit]
+        survivor_member_ids = {id(member) for member in survivors}
+
+        finalized_results: List[EvolutionCandidateResult] = []
+        for member, result in zip(evaluated, displayed_results):
+            retained = id(member) in survivor_member_ids
+            reason = result.reason
+            if result.quality_passed:
+                reason = (
+                    f"retained among the best {survivor_limit} quality-passing candidate(s) by "
+                    f"{selection_metric!r}"
+                    if retained else
+                    f"passed all quality filters but ranked below the best {survivor_limit} "
+                    f"candidate(s) by {selection_metric!r}"
+                )
+            finalized = replace(result, retained=retained, reason=reason)
+            finalized_results.append(finalized)
+            member.evaluation = finalized
+
+        offspring: List[_EvolutionMember] = []
+        offspring_run_ids: List[str] = []
+        if population_index + 1 < population_count and survivors and not stage_budget_exceeded:
+            child_count = population_size - len(survivors)
+            for child_offset in range(child_count):
+                child_slot = len(survivors) + child_offset
+                base_breeding_seed = seed + (population_index + 1) * 1_000_003 + child_offset
+                breeding = None
+                for breeding_attempt in range(64):
+                    breeding_seed = base_breeding_seed + breeding_attempt * 104_729
+                    rng = random.Random(breeding_seed)
+                    if len(survivors) == 1:
+                        parent_a = parent_b = survivors[0]
+                    else:
+                        parent_a, parent_b = rng.sample(survivors, 2)
+                    assert parent_a.parent_record is not None and parent_b.parent_record is not None
+                    try:
+                        breeding = breed(
+                            parent_a.parent_record,
+                            parent_b.parent_record,
+                            genome_schema,
+                            objective=str(base_spec.training["objective"]),
+                            generation=population_index + 1,
+                            seed=breeding_seed,
+                            mutation_rate=mutation_rate,
+                            min_episode_length=effective_min_episode_frames,
+                            stage_budget_seconds=stage_budget_seconds,
+                            cost_model=cost_model,
+                        )
+                    except GenomeRepairError:
+                        continue
+                    break
+                if breeding is None:
+                    raise SearchError(
+                        f"could not breed a corpus-compatible child for population "
+                        f"{population_index + 1} slot {child_slot} after 64 deterministic attempts"
+                    )
+                offspring.append(_EvolutionMember(
+                    spec=breeding.child_spec,
+                    origin_population=population_index + 1,
+                    breeding_lineage=breeding.lineage,
+                ))
+                offspring_run_ids.append(f"{prefix}-p{population_index + 1}-c{child_slot}")
+
+        reports.append(PopulationReport(
+            population_index=population_index,
+            results=tuple(finalized_results),
+            survivor_run_ids=tuple(member.evaluation.run_id for member in survivors if member.evaluation),
+            offspring_run_ids=tuple(offspring_run_ids),
+        ))
+        final_survivors = survivors
+
+        if population_index + 1 >= population_count or not survivors or stage_budget_exceeded:
+            break
+        members = survivors + offspring
+
+    best_run_id = final_survivors[0].evaluation.run_id if final_survivors else None
+    best_metric_value = final_survivors[0].evaluation.metric_value if final_survivors else None
+    champion_comparison = _champion_comparison(
+        root=root,
+        organism=base_spec.organism,
+        champion_run_id=champion_run_id,
+        candidate_run_id=best_run_id,
+        selection_metric=selection_metric,
+        ticks_per_frame=ticks_per_frame,
+    )
+    return EvolutionarySearchReport(
+        format=EVOLUTIONARY_SEARCH_FORMAT,
+        seed=seed,
+        method=method,
+        population_size=population_size,
+        population_count=population_count,
+        mutation_rate=mutation_rate,
+        populations=tuple(reports),
+        total_trials_started=total_trials_started,
+        total_epochs_executed=total_epochs_executed,
+        stage_budget_exceeded=stage_budget_exceeded,
+        final_survivor_run_ids=tuple(
+            member.evaluation.run_id for member in final_survivors if member.evaluation
+        ),
+        best_run_id=best_run_id,
+        best_metric_value=best_metric_value,
+        champion_comparison=champion_comparison,
+    )
 
 
 def run_successive_halving(
@@ -576,6 +1180,12 @@ def run_successive_halving(
     and any later rung) is recorded with ``state="not_attempted"`` and never
     launched, :attr:`SuccessiveHalvingReport.stage_budget_exceeded` is
     ``True``, and no further rungs run.
+
+    A failure raised by one candidate's :func:`run_trial` call is recorded as
+    a failed, non-advancing rung result and does not abort its siblings. This
+    isolation deliberately covers only the trial call: campaign-level
+    integrity checks performed afterward (for example, detecting different
+    validation episode IDs across candidates) still raise immediately.
     """
     resolved_budgets = _validate_budgets(budgets)
     if halving_factor < 2:
@@ -658,14 +1268,29 @@ def run_successive_halving(
                 ))
                 continue
 
-            result, reused = trial_cache.reuse_or_run(
-                child_spec.to_dict(),
-                lambda: run_trial(
-                    child_spec, root=root, corpus_root=corpus_root, run_id=run_id,
-                    naming_seed=naming_seed, trace_dir=trace_dir,
-                    heartbeat_timeout_seconds=heartbeat_timeout_seconds,
-                ),
-            )
+            try:
+                result, reused = trial_cache.reuse_or_run(
+                    child_spec.to_dict(),
+                    lambda: run_trial(
+                        child_spec, root=root, corpus_root=corpus_root, run_id=run_id,
+                        naming_seed=naming_seed, trace_dir=trace_dir,
+                        heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+                    ),
+                )
+            except Exception as exc:
+                # `run_trial` persists STATE_FAILED itself when allocation has
+                # progressed far enough to create a run directory. Some
+                # candidate-local validation failures happen earlier (for
+                # example, a sampled warmup/rollout window that is too long
+                # for the corpus), so the rung report must also carry the
+                # failure independently of whether artifacts exist on disk.
+                results.append(RungCandidateResult(
+                    candidate_index=track.index, run_id=run_id, mode=child_spec.mode, budget=budget,
+                    epochs_executed=0, state=STATE_FAILED, metric_value=None, gates=(),
+                    gate_passed=False, advanced=False,
+                    reason=f"candidate trial failed with {type(exc).__name__}: {exc}",
+                ))
+                continue
             # A duplicate's result is anchored to the original immutable run
             # directory.  Do not invent a second run ID for a trial that was
             # deliberately never launched.
@@ -823,6 +1448,11 @@ __all__ = [
     "METHODS",
     "SearchError",
     "propose",
+    "EVOLUTIONARY_SEARCH_FORMAT",
+    "EvolutionCandidateResult",
+    "PopulationReport",
+    "EvolutionarySearchReport",
+    "run_evolutionary_search",
     "SUCCESSIVE_HALVING_FORMAT",
     "STATE_NOT_ATTEMPTED",
     "RungCandidateResult",

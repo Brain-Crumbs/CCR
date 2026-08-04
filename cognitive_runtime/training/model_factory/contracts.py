@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass, field, fields
+from dataclasses import InitVar, dataclass, field, fields
 from functools import cached_property
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -174,8 +174,15 @@ class DataContract(_ContractMixin):
     pixel_provenance: str
     semantic_vocabulary_version: str
     preprocessing_version: str
-    horizons_ticks: Tuple[int, ...]
     ticks_per_frame: float
+    #: Per-session/per-episode frame counts and recorded tick spans. Prediction
+    #: horizons are deliberately absent: they belong to the experiment/model
+    #: contract, while this field describes which offsets the frozen evidence
+    #: can support.
+    temporal_coverage: Mapping[str, Any] = field(default_factory=dict)
+    #: Construction-only compatibility for historical manifests/callers. It
+    #: is intentionally neither stored nor hashed into new data contracts.
+    horizons_ticks: InitVar[Optional[Tuple[int, ...]]] = None
     quality_policy: Mapping[str, Any] = field(default_factory=dict)
     split_overlap_policy: Mapping[str, Any] = field(default_factory=dict)
     #: Epic #212 Sec 12.6's remaining generic-action-effects fields (issue
@@ -240,6 +247,15 @@ class DataContract(_ContractMixin):
     #: loss regression consumed by ``promotion``'s existing forgetting
     #: metric.
     retention_policy: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self, horizons_ticks: Optional[Tuple[int, ...]]) -> None:
+        # Historical corpus contracts duplicated NurseryConfig.horizons both
+        # as a named field and inside program_config. Neither value describes
+        # recorded bytes, so normalize it away even when loading old payloads.
+        program_config = dict(self.program_config)
+        program_config.pop("horizons", None)
+        object.__setattr__(self, "program_config", program_config)
+        super().__post_init__()
 
 
 @dataclass(frozen=True)

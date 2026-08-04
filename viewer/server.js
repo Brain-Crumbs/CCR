@@ -28,7 +28,7 @@ function parseArgs(argv) {
   // live, and presents them as one selected run.
   if (args.dataDir) args.dataDir = path.resolve(args.dataDir);
   else {
-    args.runsDir = path.resolve(args.runsDir || path.join(REPO_DIR, "notebooks", "runs"));
+    args.runsDir = path.resolve(args.runsDir || path.join(REPO_DIR, "runs"));
     args.episodeCacheDir = path.resolve(args.episodeCacheDir || path.join(REPO_DIR, "notebooks", "episode_cache"));
     args.corpusRoot = path.resolve(args.corpusRoot || path.join(REPO_DIR, "corpora"));
   }
@@ -365,7 +365,7 @@ function serveStatic(res, urlPath) {
 
 function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, corpusRoot = null }) {
   const clinic = dataDir ? null : makeClinicStore(
-    runsDir || path.join(REPO_DIR, "notebooks", "runs"),
+    runsDir || path.join(REPO_DIR, "runs"),
     episodeCacheDir || path.join(REPO_DIR, "notebooks", "episode_cache"),
     corpusRoot || path.join(REPO_DIR, "corpora"),
   );
