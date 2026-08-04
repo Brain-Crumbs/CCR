@@ -224,6 +224,53 @@ def test_invalid_mode_is_rejected():
         resolve(raw)
 
 
+# --------------------------------------------------------------------- evaluation.reference_run
+
+
+def test_reference_run_is_absent_by_default():
+    spec = resolve(_minimal_raw())
+    assert spec.evaluation.get("reference_run") is None
+
+
+def test_fresh_mode_accepts_a_reference_run_alongside_no_parent():
+    """reference_run is independent of mode/parent -- a fresh run may
+    declare one, evaluated read-only against it, never loaded as a weight
+    donor the way `parent` would be."""
+    raw = _minimal_raw()
+    raw["evaluation"]["reference_run"] = {
+        "run_id": "crafter-champion-0007", "checkpoint": "best-validation.pt", "sha256": "deadbeef",
+    }
+    spec = resolve(raw)
+    assert spec.mode == "fresh"
+    assert spec.parent is None
+    assert spec.evaluation["reference_run"] == {
+        "run_id": "crafter-champion-0007", "checkpoint": "best-validation.pt", "sha256": "deadbeef",
+    }
+
+
+def test_reference_run_without_sha256_is_rejected_naming_the_missing_field():
+    raw = _minimal_raw()
+    raw["evaluation"]["reference_run"] = {"run_id": "crafter-champion-0007", "checkpoint": "best-validation.pt"}
+    with pytest.raises(SpecError, match="reference_run.sha256"):
+        resolve(raw)
+
+
+def test_reference_run_without_run_id_is_rejected_naming_the_missing_field():
+    raw = _minimal_raw()
+    raw["evaluation"]["reference_run"] = {"checkpoint": "best-validation.pt", "sha256": "deadbeef"}
+    with pytest.raises(SpecError, match="reference_run.run_id"):
+        resolve(raw)
+
+
+def test_reference_run_rejects_an_unknown_key_naming_the_nearest_match():
+    raw = _minimal_raw()
+    raw["evaluation"]["reference_run"] = {
+        "run_id": "crafter-champion-0007", "checkpont": "best-validation.pt", "sha256": "deadbeef",
+    }
+    with pytest.raises(SpecError, match="checkpont"):
+        resolve(raw)
+
+
 # --------------------------------------------------------------------- run_id / display_name
 
 

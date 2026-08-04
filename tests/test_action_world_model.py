@@ -384,6 +384,74 @@ def test_direct_evaluation_preserves_colliding_tick_horizons(turn_session):
     assert report["horizons"][2]["horizon_frame"] == 1
 
 
+# --------------------------------------------------------------------- reference_model comparison
+
+
+def test_windowed_rollout_reports_reference_model_comparison_when_given(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    reference_model, _reference_stats = train_action_world_model(dataset, _small_model_config())
+
+    report = evaluate_action_world_model(
+        model, dataset, [1, 3], warmup_frames=2, reference_model=reference_model,
+    )
+
+    for entry in report["horizons"].values():
+        assert entry["reference_mse"] is not None and entry["reference_mse"] > 0.0
+        assert entry["model_over_reference_mse"] is not None
+        assert isinstance(entry["beats_reference"], bool)
+
+
+def test_windowed_rollout_omits_reference_keys_when_none_given(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    report = evaluate_action_world_model(model, dataset, [1], warmup_frames=2)
+    for entry in report["horizons"].values():
+        assert "reference_mse" not in entry
+        assert "model_over_reference_mse" not in entry
+        assert "beats_reference" not in entry
+
+
+def test_direct_evaluation_reports_reference_model_comparison_when_given(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    reference_model, _reference_stats = train_action_world_model(dataset, _small_model_config())
+
+    report = evaluate_action_world_model_direct(
+        model, dataset, [1, 4], warmup_frames=2, reference_model=reference_model,
+    )
+
+    for entry in report["horizons"].values():
+        assert entry["reference_mse"] is not None and entry["reference_mse"] > 0.0
+        assert entry["model_over_reference_mse"] is not None
+        assert isinstance(entry["beats_reference"], bool)
+
+
+def test_direct_evaluation_omits_reference_keys_when_none_given(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    report = evaluate_action_world_model_direct(model, dataset, [1], warmup_frames=2)
+    for entry in report["horizons"].values():
+        assert "reference_mse" not in entry
+
+
+def test_reference_model_vocabulary_mismatch_is_a_clear_value_error(turn_session):
+    dataset = build_action_sequence_dataset([turn_session])
+    model, _stats = train_action_world_model(dataset, _small_model_config())
+    # Train normally, then corrupt the *already-trained* reference model's
+    # declared vocabulary (mirroring how the sibling vocabulary tests above
+    # corrupt a dataset post-hoc) -- training on a genuinely mismatched
+    # dataset would fail for an unrelated reason (the recorded action
+    # indices would be out of bounds for a vocabulary that never saw them).
+    reference_model, _reference_stats = train_action_world_model(dataset, _small_model_config())
+    reference_model.action_keys = ["SOMETHING_ELSE"]
+
+    with pytest.raises(ValueError, match="reference_run must share"):
+        evaluate_action_world_model(model, dataset, [1], warmup_frames=2, reference_model=reference_model)
+    with pytest.raises(ValueError, match="reference_run must share"):
+        evaluate_action_world_model_direct(model, dataset, [1], warmup_frames=2, reference_model=reference_model)
+
+
 def test_ema_target_encoder_is_opt_in_and_reported(turn_session):
     dataset = build_action_sequence_dataset([turn_session])
     _model, default_stats = train_action_world_model(dataset, _small_model_config())
