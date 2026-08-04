@@ -1915,6 +1915,7 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
     Supplying the deprecated ``--budgets`` option explicitly retains the old
     successive-halving workflow for reproducibility of existing campaigns.
     """
+    from cognitive_runtime.training.model_factory.checkpoint import read_factory_checkpoint_metadata
     from cognitive_runtime.training.model_factory.genome import get_schema
     from cognitive_runtime.training.model_factory.search import (
         propose,
@@ -1927,6 +1928,25 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
         raw = load_spec(args.spec)
         if args.set:
             raw = apply_overrides(raw, args.set)
+        if args.reference_run:
+            # A convenience wholly analogous to clone/resume's own parent-block
+            # construction: a human should never have to look up and type a
+            # checkpoint's sha256 by hand. Applied after --set (and as a
+            # wholesale replacement, not a merge) so this flag always wins
+            # over an incomplete/conflicting --set evaluation.reference_run.*.
+            reference_directory = _factory_run_directory(args.root, args.reference_run, raw.get("organism"))
+            reference_checkpoint_path = reference_directory / "checkpoints" / args.reference_checkpoint
+            reference_sha256 = read_factory_checkpoint_metadata(
+                str(reference_checkpoint_path)
+            ).get("checkpoint_sha256")
+            raw = dict(raw)
+            raw["evaluation"] = {
+                **(raw.get("evaluation") or {}),
+                "reference_run": {
+                    "run_id": args.reference_run, "checkpoint": args.reference_checkpoint,
+                    "sha256": reference_sha256,
+                },
+            }
         legacy_halving = args.budgets is not None
         budgets = tuple(args.budgets or ())
         if legacy_halving:
@@ -3294,6 +3314,13 @@ def build_parser() -> argparse.ArgumentParser:
                                   help="stable campaign/run prefix (default: evo<seed>)")
     p_factory_search.add_argument("--champion", default=None,
                                   help="optional champion run id for the final paired comparison")
+    p_factory_search.add_argument("--reference-run", default=None, metavar="RUN_ID",
+                                  help="optional run whose checkpoint every candidate is evaluated against "
+                                       "(evaluation.reference_run) -- a configurable comparison baseline "
+                                       "beyond copy-last-frame; auto-resolves its checkpoint sha256")
+    p_factory_search.add_argument("--reference-checkpoint", default="best-validation.pt", metavar="NAME",
+                                  help="checkpoint file within --reference-run to compare against "
+                                       "(default: best-validation.pt)")
     p_factory_search.add_argument("--stage-budget-seconds", type=float, default=None,
                                   help="optional wall-clock cap for the whole campaign")
     p_factory_search.add_argument("--min-episode-length", type=int, default=None,

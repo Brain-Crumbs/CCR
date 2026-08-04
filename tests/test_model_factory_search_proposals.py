@@ -106,6 +106,98 @@ def test_successive_halving_reuses_duplicate_resolved_proposals_before_training(
 
 
 # ---------------------------------------------------------------------------
+# Phase 1.5 (clinic redesign): evaluation.reference_run threading.
+# ---------------------------------------------------------------------------
+
+
+def test_reference_run_is_shared_by_every_proposed_candidate():
+    """propose() holds evaluation -- including any configured
+    reference_run -- fixed across every candidate in a batch, exactly like
+    it already holds data/model/parent fixed (test_batch_shares_one_
+    architecture_and_data_identity's own `spec.evaluation ==
+    BASE_SPEC.evaluation` assertion covers this implicitly; this makes it
+    explicit)."""
+    raw = _minimal_raw()
+    raw["evaluation"]["reference_run"] = {
+        "run_id": "champion-0007", "checkpoint": "best-validation.pt", "sha256": "c" * 64,
+    }
+    base_with_reference = resolve(raw)
+
+    proposals = propose(base_with_reference, SCHEMA, 6, seed=5)
+
+    assert proposals
+    for spec in proposals:
+        assert spec.evaluation["reference_run"] == {
+            "run_id": "champion-0007", "checkpoint": "best-validation.pt", "sha256": "c" * 64,
+        }
+
+
+def test_halving_gates_includes_the_reference_comparison_gate():
+    """search.py reuses promotion.py's gate directly rather than
+    reimplementing it -- the same object, not a lookalike."""
+    from cognitive_runtime.training.model_factory.promotion import _reference_comparison_gate
+
+    assert _reference_comparison_gate in search_module._HALVING_GATES
+
+
+def test_a_candidate_failing_reference_comparison_is_excluded_from_selection(tmp_path, monkeypatch):
+    """End-to-end through run_successive_halving's real (unmocked)
+    _HALVING_GATES: a candidate whose rollout report carries
+    beats_reference=False at any horizon must be eliminated, exactly like
+    failing rollout_beats_copy_last or rollout_health already would."""
+    monkeypatch.setattr(
+        search_module,
+        "resolve_corpus",
+        lambda *args, **kwargs: SimpleNamespace(data_contract=SimpleNamespace(ticks_per_frame=1.0)),
+    )
+    monkeypatch.setattr(search_module, "_resolve_selection_metric", lambda *args: (1.0, [1.0]))
+    monkeypatch.setattr(
+        search_module,
+        "read_factory_checkpoint_metadata",
+        lambda *args, **kwargs: {"checkpoint_sha256": "a" * 64},
+    )
+
+    def fake_run_trial(spec, *, run_id, **kwargs):
+        directory = tmp_path / run_id
+        (directory / "metrics").mkdir(parents=True)
+        (directory / "metrics" / "validation.json").write_text(
+            '{"episode_ids": ["validation-1"]}', encoding="utf-8",
+        )
+        # c1 fails only the new gate; both still beat copy-last and report
+        # a healthy rollout, so only reference_comparison explains the cut.
+        beats_reference = run_id != "sh9-r0-c1"
+        return SimpleNamespace(
+            run_id=run_id,
+            directory=directory,
+            state="completed",
+            budget_report={"epochs_recorded": 1},
+            evaluation={
+                "rollout": {
+                    "horizons": {
+                        1: {
+                            "model_mse": 0.1, "copy_last_mse": 1.0, "beats_copy_last": True,
+                            "reference_mse": 1.0, "model_over_reference_mse": 0.1 if beats_reference else 10.0,
+                            "beats_reference": beats_reference,
+                        },
+                    },
+                    "rollout_health": {"frozen_rollout": False},
+                },
+            },
+        )
+
+    monkeypatch.setattr(search_module, "run_trial", fake_run_trial)
+    report = run_successive_halving(BASE_SPEC, SCHEMA, budgets=(1,), n=2, seed=9)
+
+    results_by_run_id = {result.run_id: result for result in report.rungs[0].results}
+    assert results_by_run_id["sh9-r0-c0"].gate_passed is True
+    assert results_by_run_id["sh9-r0-c1"].gate_passed is False
+    assert any(
+        gate["name"] == "reference_comparison" and not gate["passed"]
+        for gate in results_by_run_id["sh9-r0-c1"].gates
+    )
+
+
+# ---------------------------------------------------------------------------
 # Input validation.
 # ---------------------------------------------------------------------------
 

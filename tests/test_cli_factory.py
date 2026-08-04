@@ -283,6 +283,59 @@ def test_factory_search_defaults_to_evolutionary_populations(capsys):
     ]
 
 
+def test_factory_search_dry_run_resolves_reference_run_checkpoint_sha256(tmp_path, capsys):
+    """--reference-run is a convenience wholly analogous to clone/resume's
+    own parent-block construction: a human should never have to look up
+    and type a checkpoint's sha256 by hand."""
+    root = tmp_path / "runs"
+    reference = _make_run(root, "champion-0001", _spec(organism="Crafter"))
+    _write_checkpoint_metadata(reference, sha256="c" * 64, name="best-validation.pt")
+
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    main([
+        "factory", "search", str(spec_path), "--root", str(root),
+        "--candidates", "2", "--seed", "13", "--budgets", "1", "2",
+        "--run-id-prefix", "preview-13", "--dry-run", "--no-trace",
+        "--reference-run", "champion-0001",
+        "--set", "evaluation.selection_metric=rollout.t+2.model_over_copy_last_mse",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["candidates"], "dry-run must still propose candidates"
+    for candidate in payload["candidates"]:
+        assert candidate["spec"]["evaluation"]["reference_run"] == {
+            "run_id": "champion-0001", "checkpoint": "best-validation.pt", "sha256": "c" * 64,
+        }
+
+
+def test_factory_search_reference_run_defaults_to_the_best_validation_checkpoint(tmp_path, capsys):
+    root = tmp_path / "runs"
+    reference = _make_run(root, "champion-0001", _spec(organism="Crafter"))
+    _write_checkpoint_metadata(reference, sha256="d" * 64, name="best-validation.pt")
+
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    main([
+        "factory", "search", str(spec_path), "--root", str(root),
+        "--candidates", "2", "--seed", "13", "--budgets", "1",
+        "--run-id-prefix", "preview-13", "--dry-run", "--no-trace",
+        "--reference-run", "champion-0001",
+        "--set", "evaluation.selection_metric=rollout.t+2.model_over_copy_last_mse",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["candidates"][0]["spec"]["evaluation"]["reference_run"]["checkpoint"] == "best-validation.pt"
+
+
+def test_factory_search_unknown_reference_run_is_a_concise_cli_error(tmp_path):
+    root = tmp_path / "runs"
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    with pytest.raises(SystemExit, match="no run 'no-such-run'"):
+        main([
+            "factory", "search", str(spec_path), "--root", str(root), "--dry-run", "--no-trace",
+            "--reference-run", "no-such-run",
+        ])
+
+
 def test_factory_search_dry_run_rejects_invalid_budget_schedule():
     spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
     with pytest.raises(SystemExit, match="strictly increasing"):
