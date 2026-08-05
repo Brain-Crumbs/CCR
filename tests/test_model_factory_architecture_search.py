@@ -25,12 +25,14 @@ from cognitive_runtime.training.model_factory.architecture_genome import (
 )
 from cognitive_runtime.training.model_factory.architecture_search import (
     ARCHITECTURE_GENOME_OPERATOR,
+    ARCHITECTURE_PROGRESS_FORMAT,
     ARCHITECTURE_SEARCH_FORMAT,
     STATE_NO_INNER_SURVIVOR,
     ArchitectureParent,
     ArchitectureSearchError,
     architecture_run_id_prefix,
     breed_architecture,
+    campaign_progress_path,
     estimate_cost,
     preview_architecture_search,
     run_architecture_search,
@@ -741,3 +743,131 @@ def test_shipped_architecture_schema_drives_a_campaign(tmp_path, monkeypatch):
     assert report.architecture_schema_version == "architecture_search_v1"
     assert report.best_architecture_id == "arch1-arch0-a1"
     assert set(report.best_genome) == set(ARCHITECTURE_SEARCH_V1.gene_names)
+
+
+# --------------------------------------------------- live campaign progress
+
+
+def _progress(root: Path, campaign_id: str) -> dict:
+    return json.loads(
+        campaign_progress_path(root, "ArchitectureTest", campaign_id).read_text()
+    )
+
+
+def test_progress_document_distinguishes_carried_from_not_reached(tmp_path, monkeypatch):
+    """The one campaign fact run IDs alone cannot express.
+
+    A retained architecture is deliberately not re-run, so it allocates no
+    runs under the next generation's prefix -- indistinguishable, to anyone
+    scanning run directories, from an architecture the campaign has not
+    reached yet. The progress document is what separates them.
+    """
+    _install_fake_inner_search(monkeypatch, scores={
+        "arch3-arch0-a0": 0.30, "arch3-arch0-a1": 0.10, "arch3-arch0-a2": 0.20,
+        "arch3-arch1-a1": 0.05, "arch3-arch1-a2": 0.40,
+    })
+    root = tmp_path / "runs"
+    run_architecture_search(
+        _base_spec(), OUTER_SCHEMA, INNER_SCHEMA,
+        outer_population_size=3, outer_population_count=2,
+        inner_population_size=2, inner_population_count=1,
+        seed=3, method="random", outer_mutation_rate=1.0, root=root,
+    )
+
+    document = _progress(root, "arch3")
+    assert document["format"] == ARCHITECTURE_PROGRESS_FORMAT
+    assert document["complete"] is True
+    assert document["campaign_id"] == "arch3"
+    assert document["organism"] == "ArchitectureTest"
+    assert document["selection_metric"] == "rollout.t+1.model_over_copy_last_mse"
+    assert document["estimate"]["estimated_max_trials"] == 3 * 2 * 2 * 1
+
+    first, second = document["generations"]
+    assert first["complete"] is True
+    assert first["survivor_architecture_ids"] == ["arch3-arch0-a1"]
+    assert first["offspring_architecture_ids"] == ["arch3-arch1-a1", "arch3-arch1-a2"]
+
+    by_slot = {result["candidate_index"]: result for result in second["results"]}
+    carried = by_slot[0]
+    assert carried["carried"] is True
+    assert carried["metric_value"] == 0.10
+    # A carried architecture keeps the architecture_id it was first
+    # evaluated under -- the same "a survivor keeps its original id"
+    # property the inner loop has -- so the document says both where it sits
+    # now (candidate_index) and where its evidence came from.
+    assert carried["architecture_id"] == "arch3-arch0-a1"
+    # And the two bred children of that generation are *not* carried, which
+    # is what makes the flag load-bearing rather than decorative.
+    assert [by_slot[slot]["carried"] for slot in (1, 2)] == [False, False]
+    assert [by_slot[slot]["architecture_id"] for slot in (1, 2)] == [
+        "arch3-arch1-a1", "arch3-arch1-a2",
+    ]
+
+
+def test_progress_is_published_as_each_architecture_is_decided(tmp_path, monkeypatch):
+    """Not written once at the end: a campaign runs for hours."""
+    root = tmp_path / "runs"
+    seen: list[tuple[int, int, bool]] = []
+
+    def record(*_args, **_kwargs):
+        document = _progress(root, "arch3")
+        generation = document["generations"][-1]
+        seen.append((
+            generation["generation_index"], len(generation["results"]), document["complete"],
+        ))
+        return SimpleNamespace(
+            best_run_id="x-p0-c0", best_metric_value=0.5,
+            total_trials_started=2, total_epochs_executed=4, stage_budget_exceeded=False,
+        )
+
+    monkeypatch.setattr(architecture_search, "run_evolutionary_search", record)
+    run_architecture_search(
+        _base_spec(), OUTER_SCHEMA, INNER_SCHEMA,
+        outer_population_size=2, outer_population_count=1,
+        inner_population_size=2, inner_population_count=1,
+        seed=3, method="random", root=root,
+    )
+
+    # Read at the top of each inner campaign: the first sees an empty
+    # in-flight generation, the second sees its predecessor's result -- so
+    # the document is genuinely live, not a post-hoc dump.
+    assert seen == [(0, 0, False), (0, 1, False)]
+
+
+def test_a_campaign_that_cannot_write_progress_still_completes(tmp_path, monkeypatch):
+    """Hours of training must not be lost to a status file."""
+    _install_fake_inner_search(monkeypatch, scores={
+        "arch1-arch0-a0": 0.4, "arch1-arch0-a1": 0.1,
+    })
+    monkeypatch.setattr(
+        architecture_search, "atomic_write_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("read-only file system")),
+    )
+    report = run_architecture_search(
+        _base_spec(), OUTER_SCHEMA, INNER_SCHEMA,
+        outer_population_size=2, outer_population_count=1,
+        inner_population_size=2, inner_population_count=1,
+        seed=1, root=tmp_path / "runs",
+    )
+    assert report.best_architecture_id == "arch1-arch0-a1"
+
+
+def test_progress_lands_beside_the_runs_it_describes_without_joining_the_catalog(
+    tmp_path, monkeypatch,
+):
+    """A dot-directory: the clinic's catalog scan keeps only run directories
+    holding an experiment.json, so this one is inert to it."""
+    _install_fake_inner_search(monkeypatch, scores={
+        "arch1-arch0-a0": 0.4, "arch1-arch0-a1": 0.1,
+    })
+    root = tmp_path / "runs"
+    run_architecture_search(
+        _base_spec(), OUTER_SCHEMA, INNER_SCHEMA,
+        outer_population_size=2, outer_population_count=1,
+        inner_population_size=2, inner_population_count=1,
+        seed=1, root=root,
+    )
+    path = campaign_progress_path(root, "ArchitectureTest", "arch1")
+    assert path.parent == root / "ArchitectureTest" / ".architecture-campaigns"
+    assert path.parent.name.startswith(".")
+    assert not (path.parent / "experiment.json").exists()

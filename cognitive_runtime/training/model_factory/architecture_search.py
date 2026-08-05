@@ -61,12 +61,14 @@ core-only install.
 
 from __future__ import annotations
 
+import datetime as dt
 import random
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
+from cognitive_runtime.training.model_factory.artifacts import atomic_write_json
 from cognitive_runtime.training.model_factory.architecture_genome import (
     ArchitectureGenomeSchema,
     apply_architecture_genome,
@@ -98,6 +100,17 @@ from cognitive_runtime.training.model_factory.spec import validate as validate_s
 from cognitive_runtime.training.model_factory.state import STATE_FAILED
 
 ARCHITECTURE_SEARCH_FORMAT = "model-factory-architecture-search-v1"
+
+#: Versioned identity for the live progress document (see
+#: :func:`campaign_progress_path`).
+ARCHITECTURE_PROGRESS_FORMAT = "model-factory-architecture-campaign-progress-v1"
+
+#: Directory, relative to ``<root>/<organism>/``, holding one progress
+#: document per architecture campaign. A dot-directory so it is inert to the
+#: clinic's own run catalog scan, which enumerates an organism's
+#: subdirectories and keeps only those holding an ``experiment.json`` --
+#: this one never will.
+ARCHITECTURE_PROGRESS_SUBDIR = ".architecture-campaigns"
 
 #: The outer loop's genetic operator, recorded verbatim into each structural
 #: child's ``evolution.genome_operator``. Distinct from
@@ -145,6 +158,42 @@ def architecture_run_id_prefix(campaign_prefix: str, generation: int, candidate_
     ``state.json`` before the subprocess reaches that candidate.
     """
     return f"{campaign_prefix}-arch{generation}-a{candidate_index}"
+
+
+def _now_iso() -> str:
+    """Mirrors :func:`.state._now_iso` so every Model Factory manifest a
+    watcher polls carries the same timestamp shape."""
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def campaign_progress_path(
+    root: Union[str, Path], organism: str, campaign_id: str,
+) -> Path:
+    """Where one architecture campaign publishes its live progress.
+
+    The nested campaign is the one Model Factory workflow whose shape cannot
+    be read back off run IDs alone. An architecture *retained* into the next
+    outer generation is deliberately not re-run -- its inner campaign's
+    evidence is carried forward verbatim -- so it allocates no runs under the
+    later generation's prefix, and a watcher scanning run directories cannot
+    tell "carried" from "not reached yet". Both look like an absence.
+
+    Everything else about a campaign is already inspectable while it runs
+    (each trial's own ``state.json``/``metrics/``), and the final
+    :class:`ArchitectureSearchReport` is printed only when the whole
+    campaign finishes -- hours later, and to stdout rather than to disk. So
+    the *decisions* the outer loop makes are published here as they are
+    made: which architectures were evaluated, which were carried, which were
+    retained, and which offspring replaced the rest.
+
+    Lives under a dot-directory inside the organism's runs directory, beside
+    the runs it describes: the clinic's catalog scan enumerates an
+    organism's subdirectories and keeps only those holding an
+    ``experiment.json``, so this one is inert to it.
+    """
+    return (
+        Path(root) / organism / ARCHITECTURE_PROGRESS_SUBDIR / f"{campaign_id}.json"
+    )
 
 
 @dataclass(frozen=True)
@@ -843,9 +892,67 @@ def run_architecture_search(
     total_trials_started = 0
     total_epochs_executed = 0
 
+    progress_path = campaign_progress_path(root, base_spec.organism, campaign_id)
+    static_progress: Dict[str, Any] = {
+        "format": ARCHITECTURE_PROGRESS_FORMAT,
+        "campaign_id": campaign_id,
+        "organism": base_spec.organism,
+        "seed": seed,
+        "method": method,
+        "architecture_schema_version": architecture_schema.version,
+        "hyperparameter_schema_version": hyperparameter_schema.version,
+        "selection_metric": selection_metric,
+        "selection_metric_mode": selection_mode,
+        "estimate": estimate.to_dict(),
+        "outer_population_size": int(outer_population_size),
+        "outer_population_count": int(outer_population_count),
+        "inner_population_size": int(inner_population_size),
+        "inner_population_count": int(inner_population_count),
+    }
+
+    def publish(
+        in_flight: Optional[Tuple[int, List[ArchitectureCandidateResult]]] = None,
+        *,
+        complete: bool = False,
+    ) -> None:
+        """Republish the campaign's decisions so far.
+
+        Called after every outer candidate rather than once per generation:
+        an inner campaign can take hours, and the whole point of the
+        document is that a watcher can see "this architecture was carried"
+        the moment the outer loop decides it, not when the generation ends.
+        Writing is atomic and best-effort -- a campaign that cannot write
+        its progress (read-only root, full disk) must not lose hours of
+        training over a status file, so a failure here is swallowed. The
+        returned report remains the authoritative record either way.
+        """
+        published = [
+            {**generation.to_dict(), "complete": True} for generation in generations
+        ]
+        if in_flight is not None:
+            index, results = in_flight
+            published.append({
+                "generation_index": index,
+                "results": [result.to_dict() for result in results],
+                "survivor_architecture_ids": [],
+                "offspring_architecture_ids": [],
+                "complete": False,
+            })
+        try:
+            atomic_write_json(progress_path, {
+                **static_progress,
+                "generations": published,
+                "complete": complete,
+                "stage_budget_exceeded": stage_budget_exceeded,
+                "updated_at": _now_iso(),
+            })
+        except OSError:
+            pass
+
     for generation_index in range(outer_population_count):
         evaluated: List[_ArchitectureMember] = []
         displayed: List[ArchitectureCandidateResult] = []
+        publish((generation_index, displayed))
 
         for candidate_index, member in enumerate(members):
             architecture_id = architecture_run_id_prefix(
@@ -867,6 +974,7 @@ def run_architecture_search(
                 member.evaluation = carried
                 evaluated.append(member)
                 displayed.append(carried)
+                publish((generation_index, displayed))
                 continue
 
             remaining: Optional[float] = None
@@ -899,6 +1007,7 @@ def run_architecture_search(
                     member.evaluation = skipped
                     evaluated.append(member)
                     displayed.append(skipped)
+                    publish((generation_index, displayed))
                     continue
 
             inner_seed = (
@@ -941,6 +1050,7 @@ def run_architecture_search(
                 member.evaluation = failed
                 evaluated.append(member)
                 displayed.append(failed)
+                publish((generation_index, displayed))
                 continue
 
             inner_campaigns_run += 1
@@ -978,6 +1088,7 @@ def run_architecture_search(
             member.evaluation = result
             evaluated.append(member)
             displayed.append(result)
+            publish((generation_index, displayed))
 
         eligible = sorted(
             (member for member in evaluated if member.evaluation and member.evaluation.quality_passed),
@@ -1070,10 +1181,16 @@ def run_architecture_search(
             offspring_architecture_ids=tuple(offspring_ids),
         ))
         final_survivors = survivors
+        # The generation's retention and breeding decisions are exactly what
+        # a watcher cannot infer from run IDs, so they are published the
+        # moment they are made rather than at the end of the campaign.
+        publish()
 
         if generation_index + 1 >= outer_population_count or not survivors or stage_budget_exceeded:
             break
         members = survivors + offspring
+
+    publish(complete=True)
 
     best = final_survivors[0] if final_survivors else None
     best_run_id = best.evaluation.best_run_id if best else None

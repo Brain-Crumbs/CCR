@@ -156,10 +156,21 @@ Per selected organism/run, tabbed by concern:
   one row per architecture per outer generation, with its inner campaign's
   aggregate state and best selection-metric value, each expandable into that
   architecture's own population grid (the same component, fed from the one
-  organism-wide poll rather than opening a poller per expanded row). An
-  architecture retained into the next outer generation is not re-trained, so
-  its later-generation cell is empty -- the campaign's own JSON report is
-  what distinguishes "carried" from "not reached yet".
+  organism-wide poll rather than opening a poller per expanded row).
+
+  Retention is the one campaign fact run ids cannot express: an architecture
+  retained into the next outer generation is deliberately not re-trained, so
+  it allocates no runs under that generation's prefix and is
+  indistinguishable, from run directories alone, from one the campaign has
+  not reached yet. So the campaign publishes its own decisions as it makes
+  them, to `<runs>/<organism>/.architecture-campaigns/<campaign>.json`
+  (`architecture_search.campaign_progress_path`; a dot-directory, inert to
+  the run catalog scan), served by `GET /api/architecture-campaigns`. The
+  board reads carried/retained/eliminated from it -- a carried slot is
+  labelled as such, names the architecture whose evidence it carries, and
+  opens onto the inner grid that architecture already ran. A campaign that
+  never published one (an older run, a read-only root) still renders from
+  run ids alone, just without naming its carried slots.
 - **Breed** -- cross two completed runs of one organism into a single
   explicit-lineage child (`ccr factory breed`). Both parent pickers offer
   only `completed` runs, because breeding reads a parent's frozen genome and
@@ -268,6 +279,7 @@ see Security above before exposing them beyond localhost.
 | `GET /api/experiments?organism=&run=` | the run's Model Factory manifests as-is: `trial_spec`, `contracts`, `lineage`, `data_manifest`, `execution`, `experiment_report`, and `metrics.{validation,test,comparison}` |
 | `GET /api/registry?organism=` | the organism's champion registry (`registry.json`) |
 | `GET /api/factory-runs?organism=` | every run under the organism with its lineage mode, `state.json` state/reason/updated_at, promotion outcome, its own `selection_metric` resolved to a `selection_metric_value` from `metrics/validation.json` (`null` until evaluated), and its `lineage.json` `configuration_parents` -- queued/running/completed/failed across the whole Factory build, not just promoted runs |
+| `GET /api/architecture-campaigns?organism=` | every nested architecture (NAS) campaign's live progress document for the organism, newest first -- the outer loop's own retention/carry/breeding decisions as it makes them, which run ids alone cannot express (a retained architecture is not re-run, so it allocates no runs under the later generation's prefix). Empty for an organism that never ran one |
 | `GET /api/sessions?organism=&run=&name=&...filters` | recordings for the selected run, with quality verdicts |
 | `GET /api/sessions/:id` | one session's streams, decisions, exports, and quality verdict |
 | `GET /api/sessions/:id/episodes/:eid/{streams,decisions,frames,predictions}` | per-episode records; `predictions` accepts `?kind=dream` and `?experiment=` |

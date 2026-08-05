@@ -323,6 +323,28 @@ describe("EvolvePanel", () => {
       expect(screen.queryByRole("columnheader", { name: "latent_width" })).not.toBeInTheDocument();
     });
 
+    it("stops quoting a dry run's estimate once the form no longer describes it", async () => {
+      await switchToArchitecture();
+      fireEvent.change(screen.getByLabelText("Architectures per generation"), { target: { value: "2" } });
+      fireEvent.click(screen.getByRole("button", { name: "Dry-run preview" }));
+      await waitFor(() => expect(screen.getByTestId("cost-estimate").textContent).toContain("up to 72 full trainings"));
+
+      // Editing a cost-affecting field must not leave the gate quoting the
+      // old figure while the launch would send the new one -- otherwise a
+      // user could acknowledge 72 and start something far larger.
+      fireEvent.change(screen.getByLabelText("Architectures per generation"), { target: { value: "20" } });
+      await waitFor(() => {
+        const text = screen.getByTestId("cost-estimate").textContent;
+        expect(text).not.toContain("up to 72 full trainings");
+        // 20 x 2 outer over the form's own 6 x 3 inner, computed fresh.
+        expect(text).toContain("up to 720 full trainings");
+      });
+      expect(screen.getByLabelText("Acknowledge campaign cost")).not.toBeChecked();
+      // The candidate table is still the last dry run's and stays visible;
+      // only the cost figure is withdrawn.
+      expect(screen.getByText("arch7-arch0-a1")).toBeInTheDocument();
+    });
+
     it("launches through /api/jobs/search and opens the nested architecture board", async () => {
       await switchToArchitecture();
       fireEvent.change(screen.getByLabelText("Architectures per generation"), { target: { value: "2" } });

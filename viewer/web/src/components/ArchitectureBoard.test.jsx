@@ -43,7 +43,10 @@ describe("buildArchitectureBoard", () => {
     expect(minimized.mode).toBe("min");
     expect(minimized.generations[0].architectures[0].bestMetricValue).toBe(0.4);
     expect(minimized.generations[0].architectures[0].bestRunId).toBe("arch7-arch0-a0-p0-c1");
-    expect(minimized.generations[0].best).toBe("arch7-arch0-a0");
+    // The generation's leader is named by *slot*, not by architecture id:
+    // a carried architecture occupies one slot per generation it survives
+    // while keeping a single id throughout.
+    expect(minimized.generations[0].best).toBe("g0-a0");
 
     const maximized = buildArchitectureBoard({
       runs: RUNS, prefix: "arch7", outerPopulationSize: 2, outerPopulationCount: 1,
@@ -51,7 +54,7 @@ describe("buildArchitectureBoard", () => {
     });
     expect(maximized.mode).toBe("max");
     expect(maximized.generations[0].architectures[0].bestMetricValue).toBe(0.6);
-    expect(maximized.generations[0].best).toBe("arch7-arch0-a1");
+    expect(maximized.generations[0].best).toBe("g0-a1");
   });
 
   it("renders configured generations that have nothing on disk yet, and any generation beyond them", () => {
@@ -71,6 +74,81 @@ describe("buildArchitectureBoard", () => {
     });
     expect(overrun.generations).toHaveLength(2);
     expect(overrun.generations[1].architectures[0].state).toBe("running");
+  });
+});
+
+// `architecture_search`'s own progress document: generation 0 evaluated both
+// architectures and retained a0; generation 1 carries a0 into slot 0 (under
+// the architecture_id it was first evaluated as) and breeds one child into
+// slot 1, which has not started.
+const PROGRESS = {
+  format: "model-factory-architecture-campaign-progress-v1",
+  campaign_id: "arch7",
+  complete: false,
+  generations: [
+    {
+      generation_index: 0,
+      complete: true,
+      survivor_architecture_ids: ["arch7-arch0-a0"],
+      offspring_architecture_ids: ["arch7-arch1-a1"],
+      results: [
+        { candidate_index: 0, architecture_id: "arch7-arch0-a0", state: "completed", carried: false, retained: true, metric_value: 0.4, best_run_id: "arch7-arch0-a0-p0-c1", reason: "retained among the best 1 architecture(s)" },
+        { candidate_index: 1, architecture_id: "arch7-arch0-a1", state: "no_inner_survivor", carried: false, retained: false, metric_value: null, best_run_id: null, reason: "eliminated: the inner hyperparameter campaign produced no surviving candidate" },
+      ],
+    },
+    {
+      generation_index: 1,
+      complete: false,
+      survivor_architecture_ids: [],
+      offspring_architecture_ids: [],
+      results: [
+        { candidate_index: 0, architecture_id: "arch7-arch0-a0", state: "completed", carried: true, retained: false, metric_value: 0.4, best_run_id: "arch7-arch0-a0-p0-c1", reason: "carried forward from the preceding generation" },
+      ],
+    },
+  ],
+};
+
+describe("buildArchitectureBoard with the campaign's progress document", () => {
+  function board(progress) {
+    return buildArchitectureBoard({
+      runs: RUNS, prefix: "arch7", outerPopulationSize: 2, outerPopulationCount: 2,
+      selectionMetric: SELECTION_METRIC, progress,
+    });
+  }
+
+  it("names a carried slot and the earlier architecture whose evidence it carries", () => {
+    const [, second] = board(PROGRESS).generations;
+    expect(second.architectures[0].carried).toBe(true);
+    expect(second.architectures[0].state).toBe("carried");
+    // It keeps the id it was first evaluated under, and shows that
+    // campaign's own inner runs rather than an empty grid.
+    expect(second.architectures[0].prefix).toBe("arch7-arch0-a0");
+    expect(second.architectures[0].runs.map((r) => r.run))
+      .toEqual(["arch7-arch0-a0-p0-c0", "arch7-arch0-a0-p0-c1"]);
+    expect(second.architectures[0].bestMetricValue).toBe(0.4);
+  });
+
+  it("still shows a not-reached slot as empty, so the two are distinguishable", () => {
+    const [, second] = board(PROGRESS).generations;
+    expect(second.architectures[1].carried).toBe(false);
+    expect(second.architectures[1].state).toBe("not started");
+    expect(second.architectures[1].runs).toEqual([]);
+  });
+
+  it("prefers the campaign's own recorded state and retention over what run states can say", () => {
+    const [first] = board(PROGRESS).generations;
+    expect(first.architectures[0].retained).toBe(true);
+    // a1's two inner runs are one completed and one failed, so run states
+    // alone would read "completed"; the campaign recorded that it produced
+    // no surviving candidate at all.
+    expect(first.architectures[1].state).toBe("no_inner_survivor");
+    expect(first.architectures[1].bestMetricValue).toBe(null);
+  });
+
+  it("falls back to the run-id view when a campaign published no progress", () => {
+    const [, second] = board(null).generations;
+    expect(second.architectures[0].carried).toBe(false);
+    expect(second.architectures[0].state).toBe("not started");
   });
 });
 
@@ -114,15 +192,25 @@ describe("ArchitectureBoard", () => {
     renderBoard();
     expect(screen.queryByText("Population board")).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByLabelText("expand arch7-arch0-a0"));
+    fireEvent.click(screen.getByLabelText("expand arch7-arch0-a0 (outer generation 0)"));
     const inner = screen.getByRole("region", { name: "Population board" });
     expect(within(inner).getByText("arch7-arch0-a0-p0-c0")).toBeInTheDocument();
     // The inner grid is scoped to its own architecture: the sibling
     // architecture's candidates are not in it.
     expect(within(inner).queryByText("arch7-arch0-a1-p0-c0")).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByLabelText("collapse arch7-arch0-a0"));
+    fireEvent.click(screen.getByLabelText("collapse arch7-arch0-a0 (outer generation 0)"));
     expect(screen.queryByText("Population board")).not.toBeInTheDocument();
+  });
+
+  it("opens a carried slot onto the inner grid it already ran", () => {
+    renderBoard({ progress: PROGRESS, outerPopulationCount: 2 });
+    const carriedRow = screen.getByText("evidence carried from an earlier generation").closest("tr");
+    expect(within(carriedRow).getByText("carried")).toBeInTheDocument();
+
+    fireEvent.click(within(carriedRow).getByLabelText(/^expand /));
+    const inner = screen.getByRole("region", { name: "Population board" });
+    expect(within(inner).getByText("arch7-arch0-a0-p0-c1")).toBeInTheDocument();
   });
 
   it("explains the empty board before the campaign has written anything", () => {

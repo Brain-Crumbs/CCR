@@ -205,6 +205,7 @@ td.population-cell.is-current .population-cell__metric { color: var(--good-fg); 
 .architecture-row__id { font-family: ui-monospace, monospace; font-size: .72rem; word-break: break-all; }
 .architecture-row__metric { font-variant-numeric: tabular-nums; font-size: .78rem; }
 .architecture-row__toggle { background: none; border: none; padding: 0; font: inherit; font-weight: 700; cursor: pointer; color: var(--text-primary); }
+.architecture-row__note { display: block; color: var(--text-secondary); font-size: .68rem; margin-top: 2px; }
 tr.architecture-row.is-current > td, tr.architecture-row.is-current > th { box-shadow: inset 0 3px 0 var(--good-fg); }
 tr.architecture-row.is-current .architecture-row__metric { color: var(--good-fg); font-weight: 700; }
 /* An expanded inner grid is a whole nested panel; strip the shell it would

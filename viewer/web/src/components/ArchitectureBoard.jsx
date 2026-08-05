@@ -34,7 +34,10 @@ export function architectureState(runs) {
 function stateBadgeClass(state) {
   if (state === "running") return "info";
   if (state === "failed") return "red";
-  if (state === "completed") return "green";
+  if (state === "completed" || state === "carried") return "green";
+  // The campaign's own two "evaluated, but produced nothing usable" states:
+  // neither is an error, and neither is a success.
+  if (state === "no_inner_survivor" || state === "not_attempted") return "amber";
   return "neutral";
 }
 
@@ -42,19 +45,25 @@ function stateBadgeClass(state) {
  * Group one nested campaign's runs into outer generation → architecture →
  * inner runs, from run ids alone.
  *
- * Only what the campaign actually wrote to disk is interpreted. In
- * particular an architecture *retained* into the next outer generation is
- * not re-run (`run_architecture_search` carries its evaluation forward
- * verbatim), so it allocates no runs under the later generation's prefix and
- * shows up there as an empty cell -- the same "carried keeps its original
- * id" property Phase 4's flat board already handles one level down. Which
- * of the empty cells are carried survivors and which are simply not reached
- * yet is not recoverable from run ids, so neither is claimed: an empty cell
- * says "no inner runs on disk", and the legend explains both ways that
- * happens.
+ * Two sources, and the split between them is deliberate. Run ids carry the
+ * whole nested coordinate system, so the grid's *shape* and every inner
+ * campaign's live state come from `/api/factory-runs` alone. What run ids
+ * cannot express is retention: an architecture retained into the next outer
+ * generation is not re-run (`run_architecture_search` carries its evaluation
+ * forward verbatim), so it allocates no runs under the later generation's
+ * prefix and is indistinguishable, from run directories alone, from one the
+ * campaign has not reached yet.
+ *
+ * So `progress` -- the campaign's own live document
+ * (`architecture_search.campaign_progress_path`), republished as each outer
+ * candidate is decided -- supplies exactly those decisions: which slots are
+ * carried (and which earlier architecture's evidence they carry), which
+ * were retained, and each candidate's own recorded state and score. It is
+ * optional throughout: a campaign that never wrote one still renders from
+ * run ids, just without naming carried slots.
  */
 export function buildArchitectureBoard({
-  runs, prefix, outerPopulationSize, outerPopulationCount, selectionMetric,
+  runs, prefix, outerPopulationSize, outerPopulationCount, selectionMetric, progress = null,
 }) {
   const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const idPattern = new RegExp(`^${escaped}-arch(\\d+)-a(\\d+)-p\\d+-c\\d+$`);
@@ -95,6 +104,17 @@ export function buildArchitectureBoard({
   const highestOnDisk = grouped.size ? Math.max(...grouped.keys()) : -1;
   const generationCount = Math.max(outerPopulationCount, highestOnDisk + 1);
 
+  // The campaign's own decisions, indexed by (generation, slot). A carried
+  // candidate keeps the architecture_id it was first evaluated under, so its
+  // entry says both where it sits now (candidate_index) and where its
+  // evidence came from.
+  const decisions = new Map();
+  for (const generation of progress?.generations || []) {
+    for (const result of generation.results || []) {
+      decisions.set(`${generation.generation_index}:${result.candidate_index}`, result);
+    }
+  }
+
   const generations = [];
   for (let generation = 0; generation < generationCount; generation += 1) {
     const byArchitecture = grouped.get(generation) || new Map();
@@ -102,18 +122,48 @@ export function buildArchitectureBoard({
     const width = Math.max(outerPopulationSize, highestArchitecture + 1);
     const architectures = [];
     for (let candidate = 0; candidate < width; candidate += 1) {
-      const innerRuns = byArchitecture.get(candidate) || [];
+      const decision = decisions.get(`${generation}:${candidate}`) ?? null;
+      // A carried slot's runs live under the architecture_id it was first
+      // evaluated as, not under this generation's slot prefix -- so its
+      // inner grid is the one it already ran, shown where it now sits.
+      const sourcePrefix = decision?.carried ? decision.architecture_id : null;
+      const innerRuns = sourcePrefix
+        ? (grouped.get(Number(/-arch(\d+)-/.exec(sourcePrefix)?.[1] ?? -1)) || new Map())
+          .get(Number(/-a(\d+)$/.exec(sourcePrefix)?.[1] ?? -1)) || []
+        : byArchitecture.get(candidate) || [];
       const best = bestOf(innerRuns);
       architectures.push({
         candidate,
-        prefix: architecturePrefix(prefix, generation, candidate),
+        // Identity of the *slot*, not of the architecture in it: a carried
+        // architecture occupies a slot in every generation it survives
+        // while keeping one architecture_id throughout, so keying anything
+        // on the id alone would conflate those cells (and expanding one
+        // would expand all of them).
+        slot: `g${generation}-a${candidate}`,
+        generation,
+        prefix: sourcePrefix || architecturePrefix(prefix, generation, candidate),
         runs: innerRuns,
-        state: architectureState(innerRuns),
-        bestRunId: best?.run ?? null,
-        bestMetricValue: best?.selection_metric_value ?? null,
+        carried: Boolean(decision?.carried),
+        retained: Boolean(decision?.retained),
+        // The campaign's own recorded state wins where it has one: it can
+        // say things run states cannot ("carried" rather than a spuriously
+        // empty cell, "not_attempted" because the stage budget ran out,
+        // "no_inner_survivor" because every inner candidate failed its
+        // quality gate).
+        state: decision ? (decision.carried ? "carried" : decision.state) : architectureState(innerRuns),
+        reason: decision?.reason ?? null,
+        // Where the campaign recorded a decision its score is authoritative
+        // *including when it is null* -- a null there means "this
+        // architecture produced no surviving candidate", which is exactly
+        // the case a fallback to the best run's own value would paper over.
+        bestRunId: decision ? decision.best_run_id : best?.run ?? null,
+        bestMetricValue: decision ? decision.metric_value : best?.selection_metric_value ?? null,
       });
     }
-    const ranked = architectures.filter((architecture) => architecture.bestMetricValue !== null);
+    const ranked = architectures.filter(
+      (architecture) => typeof architecture.bestMetricValue === "number"
+        && Number.isFinite(architecture.bestMetricValue),
+    );
     const best = ranked.length
       ? ranked.reduce((leader, architecture) => {
         const better = mode === "min"
@@ -122,7 +172,7 @@ export function buildArchitectureBoard({
         return better ? architecture : leader;
       })
       : null;
-    generations.push({ generation, architectures, best: best?.prefix ?? null });
+    generations.push({ generation, architectures, best: best?.slot ?? null });
   }
 
   return {
@@ -146,13 +196,29 @@ function ArchitectureRow({
           <button
             type="button" className="architecture-row__toggle" onClick={onToggle}
             aria-expanded={expanded}
-            aria-label={`${expanded ? "collapse" : "expand"} ${architecture.prefix}`}
+            // Names the generation as well as the architecture: a carried
+            // architecture appears once per generation it survives, under
+            // one unchanging id.
+            aria-label={
+              `${expanded ? "collapse" : "expand"} ${architecture.prefix} `
+              + `(outer generation ${architecture.generation})`
+            }
           >
             {expanded ? "▾" : "▸"} a{architecture.candidate}
           </button>
         </th>
-        <td className="architecture-row__id">{architecture.prefix}</td>
-        <td><span className={`state-badge state-badge--${badge}`}>{architecture.state}</span></td>
+        <td className="architecture-row__id">
+          {architecture.prefix}
+          {architecture.carried && (
+            <span className="architecture-row__note">evidence carried from an earlier generation</span>
+          )}
+        </td>
+        <td>
+          <span className={`state-badge state-badge--${badge}`} title={architecture.reason || ""}>
+            {architecture.state}
+          </span>
+          {architecture.retained && <span className="architecture-row__note">retained</span>}
+        </td>
         <td className="architecture-row__metric">{formatExponential(architecture.bestMetricValue)}</td>
         <td className="architecture-row__id">{architecture.bestRunId || "–"}</td>
         <td className="architecture-row__metric">{architecture.runs.length}</td>
@@ -189,9 +255,10 @@ function ArchitectureRow({
 export function ArchitectureBoard({
   organism, prefix, outerPopulationSize, outerPopulationCount,
   innerPopulationSize, innerPopulationCount, selectionMetric,
-  runs: providedRuns = null, pollIntervalMs = 4000,
+  runs: providedRuns = null, progress: providedProgress = null, pollIntervalMs = 4000,
 }) {
   const [polledRuns, setPolledRuns] = useState(null);
+  const [polledProgress, setPolledProgress] = useState(null);
   const [expanded, setExpanded] = useState(() => new Set());
   const polling = providedRuns === null;
 
@@ -205,25 +272,39 @@ export function ArchitectureBoard({
       } catch {
         if (!cancelled) setPolledRuns([]);
       }
+      // A campaign that never published progress (an older run, a read-only
+      // root) is not an error here: the board falls back to what run ids
+      // say on their own.
+      try {
+        const document = await api.architectureCampaigns(organism);
+        if (!cancelled) {
+          setPolledProgress((document?.campaigns || []).find((c) => c.campaign_id === prefix) ?? null);
+        }
+      } catch {
+        if (!cancelled) setPolledProgress(null);
+      }
     }
     poll();
     const interval = setInterval(poll, pollIntervalMs);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [polling, organism, pollIntervalMs]);
+  }, [polling, organism, prefix, pollIntervalMs]);
 
   const runs = providedRuns ?? polledRuns;
+  const progress = providedProgress ?? polledProgress;
   const board = useMemo(
     () => (runs
-      ? buildArchitectureBoard({ runs, prefix, outerPopulationSize, outerPopulationCount, selectionMetric })
+      ? buildArchitectureBoard({
+        runs, prefix, outerPopulationSize, outerPopulationCount, selectionMetric, progress,
+      })
       : null),
-    [runs, prefix, outerPopulationSize, outerPopulationCount, selectionMetric],
+    [runs, prefix, outerPopulationSize, outerPopulationCount, selectionMetric, progress],
   );
 
-  function toggle(architecturePrefixId) {
+  function toggle(slot) {
     setExpanded((current) => {
       const next = new Set(current);
-      if (next.has(architecturePrefixId)) next.delete(architecturePrefixId);
-      else next.add(architecturePrefixId);
+      if (next.has(slot)) next.delete(slot);
+      else next.add(slot);
       return next;
     });
   }
@@ -259,11 +340,11 @@ export function ArchitectureBoard({
                 <tbody>
                   {generation.architectures.map((architecture) => (
                     <ArchitectureRow
-                      key={architecture.prefix}
+                      key={architecture.slot}
                       architecture={architecture}
-                      isBest={generation.best === architecture.prefix}
-                      expanded={expanded.has(architecture.prefix)}
-                      onToggle={() => toggle(architecture.prefix)}
+                      isBest={generation.best === architecture.slot}
+                      expanded={expanded.has(architecture.slot)}
+                      onToggle={() => toggle(architecture.slot)}
                       organism={organism}
                       innerPopulationSize={innerPopulationSize}
                       innerPopulationCount={innerPopulationCount}
@@ -278,9 +359,10 @@ export function ArchitectureBoard({
       )}
       <p className="build-form__hint">
         An architecture retained into the next outer generation is not re-trained — its inner campaign&apos;s
-        evidence is carried forward under its <em>original</em> generation&apos;s ids, so its cell in the later
-        generation stays empty. An empty cell therefore means either &ldquo;carried&rdquo; or &ldquo;not reached
-        yet&rdquo;; the campaign&apos;s own JSON report (printed when the job finishes) is what distinguishes them.
+        evidence is carried forward under its <em>original</em> generation&apos;s ids. Those slots are marked
+        &ldquo;carried&rdquo; and still open to the inner grid they already ran, read from the campaign&apos;s
+        own live progress document rather than inferred from run ids
+        {progress ? "" : " — which this campaign has not published, so its carried slots cannot be named"}.
       </p>
     </section>
   );

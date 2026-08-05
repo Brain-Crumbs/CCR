@@ -276,6 +276,14 @@ export function EvolvePanel({ catalog, organism: initialOrganism }) {
   // genuinely no bound to report, which is itself worth showing.
   const perTrialSeconds = baseSpec?.training?.max_training_seconds ?? null;
   const maxSeconds = typeof perTrialSeconds === "number" ? perTrialSeconds * maxTrials : null;
+  // Everything the quoted cost depends on. A dry run's estimate is tagged
+  // with this at the moment it is requested, so it can only ever be quoted
+  // back for the configuration it actually describes -- and the
+  // acknowledgement below is withdrawn on the same signal.
+  const costKey = JSON.stringify([
+    architecture, form.outerPopulationSize, form.outerPopulationCount,
+    form.populationSize, form.populationCount, perTrialSeconds,
+  ]);
 
   function set(field) {
     return (value) => setForm((current) => ({ ...current, [field]: value }));
@@ -284,7 +292,7 @@ export function EvolvePanel({ catalog, organism: initialOrganism }) {
   // Any change to what the campaign would cost withdraws the
   // acknowledgement: a confirm that survives an edit from 24 trials to 240
   // is not a confirm of anything.
-  useEffect(() => { setCostAcknowledged(false); }, [maxTrials, architecture, form.baseRun]);
+  useEffect(() => { setCostAcknowledged(false); }, [costKey, form.baseRun]);
 
   function specOverrides() {
     const rows = overrides
@@ -341,7 +349,11 @@ export function EvolvePanel({ catalog, organism: initialOrganism }) {
     setPreviewing(true);
     setError(null);
     try {
-      setPreview(await api.previewJob("search", searchBody()));
+      // Tagged with the cost configuration in force when the request was
+      // sent, never the one in force when the response lands: an edit made
+      // while the dry run was in flight must invalidate its estimate too.
+      const requestedCostKey = costKey;
+      setPreview({ ...await api.previewJob("search", searchBody()), costKey: requestedCostKey });
     } catch (err) {
       setPreview(null);
       setError(err.message);
@@ -386,10 +398,13 @@ export function EvolvePanel({ catalog, organism: initialOrganism }) {
 
   const geneColumns = varyingGenePaths(preview?.candidates);
   const architectureGeneColumns = varyingGenomeGenes(preview?.candidates);
-  // The dry run's own estimate wins over the client-side one whenever it is
-  // available: it is the number `architecture_search` itself computed for
-  // the exact configuration the launch will send.
-  const previewEstimate = preview?.estimate ?? null;
+  // The dry run's own estimate wins over the client-side one -- but only
+  // while the form still describes the campaign that estimate was computed
+  // for. Otherwise editing the population fields after a preview would leave
+  // the gate quoting the old figure while `searchBody()` launches the new
+  // one, so a user could acknowledge 72 trainings and start 720 (Codex
+  // review, PR #281).
+  const previewEstimate = preview?.estimate && preview.costKey === costKey ? preview.estimate : null;
   const quotedTrials = previewEstimate?.estimated_max_trials ?? maxTrials;
   const quotedSeconds = previewEstimate ? previewEstimate.estimated_max_seconds : maxSeconds;
   const launchBlocked = architecture && !costAcknowledged;
