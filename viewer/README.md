@@ -151,9 +151,12 @@ Per selected organism/run, tabbed by concern:
   and the child's value, flagged where mutation or repair then moved it --
   plus the resolved child spec's mode, weight-donor parent and checkpoint,
   corpus, objective and selection metric. **Breed child** stays disabled
-  until a preview succeeds, and launches the same subcommand minus
-  `--dry-run` as a `POST /api/jobs/breed` job, tracked in the shared Jobs
-  panel. The same seed, parents and schema always reproduce the same child.
+  until a preview of *exactly these settings* has succeeded -- an edit made
+  while the previous check is still on screen marks it stale rather than
+  letting a click breed a child the panel isn't describing -- and launches
+  the same subcommand minus `--dry-run` as a `POST /api/jobs/breed` job,
+  tracked in the shared Jobs panel. The same seed, parents and schema always
+  reproduce the same child.
 
 Each recording also shows its `record/quality.py` green/amber/red verdict
 before you ever train on it.

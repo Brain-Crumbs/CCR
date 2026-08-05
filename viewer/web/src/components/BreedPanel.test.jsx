@@ -156,6 +156,26 @@ describe("BreedPanel", () => {
     expect(latest.body.options).toMatchObject({ seed: 11, mutation_rate: 0.5, weight_donor: "run-1" });
   });
 
+  it("refuses to breed a change the on-screen preview does not describe yet", async () => {
+    await renderPanel();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Breed child" })).toBeEnabled());
+    const previews = posted.length;
+
+    // Inside the debounce window the previous check is still on screen, so
+    // it is labelled stale and launching is refused -- otherwise this click
+    // would breed a seed-11 child while the panel describes the seed-7 one.
+    fireEvent.change(screen.getByLabelText("Seed", { exact: true }), { target: { value: "11" } });
+    expect(screen.getByRole("button", { name: "Breed child" })).toBeDisabled();
+    expect(screen.getByTestId("breed-stale")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Breed child" }));
+    expect(posted.some((entry) => entry.route === "/api/jobs/breed")).toBe(false);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Breed child" })).toBeEnabled());
+    expect(screen.queryByTestId("breed-stale")).not.toBeInTheDocument();
+    expect(posted.length).toBeGreaterThan(previews);
+    expect(posted[posted.length - 1].body.options.seed).toBe(11);
+  });
+
   it("surfaces check_compatible's own mismatch reasons and refuses to launch", async () => {
     posted = [];
     vi.stubGlobal("fetch", vi.fn(makeRoute(posted, {

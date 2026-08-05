@@ -102,6 +102,11 @@ export function BreedPanel({ catalog, organism: initialOrganism }) {
   const [form, setForm] = useState(DEFAULT_FORM);
   const [preview, setPreview] = useState(null);
   const [previewError, setPreviewError] = useState(null);
+  // Exactly which request body the current preview/previewError describes.
+  // A preview that no longer matches the form is shown but never launched:
+  // between an edit and its debounced re-check, the displayed child is not
+  // the child these settings would produce.
+  const [previewedBody, setPreviewedBody] = useState(null);
   const [previewing, setPreviewing] = useState(false);
   const [previewToken, setPreviewToken] = useState(0);
   const [launching, setLaunching] = useState(false);
@@ -191,7 +196,7 @@ export function BreedPanel({ catalog, organism: initialOrganism }) {
   }), [organism, form]);
 
   useEffect(() => {
-    if (!canPreview) { setPreview(null); setPreviewError(null); return undefined; }
+    if (!canPreview) { setPreview(null); setPreviewError(null); setPreviewedBody(null); return undefined; }
     let cancelled = false;
     const timer = setTimeout(async () => {
       setPreviewing(true);
@@ -205,15 +210,24 @@ export function BreedPanel({ catalog, organism: initialOrganism }) {
         setPreview(null);
         setPreviewError(err.message);
       } finally {
-        if (!cancelled) setPreviewing(false);
+        if (!cancelled) { setPreviewedBody(previewBody); setPreviewing(false); }
       }
     }, PREVIEW_DEBOUNCE_MS);
     return () => { cancelled = true; clearTimeout(timer); };
   }, [previewBody, canPreview, previewToken]);
 
+  // What the panel is showing describes the form as it stands right now --
+  // not an earlier one whose re-check has not landed yet.
+  const previewIsCurrent = previewedBody === previewBody;
+  const launchable = Boolean(preview) && previewIsCurrent;
+
   async function handleLaunch(event) {
     event.preventDefault();
-    if (!canPreview) return;
+    // Never launch a body the displayed lineage does not describe: an edit
+    // made inside the debounce window would otherwise breed a different
+    // child than the one on screen, or an incompatible pair the pending
+    // re-check is about to reject.
+    if (!canPreview || !launchable) return;
     setLaunching(true);
     setLaunchError(null);
     try {
@@ -370,17 +384,26 @@ export function BreedPanel({ catalog, organism: initialOrganism }) {
             <button type="button" onClick={() => setPreviewToken((token) => token + 1)} disabled={!canPreview || previewing}>
               {previewing ? "Checking…" : "Recheck compatibility"}
             </button>
-            <button type="submit" disabled={launching || !preview}>
+            <button type="submit" disabled={launching || !launchable}>
               {launching ? "Launching…" : "Breed child"}
             </button>
           </div>
-          {!preview && canPreview && !previewError && (
-            <p className="build-form__hint">breeding stays disabled until these two parents preview as compatible</p>
+          {canPreview && !launchable && !previewError && (
+            <p className="build-form__hint">breeding stays disabled until these settings preview as compatible</p>
           )}
         </form>
 
         <div className="breed-preview">
           <h4>Compatibility &amp; child preview</h4>
+          {/* The last completed check stays on screen while the next one
+              runs -- re-blanking the panel on every keystroke would flicker
+              -- but it is labelled as describing the previous settings, and
+              breeding is disabled until the re-check lands. */}
+          {canPreview && previewedBody && !previewIsCurrent && (
+            <p className="build-form__hint" data-testid="breed-stale">
+              settings changed -- re-checking; what follows describes the previous check
+            </p>
+          )}
           {!canPreview ? (
             <p className="no-data">select two different completed runs to check</p>
           ) : previewError ? (
