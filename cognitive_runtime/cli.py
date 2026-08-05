@@ -1908,6 +1908,75 @@ def cmd_factory_baseline(args: argparse.Namespace) -> None:
     _print_trial_result(result)
 
 
+def _run_architecture_campaign(
+    args: argparse.Namespace,
+    base_spec: Any,
+    outer_schema: Any,
+    inner_schema: Any,
+    preview: Any,
+    run_architecture_search: Any,
+) -> None:
+    """``ccr factory search --genome architecture``'s tail: cost, then campaign.
+
+    Split out of :func:`cmd_factory_search` rather than inlined so the
+    nested workflow's one genuinely distinctive obligation is impossible to
+    miss: the cost bound is *always* printed, dry run or not, before a
+    single trial starts. Outer and inner budgets multiply
+    (``architecture_search.estimate_cost``), so a "modest" 4x2 over 3x1 is
+    already 24 full trainings; the estimate goes to stderr so stdout stays
+    the single JSON document every other factory subcommand prints.
+    """
+    estimate = preview.estimate
+    seconds = estimate.estimated_max_seconds
+    print(
+        f"architecture search cost bound: {estimate.estimated_max_trials} trial(s) "
+        f"({estimate.outer_population_size} architectures x {estimate.outer_population_count} outer "
+        f"generation(s) x {estimate.inner_population_size} candidates x "
+        f"{estimate.inner_population_count} inner population(s)); "
+        + (
+            f"up to {seconds:.0f}s of training at "
+            f"{estimate.max_training_seconds_per_trial:.0f}s per trial"
+            if seconds is not None else
+            "no wall-clock bound -- this spec declares no training.max_training_seconds"
+        ),
+        file=sys.stderr,
+    )
+
+    if args.dry_run:
+        print(json.dumps(_factory_json_ready({
+            **preview.to_dict(),
+            "workflow": "architecture",
+            "architecture_schema_hash": outer_schema.content_hash,
+            "hyperparameter_schema_hash": inner_schema.content_hash,
+        }), indent=2, sort_keys=True))
+        return
+
+    try:
+        report = run_architecture_search(
+            base_spec, outer_schema, inner_schema,
+            outer_population_size=args.outer_population_size,
+            outer_population_count=args.outer_population_count,
+            inner_population_size=args.population_size,
+            inner_population_count=args.population_count,
+            seed=args.seed, method=args.method,
+            outer_mutation_rate=args.outer_mutation_rate,
+            inner_mutation_rate=args.mutation_rate,
+            root=args.root, corpus_root=args.corpus_root,
+            run_id_prefix=preview.campaign_id, naming_seed=args.naming_seed,
+            champion_run_id=args.champion,
+            min_episode_length=args.min_episode_length,
+            stage_budget_seconds=args.stage_budget_seconds,
+        )
+    except ImportError as exc:
+        sys.exit(f"'ccr factory search' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+    payload = report.to_dict()
+    payload["campaign_id"] = preview.campaign_id
+    payload["workflow"] = "architecture"
+    payload["architecture_schema_hash"] = outer_schema.content_hash
+    payload["hyperparameter_schema_hash"] = inner_schema.content_hash
+    print(json.dumps(_factory_json_ready(payload), indent=2, sort_keys=True))
+
+
 def cmd_factory_search(args: argparse.Namespace) -> None:
     """Preview or run one bounded evolutionary factory campaign.
 
@@ -1915,7 +1984,20 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
     specs and prints them without resolving a corpus or launching training.
     Supplying the deprecated ``--budgets`` option explicitly retains the old
     successive-halving workflow for reproducibility of existing campaigns.
+
+    ``--genome architecture`` switches to the nested NAS campaign
+    (:mod:`~.model_factory.architecture_search`): an outer evolutionary loop
+    over architectures, each scored by a complete inner training-gene
+    campaign. ``--population-size``/``--populations``/``--mutation-rate``
+    keep their meaning as that *inner* campaign's parameters -- the inner
+    engine is ``run_evolutionary_search`` unchanged -- and the outer loop has
+    its own ``--outer-*`` flags.
     """
+    from cognitive_runtime.training.model_factory.architecture_genome import get_architecture_schema
+    from cognitive_runtime.training.model_factory.architecture_search import (
+        preview_architecture_search,
+        run_architecture_search,
+    )
     from cognitive_runtime.training.model_factory.checkpoint import read_factory_checkpoint_metadata
     from cognitive_runtime.training.model_factory.genome import get_schema
     from cognitive_runtime.training.model_factory.search import (
@@ -1962,6 +2044,12 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
             }
         legacy_halving = args.budgets is not None
         budgets = tuple(args.budgets or ())
+        architecture_mode = args.genome == "architecture"
+        if architecture_mode and legacy_halving:
+            raise ValueError(
+                "--budgets runs the legacy successive-halving workflow, which has no "
+                "architecture mode; drop --budgets to run the nested architecture campaign"
+            )
         if legacy_halving:
             if any(budget <= 0 for budget in budgets) or list(budgets) != sorted(set(budgets)):
                 raise ValueError(f"budgets must be positive, strictly increasing epoch counts; got {budgets!r}")
@@ -1975,13 +2063,28 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
             raise ValueError(f"mutation_rate must be in [0, 1]; got {args.mutation_rate!r}")
         base_spec = resolve(raw)
         schema = get_schema(args.schema)
+        outer_schema = get_architecture_schema(args.outer_schema) if architecture_mode else None
         proposals = (
             propose(
                 base_spec, schema, args.population_size, args.seed, method=args.method,
                 min_episode_length=args.min_episode_length,
                 stage_budget_seconds=args.stage_budget_seconds,
             )
-            if args.dry_run else ()
+            if args.dry_run and not architecture_mode else ()
+        )
+        architecture_preview = (
+            preview_architecture_search(
+                base_spec, outer_schema, schema,
+                outer_population_size=args.outer_population_size,
+                outer_population_count=args.outer_population_count,
+                inner_population_size=args.population_size,
+                inner_population_count=args.population_count,
+                seed=args.seed, method=args.method,
+                outer_mutation_rate=args.outer_mutation_rate,
+                inner_mutation_rate=args.mutation_rate,
+                run_id_prefix=args.run_id_prefix,
+            )
+            if architecture_mode else None
         )
     except FileNotFoundError as exc:
         # OSError's own branch below would render this as a bare errno
@@ -1990,6 +2093,12 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
         sys.exit(f"invalid factory search: file not found: {exc.filename or exc}")
     except (OSError, SpecError, ValueError) as exc:
         sys.exit(f"invalid factory search: {exc}")
+
+    if architecture_mode:
+        _run_architecture_campaign(
+            args, base_spec, outer_schema, schema, architecture_preview, run_architecture_search,
+        )
+        return
 
     campaign_id = args.run_id_prefix or (f"sh{args.seed}" if legacy_halving else f"evo{args.seed}")
     if args.dry_run:
@@ -2257,6 +2366,10 @@ def cmd_factory_meta(args: argparse.Namespace) -> None:
     actually declared instead of duplicating them. Pure Python, no torch
     import, no run directory touched.
     """
+    from cognitive_runtime.training.model_factory.architecture_genome import (
+        ARCHITECTURE_GENOME_SCHEMAS,
+        BACKBONE_PRESETS,
+    )
     from cognitive_runtime.training.model_factory.genome import GENOME_SCHEMAS, OBJECTIVES
     from cognitive_runtime.training.model_factory.spec import VALID_MODES
 
@@ -2264,6 +2377,18 @@ def cmd_factory_meta(args: argparse.Namespace) -> None:
         "modes": list(VALID_MODES),
         "objectives": list(OBJECTIVES),
         "genome_schemas": sorted(GENOME_SCHEMAS),
+        # The architecture (NAS) axis is a separate schema registry on
+        # purpose (`architecture_genome.ARCHITECTURE_GENOME_SCHEMAS`): the
+        # two families are mutually exclusive by construction, so a caller
+        # must never be able to offer one where the other is expected.
+        "architecture_genome_schemas": sorted(ARCHITECTURE_GENOME_SCHEMAS),
+        "backbone_presets": {
+            name: {
+                "backbone": preset["backbone"],
+                "backbone_kwargs": dict(preset["backbone_kwargs"]),
+            }
+            for name, preset in BACKBONE_PRESETS.items()
+        },
         # Mirrors the choices already declared for `ccr nursery joint/bench`
         # (ActionWorldModelConfig.backbone, issue #93) -- not centralized as
         # a shared constant there, so named again here rather than reaching
@@ -3404,8 +3529,28 @@ def build_parser() -> argparse.ArgumentParser:
         "search", help="evolve candidate populations through quality filtering, selection, and breeding"
     )
     p_factory_search.add_argument("spec", help="base experiment spec file (.yaml/.yml/.json)")
+    p_factory_search.add_argument("--genome", choices=["training", "architecture"], default="training",
+                                  help="which axis to evolve: 'training' (default) evolves training genes "
+                                       "against one fixed architecture; 'architecture' runs a nested "
+                                       "NAS campaign whose outer loop evolves the architecture and whose "
+                                       "inner loop is a complete training-gene campaign per candidate")
     p_factory_search.add_argument("--schema", default="generic_action_effects_v1",
-                                  help="versioned genome schema (default: generic_action_effects_v1)")
+                                  help="versioned genome schema (default: generic_action_effects_v1). "
+                                       "With --genome architecture this is the *inner* (training) schema")
+    p_factory_search.add_argument("--outer-schema", default="architecture_search_v1",
+                                  help="--genome architecture only: versioned architecture genome schema "
+                                       "for the outer loop (default: architecture_search_v1)")
+    p_factory_search.add_argument("--outer-population-size", type=int, default=4,
+                                  help="--genome architecture only: architectures maintained per outer "
+                                       "generation (default: 4). --population-size stays the inner size")
+    p_factory_search.add_argument("--outer-populations", "--outer-generations",
+                                  dest="outer_population_count", type=int, default=2,
+                                  help="--genome architecture only: outer generations to evaluate, "
+                                       "including the initial one (default: 2)")
+    p_factory_search.add_argument("--outer-mutation-rate", type=float, default=0.2,
+                                  help="--genome architecture only: per-gene mutation probability for "
+                                       "structural children (default: 0.2). --mutation-rate stays the "
+                                       "inner rate")
     p_factory_search.add_argument("--population-size", "--candidates", "-n", dest="population_size",
                                   type=int, default=8,
                                   help="candidate count maintained in each population (default: 8)")
@@ -3424,7 +3569,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_factory_search.add_argument("--halving-factor", type=int, default=2,
                                   help="candidate reduction factor per rung (default: 2)")
     p_factory_search.add_argument("--run-id-prefix", default=None,
-                                  help="stable campaign/run prefix (default: evo<seed>)")
+                                  help="stable campaign/run prefix (default: evo<seed>, or arch<seed> "
+                                       "with --genome architecture)")
     p_factory_search.add_argument("--champion", default=None,
                                   help="optional champion run id for the final paired comparison")
     p_factory_search.add_argument("--reference-run", default=None, metavar="RUN_ID",

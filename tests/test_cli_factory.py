@@ -364,6 +364,86 @@ def test_factory_search_missing_reference_checkpoint_names_the_checkpoint_not_th
     assert "spec file not found" not in message
 
 
+def test_factory_search_architecture_dry_run_previews_the_outer_population(capsys):
+    """``--genome architecture`` previews architectures, not training genes."""
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    main([
+        "factory", "search", str(spec_path), "--genome", "architecture",
+        "--outer-population-size", "3", "--outer-populations", "2",
+        "--population-size", "2", "--populations", "1",
+        "--seed", "13", "--run-id-prefix", "preview-13", "--dry-run", "--no-trace",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["workflow"] == "architecture"
+    assert payload["dry_run"] is True
+    assert payload["campaign_id"] == "preview-13"
+    assert payload["architecture_schema_version"] == "architecture_search_v1"
+    assert payload["hyperparameter_schema_version"] == "generic_action_effects_v1"
+    assert [candidate["architecture_id"] for candidate in payload["candidates"]] == [
+        "preview-13-arch0-a0", "preview-13-arch0-a1", "preview-13-arch0-a2",
+    ]
+    # Each previewed candidate's genome is genuinely merged into its spec's
+    # model block -- the outer axis, never the training block.
+    for candidate in payload["candidates"]:
+        assert candidate["spec"]["model"]["hidden_dim"] == candidate["genome"]["hidden_dim"]
+        assert candidate["spec"]["mode"] == "fresh"
+        assert candidate["spec"]["parent"] is None
+
+
+def test_factory_search_architecture_always_prints_the_multiplicative_cost_bound(capsys):
+    """The cost bound is the one thing this workflow must never launch without.
+
+    Printed to stderr so stdout stays the single JSON document every other
+    factory subcommand prints.
+    """
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    main([
+        "factory", "search", str(spec_path), "--genome", "architecture",
+        "--outer-population-size", "4", "--outer-populations", "2",
+        "--population-size", "3", "--populations", "1",
+        "--seed", "1", "--dry-run", "--no-trace",
+    ])
+    captured = capsys.readouterr()
+
+    assert "24 trial(s)" in captured.err
+    assert "4 architectures x 2 outer generation(s) x 3 candidates" in captured.err
+    assert json.loads(captured.out)["estimate"]["estimated_max_trials"] == 24
+
+
+def test_factory_search_architecture_rejects_the_legacy_halving_flag(tmp_path):
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    with pytest.raises(SystemExit, match="--budgets"):
+        main([
+            "factory", "search", str(spec_path), "--genome", "architecture",
+            "--budgets", "1", "2", "--dry-run", "--no-trace",
+        ])
+
+
+def test_factory_search_architecture_rejects_an_unknown_outer_schema(tmp_path):
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    with pytest.raises(SystemExit, match="unknown architecture genome schema"):
+        main([
+            "factory", "search", str(spec_path), "--genome", "architecture",
+            "--outer-schema", "architecture_search_v99", "--dry-run", "--no-trace",
+        ])
+
+
+def test_factory_meta_declares_the_architecture_schemas_and_backbone_presets(capsys):
+    """The Evolve tab's NAS mode sources its options from the backend's enums."""
+    main(["factory", "meta", "--no-trace"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["architecture_genome_schemas"] == ["architecture_search_v1"]
+    assert payload["backbone_presets"]["transformer_h4_l2"] == {
+        "backbone": "transformer", "backbone_kwargs": {"n_heads": 4, "n_layers": 2},
+    }
+    assert payload["backbone_presets"]["gru"] == {"backbone": "gru", "backbone_kwargs": {}}
+    # The two schema registries stay separate: neither can be offered where
+    # the other is expected.
+    assert not set(payload["architecture_genome_schemas"]) & set(payload["genome_schemas"])
+
+
 def test_factory_search_missing_spec_file_still_names_the_spec(tmp_path):
     with pytest.raises(SystemExit, match="spec file not found"):
         main([

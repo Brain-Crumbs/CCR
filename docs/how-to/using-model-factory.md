@@ -26,6 +26,7 @@ The implemented CLI commands are:
 | `ccr factory corpus build <spec>` | Build and freeze a quality-gated train/validation/test corpus. |
 | `ccr factory baseline <spec>` | Resolve and launch any `fresh`, `clone`, `resume`, or `fine_tune` spec. |
 | `ccr factory search <spec>` | Evaluate, filter, retain, and breed candidate populations. |
+| `ccr factory search <spec> --genome architecture` | Nested architecture (NAS) campaign: evolve architectures, each scored by its own inner training-gene campaign. |
 | `ccr factory clone <run> --set path=value` | Create a controlled clone or fine-tune child from an existing run. |
 | `ccr factory breed <parent-a> <parent-b>` | Breed two compatible completed runs and launch the explicit-lineage child. |
 | `ccr factory compare <baseline> <candidate>...` | Produce paired validation comparisons. |
@@ -212,6 +213,52 @@ run IDs are stable under the chosen prefix:
 For reproducibility of an older campaign, explicitly passing
 `--budgets 50 150 500` selects the legacy successive-halving engine.
 
+## 7a. Architecture search (NAS)
+
+`--genome architecture` evolves the *architecture* instead of the training
+procedure. It is a nested campaign: an outer evolutionary loop over
+architectures, where each candidate is scored by running a complete inner
+training-gene campaign (the engine from section 7, unchanged) with that
+architecture held fixed. Every architecture therefore gets the same inner
+search budget before it is judged, so its score is a property of the
+architecture rather than of one arbitrary hyperparameter setting.
+
+```bash
+ccr factory search specs/crafter-baseline.yaml \
+  --genome architecture \
+  --outer-schema architecture_search_v1 --schema generic_action_effects_v1 \
+  --outer-population-size 4 --outer-populations 2 \
+  --population-size 3 --populations 1 \
+  --seed 7 --run-id-prefix crafter-nas-7 --dry-run
+```
+
+`--population-size`/`--populations`/`--mutation-rate` keep their meaning as
+the *inner* campaign's parameters; the outer loop has its own `--outer-*`
+flags. Run IDs extend the same convention with the outer coordinates:
+`crafter-nas-7-arch<generation>-a<architecture>-p<population>-c<candidate>`.
+
+**Cost multiplies.** The bound is
+`outer-population-size × outer-populations × population-size × populations`
+full trainings — the 4×2×3×1 above is already 24 — so the command prints
+that bound (and its wall-clock equivalent, from the spec's
+`training.max_training_seconds`) to stderr on every invocation, dry run or
+not, before anything launches. Preview with `--dry-run` first.
+
+The evolvable architecture genes are deliberately few:
+`backbone_preset` (one categorical gene over curated whole
+`{backbone, backbone_kwargs}` presets, so a transformer never inherits a
+convolution's kwargs), `latent_width`, `hidden_dim`, `action_embed_dim` and
+`context_length`. Corpus-derived `ArchitectureContract` fields are not free
+choices and are not evolvable; `reconstruction_size` is excluded from v1
+because changing decoder output resolution across candidates would make raw
+pixel MSE comparisons unfair.
+
+An architecture-changing child **trains from scratch** (`mode: fresh`, no
+`parent` block): there is no compatible checkpoint to inherit, and the
+factory never averages or splices weights across parents. Its lineage still
+records both configuration parents and the fitter one as `weight_donor` —
+a provenance label, not a checkpoint reference.
+
 Breed two compatible completed parents after inspecting the child first:
 
 ```bash
@@ -250,6 +297,36 @@ report = run_evolutionary_search(
     population_count=4,
     seed=7,
     mutation_rate=0.2,
+)
+```
+
+The nested architecture campaign lives beside it, in
+`cognitive_runtime.training.model_factory.architecture_search`:
+
+```python
+from cognitive_runtime.training.model_factory.architecture_genome import (
+    get_architecture_schema,
+)
+from cognitive_runtime.training.model_factory.architecture_search import (
+    estimate_cost,
+    preview_architecture_search,
+    run_architecture_search,
+)
+
+outer_schema = get_architecture_schema("architecture_search_v1")
+sizes = dict(
+    outer_population_size=4,
+    outer_population_count=2,
+    inner_population_size=3,
+    inner_population_count=1,
+)
+# Always look at this before launching: outer and inner budgets multiply.
+print(estimate_cost(base_spec, **sizes).estimated_max_trials)
+preview = preview_architecture_search(
+    base_spec, outer_schema, schema, seed=7, **sizes,
+)
+report = run_architecture_search(
+    base_spec, outer_schema, schema, seed=7, **sizes,
 )
 ```
 
