@@ -2029,7 +2029,10 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
             raw = apply_overrides(raw, args.set)
         legacy_halving = args.budgets is not None
         budgets = tuple(args.budgets or ())
+        seed_run_ids = tuple(args.seed_run or ())
         if legacy_halving:
+            if seed_run_ids:
+                raise ValueError("--seed-run is supported by evolutionary search, not legacy --budgets")
             if any(budget <= 0 for budget in budgets) or list(budgets) != sorted(set(budgets)):
                 raise ValueError(f"budgets must be positive, strictly increasing epoch counts; got {budgets!r}")
             if args.halving_factor < 2:
@@ -2040,15 +2043,22 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
             raise ValueError(f"population_count must be at least 1; got {args.population_count!r}")
         if not 0.0 <= args.mutation_rate <= 1.0:
             raise ValueError(f"mutation_rate must be in [0, 1]; got {args.mutation_rate!r}")
+        if len(set(seed_run_ids)) != len(seed_run_ids):
+            raise ValueError("--seed-run values must be unique")
+        if len(seed_run_ids) > args.population_size:
+            raise ValueError(
+                f"received {len(seed_run_ids)} seed runs for population_size={args.population_size}"
+            )
         base_spec = resolve(raw)
         schema = get_schema(args.schema)
+        fresh_count = args.population_size - len(seed_run_ids)
         proposals = (
             propose(
-                base_spec, schema, args.population_size, args.seed, method=args.method,
+                base_spec, schema, fresh_count, args.seed, method=args.method,
                 min_episode_length=args.min_episode_length,
                 stage_budget_seconds=args.stage_budget_seconds,
             )
-            if args.dry_run else ()
+            if args.dry_run and fresh_count else ()
         )
     except FileNotFoundError:
         sys.exit(f"invalid factory search: spec file not found: {args.spec}")
@@ -2068,13 +2078,23 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
             "population_size": args.population_size,
             "population_count": args.population_count,
             "mutation_rate": args.mutation_rate,
+            "seed_run_ids": list(seed_run_ids),
             "candidates": [
                 {
                     "candidate_index": index,
+                    "run_id": run_id,
+                    "source": "seed_run",
+                    "spec": None,
+                }
+                for index, run_id in enumerate(seed_run_ids)
+            ] + [
+                {
+                    "candidate_index": index + len(seed_run_ids),
                     "run_id": (
-                        f"{campaign_id}-r0-c{index}" if legacy_halving
-                        else f"{campaign_id}-p0-c{index}"
+                        f"{campaign_id}-r0-c{index + len(seed_run_ids)}" if legacy_halving
+                        else f"{campaign_id}-p0-c{index + len(seed_run_ids)}"
                     ),
+                    "source": "fresh_proposal",
                     "spec": spec.to_dict(),
                 }
                 for index, spec in enumerate(proposals)
@@ -2101,11 +2121,14 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
                 method=args.method, mutation_rate=args.mutation_rate,
                 root=args.root, corpus_root=args.corpus_root, run_id_prefix=campaign_id,
                 naming_seed=args.naming_seed, champion_run_id=args.champion,
+                seed_run_ids=seed_run_ids,
                 min_episode_length=args.min_episode_length,
                 stage_budget_seconds=args.stage_budget_seconds,
             )
     except ImportError as exc:
         sys.exit(f"'ccr factory search' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+    except (OSError, ValueError) as exc:
+        sys.exit(f"invalid factory search: {exc}")
     payload = report.to_dict()
     payload["campaign_id"] = campaign_id
     payload["schema"] = schema.version
@@ -3314,8 +3337,8 @@ def build_parser() -> argparse.ArgumentParser:
         "search", help="evolve candidate populations through quality filtering, selection, and breeding"
     )
     p_factory_search.add_argument("spec", help="base experiment spec file (.yaml/.yml/.json)")
-    p_factory_search.add_argument("--schema", default="generic_action_effects_v1",
-                                  help="versioned genome schema (default: generic_action_effects_v1)")
+    p_factory_search.add_argument("--schema", default="generic_action_effects_v2",
+                                  help="versioned genome schema (default: generic_action_effects_v2)")
     p_factory_search.add_argument("--population-size", "--candidates", "-n", dest="population_size",
                                   type=int, default=8,
                                   help="candidate count maintained in each population (default: 8)")
@@ -3337,6 +3360,10 @@ def build_parser() -> argparse.ArgumentParser:
                                   help="stable campaign/run prefix (default: evo<seed>)")
     p_factory_search.add_argument("--champion", default=None,
                                   help="optional champion run id for the final paired comparison")
+    p_factory_search.add_argument(
+        "--seed-run", action="append", default=None, metavar="RUN_ID",
+        help="completed compatible run to carry into population zero without retraining (repeatable)",
+    )
     p_factory_search.add_argument("--stage-budget-seconds", type=float, default=None,
                                   help="optional wall-clock cap for the whole campaign")
     p_factory_search.add_argument("--min-episode-length", type=int, default=None,
@@ -3386,8 +3413,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_factory_breed.add_argument("parent_a", help="first configuration parent run id")
     p_factory_breed.add_argument("parent_b", help="second configuration parent run id")
-    p_factory_breed.add_argument("--schema", default="generic_action_effects_v1",
-                                 help="versioned genome schema (default: generic_action_effects_v1)")
+    p_factory_breed.add_argument("--schema", default="generic_action_effects_v2",
+                                 help="versioned genome schema (default: generic_action_effects_v2)")
     p_factory_breed.add_argument("--tier", default=None,
                                  help="shared budget tier (default: infer from both budget reports)")
     p_factory_breed.add_argument("--objective", default=None,

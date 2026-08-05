@@ -184,12 +184,12 @@ rather than copied weights.
 
 ## 7. Search and breeding
 
-Preview the exact resolved proposals without loading a corpus or starting
-PyTorch:
+Preview the population layout and exact fresh proposals without loading a
+corpus or starting PyTorch:
 
 ```bash
 ccr factory search specs/crafter-baseline.yaml \
-  --schema generic_action_effects_v1 \
+  --schema generic_action_effects_v2 \
   --population-size 8 --populations 4 --mutation-rate 0.2 \
   --seed 7 --run-id-prefix crafter-evo-7 --dry-run
 ```
@@ -209,6 +209,21 @@ trials/epochs, final survivors, and the optional champion comparison. Candidate
 run IDs are stable under the chosen prefix:
 `crafter-evo-7-p<population>-c<candidate>`.
 
+To continue from completed compatible runs, add repeatable `--seed-run`
+arguments. Seeded runs occupy the first population-zero slots, reuse stored
+validation evidence and checkpoints without retraining, and leave the remaining
+slots for fresh proposals. Architecture, corpus/data contract, non-genome
+training settings, evaluation contract, validation episodes, and genome values
+must match. Child generation numbers continue after the highest seeded
+generation.
+
+```bash
+ccr factory search specs/crafter-baseline.yaml \
+  --seed-run <prior-champion-a> --seed-run <prior-champion-b> \
+  --population-size 8 --populations 4 \
+  --run-id-prefix crafter-evo-continued
+```
+
 For reproducibility of an older campaign, explicitly passing
 `--budgets 50 150 500` selects the legacy successive-halving engine.
 
@@ -216,9 +231,9 @@ Breed two compatible completed parents after inspecting the child first:
 
 ```bash
 ccr factory breed <parent-a> <parent-b> \
-  --schema generic_action_effects_v1 --seed 19 --dry-run
+  --schema generic_action_effects_v2 --seed 19 --dry-run
 ccr factory breed <parent-a> <parent-b> \
-  --schema generic_action_effects_v1 --seed 19
+  --schema generic_action_effects_v2 --seed 19
 ```
 
 The tier is inferred from both parents' budget reports. Use `--tier fast` only
@@ -240,7 +255,7 @@ from cognitive_runtime.training.model_factory.search import (
     run_evolutionary_search,
 )
 
-schema = get_schema("generic_action_effects_v1")
+schema = get_schema("generic_action_effects_v2")
 base_spec = resolve(load_spec("specs/crafter-baseline.yaml"))
 proposals = propose(base_spec, schema, 8, seed=7, method="lhs")
 report = run_evolutionary_search(
@@ -250,6 +265,7 @@ report = run_evolutionary_search(
     population_count=4,
     seed=7,
     mutation_rate=0.2,
+    seed_run_ids=("prior-champion-a", "prior-champion-b"),
 )
 ```
 
@@ -264,7 +280,7 @@ from cognitive_runtime.training.model_factory import (
     run_trial,
 )
 
-schema = get_schema("generic_action_effects_v1")
+schema = get_schema("generic_action_effects_v2")
 parent_a = load_parent("runs", "Crafter", "<parent-a>", schema, tier="fast")
 parent_b = load_parent("runs", "Crafter", "<parent-b>", schema, tier="fast")
 bred = breed(

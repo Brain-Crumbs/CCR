@@ -273,11 +273,37 @@ def test_factory_search_defaults_to_evolutionary_populations(capsys):
     payload = json.loads(capsys.readouterr().out)
 
     assert payload["workflow"] == "evolutionary"
+    assert payload["schema"] == "generic_action_effects_v2"
     assert payload["population_size"] == 4
     assert payload["population_count"] == 2
     assert "budgets" not in payload
     assert [candidate["run_id"] for candidate in payload["candidates"]] == [
         "preview-13-p0-c0", "preview-13-p0-c1", "preview-13-p0-c2", "preview-13-p0-c3",
+    ]
+    assert all(
+        {"pixel", "latent", "semantic"}
+        <= set(candidate["spec"]["training"]["loss_weights"])
+        for candidate in payload["candidates"]
+    )
+
+
+def test_factory_search_dry_run_accepts_repeatable_seed_runs(capsys):
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    main([
+        "factory", "search", str(spec_path),
+        "--seed-run", "prior-a", "--seed-run", "prior-b",
+        "--population-size", "4", "--populations", "2",
+        "--run-id-prefix", "continued", "--dry-run", "--no-trace",
+        "--set", "evaluation.selection_metric=rollout.t+2.model_over_copy_last_mse",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["seed_run_ids"] == ["prior-a", "prior-b"]
+    assert [candidate["run_id"] for candidate in payload["candidates"]] == [
+        "prior-a", "prior-b", "continued-p0-c2", "continued-p0-c3",
+    ]
+    assert [candidate["source"] for candidate in payload["candidates"]] == [
+        "seed_run", "seed_run", "fresh_proposal", "fresh_proposal",
     ]
 
 
@@ -309,6 +335,9 @@ def test_factory_breed_dry_run_prints_explicit_parent_and_weight_donor_lineage(t
         "loss_weights": {
             "closed_loop_pixel_loss_weight": 0.2,
             "closed_loop_latent_loss_weight": 0.3,
+            "pixel": 1.0,
+            "latent": 1.0,
+            "semantic": 1.0,
         },
         "transition_balance_policy": {"stationary_cap": 0.4},
     })
