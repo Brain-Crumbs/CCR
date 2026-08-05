@@ -1927,6 +1927,18 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
 
     try:
         raw = load_spec(args.spec)
+    except FileNotFoundError:
+        # Narrowed to this one call deliberately. The broader ``try`` below
+        # also reads a --reference-run's checkpoint header, whose own
+        # FileNotFoundError used to surface here as "spec file not found:
+        # <spec>" -- naming a file that was in fact read fine and hiding the
+        # checkpoint that was actually missing. The clinic's Evolve tab
+        # (which offers a reference-run picker over every completed run,
+        # including ones with no checkpoint on disk) shows this string to a
+        # human verbatim, so it has to name the right file.
+        sys.exit(f"invalid factory search: spec file not found: {args.spec}")
+
+    try:
         if args.set:
             raw = apply_overrides(raw, args.set)
         if args.reference_run:
@@ -1971,8 +1983,11 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
             )
             if args.dry_run else ()
         )
-    except FileNotFoundError:
-        sys.exit(f"invalid factory search: spec file not found: {args.spec}")
+    except FileNotFoundError as exc:
+        # OSError's own branch below would render this as a bare errno
+        # string; `filename` is the part that tells a human which artifact
+        # to go build (almost always a --reference-run checkpoint header).
+        sys.exit(f"invalid factory search: file not found: {exc.filename or exc}")
     except (OSError, SpecError, ValueError) as exc:
         sys.exit(f"invalid factory search: {exc}")
 

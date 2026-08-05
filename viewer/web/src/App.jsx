@@ -16,6 +16,7 @@ import { ChampionRegistryPanel } from "./components/ChampionRegistryPanel.jsx";
 import { FactoryRunsPanel } from "./components/FactoryRunsPanel.jsx";
 import { CompareView } from "./components/CompareView.jsx";
 import { BuildPanel } from "./components/BuildPanel.jsx";
+import { EvolvePanel } from "./components/EvolvePanel.jsx";
 
 const TABS = [
   ["episode", "Episode"],
@@ -24,6 +25,7 @@ const TABS = [
   ["factory", "Factory"],
   ["compare", "Compare"],
   ["build", "Build"],
+  ["evolve", "Evolve"],
 ];
 
 /**
@@ -181,6 +183,9 @@ export function App() {
       )}
       {tab === "build" && (
         <BuildPanel catalog={catalog} organism={organism} />
+      )}
+      {tab === "evolve" && (
+        <EvolvePanel catalog={catalog} organism={organism} />
       )}
     </main>
   );

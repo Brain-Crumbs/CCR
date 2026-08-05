@@ -104,6 +104,36 @@ Per selected organism/run, tabbed by concern:
   run's live state, a log tail, and a cancel action -- polling the exact
   routes described below rather than the hand-edited-dict notebook
   workflow this supersedes.
+- **Evolve** -- run a bounded evolutionary campaign (`ccr factory search`)
+  over one completed run's spec: that run's `trial_spec.json` becomes the
+  base every candidate inherits (its `mode` and `parent` carry through, so a
+  clone-mode base means a fixed-parent campaign), and only the declared
+  genome schema's training genes vary. Set population size, generations,
+  mutation rate, seed, and proposal method; the worst-case training count is
+  stated up front, alongside the `{prefix}-p<generation>-c<candidate>` shape
+  the campaign's runs will land under. **Dry-run preview** posts to
+  `/api/preview/search`, which is the CLI's own torch-free `--dry-run`, and
+  tabulates the resolved candidates against the dotted `training.*` paths
+  that actually differ between them -- so the genome's active genes are
+  *observed* from real proposals rather than re-declared in the front end.
+  A **reference run** picker (defaulting to the organism's leading champion
+  from `GET /api/registry`) sets `evaluation.reference_run`, making every
+  candidate report `model_over_reference_mse` against that model's own
+  predictions and gating the campaign on beating it -- the configurable
+  comparison baseline, beyond copy-last-frame. Editing the selection metric
+  sends one `--set evaluation.selection_metric=...` rather than a second
+  copy of the evaluation block.
+
+  After launch, a **population board** shows the campaign generation by
+  generation: each candidate's live `state.json` pill and its resolved
+  selection-metric value, the generation's leader marked, and each bred
+  offspring's two parents. Only generation 0's run ids are precomputable --
+  `run_evolutionary_search` fills a later generation's low slots with
+  *carried* survivors, which keep the run ids they were first trained under
+  -- so the board recovers each generation's survivor count from its lowest
+  offspring slot and names the survivors from the offspring's own
+  `lineage.json` parents. It re-reads only what the campaign wrote to disk;
+  no selection or breeding decision is re-derived in the browser.
 
 Each recording also shows its `record/quality.py` green/amber/red verdict
 before you ever train on it.
@@ -119,7 +149,7 @@ viewer/
     src/
       lib/             # pure data transforms (frame/prediction math, diagnostics, actions, format)
       hooks/           # usePixelHorizonData, useDarkMode
-      components/      # PixelHorizonViewer, SeenFramePanel, ActionTimeline, EEGPanel, BuildPanel, JobsPanel, ...
+      components/      # PixelHorizonViewer, SeenFramePanel, ActionTimeline, EEGPanel, BuildPanel, EvolvePanel, PopulationBoard, JobsPanel, ...
       App.jsx
   test/                # server.js contract tests (node:test)
 ```
@@ -188,7 +218,7 @@ see Security above before exposing them beyond localhost.
 | `GET /api/runs?organism=&run=` | the run's experiment_report.json header slice (model, training, evaluation, promotion) |
 | `GET /api/experiments?organism=&run=` | the run's Model Factory manifests as-is: `trial_spec`, `contracts`, `lineage`, `data_manifest`, `execution`, `experiment_report`, and `metrics.{validation,test,comparison}` |
 | `GET /api/registry?organism=` | the organism's champion registry (`registry.json`) |
-| `GET /api/factory-runs?organism=` | every run under the organism with its lineage mode, `state.json` state/reason/updated_at, and promotion outcome -- queued/running/completed/failed across the whole Factory build, not just promoted runs |
+| `GET /api/factory-runs?organism=` | every run under the organism with its lineage mode, `state.json` state/reason/updated_at, promotion outcome, its own `selection_metric` resolved to a `selection_metric_value` from `metrics/validation.json` (`null` until evaluated), and its `lineage.json` `configuration_parents` -- queued/running/completed/failed across the whole Factory build, not just promoted runs |
 | `GET /api/sessions?organism=&run=&name=&...filters` | recordings for the selected run, with quality verdicts |
 | `GET /api/sessions/:id` | one session's streams, decisions, exports, and quality verdict |
 | `GET /api/sessions/:id/episodes/:eid/{streams,decisions,frames,predictions}` | per-episode records; `predictions` accepts `?kind=dream` and `?experiment=` |

@@ -170,6 +170,27 @@ function validateJobBody(clinic, body) {
   if (body.options?.run_id_prefix !== undefined && !isPlainId(body.options.run_id_prefix)) {
     return { status: 400, error: "options.run_id_prefix must be a plain identifier" };
   }
+  // `search --champion/--reference-run` name *existing* runs the CLI
+  // subprocess resolves into directories under --root, exactly like the
+  // positional run/parent_a/parent_b above, so they get the same
+  // already-enumerated-catalog check rather than being passed through.
+  for (const field of ["champion", "reference_run"]) {
+    const value = body.options?.[field];
+    if (typeof value !== "string" || !value) continue;
+    if (!clinic.catalog().some((entry) => entry.organism === body.organism && entry.run === value)) {
+      return { status: 404, error: `unknown options.${field}: ${value}` };
+    }
+  }
+  // A checkpoint file name is joined into `<run>/checkpoints/<name>` by the
+  // CLI. There is no catalog of checkpoint names to check against, so the
+  // character-class floor applies -- the same reasoning isPlainId documents
+  // for a not-yet-existing run id.
+  for (const field of ["checkpoint", "reference_checkpoint"]) {
+    const value = body.options?.[field];
+    if (value !== undefined && value !== null && !isPlainId(value)) {
+      return { status: 400, error: `options.${field} must be a plain identifier` };
+    }
+  }
   return null;
 }
 
@@ -232,6 +253,69 @@ function runSummary(entry) {
   };
 }
 
+/** runner._SELECTION_METRIC_RE / runner._GOAL_NAVIGATION_METRICS, mirrored
+ * for the one read below. */
+const SELECTION_METRIC_RE = /^(rollout|direct)\.t\+(\d+)\.([a-zA-Z_][a-zA-Z0-9_]*)$/;
+const GOAL_NAVIGATION_METRICS = new Set(["success_rate", "geodesic_efficiency", "collision_rate", "replan_recovery"]);
+
+/** Python's ``round`` -- round-half-to-even -- not JavaScript's
+ * ``Math.round``, which breaks a tie away from zero instead. Mirrored
+ * exactly because the line below reproduces
+ * ``action_world_model.horizons_ticks_to_frames``' own tick-to-frame key
+ * derivation: at a ticks_per_frame that lands a horizon precisely on .5
+ * (2 ticks/frame with a 5-tick horizon, say) the two roundings disagree,
+ * and this would then look up a horizon key the run never recorded and
+ * report "no metric yet" for a run that has one. */
+function pythonRound(value) {
+  const floor = Math.floor(value), remainder = value - floor;
+  if (remainder > 0.5) return floor + 1;
+  if (remainder < 0.5) return floor;
+  return floor % 2 === 0 ? floor : floor + 1;
+}
+
+/** Resolve one run's own ``evaluation.selection_metric`` against its
+ * persisted ``metrics/validation.json`` -- the single number the
+ * evolutionary campaign actually selected that candidate on, which
+ * state.json alone cannot answer.
+ *
+ * A port of ``runner._resolve_selection_metric``'s *scalar* half only (its
+ * per-episode paired-comparison series has no reader here), keyed the same
+ * way: a ``direct.t+N.*`` horizon is tick-denominated as written, while a
+ * ``rollout.t+N.*`` horizon is recorded in frames and needs the run's own
+ * ``contracts.json`` ticks_per_frame to convert -- the same two files
+ * ``registry._load_validation_for_candidate`` reads for exactly this
+ * purpose. Anything unresolvable (no validation.json yet, a horizon that
+ * was not evaluated, a metric shape this port does not cover) is reported
+ * as ``null`` rather than guessed at: a still-running candidate simply has
+ * no metric yet, and the board renders that honestly. */
+function selectionMetric(dir) {
+  const validation = readJSON(path.join(dir, "metrics", "validation.json"), null);
+  const metric = typeof validation?.selection_metric === "string" ? validation.selection_metric : null;
+  if (!metric) return { selection_metric: null, selection_metric_value: null };
+  return { selection_metric: metric, selection_metric_value: resolveSelectionMetric(validation, metric, dir) };
+}
+
+function resolveSelectionMetric(validation, metric, dir) {
+  const finite = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
+  const navigationPrefix = "goal_navigation.";
+  if (metric.startsWith(navigationPrefix)) {
+    const name = metric.slice(navigationPrefix.length);
+    if (!GOAL_NAVIGATION_METRICS.has(name)) return null;
+    return finite(validation.goal_navigation?.[name]);
+  }
+  const match = SELECTION_METRIC_RE.exec(metric);
+  if (!match) return null;
+  const [, report, ticksText, stat] = match;
+  let horizonKey = Number(ticksText);
+  if (report !== "direct") {
+    const contracts = readJSON(path.join(dir, "contracts.json"), null);
+    const ticksPerFrame = Number(contracts?.data_contract?.ticks_per_frame);
+    if (!Number.isFinite(ticksPerFrame) || ticksPerFrame <= 0) return null;
+    horizonKey = Math.max(1, pythonRound(horizonKey / ticksPerFrame));
+  }
+  return finite(validation[report]?.horizons?.[String(horizonKey)]?.[stat]);
+}
+
 const ARTIFACT_FILES = [
   "experiment.json", "trial_spec.json", "contracts.json", "lineage.json",
   "data_manifest.json", "execution.json", "experiment_report.json",
@@ -278,6 +362,15 @@ function factoryRunsDocument(runsDir, organism) {
         state_reason: state?.reason ?? null,
         updated_at: state?.updated_at ?? null,
         promoted: runSummary(entry).promotion.promoted,
+        // The Evolve tab's population board needs two things state.json
+        // cannot answer: what each candidate scored on the campaign's own
+        // selection metric, and (for a bred offspring) which two survivors
+        // it came from -- lineage.json's `configuration_parents`, which is
+        // how the board reconstructs a generation's survivor set at all,
+        // since a carried-forward survivor keeps its *original* run id
+        // rather than taking a fresh slot-shaped one (see search.py).
+        ...selectionMetric(entry.dir),
+        configuration_parents: Array.isArray(lineage?.configuration_parents) ? lineage.configuration_parents : [],
       };
     })
     .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
