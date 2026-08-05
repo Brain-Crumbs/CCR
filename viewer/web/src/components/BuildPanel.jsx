@@ -124,10 +124,17 @@ function launchOptions(form) {
  * off to the matching `POST /api/jobs/<kind>` control-plane route (Phase 2)
  * and the result is tracked in `JobsPanel`, not re-derived here.
  */
-export function BuildPanel({ catalog, organism: initialOrganism }) {
-  const organisms = catalog?.organisms || [];
-  const [organism, setOrganism] = useState(initialOrganism ?? organisms[0] ?? null);
+export function BuildPanel({ catalog, organism: initialOrganism, onOrganismCreated = null }) {
+  const catalogOrganisms = catalog?.organisms || [];
+  const [organism, setOrganism] = useState(initialOrganism ?? catalogOrganisms[0] ?? null);
+  const organisms = useMemo(
+    () => [...new Set([...catalogOrganisms, organism].filter(Boolean))].sort(),
+    [catalogOrganisms, organism],
+  );
   const [mode, setMode] = useState(FRESH_MODE);
+  const [newOrganism, setNewOrganism] = useState("");
+  const [creatingOrganism, setCreatingOrganism] = useState(false);
+  const [organismError, setOrganismError] = useState(null);
   const [meta, setMeta] = useState(null);
   const [metaError, setMetaError] = useState(null);
   const [corpora, setCorpora] = useState(null);
@@ -147,6 +154,10 @@ export function BuildPanel({ catalog, organism: initialOrganism }) {
     if (organism || !organisms.length) return;
     setOrganism(organisms[0]);
   }, [organism, organisms]);
+
+  useEffect(() => {
+    if (initialOrganism && initialOrganism !== organism) setOrganism(initialOrganism);
+  }, [initialOrganism]);
 
   useEffect(() => {
     let cancelled = false;
@@ -178,7 +189,7 @@ export function BuildPanel({ catalog, organism: initialOrganism }) {
     if (!organism) return;
     let cancelled = false;
     setCorpusSpecs(null);
-    api.corpusSpecs(organism).then((list) => {
+    api.corpusSpecs().then((list) => {
       if (cancelled) return;
       setCorpusSpecs(list);
       setCorpusSpecId((current) => (list.some((item) => item.spec_id === current) ? current : (list[0]?.spec_id ?? "")));
@@ -276,11 +287,48 @@ export function BuildPanel({ catalog, organism: initialOrganism }) {
     }
   }
 
+  async function handleCreateOrganism() {
+    const requested = newOrganism.trim();
+    if (!requested) return;
+    setCreatingOrganism(true);
+    setOrganismError(null);
+    try {
+      const result = await api.createOrganism(requested);
+      setOrganism(result.organism);
+      setNewOrganism("");
+      onOrganismCreated?.(result.organism);
+    } catch (err) {
+      setOrganismError(err.message);
+    } finally {
+      setCreatingOrganism(false);
+    }
+  }
+
+  const organismCreator = (
+    <>
+      <div className="organism-create">
+        <label className="field">New organism
+          <input
+            value={newOrganism}
+            onChange={(event) => setNewOrganism(event.target.value)}
+            placeholder="MyOrganism"
+            aria-label="New organism name"
+          />
+        </label>
+        <button type="button" onClick={handleCreateOrganism} disabled={creatingOrganism || !newOrganism.trim()}>
+          {creatingOrganism ? "Creating…" : "Create organism"}
+        </button>
+      </div>
+      {organismError && <p className="no-data">{organismError}</p>}
+    </>
+  );
+
   if (!organisms.length) {
     return (
       <section className="diagnostic build" aria-labelledby="build-title">
         <h3 id="build-title">Build</h3>
-        <p className="no-data">no organisms found -- launch at least one run from the CLI first</p>
+        <p>Create an organism namespace to begin building from the interface.</p>
+        {organismCreator}
       </section>
     );
   }
@@ -299,6 +347,7 @@ export function BuildPanel({ catalog, organism: initialOrganism }) {
             options={meta?.modes || [FRESH_MODE, ...NON_FRESH_MODES]} onChange={setMode}
           />
         </div>
+        {organismCreator}
         <p className="build-form__help">{MODE_HELP[mode]}</p>
 
         {mode === FRESH_MODE ? (

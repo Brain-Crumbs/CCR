@@ -732,6 +732,20 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
         organisms: clinic?.organisms() || [],
         runs: (clinic?.catalog() || []).map(({ organism, run }) => ({ organism, run })),
       });
+      if (p.length === 2 && p[1] === "organisms") {
+        if (req.method !== "POST") return sendJSON(res, 405, { error: "method not allowed" });
+        if (!clinic || !clinic.corpusRoot) return sendJSON(res, 400, { error: "organism creation requires clinic mode with a corpus root" });
+        let body;
+        try { body = await readBody(req); } catch (err) { return sendJSON(res, 400, { error: String(err.message || err) }); }
+        const organism = typeof body.organism === "string" ? body.organism.trim() : "";
+        if (!isPlainId(organism)) return sendJSON(res, 400, {
+          error: "organism must use only letters, numbers, underscores, dots, or hyphens",
+        });
+        const directory = path.join(clinic.corpusRoot, organism);
+        const created = !fs.existsSync(directory);
+        fs.mkdirSync(directory, { recursive: true });
+        return sendJSON(res, created ? 201 : 200, { organism, created });
+      }
       if (p.length === 2 && p[1] === "runs") {
         if (!clinic) return sendJSON(res, 400, { error: "run summaries require clinic mode" });
         const organism = url.searchParams.get("organism"), run = url.searchParams.get("run");
@@ -786,7 +800,7 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
         const invalid = validateJobBody(clinic, body);
         if (invalid) return sendJSON(res, invalid.status, { error: invalid.error });
         if (kind === "corpus") {
-          const selectedSpec = corpusSpecCatalog(clinic.corpusSpecsDir, body.organism)
+          const selectedSpec = corpusSpecCatalog(clinic.corpusSpecsDir)
             .find((entry) => entry.spec_id === body.spec_id);
           if (!selectedSpec) return sendJSON(res, 404, { error: "unknown corpus spec" });
           body = { ...body, spec_path: selectedSpec.file };

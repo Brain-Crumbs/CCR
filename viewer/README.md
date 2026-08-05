@@ -97,7 +97,8 @@ Per selected organism/run, tabbed by concern:
   directories; otherwise the side without a matching export falls back to
   baselines.
 - **Build** -- launch a Model Factory trial without leaving the browser:
-  pick an organism and a mode (fresh / clone / fine_tune / resume, sourced
+  pick an existing organism or create a new named organism, then choose a
+  mode (fresh / clone / fine_tune / resume, sourced
   from `GET /api/factory-meta`). On a clean workspace, first launch one of
   the repository's corpus recipes and follow that corpus build in the same
   Jobs panel. Then fill in a form over `spec.data`/`model`/
@@ -287,6 +288,7 @@ see Security above before exposing them beyond localhost.
 | `GET /api/sessions?organism=&run=&name=&...filters` | recordings for the selected run, with quality verdicts |
 | `GET /api/sessions/:id` | one session's streams, decisions, exports, and quality verdict |
 | `GET /api/sessions/:id/episodes/:eid/{streams,decisions,frames,predictions}` | per-episode records; `predictions` accepts `?kind=dream` and `?experiment=` |
+| `POST /api/organisms` | creates a new organism namespace under `--corpus-root`; body: `{ "organism": "Name" }` |
 | `POST /api/jobs/{corpus,baseline,clone,resume,search,breed}` | launches the matching `ccr factory ...` workflow as a detached subprocess; body shape per kind in `viewer/lib/jobs.js`'s `buildLaunch`. `409` past `--max-concurrent-jobs` |
 | `GET /api/jobs?organism=` | every launched job (registry entry) plus each precomputed run's live `state.json`/heartbeat |
 | `GET /api/jobs/:id/log?offset=` | the job's combined stdout+stderr log, tailed from a byte offset |

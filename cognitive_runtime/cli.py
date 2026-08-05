@@ -2818,6 +2818,8 @@ def cmd_factory_corpus_build(args: argparse.Namespace) -> None:
     from cognitive_runtime.training.model_factory.spec import load_spec
 
     raw = load_spec(args.spec)
+    if args.organism:
+        raw["organism"] = args.organism
     raw.setdefault("root", args.root)
 
     try:
@@ -3856,6 +3858,10 @@ def build_parser() -> argparse.ArgumentParser:
         "build", help="record/reuse every declared episode, gate it, and freeze its session hashes"
     )
     p_factory_corpus_build.add_argument("spec", help="corpus spec file (.yaml/.yml/.json)")
+    p_factory_corpus_build.add_argument(
+        "--organism", default=None,
+        help="build this corpus recipe for a different organism name",
+    )
     p_factory_corpus_build.add_argument("--root", default=_FACTORY_CORPORA_ROOT_DEFAULT,
                                         help=f"corpora root directory (default: "
                                              f"{_FACTORY_CORPORA_ROOT_DEFAULT!r})")

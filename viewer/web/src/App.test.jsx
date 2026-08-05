@@ -100,8 +100,12 @@ describe("App", () => {
   });
 
   it("opens Build and keeps all control tabs reachable when the run catalog is empty", async () => {
-    vi.mocked(fetch).mockImplementation((url) => {
+    vi.mocked(fetch).mockImplementation((url, init) => {
       const path = String(url);
+      if (init?.method === "POST" && path === "/api/organisms") {
+        const body = JSON.parse(init.body);
+        return jsonResponse({ organism: body.organism, created: true });
+      }
       if (path.startsWith("/api/catalog")) return jsonResponse({ organisms: ["Crafter"], runs: [] });
       if (path.startsWith("/api/factory-meta")) return jsonResponse({
         modes: ["fresh", "clone", "resume", "fine_tune"], objectives: ["windowed_rollout"],
@@ -123,6 +127,11 @@ describe("App", () => {
     expect(screen.getByText(/No experiment runs yet/)).toBeInTheDocument();
     expect(screen.getAllByLabelText("Organism")[0].value).toBe("Crafter");
     await waitFor(() => expect(screen.getByLabelText("Corpus recipe")).toBeInTheDocument());
+
+    fireEvent.change(screen.getByLabelText("New organism name"), { target: { value: "Nova-1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create organism" }));
+    await waitFor(() => expect(screen.getAllByLabelText("Organism")[0].value).toBe("Nova-1"));
+    expect(screen.getByLabelText("Build organism").value).toBe("Nova-1");
 
     fireEvent.click(screen.getByRole("tab", { name: "Factory" }));
     expect(screen.getByText(/no factory runs found/)).toBeInTheDocument();

@@ -154,7 +154,10 @@ function buildLaunch(kind, body, { runsDir, corpusRoot = null, jobId }) {
       if (!corpusRoot) throw new Error("corpus requires a configured corpus root");
       return {
         command: ["corpus", "build"],
-        argv: [path.resolve(body.spec_path), "--root", path.resolve(corpusRoot)],
+        argv: [
+          path.resolve(body.spec_path), "--root", path.resolve(corpusRoot),
+          "--organism", body.organism,
+        ],
         runIds: [],
       };
     }

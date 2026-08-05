@@ -37,6 +37,11 @@ function makeRoute(posted) {
         run_ids: [`${kind}-run`], started_at: "2026-01-03T00:00:00Z", exit_code: null, error: null,
       });
     }
+    if (init?.method === "POST" && path === "/api/organisms") {
+      const body = JSON.parse(init.body);
+      posted.push({ kind: "organism", body });
+      return jsonResponse({ organism: body.organism, created: true });
+    }
     if (path.startsWith("/api/factory-meta")) return jsonResponse(META);
     if (path.startsWith("/api/corpora")) return jsonResponse({ corpora: CORPORA });
     if (path.startsWith("/api/corpus-specs")) return jsonResponse({ specs: [] });
@@ -132,5 +137,18 @@ describe("BuildPanel", () => {
       kind: "corpus",
       body: { organism: "Crafter", spec_id: "generic-action-effects-v1.yaml" },
     });
+  });
+
+  it("creates and selects a new organism without inheriting the Crafter name", async () => {
+    const onOrganismCreated = vi.fn();
+    render(<BuildPanel catalog={CATALOG} organism="Crafter" onOrganismCreated={onOrganismCreated} />);
+    await waitFor(() => expect(screen.getByLabelText("Build mode")).toBeInTheDocument());
+
+    fireEvent.change(screen.getByLabelText("New organism name"), { target: { value: "Nova-1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create organism" }));
+
+    await waitFor(() => expect(onOrganismCreated).toHaveBeenCalledWith("Nova-1"));
+    expect(posted[0]).toEqual({ kind: "organism", body: { organism: "Nova-1" } });
+    expect(screen.getByLabelText("Build organism").value).toBe("Nova-1");
   });
 });

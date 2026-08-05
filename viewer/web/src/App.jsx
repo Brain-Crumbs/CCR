@@ -81,12 +81,22 @@ export function App() {
     const initialOrganism = initial?.organism
       || (catalog.organisms.includes(parsed.organism) ? parsed.organism : catalog.organisms[0])
       || null;
-    setOrganism(initialOrganism);
-    setRun(initial?.run ?? null);
     if (!bootstrapped.current) {
       bootstrapped.current = true;
+      setOrganism(initialOrganism);
+      setRun(initial?.run ?? null);
       if (!initial) setTab("build");
+      return;
     }
+
+    // Catalog refreshes must not undo an explicit selection, notably just
+    // after the user creates an organism that has no runs yet.
+    setOrganism((current) => (
+      current && catalog.organisms.includes(current) ? current : initialOrganism
+    ));
+    setRun((current) => (
+      current && catalog.runs.some((item) => item.run === current) ? current : null
+    ));
   }, [catalog]);
 
   // A selected organism/run pulls its sessions, header summary, and Model
@@ -145,6 +155,19 @@ export function App() {
     () => (sessionId && episode ? episodeUrls(sessionId, episode, { organism, run, experiment: run }) : null),
     [sessionId, episode, organism, run],
   );
+
+  function handleOrganismCreated(next) {
+    setCatalog((current) => ({
+      ...current,
+      organisms: [...new Set([...(current?.organisms || []), next])].sort(),
+    }));
+    setOrganism(next);
+    setRun(null);
+    setSessions(null);
+    setSessionId(null);
+    setEpisode(null);
+    setTab("build");
+  }
 
   if (error) return <main><h1>CCR Clinic</h1><p className="empty">{error}</p></main>;
   if (!catalog) return <main><h1>CCR Clinic</h1><p className="empty">Loading runs…</p></main>;
@@ -228,7 +251,7 @@ export function App() {
           : <p className="no-data">At least one completed run is needed for comparison.</p>
       )}
       {tab === "build" && (
-        <BuildPanel catalog={catalog} organism={organism} />
+        <BuildPanel catalog={catalog} organism={organism} onOrganismCreated={handleOrganismCreated} />
       )}
       {tab === "evolve" && (
         <EvolvePanel catalog={catalog} organism={organism} />

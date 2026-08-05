@@ -28,6 +28,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -217,6 +218,43 @@ FACTORY_DISPATCH = [
 def test_factory_subcommand_parses_and_dispatches(argv, expected_func):
     args = build_parser().parse_args(argv)
     assert args.func.__name__ == expected_func
+
+
+def test_factory_corpus_build_accepts_an_organism_override():
+    args = build_parser().parse_args([
+        "factory", "corpus", "build", "spec.yaml", "--organism", "Nova-1",
+    ])
+    assert args.organism == "Nova-1"
+
+
+def test_factory_corpus_build_applies_the_organism_override(tmp_path, capsys, monkeypatch):
+    from cognitive_runtime.training.model_factory import corpus as corpus_module
+    from cognitive_runtime.training.model_factory import spec as spec_module
+
+    captured = {}
+    monkeypatch.setattr(spec_module, "load_spec", lambda _path: {
+        "organism": "Crafter",
+        "corpus_id": "generic-v1",
+    })
+
+    def fake_build_corpus(raw):
+        captured.update(raw)
+        return SimpleNamespace(
+            corpus_id="generic-v1",
+            directory=tmp_path / "Nova-1" / "generic-v1",
+            data_contract_hash="abc123",
+            manifest={"sessions": {}},
+        )
+
+    monkeypatch.setattr(corpus_module, "build_corpus", fake_build_corpus)
+    main([
+        "factory", "corpus", "build", "spec.yaml",
+        "--organism", "Nova-1", "--root", str(tmp_path),
+    ])
+
+    assert captured["organism"] == "Nova-1"
+    assert captured["root"] == str(tmp_path)
+    assert "corpus_id: generic-v1" in capsys.readouterr().out
 
 
 HELP_ARGVS = [

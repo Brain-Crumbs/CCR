@@ -425,6 +425,13 @@ test("empty clinic discovers corpus organisms and monitors state-only runs befor
   assert.equal(factory.status, 200);
   assert.equal(factory.body.runs[0].run, "first-run");
   assert.equal(factory.body.runs[0].state, "running");
+
+  assert.equal((await get(port, "/api/organisms")).status, 405);
+  assert.equal((await post(port, "/api/organisms", { organism: "../escape" })).status, 400);
+  const created = await post(port, "/api/organisms", { organism: "Nova-1" });
+  assert.equal(created.status, 201);
+  assert.deepEqual(created.body, { organism: "Nova-1", created: true });
+  assert.deepEqual((await get(port, "/api/catalog")).body.organisms, ["Crafter", "Nova-1"]);
 });
 
 // The job-launch API (Model Factory clinic redesign, control-plane
@@ -710,6 +717,7 @@ test("job-launch API", async (t) => {
     assert.equal(launched.body.kind, "corpus");
     assert.deepEqual(launched.body.run_ids, []);
     assert.match(launched.body.argv.join(" "), /factory corpus build .*starter\.yaml --root/);
+    assert.match(launched.body.argv.join(" "), /--organism Test/);
     const finished = await waitFor(async () => {
       const current = await get(port, "/api/jobs?organism=Test");
       return current.body.jobs[0]?.status !== "running" ? current.body.jobs[0] : null;
