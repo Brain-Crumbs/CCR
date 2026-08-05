@@ -12,26 +12,25 @@ function actionLabel(action) {
  * cross-referencing a separate action list.
  */
 export function SeenFramePanel({ t, tick, bytes, shape, action }) {
-  // return (
-  //   <div className="panel seen-panel">
-  //     <h3>t = {t}<span className="seen-panel__tick">tick {tick}</span></h3>
-  //     <div className="strip">
-  //       <figure className="cell"><PixelCanvas bytes={bytes} shape={shape} label={`seen at t=${t}`} /><figcaption>seen</figcaption></figure>
-  //     </div>
-  //     <div className="seen-action">
-  //       {action ? (
-  //         <>
-  //           <span className="seen-action__taken">action taken: <b>{actionLabel(action.actuated)}</b></span>
-  //           {action.diverged && (
-  //             <span className="seen-action__assumed">
-  //               assumed <b>{actionLabel(action.voluntary)}</b>
-  //               {action.motorReflex ? ` — ${actionLabel(action.motorReflex.name)}` : action.caregiverOverride ? " — caregiver override" : ""}
-  //             </span>
-  //           )}
-  //         </>
-  //       ) : <span className="no-data">no motor decision recorded for this tick</span>}
-  //     </div>
-  //   </div>
-  // );
-  return null;
+  return (
+    <div className="panel seen-panel">
+      <h3>t = {t}<span className="seen-panel__tick">tick {tick}</span></h3>
+      <div className="strip">
+        <figure className="cell"><PixelCanvas bytes={bytes} shape={shape} label={`seen at t=${t}`} /><figcaption>seen</figcaption></figure>
+      </div>
+      <div className="seen-action">
+        {action ? (
+          <>
+            <span className="seen-action__taken">action taken: <b>{actionLabel(action.actuated)}</b></span>
+            {action.diverged && (
+              <span className="seen-action__assumed">
+                assumed <b>{actionLabel(action.voluntary)}</b>
+                {action.motorReflex ? ` — ${actionLabel(action.motorReflex.name)}` : action.caregiverOverride ? " — caregiver override" : ""}
+              </span>
+            )}
+          </>
+        ) : <span className="no-data">no motor decision recorded for this tick</span>}
+      </div>
+    </div>
+  );
 }

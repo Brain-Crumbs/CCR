@@ -75,6 +75,32 @@ test("jobs", async (t) => {
     assert.match(entry.argv.join(" "), /factory clone parent-1 --root .* --factory-run-id clone-1/);
   });
 
+  await t.test("launchJob passes the selected organism to every positional-run command", () => {
+    const runsDir = fixtureRunsRoot();
+    // clone/resume/breed take their parent/run as a positional id the CLI
+    // otherwise resolves by searching every organism under --root, which
+    // errors out as ambiguous when two organisms share a run id. The route
+    // handler already validated body.organism, so it must be passed through
+    // rather than left to clients to duplicate inside options.
+    const clone = jobs.launchJob("clone", { organism: "Crafter", run: "parent-1" }, { runsDir });
+    assert.match(clone.argv.join(" "), /--organism Crafter\b/);
+    const resume = jobs.launchJob("resume", { organism: "Crafter", run: "interrupted-1" }, { runsDir });
+    assert.match(resume.argv.join(" "), /--organism Crafter\b/);
+    const bred = jobs.launchJob(
+      "breed", { organism: "Crafter", parent_a: "run-a", parent_b: "run-b" }, { runsDir },
+    );
+    assert.match(bred.argv.join(" "), /--organism Crafter\b/);
+    // body.organism wins over a conflicting options.organism: the registry
+    // keys every later status/log/cancel lookup on body.organism, so the
+    // subprocess must resolve against the same one.
+    const conflicting = jobs.launchJob(
+      "clone", { organism: "Crafter", run: "parent-1", options: { organism: "Other" } }, { runsDir },
+    );
+    const argv = conflicting.argv.join(" ");
+    assert.match(argv, /--organism Crafter\b/);
+    assert.doesNotMatch(argv, /--organism Other\b/);
+  });
+
   await t.test("launchJob(clone) repeats --set once per override, matching argparse's action=\"append\" contract", () => {
     const runsDir = fixtureRunsRoot();
     const entry = jobs.launchJob("clone", {
@@ -263,6 +289,29 @@ test("jobs", async (t) => {
     // No live pid to SIGTERM or wait out -- must not pay any of
     // killGraceMs's grace period.
     assert.ok(Date.now() - startedWaitingAt < 500);
+  });
+
+  await t.test("cancelJob never signals the recorded pid of a job that is no longer running", async () => {
+    const runsDir = fixtureRunsRoot();
+    process.env.FAKE_PYTHON_DELAY_MS = "2000";
+    let entry;
+    try {
+      // Stand in for the hazard exactly: a terminal registry entry whose
+      // recorded pid now belongs to a live, unrelated process (the OS reused
+      // that number). Cancelling must leave it strictly alone.
+      entry = jobs.launchJob("resume", { organism: "Crafter", run: "unrelated-run" }, { runsDir });
+      await waitFor(() => isProcessRunning(entry.pid) || null, { timeoutMs: 1000 });
+      const file = path.join(jobs.jobsDir(runsDir), `${entry.job_id}.json`);
+      const stored = JSON.parse(fs.readFileSync(file, "utf8"));
+      fs.writeFileSync(file, JSON.stringify({ ...stored, status: "completed", exit_code: 0 }));
+
+      const cancelled = await jobs.cancelJob(runsDir, entry.job_id);
+      assert.equal(cancelled.status, "completed");
+      assert.ok(isProcessRunning(entry.pid), "cancelJob SIGTERM'd a process it no longer owns");
+    } finally {
+      delete process.env.FAKE_PYTHON_DELAY_MS;
+      if (entry?.pid) { try { process.kill(entry.pid, "SIGKILL"); } catch { /* already gone */ } }
+    }
   });
 
   await t.test("cancelJob is a no-op for an unknown job id", async () => {

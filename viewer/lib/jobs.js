@@ -122,6 +122,21 @@ function buildLaunch(kind, body, { runsDir, jobId }) {
     options.factory_run_id = body.run_id || `job-${jobId}`;
   }
 
+  if (kind === "clone" || kind === "resume" || kind === "breed") {
+    // These three take their parent/run as a *positional* id, which the CLI
+    // resolves by searching every organism under --root and erroring out as
+    // ambiguous when two organisms happen to share a run id. The route
+    // handler has already validated body.organism (and that the run exists
+    // under it) against the enumerated catalog, so pass that resolution
+    // through instead of leaving it to be re-derived -- and force it rather
+    // than merging, for the same reason baseline/search force the temp
+    // spec's own `organism` field: a body.organism / options.organism
+    // disagreement would resolve the subprocess against one organism while
+    // the registry keys every later status/log/cancel lookup on the other
+    // (Codex review, PR #282).
+    options.organism = body.organism;
+  }
+
   switch (kind) {
     case "baseline": {
       if (!body.spec) throw new Error("baseline requires a spec document (body.spec)");
@@ -325,11 +340,20 @@ function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
  * "cancelled"; the stale-worker watchdog remains the eventual backstop for
  * that case, same as it always was.
  *
+ * A job that is no longer running is returned untouched. getJob has just
+ * reconciled the entry against real process liveness, so any non-"running"
+ * status means the subprocess is already gone -- there is no worker left to
+ * read a cancellation flag, and the persisted `pid` (kept in the registry
+ * for the record) may by now belong to an entirely unrelated process the OS
+ * reused that number for. Signalling it would kill a stranger (Codex
+ * review, PR #282).
+ *
  * Returns the (possibly already terminal) job entry, or null if the job id
  * is unknown. */
 async function cancelJob(runsDir, jobId, { killGraceMs = 3000, pollIntervalMs = 50 } = {}) {
   const entry = getJob(runsDir, jobId);
   if (!entry) return null;
+  if (entry.status !== "running") return entry;
   for (const runId of entry.run_ids) {
     spawnSync(pythonCommand(), [
       "-m", "cognitive_runtime.cli", "factory", "cancel", runId,
