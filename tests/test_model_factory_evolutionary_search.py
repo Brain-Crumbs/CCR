@@ -71,7 +71,9 @@ def _install_fake_trials(monkeypatch, tmp_path: Path, *, all_fail: bool = False)
     monkeypatch.setattr(
         search_module,
         "resolve_corpus",
-        lambda *args, **kwargs: SimpleNamespace(data_contract=SimpleNamespace(ticks_per_frame=1.0)),
+        lambda *args, **kwargs: SimpleNamespace(
+            data_contract=SimpleNamespace(ticks_per_frame=1.0, hash="data")
+        ),
     )
     monkeypatch.setattr(
         search_module,
@@ -165,6 +167,84 @@ def test_zero_quality_survivors_ends_without_breeding(tmp_path, monkeypatch):
     assert report.populations[0].offspring_run_ids == ()
     assert report.best_run_id is None
     assert recorded_lineages == []
+
+
+def test_completed_seed_run_enters_population_zero_without_retraining(tmp_path, monkeypatch):
+    recorded_lineages = _install_fake_trials(monkeypatch, tmp_path)
+    seed_spec = resolve({
+        **_base_spec().to_dict(),
+        "evolution": {
+            "generation": 3,
+            "configuration_parents": ["old-a", "old-b"],
+            "weight_donor": "old-a",
+            "genome_operator": "uniform_crossover_v1",
+            "mutations": [],
+        },
+    })
+    seed_parent = search_module.ParentRecord(
+        run_id="prior-champion",
+        genome_schema_version=SCHEMA.version,
+        architecture_hash="architecture",
+        data_contract_hash="data",
+        corpus_id="fixed-v1",
+        tier="evolutionary-search",
+        evaluation_contract=dict(seed_spec.evaluation),
+        genome={"optimizer.lr": seed_spec.training["optimizer"]["lr"]},
+        checkpoint_name="best-validation.pt",
+        checkpoint_sha256="seed-sha",
+        spec=seed_spec,
+    )
+    seed_result = search_module.EvolutionCandidateResult(
+        candidate_index=0,
+        run_id="prior-champion",
+        origin_population=0,
+        mode="clone",
+        state="completed",
+        epochs_executed=0,
+        metric_value=0.05,
+        gates=({"name": "quality", "passed": True, "reason": "quality passed"},),
+        quality_passed=True,
+        retained=False,
+        carried=True,
+        configuration_parents=("old-a", "old-b"),
+        reason="seeded",
+    )
+    monkeypatch.setattr(
+        search_module,
+        "_load_seed_member",
+        lambda run_id, **kwargs: search_module._EvolutionMember(
+            spec=seed_spec,
+            origin_population=0,
+            evaluation=seed_result,
+            parent_record=seed_parent,
+            validation_episode_ids=("validation-1",),
+            seeded=True,
+        ),
+    )
+
+    report = run_evolutionary_search(
+        _base_spec(), SCHEMA, population_size=4, population_count=2, seed=9,
+        method="random", mutation_rate=1.0, root=tmp_path / "runs", run_id_prefix="evo",
+        seed_run_ids=("prior-champion",),
+    )
+
+    assert report.seed_run_ids == ("prior-champion",)
+    assert report.populations[0].results[0].run_id == "prior-champion"
+    assert report.populations[0].results[0].carried is True
+    assert report.populations[0].results[0].epochs_executed == 0
+    assert report.populations[0].survivor_run_ids == ("prior-champion",)
+    assert report.total_trials_started == 6
+    assert all(lineage.parent_a_run_id == "prior-champion" for lineage in recorded_lineages)
+    assert all(lineage.parent_b_run_id == "prior-champion" for lineage in recorded_lineages)
+    assert all(lineage.generation == 4 for lineage in recorded_lineages)
+
+
+def test_evolutionary_search_rejects_more_seed_runs_than_population_slots():
+    with pytest.raises(SearchError, match="cannot exceed population_size"):
+        run_evolutionary_search(
+            _base_spec(), SCHEMA, population_size=2, population_count=1, seed=1,
+            seed_run_ids=("a", "b", "c"),
+        )
 
 
 def test_initial_population_resamples_windows_that_do_not_fit_shortest_episode():

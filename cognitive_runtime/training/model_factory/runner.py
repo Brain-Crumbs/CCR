@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import re
 import statistics
 import time
@@ -256,10 +257,110 @@ def _action_world_model_config(spec: ExperimentSpec) -> Any:
         device=str(training_block["device"]),
         epochs=int(training_block.get("epoch_budget") or DEFAULT_EPOCH_BUDGET),
     )
-    for key, value in dict(training_block.get("loss_weights") or {}).items():
-        if key in valid_fields:
-            kwargs[key] = value
+    # Factory specs use concise public names while ActionWorldModelConfig
+    # retains the older explicit field names. Preserve support for callers
+    # already using the explicit names, but make the documented/spec-shipped
+    # aliases actually reach the loss calculation.
+    loss_weight_aliases = {
+        "pixel": "pixel_loss_weight",
+        "latent": "latent_loss_weight",
+        "semantic": "semantic_loss_weight",
+    }
+    loss_weights = dict(training_block.get("loss_weights") or {})
+    for alias, field_name in loss_weight_aliases.items():
+        if alias in loss_weights and field_name in loss_weights:
+            raise ValueError(
+                f"training.loss_weights declares both {alias!r} and {field_name!r}; "
+                "use only one name for the same loss weight"
+            )
+    for key, value in loss_weights.items():
+        field_name = loss_weight_aliases.get(key, key)
+        if field_name in valid_fields:
+            kwargs[field_name] = value
     return awm.ActionWorldModelConfig(**kwargs)
+
+
+def _transition_balance_weights(
+    dataset: Any,
+    train_entries: Sequence[Mapping[str, Any]],
+    policy: Mapping[str, Any],
+) -> Tuple[Optional[List[List[float]]], Optional[Dict[str, Any]]]:
+    """Build trainer-aligned transition weights for a Factory corpus.
+
+    Labels are computed from ``dataset.episodes`` itself, then sliced back
+    into that exact episode order. This is the same alignment discipline as
+    the nursery trainer and prevents manifest order or multi-episode sessions
+    from assigning one episode's weights to another.
+    """
+    if "stationary_cap" not in policy:
+        return None, None
+    stationary_cap = float(policy["stationary_cap"])
+    if not math.isfinite(stationary_cap) or not 0.0 <= stationary_cap <= 1.0:
+        raise ValueError(
+            "training.transition_balance_policy.stationary_cap must be finite and in [0, 1], "
+            f"got {policy['stationary_cap']!r}"
+        )
+
+    def session_key(value: Any) -> str:
+        return str(Path(str(value)).resolve()).casefold()
+
+    session_to_scenario: Dict[str, str] = {}
+    for entry in train_entries:
+        key = session_key(entry["session_path"])
+        scenario = str(entry["scenario"])
+        prior = session_to_scenario.setdefault(key, scenario)
+        if prior != scenario:
+            raise ValueError(
+                f"training session {entry['session_path']!r} is assigned to both "
+                f"{prior!r} and {scenario!r}"
+            )
+
+    nursery = _nursery_module()
+    labels_by_episode: List[List[Any]] = []
+    for episode in dataset.episodes:
+        key = session_key(episode.session_dir)
+        if key not in session_to_scenario:
+            raise ValueError(
+                f"training dataset episode {episode.session_dir!r}/{episode.episode_id} "
+                "does not correspond to a training corpus manifest entry"
+            )
+        labels = nursery.compute_scenario_transition_labels(
+            episode.session_dir, episode.episode_id, session_to_scenario[key]
+        )
+        if len(labels) != len(episode.actions):
+            raise ValueError(
+                f"transition labels for {episode.session_dir!r}/{episode.episode_id} have "
+                f"{len(labels)} transitions, but the training dataset has {len(episode.actions)}"
+            )
+        labels_by_episode.append(labels)
+
+    flat_labels = [label for episode_labels in labels_by_episode for label in episode_labels]
+    flat_weights = nursery.balanced_transition_weights(
+        flat_labels, max_stationary_fraction=stationary_cap,
+    )
+    transition_weights: List[List[float]] = []
+    cursor = 0
+    for episode_labels in labels_by_episode:
+        count = len(episode_labels)
+        transition_weights.append(flat_weights[cursor : cursor + count])
+        cursor += count
+
+    total_weight = sum(flat_weights)
+    stationary_weight = sum(
+        weight for weight, label in zip(flat_weights, flat_labels)
+        if label.movement_state == "blocked"
+    )
+    report = {
+        "stationary_cap": stationary_cap,
+        "transitions": len(flat_labels),
+        "stationary_transitions": sum(
+            label.movement_state == "blocked" for label in flat_labels
+        ),
+        "weighted_stationary_fraction": (
+            stationary_weight / total_weight if total_weight > 0 else None
+        ),
+    }
+    return transition_weights, report
 
 
 def _parent_checkpoint_path(root: Union[str, Path], spec: ExperimentSpec) -> Path:
@@ -729,6 +830,11 @@ def run_trial(
     train_dataset = awm.build_action_sequence_dataset(
         [entry["session_path"] for entry in train_entries], action_keys=vocabulary,
     )
+    transition_weights, transition_balance_report = _transition_balance_weights(
+        train_dataset,
+        train_entries,
+        dict(resolved_spec.training.get("transition_balance_policy") or {}),
+    )
     validation_dataset = awm.build_action_sequence_dataset(
         [entry["session_path"] for entry in validation_entries], action_keys=vocabulary,
     )
@@ -918,8 +1024,11 @@ def run_trial(
                 chunk_cfg = replace(cfg, epochs=next_epoch)
                 with EpochTimer() as timer:
                     model, stats = awm.train_action_world_model(
-                        train_dataset, chunk_cfg, initial_model=model, resume_state=resume_state,
+                        train_dataset, chunk_cfg, initial_model=model,
+                        transition_weights=transition_weights, resume_state=resume_state,
                     )
+                if transition_balance_report is not None:
+                    stats["transition_balance_policy"] = dict(transition_balance_report)
                 epoch = next_epoch
                 resume_state = stats["resume_state"]
                 last_stats = stats

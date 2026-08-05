@@ -130,6 +130,7 @@ from cognitive_runtime.training.model_factory.genome import (
     GENE_TYPES,
     GENOME_SCHEMAS,
     GENERIC_ACTION_EFFECTS_V1,
+    GENERIC_ACTION_EFFECTS_V2,
     MUTATION_DISTRIBUTIONS,
     OBJECTIVES,
     Gene,

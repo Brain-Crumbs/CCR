@@ -19,6 +19,7 @@ import pytest
 from cognitive_runtime.training.model_factory.contracts import ArchitectureContract
 from cognitive_runtime.training.model_factory.genome import (
     GENERIC_ACTION_EFFECTS_V1,
+    GENERIC_ACTION_EFFECTS_V2,
     Gene,
     GenomeRepairError,
     GenomeSchema,
@@ -364,6 +365,20 @@ def test_schema_version_is_generic_action_effects_v1():
     assert get_schema("generic_action_effects_v1") is GENERIC_ACTION_EFFECTS_V1
 
 
+def test_v2_adds_primary_loss_weights_and_keeps_stationary_cap_in_the_genome():
+    assert get_schema("generic_action_effects_v2") is GENERIC_ACTION_EFFECTS_V2
+    assert set(GENERIC_ACTION_EFFECTS_V2.genes) - set(GENERIC_ACTION_EFFECTS_V1.genes) == {
+        "loss_weights.pixel",
+        "loss_weights.latent",
+        "loss_weights.semantic",
+    }
+    assert "transition_balance_policy.stationary_cap" in GENERIC_ACTION_EFFECTS_V2.genes
+    defaults = default_genome(GENERIC_ACTION_EFFECTS_V2)
+    assert defaults["loss_weights.pixel"] == 1.0
+    assert defaults["loss_weights.latent"] == 1.0
+    assert defaults["loss_weights.semantic"] == 1.0
+
+
 def test_get_schema_rejects_unknown_version():
     with pytest.raises(GenomeSchemaError, match="unknown genome schema version"):
         get_schema("does_not_exist_v99")
@@ -403,6 +418,12 @@ def test_shipped_schema_content_hash_matches_its_pinned_value():
     # place. The fix is a new schema version, not updating the pin here.
     assert GENERIC_ACTION_EFFECTS_V1.content_hash == (
         "e247442c3fac00d30f90ca411cce0a7c4b7428247f963e3034dc22b0e408135d"
+    )
+
+
+def test_shipped_v2_schema_content_hash_matches_its_pinned_value():
+    assert GENERIC_ACTION_EFFECTS_V2.content_hash == (
+        "f2ccc7d2dfcd490d57c5b30822e83603f66bea1b77634c36af63ccea1aeb6925"
     )
 
 

@@ -163,7 +163,10 @@ def test_run_trial_rejects_horizon_beyond_recorded_temporal_coverage(tmp_path):
 
 
 def test_fresh_trial_completes_and_writes_artifacts(tmp_path, corpus):
-    result = _run(_spec_dict(corpus.corpus_id), tmp_path)
+    spec = _spec_dict(corpus.corpus_id, training_overrides={
+        "transition_balance_policy": {"stationary_cap": 0.4},
+    })
+    result = _run(spec, tmp_path)
 
     assert result.mode == "fresh"
     assert result.state == "completed"
@@ -184,6 +187,25 @@ def test_fresh_trial_completes_and_writes_artifacts(tmp_path, corpus):
     report = json.loads((directory / "experiment_report.json").read_text(encoding="utf-8"))
     assert report["checkpoint"]["sha256"] == result.checkpoint_sha256
     assert report["training_stats"]["completion_status"] == "completed"
+    balance = result.training_stats["transition_balance_policy"]
+    assert balance["stationary_cap"] == pytest.approx(0.4)
+    assert balance["transitions"] > 0
+    assert balance["stationary_transitions"] >= 0
+    assert balance["weighted_stationary_fraction"] is not None
+
+
+def test_factory_loss_weight_aliases_reach_the_real_trainer_config():
+    from cognitive_runtime.training.model_factory.runner import _action_world_model_config
+    from cognitive_runtime.training.model_factory.spec import resolve
+
+    spec = resolve(_spec_dict("unused", training_overrides={
+        "loss_weights": {"pixel": 0.2, "latent": 0.3, "semantic": 0.4},
+    }))
+    cfg = _action_world_model_config(spec)
+
+    assert cfg.pixel_loss_weight == pytest.approx(0.2)
+    assert cfg.latent_loss_weight == pytest.approx(0.3)
+    assert cfg.semantic_loss_weight == pytest.approx(0.4)
 
 
 def test_fresh_trial_writes_clinic_session_index_and_exports_validation_predictions(tmp_path, corpus):

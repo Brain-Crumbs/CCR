@@ -397,17 +397,12 @@ def _verify_schema_integrity(schema: GenomeSchema, expected_content_hash: str) -
 # so a resolved gene value can be merged straight into an ExperimentSpec's
 # `training` block via a dotted-path override.
 #
-# Two genes below are declared per the issue #229 gene table and §17's
-# "new configurable properties" list, but are not yet consumed by the real
-# trainer: `optimizer.weight_decay` is recorded on TrainingContract for
-# identity, matching the pre-existing, documented limitation in
-# `runner.py::_action_world_model_config` (`ActionWorldModelConfig`/
-# `torch.optim.Adam` construction never receives it); `transition_balance_
-# policy.*` has no consumer anywhere in the codebase yet (§17 lists it as
-# still-to-be-exposed). Evolving either gene today cannot change measured
-# training behavior -- a real search over this schema must wire both into
-# the trainer first, or drop them, before comparing genomes that differ
-# only in these fields as if the difference were signal.
+# `optimizer.weight_decay` is recorded on TrainingContract for identity but
+# remains a declared-only v1 gene: `runner.py::_action_world_model_config`
+# and the reused trainer's `torch.optim.Adam` construction do not consume it.
+# `transition_balance_policy.stationary_cap`, by contrast, is consumed by
+# the Model Factory runner when it builds the real trainer's per-transition
+# sampling weights.
 _GENERIC_ACTION_EFFECTS_V1_GENES: Dict[str, Dict[str, Any]] = {
     "optimizer.lr": {
         "type": "float",
@@ -466,15 +461,36 @@ _GENERIC_ACTION_EFFECTS_V1_GENES: Dict[str, Dict[str, Any]] = {
         "default": 3,
         "mutation": {"distribution": "categorical_resample"},
     },
-    # NOT YET WIRED -- see the module note above. No code anywhere in the
-    # repository reads `training.transition_balance_policy` yet (§17: a
-    # "new configurable property" still to be exposed); declared here so
-    # the schema is ready the moment that consumer lands.
     "transition_balance_policy.stationary_cap": {
         "type": "float",
         "bounds": (0.0, 1.0),
         "default": 0.5,
         "mutation": {"distribution": "normal_perturb", "sigma": 0.1},
+    },
+}
+
+# v2 adds the three primary objective weights used by existing Factory specs.
+# Keep v1 byte-for-byte stable: schema hashes are reproducibility identities,
+# so extending a shipped genome always receives a new version.
+_GENERIC_ACTION_EFFECTS_V2_GENES: Dict[str, Dict[str, Any]] = {
+    **_GENERIC_ACTION_EFFECTS_V1_GENES,
+    "loss_weights.pixel": {
+        "type": "float",
+        "bounds": (0.0, 2.0),
+        "default": 1.0,
+        "mutation": {"distribution": "normal_perturb", "sigma": 0.2},
+    },
+    "loss_weights.latent": {
+        "type": "float",
+        "bounds": (0.0, 2.0),
+        "default": 1.0,
+        "mutation": {"distribution": "normal_perturb", "sigma": 0.2},
+    },
+    "loss_weights.semantic": {
+        "type": "float",
+        "bounds": (0.0, 2.0),
+        "default": 1.0,
+        "mutation": {"distribution": "normal_perturb", "sigma": 0.2},
     },
 }
 
@@ -486,6 +502,9 @@ _EXPECTED_CONTENT_HASHES: Dict[str, str] = {
     "generic_action_effects_v1": (
         "e247442c3fac00d30f90ca411cce0a7c4b7428247f963e3034dc22b0e408135d"
     ),
+    "generic_action_effects_v2": (
+        "f2ccc7d2dfcd490d57c5b30822e83603f66bea1b77634c36af63ccea1aeb6925"
+    ),
 }
 
 GENERIC_ACTION_EFFECTS_V1: GenomeSchema = _verify_schema_integrity(
@@ -493,10 +512,16 @@ GENERIC_ACTION_EFFECTS_V1: GenomeSchema = _verify_schema_integrity(
     _EXPECTED_CONTENT_HASHES["generic_action_effects_v1"],
 )
 
+GENERIC_ACTION_EFFECTS_V2: GenomeSchema = _verify_schema_integrity(
+    build_schema("generic_action_effects_v2", _GENERIC_ACTION_EFFECTS_V2_GENES),
+    _EXPECTED_CONTENT_HASHES["generic_action_effects_v2"],
+)
+
 #: Registry of every declared per-stage schema (§14.2: "The factory declares
 #: a versioned genome schema per stage.").
 GENOME_SCHEMAS: Dict[str, GenomeSchema] = {
     GENERIC_ACTION_EFFECTS_V1.version: GENERIC_ACTION_EFFECTS_V1,
+    GENERIC_ACTION_EFFECTS_V2.version: GENERIC_ACTION_EFFECTS_V2,
 }
 
 
@@ -662,6 +687,7 @@ __all__ = [
     "GenomeSchema",
     "build_schema",
     "GENERIC_ACTION_EFFECTS_V1",
+    "GENERIC_ACTION_EFFECTS_V2",
     "GENOME_SCHEMAS",
     "get_schema",
     "default_genome",
