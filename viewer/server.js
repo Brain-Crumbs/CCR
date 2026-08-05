@@ -182,10 +182,11 @@ function validateJobBody(clinic, body) {
     }
   }
   // A checkpoint file name is joined into `<run>/checkpoints/<name>` by the
-  // CLI. There is no catalog of checkpoint names to check against, so the
-  // character-class floor applies -- the same reasoning isPlainId documents
-  // for a not-yet-existing run id.
-  for (const field of ["checkpoint", "reference_checkpoint"]) {
+  // CLI (breed's --checkpoint-a/--checkpoint-b are two more of exactly
+  // these, one per parent). There is no catalog of checkpoint names to
+  // check against, so the character-class floor applies -- the same
+  // reasoning isPlainId documents for a not-yet-existing run id.
+  for (const field of ["checkpoint", "reference_checkpoint", "checkpoint_a", "checkpoint_b"]) {
     const value = body.options?.[field];
     if (value !== undefined && value !== null && !isPlainId(value)) {
       return { status: 400, error: `options.${field} must be a plain identifier` };

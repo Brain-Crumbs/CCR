@@ -182,6 +182,19 @@ td.population-cell.is-current { box-shadow: inset 3px 0 0 var(--good-fg); }
 td.population-cell.is-current .population-cell__metric { color: var(--good-fg); font-weight: 700; }
 .evolve-preview td:nth-child(2) { font-family: ui-monospace, monospace; font-size: .72rem; white-space: nowrap; }
 
+/* Breed tab */
+.breed-preview { margin-top: 16px; }
+/* check_compatible names every mismatched dimension at once, so its message
+   is shown verbatim and wrapped rather than truncated to one line. */
+.breed-error { margin: 4px 0 0; padding: 8px; background: var(--surface-1); border: 1px solid var(--line); border-radius: 6px; font-size: .74rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.gene-table th[scope="row"] { font-family: ui-monospace, monospace; font-size: .72rem; text-align: left; white-space: nowrap; }
+.gene-table td { font-variant-numeric: tabular-nums; }
+.gene-table td .state-badge { margin-left: 6px; }
+/* A gene mutation or repair moved after crossover -- the row a reader
+   scanning the child's genome is actually looking for. */
+.gene-table tr.is-current th[scope="row"] { font-weight: 700; }
+.gene-table tr.is-current { background: var(--surface-3); }
+
 /* Pixel horizon viewer */
 .pixel-horizon-viewer { margin-top: 18px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); overflow-x: auto; font-size: 13px; }
 .pixel-horizon-viewer .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 10px; }

@@ -17,6 +17,7 @@ import { FactoryRunsPanel } from "./components/FactoryRunsPanel.jsx";
 import { CompareView } from "./components/CompareView.jsx";
 import { BuildPanel } from "./components/BuildPanel.jsx";
 import { EvolvePanel } from "./components/EvolvePanel.jsx";
+import { BreedPanel } from "./components/BreedPanel.jsx";
 
 const TABS = [
   ["episode", "Episode"],
@@ -26,6 +27,7 @@ const TABS = [
   ["compare", "Compare"],
   ["build", "Build"],
   ["evolve", "Evolve"],
+  ["breed", "Breed"],
 ];
 
 /**
@@ -186,6 +188,9 @@ export function App() {
       )}
       {tab === "evolve" && (
         <EvolvePanel catalog={catalog} organism={organism} />
+      )}
+      {tab === "breed" && (
+        <BreedPanel catalog={catalog} organism={organism} />
       )}
     </main>
   );
