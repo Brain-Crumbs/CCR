@@ -642,6 +642,13 @@ test("job-launch API", async (t) => {
       modes: ["fresh", "clone", "resume", "fine_tune"],
       objectives: ["windowed_rollout", "autoregressive"],
       genome_schemas: ["generic_action_effects_v1"],
+      architecture_genome_schemas: ["architecture_search_v1"],
+      backbone_presets: {
+        gru: { backbone: "gru", backbone_kwargs: {} },
+        dilated_conv: { backbone: "dilated_conv", backbone_kwargs: {} },
+        transformer_h2_l1: { backbone: "transformer", backbone_kwargs: { n_heads: 2, n_layers: 1 } },
+        transformer_h4_l2: { backbone: "transformer", backbone_kwargs: { n_heads: 4, n_layers: 2 } },
+      },
       backbones: ["gru", "dilated_conv", "transformer"],
     });
   });
