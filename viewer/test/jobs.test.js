@@ -6,7 +6,8 @@ const path = require("node:path");
 const test = require("node:test");
 const jobs = require("../lib/jobs");
 
-const FAKE_PYTHON = path.join(__dirname, "fixtures", "fake-python.sh");
+const FAKE_PYTHON = process.execPath;
+const FAKE_PYTHON_PREFIX = JSON.stringify([path.join(__dirname, "fixtures", "fake-python.js")]);
 
 function fixtureRunsRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "clinic-jobs-"));
@@ -23,9 +24,12 @@ async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 20 } = {}) {
 }
 
 test("jobs", async (t) => {
-  let originalPython;
-  t.before(() => { originalPython = process.env.PYTHON; process.env.PYTHON = FAKE_PYTHON; });
-  t.after(() => { process.env.PYTHON = originalPython; });
+  let originalPython, originalPrefix;
+  t.before(() => {
+    originalPython = process.env.PYTHON; originalPrefix = process.env.CCR_PYTHON_PREFIX_ARGS;
+    process.env.PYTHON = FAKE_PYTHON; process.env.CCR_PYTHON_PREFIX_ARGS = FAKE_PYTHON_PREFIX;
+  });
+  t.after(() => { process.env.PYTHON = originalPython; process.env.CCR_PYTHON_PREFIX_ARGS = originalPrefix; });
 
   await t.test("launchJob(baseline) registers a running job, then reconciles to completed", async () => {
     const runsDir = fixtureRunsRoot();

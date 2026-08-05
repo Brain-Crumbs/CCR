@@ -22,11 +22,22 @@ const { spawn, spawnSync } = require("child_process");
 const REPO_DIR = path.join(__dirname, "..", "..");
 const JOBS_SUBDIR = ".clinic-jobs";
 const JOB_FORMAT = "clinic-job-v1";
+const localChildPids = new Set();
 
-const JOB_KINDS = ["baseline", "clone", "resume", "search", "breed"];
+const JOB_KINDS = ["corpus", "baseline", "clone", "resume", "search", "breed"];
 
 function pythonCommand() {
   return process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
+}
+
+function pythonPrefixArgs() {
+  if (!process.env.CCR_PYTHON_PREFIX_ARGS) return [];
+  try {
+    const value = JSON.parse(process.env.CCR_PYTHON_PREFIX_ARGS);
+    return Array.isArray(value) ? value.map(String) : [];
+  } catch {
+    return [];
+  }
 }
 
 function jobsDir(runsDir) { return path.join(path.resolve(runsDir), JOBS_SUBDIR); }
@@ -108,7 +119,7 @@ function writeTempSpec(runsDir, jobId, specDocument) {
  * believes -- letting the two disagree would silently point every later
  * status/log/cancel lookup at the wrong (or a nonexistent) directory
  * (Codex review, PR #277). */
-function buildLaunch(kind, body, { runsDir, jobId }) {
+function buildLaunch(kind, body, { runsDir, corpusRoot = null, jobId }) {
   const options = { ...(body.options || {}) };
   const root = ["--root", path.resolve(runsDir)];
 
@@ -138,6 +149,15 @@ function buildLaunch(kind, body, { runsDir, jobId }) {
   }
 
   switch (kind) {
+    case "corpus": {
+      if (!body.spec_path) throw new Error("corpus requires a server-selected corpus spec");
+      if (!corpusRoot) throw new Error("corpus requires a configured corpus root");
+      return {
+        command: ["corpus", "build"],
+        argv: [path.resolve(body.spec_path), "--root", path.resolve(corpusRoot)],
+        runIds: [],
+      };
+    }
     case "baseline": {
       if (!body.spec) throw new Error("baseline requires a spec document (body.spec)");
       const specFile = writeTempSpec(runsDir, jobId, { ...body.spec, organism: body.organism });
@@ -222,7 +242,7 @@ class ConcurrencyLimitError extends Error {}
  * "auto"-device trials (only per-file and per-device locks exist), so
  * without this a control plane could pile up more simultaneous trainings
  * than the host can actually run well. */
-function launchJob(kind, body, { runsDir, maxConcurrent = null }) {
+function launchJob(kind, body, { runsDir, corpusRoot = null, maxConcurrent = null }) {
   if (!JOB_KINDS.includes(kind)) {
     throw new Error(`unknown job kind ${JSON.stringify(kind)}; expected one of ${JOB_KINDS.join(", ")}`);
   }
@@ -238,14 +258,14 @@ function launchJob(kind, body, { runsDir, maxConcurrent = null }) {
     }
   }
   const jobId = crypto.randomUUID();
-  const { argv, runIds } = buildLaunch(kind, body, { runsDir, jobId });
-  const fullArgv = ["-m", "cognitive_runtime.cli", "factory", kind, ...argv];
+  const { argv, runIds, command = [kind] } = buildLaunch(kind, body, { runsDir, corpusRoot, jobId });
+  const fullArgv = ["-m", "cognitive_runtime.cli", "factory", ...command, ...argv];
   const logPath = jobLogPath(runsDir, jobId);
   fs.mkdirSync(path.dirname(logPath), { recursive: true });
   const logFd = fs.openSync(logPath, "a");
   let child;
   try {
-    child = spawn(pythonCommand(), fullArgv, {
+    child = spawn(pythonCommand(), [...pythonPrefixArgs(), ...fullArgv], {
       cwd: REPO_DIR, detached: true, stdio: ["ignore", logFd, logFd], env: process.env,
     });
   } finally {
@@ -258,14 +278,17 @@ function launchJob(kind, body, { runsDir, maxConcurrent = null }) {
     error: null, organism: body.organism, run_ids: runIds,
   };
   writeJSONAtomic(jobPath(runsDir, jobId), baseEntry);
+  if (child.pid) localChildPids.add(child.pid);
 
   child.on("exit", (code) => {
+    if (child.pid) localChildPids.delete(child.pid);
     const current = readJSON(jobPath(runsDir, jobId), baseEntry);
     writeJSONAtomic(jobPath(runsDir, jobId), {
       ...current, status: code === 0 ? "completed" : "failed", exit_code: code,
     });
   });
   child.on("error", (err) => {
+    if (child.pid) localChildPids.delete(child.pid);
     const current = readJSON(jobPath(runsDir, jobId), baseEntry);
     writeJSONAtomic(jobPath(runsDir, jobId), {
       ...current, status: "failed", error: String((err && err.message) || err),
@@ -291,7 +314,7 @@ function getJob(runsDir, jobId) {
   // would (and, before this fix, did) misread that spec document as a job
   // registry entry with no run_ids of its own.
   if (!entry || entry.format !== JOB_FORMAT) return null;
-  if (entry.status === "running" && !isAlive(entry.pid)) {
+  if (entry.status === "running" && !isAlive(entry.pid) && !localChildPids.has(entry.pid)) {
     const reconciled = { ...entry, status: "unknown" };
     writeJSONAtomic(jobPath(runsDir, jobId), reconciled);
     return reconciled;
@@ -355,7 +378,7 @@ async function cancelJob(runsDir, jobId, { killGraceMs = 3000, pollIntervalMs = 
   if (!entry) return null;
   if (entry.status !== "running") return entry;
   for (const runId of entry.run_ids) {
-    spawnSync(pythonCommand(), [
+    spawnSync(pythonCommand(), [...pythonPrefixArgs(),
       "-m", "cognitive_runtime.cli", "factory", "cancel", runId,
       "--root", path.resolve(runsDir), "--organism", entry.organism,
     ], { cwd: REPO_DIR });
@@ -368,7 +391,7 @@ async function cancelJob(runsDir, jobId, { killGraceMs = 3000, pollIntervalMs = 
     }
     if (!isAlive(entry.pid)) {
       for (const runId of entry.run_ids) {
-        spawnSync(pythonCommand(), [
+        spawnSync(pythonCommand(), [...pythonPrefixArgs(),
           "-m", "cognitive_runtime.cli", "factory", "reconcile-kill", runId,
           "--root", path.resolve(runsDir), "--organism", entry.organism, "--state", "cancelled",
         ], { cwd: REPO_DIR });
@@ -417,4 +440,5 @@ module.exports = {
   jobsDir,
   jobSpecPath,
   pythonCommand,
+  pythonPrefixArgs,
 };

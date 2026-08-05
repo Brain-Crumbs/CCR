@@ -1,9 +1,10 @@
 # CCR Clinic
 
-The clinic is the presentation layer for the Model Factory (epic #212): a
-read-only Node/HTTP API over recorded streams-v2 sessions and factory runs
-(`server.js`), and a React front end (`web/`, built into `public/`) that lets
-you inspect one experiment run at a time -- its pixels, its predictions at
+The clinic is the control and presentation layer for the Model Factory (epic
+#212): a zero-dependency Node/HTTP API over recorded streams-v2 sessions,
+factory runs, and detached jobs (`server.js`), and a React front end (`web/`,
+built into `public/`) that lets you launch work and inspect one experiment run
+at a time -- its pixels, its predictions at
 every horizon, the actions taken tick by tick, and the factory's own
 lineage/contract/champion evidence.
 
@@ -13,6 +14,7 @@ lineage/contract/champion evidence.
 node viewer/server.js                       # serves runs + episode_cache + corpora on :8787
 node viewer/server.js --data-dir /path/to/sessions --port 9000
 node viewer/server.js --runs-dir runs --episode-cache-dir episode_cache --corpus-root corpora
+node viewer/server.js --corpus-specs-dir specs/corpora
 node viewer/server.js --host 0.0.0.0 --max-concurrent-jobs 4   # see Security below first
 ```
 
@@ -96,7 +98,9 @@ Per selected organism/run, tabbed by concern:
   baselines.
 - **Build** -- launch a Model Factory trial without leaving the browser:
   pick an organism and a mode (fresh / clone / fine_tune / resume, sourced
-  from `GET /api/factory-meta`), fill in a form over `spec.data`/`model`/
+  from `GET /api/factory-meta`). On a clean workspace, first launch one of
+  the repository's corpus recipes and follow that corpus build in the same
+  Jobs panel. Then fill in a form over `spec.data`/`model`/
   `training`/`evaluation` (fresh) or a completed run plus checkpoint and
   `--set` overrides (clone/fine_tune/resume), and launch it as a
   `POST /api/jobs/{baseline,clone,resume}` job. A Jobs panel underneath
@@ -202,7 +206,7 @@ before you ever train on it.
 
 ```text
 viewer/
-  server.js            # read-only Node/HTTP API (no framework, no deps)
+  server.js            # Node/HTTP viewer + local control plane (no framework, no deps)
   export_predictions.py
   public/              # built React bundle (npm run build writes here)
   web/                 # React source
@@ -283,11 +287,12 @@ see Security above before exposing them beyond localhost.
 | `GET /api/sessions?organism=&run=&name=&...filters` | recordings for the selected run, with quality verdicts |
 | `GET /api/sessions/:id` | one session's streams, decisions, exports, and quality verdict |
 | `GET /api/sessions/:id/episodes/:eid/{streams,decisions,frames,predictions}` | per-episode records; `predictions` accepts `?kind=dream` and `?experiment=` |
-| `POST /api/jobs/{baseline,clone,resume,search,breed}` | launches `ccr factory <kind> ...` as a detached subprocess; body shape per kind in `viewer/lib/jobs.js`'s `buildLaunch`. `409` past `--max-concurrent-jobs` |
+| `POST /api/jobs/{corpus,baseline,clone,resume,search,breed}` | launches the matching `ccr factory ...` workflow as a detached subprocess; body shape per kind in `viewer/lib/jobs.js`'s `buildLaunch`. `409` past `--max-concurrent-jobs` |
 | `GET /api/jobs?organism=` | every launched job (registry entry) plus each precomputed run's live `state.json`/heartbeat |
 | `GET /api/jobs/:id/log?offset=` | the job's combined stdout+stderr log, tailed from a byte offset |
 | `POST /api/jobs/:id/cancel` | asks every one of the job's runs to stop gracefully, then `SIGTERM`s the subprocess |
 | `GET /api/corpora?organism=` | frozen Model Factory corpora under `--corpus-root` (id, data contract hash, session counts per split) |
+| `GET /api/corpus-specs?organism=` | repository corpus recipes under `--corpus-specs-dir`; the Build tab can launch one when a clean workspace has no frozen corpus yet |
 | `POST /api/preview/{search,breed}` | the same CLI invocation a launch would use, plus `--dry-run` -- candidate specs or the resolved child + lineage, no run allocated |
 | `GET /api/factory-meta` | the factory's own declared modes/objectives/genome schema versions (training *and* architecture)/backbone presets (`ccr factory meta`), so a form can source its options from the backend instead of duplicating them |
 

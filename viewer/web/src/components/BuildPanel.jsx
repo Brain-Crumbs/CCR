@@ -131,6 +131,10 @@ export function BuildPanel({ catalog, organism: initialOrganism }) {
   const [meta, setMeta] = useState(null);
   const [metaError, setMetaError] = useState(null);
   const [corpora, setCorpora] = useState(null);
+  const [corpusSpecs, setCorpusSpecs] = useState(null);
+  const [corpusSpecId, setCorpusSpecId] = useState("");
+  const [corpusLaunching, setCorpusLaunching] = useState(false);
+  const [corpusError, setCorpusError] = useState(null);
   const [factoryRuns, setFactoryRuns] = useState(null);
   const [form, setForm] = useState(DEFAULT_FORM);
   const [overrides, setOverrides] = useState([]);
@@ -154,19 +158,43 @@ export function BuildPanel({ catalog, organism: initialOrganism }) {
     if (!organism) return;
     let cancelled = false;
     setCorpora(null);
-    api.corpora(organism).then((list) => {
+    async function poll() {
+      try {
+        const list = await api.corpora(organism);
+        if (cancelled) return;
+        setCorpora(list);
+        setForm((current) => (list.some((item) => item.corpus_id === current.corpusId)
+          ? current : { ...current, corpusId: list[0]?.corpus_id ?? "" }));
+      } catch {
+        if (!cancelled) setCorpora([]);
+      }
+    }
+    poll();
+    const interval = setInterval(poll, 4000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [organism, refreshToken]);
+
+  useEffect(() => {
+    if (!organism) return;
+    let cancelled = false;
+    setCorpusSpecs(null);
+    api.corpusSpecs(organism).then((list) => {
       if (cancelled) return;
-      setCorpora(list);
-      setForm((current) => (current.corpusId ? current : { ...current, corpusId: list[0]?.corpus_id ?? "" }));
-    }, () => !cancelled && setCorpora([]));
+      setCorpusSpecs(list);
+      setCorpusSpecId((current) => (list.some((item) => item.spec_id === current) ? current : (list[0]?.spec_id ?? "")));
+    }, () => !cancelled && setCorpusSpecs([]));
     return () => { cancelled = true; };
   }, [organism]);
 
   useEffect(() => {
     if (!organism) return;
     let cancelled = false;
-    api.factoryRuns(organism).then((r) => !cancelled && setFactoryRuns(r), () => !cancelled && setFactoryRuns(null));
-    return () => { cancelled = true; };
+    async function poll() {
+      api.factoryRuns(organism).then((r) => !cancelled && setFactoryRuns(r), () => !cancelled && setFactoryRuns(null));
+    }
+    poll();
+    const interval = setInterval(poll, 4000);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [organism, refreshToken]);
 
   const runOptions = useMemo(() => (factoryRuns?.runs || []).map((r) => r.run), [factoryRuns]);
@@ -233,6 +261,21 @@ export function BuildPanel({ catalog, organism: initialOrganism }) {
     }
   }
 
+  async function handleCorpusBuild() {
+    if (!organism || !corpusSpecId) return;
+    setCorpusLaunching(true);
+    setCorpusError(null);
+    try {
+      const entry = await api.launchJob("corpus", { organism, spec_id: corpusSpecId });
+      setLastJobId(entry.job_id);
+      setRefreshToken((n) => n + 1);
+    } catch (err) {
+      setCorpusError(err.message);
+    } finally {
+      setCorpusLaunching(false);
+    }
+  }
+
   if (!organisms.length) {
     return (
       <section className="diagnostic build" aria-labelledby="build-title">
@@ -261,6 +304,29 @@ export function BuildPanel({ catalog, organism: initialOrganism }) {
         {mode === FRESH_MODE ? (
           <>
             <h4>Data</h4>
+            {corpora?.length === 0 && (
+              <div className="corpus-bootstrap">
+                <strong>No frozen corpus is available for {organism} yet.</strong>
+                <p>
+                  Build one from a repository corpus spec here. This records and quality-gates the data needed
+                  by both individual trials and evolutionary searches; progress appears in Jobs.
+                </p>
+                <div className="pickers">
+                  <label className="picker">Corpus recipe
+                    <select value={corpusSpecId} onChange={(event) => setCorpusSpecId(event.target.value)} aria-label="Corpus recipe">
+                      {!corpusSpecs?.length && <option value="">{corpusSpecs ? "no corpus recipes found" : "loading…"}</option>}
+                      {corpusSpecs?.map((item) => (
+                        <option key={item.spec_id} value={item.spec_id}>{item.corpus_id}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <button type="button" onClick={handleCorpusBuild} disabled={corpusLaunching || !corpusSpecId}>
+                    {corpusLaunching ? "Starting corpus build…" : "Build corpus"}
+                  </button>
+                </div>
+                {corpusError && <p className="no-data">{corpusError}</p>}
+              </div>
+            )}
             <div className="field-grid">
               <label className="field">Corpus
                 <select value={form.corpusId} onChange={(e) => set("corpusId")(e.target.value)} aria-label="Corpus">
@@ -389,7 +455,12 @@ export function BuildPanel({ catalog, organism: initialOrganism }) {
         </div>
 
         {launchError && <p className="no-data">{launchError}</p>}
-        <button type="submit" disabled={launching || !organism}>{launching ? "Launching…" : "Launch"}</button>
+        <button
+          type="submit"
+          disabled={launching || !organism || (mode === FRESH_MODE ? !form.corpusId : !form.parentRun)}
+        >
+          {launching ? "Launching…" : "Launch"}
+        </button>
       </form>
 
       <JobsPanel organism={organism} refreshToken={refreshToken} highlightJobId={lastJobId} />

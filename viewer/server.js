@@ -14,7 +14,7 @@ const REPO_DIR = path.join(__dirname, "..");
 
 function parseArgs(argv) {
   const args = {
-    dataDir: null, runsDir: null, episodeCacheDir: null, corpusRoot: null, port: 8787,
+    dataDir: null, runsDir: null, episodeCacheDir: null, corpusRoot: null, corpusSpecsDir: null, port: 8787,
     // The job-launch API (POST /api/jobs/*, /api/preview/*) is unauthenticated,
     // so the server binds to localhost only unless an operator explicitly
     // opts into wider exposure -- see viewer/README.md's Security section.
@@ -29,11 +29,12 @@ function parseArgs(argv) {
     else if (argv[i] === "--runs-dir") args.runsDir = argv[++i];
     else if (argv[i] === "--episode-cache-dir") args.episodeCacheDir = argv[++i];
     else if (argv[i] === "--corpus-root") args.corpusRoot = argv[++i];
+    else if (argv[i] === "--corpus-specs-dir") args.corpusSpecsDir = argv[++i];
     else if (argv[i] === "--port") args.port = Number(argv[++i]);
     else if (argv[i] === "--host") args.host = argv[++i];
     else if (argv[i] === "--max-concurrent-jobs") args.maxConcurrentJobs = Number(argv[++i]);
     else if (argv[i] === "--help" || argv[i] === "-h") {
-      console.log("usage: node server.js [--runs-dir <runs dir>] [--episode-cache-dir <cache dir>] [--corpus-root <corpora dir>] [--data-dir <sessions dir>] [--port 8787] [--host 127.0.0.1] [--max-concurrent-jobs 2]");
+      console.log("usage: node server.js [--runs-dir <runs dir>] [--episode-cache-dir <cache dir>] [--corpus-root <corpora dir>] [--corpus-specs-dir <corpus specs dir>] [--data-dir <sessions dir>] [--port 8787] [--host 127.0.0.1] [--max-concurrent-jobs 2]");
       process.exit(0);
     }
   }
@@ -45,6 +46,7 @@ function parseArgs(argv) {
     args.runsDir = path.resolve(args.runsDir || path.join(REPO_DIR, "runs"));
     args.episodeCacheDir = path.resolve(args.episodeCacheDir || path.join(REPO_DIR, "notebooks", "episode_cache"));
     args.corpusRoot = path.resolve(args.corpusRoot || path.join(REPO_DIR, "corpora"));
+    args.corpusSpecsDir = path.resolve(args.corpusSpecsDir || path.join(REPO_DIR, "specs", "corpora"));
   }
   return args;
 }
@@ -155,12 +157,17 @@ function isPlainId(value) {
  * body clears every check. */
 function validateJobBody(clinic, body) {
   if (!body.organism) return { status: 400, error: "select an organism" };
-  if (!clinic.catalog().some((entry) => entry.organism === body.organism)) {
+  if (!clinic.organisms().includes(body.organism)) {
     return { status: 404, error: "unknown organism" };
+  }
+  const corpusId = body.spec?.data?.corpus_id;
+  if (typeof corpusId === "string" && corpusId && !corpusCatalog(clinic.corpusRoot, body.organism)
+    .some((entry) => entry.corpus_id === corpusId)) {
+    return { status: 404, error: `unknown corpus: ${corpusId}` };
   }
   for (const field of ["run", "parent_a", "parent_b"]) {
     if (typeof body[field] !== "string") continue;
-    if (!clinic.catalog().some((entry) => entry.organism === body.organism && entry.run === body[field])) {
+    if (!clinic.factoryCatalog(body.organism).some((entry) => entry.run === body[field])) {
       return { status: 404, error: `unknown ${field}: ${body[field]}` };
     }
   }
@@ -177,7 +184,7 @@ function validateJobBody(clinic, body) {
   for (const field of ["champion", "reference_run"]) {
     const value = body.options?.[field];
     if (typeof value !== "string" || !value) continue;
-    if (!clinic.catalog().some((entry) => entry.organism === body.organism && entry.run === value)) {
+    if (!clinic.factoryCatalog(body.organism).some((entry) => entry.run === value)) {
       return { status: 404, error: `unknown options.${field}: ${value}` };
     }
   }
@@ -207,6 +214,26 @@ function runCatalog(runsDir) {
       return [{ organism: experiment.organism || organism.name, run: experiment.experiment_id || run.name, dir }];
     });
   }).sort((a, b) => a.organism.localeCompare(b.organism) || b.run.localeCompare(a.run));
+}
+
+/** Model Factory runs become monitorable as soon as the runner allocates a
+ * state/spec directory, well before experiment.json exists.  The presentation
+ * catalog above intentionally remains limited to runs with viewable experiment
+ * artifacts; this wider catalog drives Factory, jobs, resume and breeding. */
+function factoryRunCatalog(runsDir, organism) {
+  const organismDir = path.join(runsDir, organism);
+  if (!fs.existsSync(organismDir) || !fs.statSync(organismDir).isDirectory()) return [];
+  const markers = ["state.json", "trial_spec.json", "experiment.json", "experiment_report.json"];
+  return fs.readdirSync(organismDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && isPlainId(entry.name))
+    .flatMap((entry) => {
+      const dir = path.join(organismDir, entry.name);
+      if (!markers.some((name) => fs.existsSync(path.join(dir, name)))) return [];
+      const experiment = readJSON(path.join(dir, "experiment.json"), {});
+      const report = readJSON(path.join(dir, "experiment_report.json"), {});
+      return [{ organism, run: experiment.experiment_id || report.experiment?.experiment_id || entry.name, dir }];
+    })
+    .sort((a, b) => b.run.localeCompare(a.run));
 }
 
 /** A deliberately small, stable slice of a run report for the clinic header. */
@@ -373,8 +400,7 @@ function architectureCampaignsDocument(runsDir, organism) {
  * across every run under an organism, which the champion registry alone
  * cannot show since it only ever holds *promoted* runs. */
 function factoryRunsDocument(runsDir, organism) {
-  const runs = runCatalog(runsDir)
-    .filter((entry) => entry.organism === organism)
+  const runs = factoryRunCatalog(runsDir, organism)
     .map((entry) => {
       const state = readJSON(path.join(entry.dir, "state.json"), null);
       const lineage = readJSON(path.join(entry.dir, "lineage.json"), null);
@@ -462,12 +488,53 @@ function corpusCatalog(corpusRoot, organism = null) {
   return corpora;
 }
 
+function corpusSpecCatalog(corpusSpecsDir, organism = null) {
+  if (!corpusSpecsDir || !fs.existsSync(corpusSpecsDir)) return [];
+  const scalar = (text, key) => {
+    const match = text.match(new RegExp(`^${key}:[ \\t]*([^#\\r\\n]+)`, "m"));
+    return match ? match[1].trim().replace(/^(?:"([\s\S]*)"|'([\s\S]*)')$/, "$1$2") : null;
+  };
+  return fs.readdirSync(corpusSpecsDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /\.(?:json|ya?ml)$/i.test(entry.name) && isPlainId(entry.name))
+    .flatMap((entry) => {
+      const file = path.join(corpusSpecsDir, entry.name);
+      const text = fs.readFileSync(file, "utf8");
+      let document = null;
+      if (entry.name.toLowerCase().endsWith(".json")) document = readJSON(file, null);
+      const item = {
+        spec_id: entry.name,
+        corpus_id: String(document?.corpus_id ?? scalar(text, "corpus_id") ?? ""),
+        organism: String(document?.organism ?? scalar(text, "organism") ?? ""),
+        file,
+      };
+      if (!isPlainId(item.corpus_id) || !isPlainId(item.organism)) return [];
+      return organism && item.organism !== organism ? [] : [item];
+    })
+    .sort((a, b) => a.spec_id.localeCompare(b.spec_id));
+}
+
+function directoryOrganisms(root) {
+  if (!root || !fs.existsSync(root)) return [];
+  return fs.readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && isPlainId(entry.name) && !entry.name.startsWith("."))
+    .map((entry) => entry.name);
+}
+
+function runRootOrganisms(runsDir) {
+  return directoryOrganisms(runsDir).filter((organism) => (
+    fs.existsSync(path.join(runsDir, organism, "registry.json"))
+    || factoryRunCatalog(runsDir, organism).length > 0
+  ));
+}
+
 /** The factory's own declared modes/objectives/genome schemas/backbones
  * (`ccr factory meta`, torch-free) -- shelled out to rather than
  * hardcoded/duplicated here, so the clinic's Build/Evolve forms always
  * reflect whatever the backend actually accepts. */
 function factoryMeta() {
-  const result = spawnSync(jobs.pythonCommand(), ["-m", "cognitive_runtime.cli", "factory", "meta"], {
+  const result = spawnSync(jobs.pythonCommand(), [
+    ...jobs.pythonPrefixArgs(), "-m", "cognitive_runtime.cli", "factory", "meta",
+  ], {
     cwd: REPO_DIR, encoding: "utf8", env: process.env,
   });
   if (result.error) throw result.error;
@@ -500,10 +567,20 @@ function manifestSessions(runDir, cacheDir, corpusRoot) {
   });
 }
 
-function makeClinicStore(runsDir, episodeCacheDir, corpusRoot) {
+function makeClinicStore(runsDir, episodeCacheDir, corpusRoot, corpusSpecsDir = path.join(REPO_DIR, "specs", "corpora")) {
   runsDir = path.resolve(runsDir); episodeCacheDir = path.resolve(episodeCacheDir);
   corpusRoot = corpusRoot ? path.resolve(corpusRoot) : null;
+  corpusSpecsDir = corpusSpecsDir ? path.resolve(corpusSpecsDir) : null;
   function catalog() { return runCatalog(runsDir); }
+  function organisms() {
+    return [...new Set([
+      ...catalog().map((entry) => entry.organism),
+      ...runRootOrganisms(runsDir),
+      ...directoryOrganisms(corpusRoot),
+      ...corpusSpecCatalog(corpusSpecsDir).map((entry) => entry.organism),
+      ...jobs.listJobs(runsDir).map((entry) => entry.organism).filter(Boolean),
+    ])].sort();
+  }
   function selected(organism, run) {
     const entry = catalog().find((candidate) => candidate.organism === organism && candidate.run === run);
     if (!entry) return null;
@@ -513,7 +590,10 @@ function makeClinicStore(runsDir, episodeCacheDir, corpusRoot) {
     const mounts = [...new Map([...direct, ...indexed, ...fallback].map((item) => [item.id, item])).values()];
     return { entry, store: makeStore(entry.dir, { sessionDirectories: mounts }) };
   }
-  return { runsDir, episodeCacheDir, corpusRoot, catalog, selected };
+  return {
+    runsDir, episodeCacheDir, corpusRoot, corpusSpecsDir, catalog, organisms,
+    factoryCatalog: (organism) => factoryRunCatalog(runsDir, organism), selected,
+  };
 }
 
 function loadFrameIndex(dir) {
@@ -630,11 +710,12 @@ function serveStatic(res, urlPath) {
   fs.readFile(file, (err, data) => { if (err) return sendJSON(res, 404, { error: "not found" }); res.writeHead(200, { "Content-Type": MIME[path.extname(file)] || "application/octet-stream" }); res.end(data); });
 }
 
-function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, corpusRoot = null, maxConcurrentJobs = 2 }) {
+function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, corpusRoot = null, corpusSpecsDir = null, maxConcurrentJobs = 2 }) {
   const clinic = dataDir ? null : makeClinicStore(
     runsDir || path.join(REPO_DIR, "runs"),
     episodeCacheDir || path.join(REPO_DIR, "notebooks", "episode_cache"),
     corpusRoot || path.join(REPO_DIR, "corpora"),
+    corpusSpecsDir || path.join(REPO_DIR, "specs", "corpora"),
   );
   const store = clinic ? null : makeStore(dataDir);
   function selectedStore(url) {
@@ -648,7 +729,7 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
       if (p[0] !== "api") return serveStatic(res, url.pathname);
       if (p.length === 2 && p[1] === "catalog") return sendJSON(res, 200, {
         runs_dir: clinic?.runsDir ?? null, episode_cache_dir: clinic?.episodeCacheDir ?? null,
-        organisms: [...new Set((clinic?.catalog() || []).map((entry) => entry.organism))],
+        organisms: clinic?.organisms() || [],
         runs: (clinic?.catalog() || []).map(({ organism, run }) => ({ organism, run })),
       });
       if (p.length === 2 && p[1] === "runs") {
@@ -673,7 +754,7 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
         // name a catalogued organism (as the sibling /api/runs and
         // /api/experiments routes already do) rather than trusting client
         // input, which could otherwise walk outside runsDir (e.g. "../../etc").
-        if (!clinic.catalog().some((entry) => entry.organism === organism)) return sendJSON(res, 404, { error: "unknown organism" });
+        if (!clinic.organisms().includes(organism)) return sendJSON(res, 404, { error: "unknown organism" });
         return sendJSON(res, 200, registryDocument(clinic.runsDir, organism));
       }
       if (p.length === 2 && p[1] === "factory-runs") {
@@ -682,7 +763,7 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
         if (!organism) return sendJSON(res, 400, { error: "select an organism" });
         // Same containment discipline as /api/registry: organism is joined
         // into a filesystem path, so only a catalogued value is trusted.
-        if (!clinic.catalog().some((entry) => entry.organism === organism)) return sendJSON(res, 404, { error: "unknown organism" });
+        if (!clinic.organisms().includes(organism)) return sendJSON(res, 404, { error: "unknown organism" });
         return sendJSON(res, 200, factoryRunsDocument(clinic.runsDir, organism));
       }
       if (p.length === 2 && p[1] === "architecture-campaigns") {
@@ -692,7 +773,7 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
         // Same containment discipline as /api/registry and /api/factory-runs:
         // organism is joined into a filesystem path, so only a catalogued
         // value is trusted.
-        if (!clinic.catalog().some((entry) => entry.organism === organism)) return sendJSON(res, 404, { error: "unknown organism" });
+        if (!clinic.organisms().includes(organism)) return sendJSON(res, 404, { error: "unknown organism" });
         return sendJSON(res, 200, architectureCampaignsDocument(clinic.runsDir, organism));
       }
       if (p.length === 3 && p[1] === "jobs") {
@@ -704,8 +785,16 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
         try { body = await readBody(req); } catch (err) { return sendJSON(res, 400, { error: String(err.message || err) }); }
         const invalid = validateJobBody(clinic, body);
         if (invalid) return sendJSON(res, invalid.status, { error: invalid.error });
+        if (kind === "corpus") {
+          const selectedSpec = corpusSpecCatalog(clinic.corpusSpecsDir, body.organism)
+            .find((entry) => entry.spec_id === body.spec_id);
+          if (!selectedSpec) return sendJSON(res, 404, { error: "unknown corpus spec" });
+          body = { ...body, spec_path: selectedSpec.file };
+        }
         try {
-          return sendJSON(res, 200, jobs.launchJob(kind, body, { runsDir: clinic.runsDir, maxConcurrent: maxConcurrentJobs }));
+          return sendJSON(res, 200, jobs.launchJob(kind, body, {
+            runsDir: clinic.runsDir, corpusRoot: clinic.corpusRoot, maxConcurrent: maxConcurrentJobs,
+          }));
         } catch (err) {
           if (err instanceof jobs.ConcurrencyLimitError) return sendJSON(res, 409, { error: String(err.message) });
           return sendJSON(res, 400, { error: String(err.message || err) });
@@ -734,7 +823,9 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
         }
         try {
           const result = spawnSync(
-            jobs.pythonCommand(), ["-m", "cognitive_runtime.cli", "factory", kind, ...launch.argv, "--dry-run"],
+            jobs.pythonCommand(), [
+              ...jobs.pythonPrefixArgs(), "-m", "cognitive_runtime.cli", "factory", kind, ...launch.argv, "--dry-run",
+            ],
             { cwd: REPO_DIR, encoding: "utf8", env: process.env },
           );
           if (result.error) return sendJSON(res, 500, { error: String(result.error.message || result.error) });
@@ -759,6 +850,16 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
         const organism = url.searchParams.get("organism");
         if (organism !== null && !isPlainId(organism)) return sendJSON(res, 400, { error: "organism must be a plain identifier" });
         return sendJSON(res, 200, { corpora: corpusCatalog(clinic.corpusRoot, organism) });
+      }
+      if (p.length === 2 && p[1] === "corpus-specs") {
+        if (req.method !== "GET") return sendJSON(res, 405, { error: "method not allowed" });
+        if (!clinic || !clinic.corpusSpecsDir) return sendJSON(res, 400, { error: "corpus specs require clinic mode" });
+        const organism = url.searchParams.get("organism");
+        if (organism !== null && !isPlainId(organism)) return sendJSON(res, 400, { error: "organism must be a plain identifier" });
+        return sendJSON(res, 200, {
+          specs: corpusSpecCatalog(clinic.corpusSpecsDir, organism)
+            .map(({ file, ...entry }) => entry),
+        });
       }
       if (p.length === 2 && p[1] === "factory-meta") {
         if (req.method !== "GET") return sendJSON(res, 405, { error: "method not allowed" });

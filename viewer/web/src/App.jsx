@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, episodeUrls } from "./lib/api.js";
 import { buildHash, parseHash } from "./lib/hashRoute.js";
 import { Picker } from "./components/Picker.jsx";
@@ -31,8 +31,9 @@ const TABS = [
 ];
 
 /**
- * The clinic: a read-only presentation layer over one selected Model Factory
- * run (epic #212's organism/run catalog) -- pixel-horizon predictions,
+ * The clinic: the Model Factory control and presentation layer. It launches
+ * corpora, trials, searches, and breeding jobs, while one selected run drives
+ * the pixel-horizon predictions,
  * predicted/assumed-vs-actuated actions, EEG/attention, the developmental
  * ladder, and the factory's own contracts/lineage/champion evidence, all
  * sharing one tick cursor.
@@ -52,16 +53,40 @@ export function App() {
   const [sessionDetail, setSessionDetail] = useState(null);
   const [tick, setTick] = useState(null);
   const [tab, setTab] = useState("episode");
+  const bootstrapped = useRef(false);
 
-  useEffect(() => { api.catalog().then(setCatalog, (e) => setError(e.message)); }, []);
+  useEffect(() => {
+    let cancelled = false;
+    async function poll() {
+      try {
+        const next = await api.catalog();
+        if (!cancelled) setCatalog((current) => (current?.runs?.length ? current : next));
+      } catch (e) {
+        if (!cancelled) setError(e.message);
+      }
+    }
+    poll();
+    const interval = setInterval(poll, 4000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, []);
 
   // Pick an organism/run from the URL hash, falling back to the first entry.
+  // An organism may be known from its corpus before its first run exists;
+  // that bootstrap state opens directly on Build instead of dead-ending.
   useEffect(() => {
-    if (!catalog?.runs?.length) return;
+    if (!catalog) return;
     const parsed = parseHash(location.hash);
-    const initial = catalog.runs.find((r) => r.organism === parsed.organism && r.run === parsed.run) || catalog.runs[0];
-    setOrganism(initial.organism);
-    setRun(initial.run);
+    const initial = catalog.runs.find((r) => r.organism === parsed.organism && r.run === parsed.run)
+      || catalog.runs[0] || null;
+    const initialOrganism = initial?.organism
+      || (catalog.organisms.includes(parsed.organism) ? parsed.organism : catalog.organisms[0])
+      || null;
+    setOrganism(initialOrganism);
+    setRun(initial?.run ?? null);
+    if (!bootstrapped.current) {
+      bootstrapped.current = true;
+      if (!initial) setTab("build");
+    }
   }, [catalog]);
 
   // A selected organism/run pulls its sessions, header summary, and Model
@@ -92,9 +117,13 @@ export function App() {
   useEffect(() => {
     if (!organism) return;
     let cancelled = false;
-    api.registry(organism).then((r) => !cancelled && setRegistry(r), () => !cancelled && setRegistry(null));
-    api.factoryRuns(organism).then((r) => !cancelled && setFactoryRuns(r), () => !cancelled && setFactoryRuns(null));
-    return () => { cancelled = true; };
+    async function poll() {
+      api.registry(organism).then((r) => !cancelled && setRegistry(r), () => !cancelled && setRegistry(null));
+      api.factoryRuns(organism).then((r) => !cancelled && setFactoryRuns(r), () => !cancelled && setFactoryRuns(null));
+    }
+    poll();
+    const interval = setInterval(poll, 4000);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [organism]);
 
   useEffect(() => {
@@ -119,24 +148,36 @@ export function App() {
 
   if (error) return <main><h1>CCR Clinic</h1><p className="empty">{error}</p></main>;
   if (!catalog) return <main><h1>CCR Clinic</h1><p className="empty">Loading runs…</p></main>;
-  if (!catalog.runs.length) return <main><h1>CCR Clinic</h1><p className="empty">No experiment runs found.</p></main>;
-  if (!organism || !run) return null;
-
-  const runsForOrganism = catalog.runs.filter((r) => r.organism === organism).map((r) => r.run);
+  const runsForOrganism = organism
+    ? catalog.runs.filter((r) => r.organism === organism).map((r) => r.run)
+    : [];
 
   return (
     <main>
       <h1>CCR Clinic</h1>
-      <p className="lede">Model Factory presentation layer — pixels, actions, and experiment evidence, tick by tick.</p>
-      <div className="pickers">
-        <Picker label="Organism" ariaLabel="Organism" value={organism} options={catalog.organisms}
-          onChange={(next) => { setOrganism(next); setRun(catalog.runs.find((r) => r.organism === next)?.run ?? null); }} />
-        <Picker label="Run" ariaLabel="Run" value={run} options={runsForOrganism} onChange={setRun} />
-      </div>
-      <p className="run-name">{organism} / {run}{sessionId ? ` / ${sessionId}` : ""}</p>
-      <RunSummary summary={summary} />
+      <p className="lede">Model Factory control room — build, evolve, breed, and inspect experiment evidence.</p>
+      {catalog.organisms.length > 0 && (
+        <div className="pickers">
+          <Picker label="Organism" ariaLabel="Organism" value={organism} options={catalog.organisms}
+            onChange={(next) => { setOrganism(next); setRun(catalog.runs.find((r) => r.organism === next)?.run ?? null); }} />
+          {runsForOrganism.length > 0 && (
+            <Picker label="Run" ariaLabel="Run" value={run} options={runsForOrganism} onChange={setRun} />
+          )}
+        </div>
+      )}
+      {run ? (
+        <>
+          <p className="run-name">{organism} / {run}{sessionId ? ` / ${sessionId}` : ""}</p>
+          <RunSummary summary={summary} />
+        </>
+      ) : (
+        <p className="empty empty--onboarding">
+          No experiment runs yet. Start in Build to launch the first model; jobs and live run state remain
+          available here while training is in progress.
+        </p>
+      )}
 
-      {!sessions ? (
+      {run && (!sessions ? (
         <p className="empty">Loading sessions…</p>
       ) : sessions.length ? (
         <div className="session-row">
@@ -151,7 +192,7 @@ export function App() {
         </div>
       ) : (
         <p className="empty">No recordings are associated with this run yet.</p>
-      )}
+      ))}
 
       {/* Tabs beyond Episode/Development don't depend on this run having any
           recorded sessions -- Factory/Compare/Build all operate at the
@@ -159,6 +200,7 @@ export function App() {
           even for a run with none yet. */}
       <Tabs tabs={TABS} active={tab} onChange={setTab} />
 
+      {tab === "episode" && !run && <p className="no-data">Launch or select a run to inspect recorded episodes.</p>}
       {tab === "episode" && sessions?.length > 0 && urls && (
         <>
           <PixelHorizonViewer framesSrc={urls.frames} predictionsSrc={urls.predictions} decisions={decisions} tick={tick} onTickChange={setTick} />
@@ -167,12 +209,13 @@ export function App() {
           <AttentionPanel records={records} decisions={decisions} tick={tick} onTickChange={setTick} />
         </>
       )}
+      {tab === "development" && !run && <p className="no-data">Launch or select a run to inspect its developmental ladder.</p>}
       {tab === "development" && sessions?.length > 0 && <DevelopmentPanel session={sessionDetail?.session || {}} />}
       {tab === "experiment" && (
-        <>
+        run ? <>
           <ExperimentDetail artifacts={artifacts} summary={summary} />
           <PairedComparisonPanel comparison={artifacts?.metrics?.comparison} />
-        </>
+        </> : <p className="no-data">Launch or select a run to inspect experiment artifacts.</p>
       )}
       {tab === "factory" && (
         <>
@@ -181,7 +224,8 @@ export function App() {
         </>
       )}
       {tab === "compare" && (
-        <CompareView catalog={catalog} organism={organism} defaultRunA={run} />
+        run ? <CompareView catalog={catalog} organism={organism} defaultRunA={run} />
+          : <p className="no-data">At least one completed run is needed for comparison.</p>
       )}
       {tab === "build" && (
         <BuildPanel catalog={catalog} organism={organism} />

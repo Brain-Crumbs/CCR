@@ -48,6 +48,7 @@ export const api = {
   // one-for-one onto viewer/server.js's job-launch routes with no reshaping.
   factoryMeta: () => getJSON("/api/factory-meta"),
   corpora: (organism) => getJSON(`/api/corpora${qs({ organism })}`).then((x) => x.corpora),
+  corpusSpecs: (organism) => getJSON(`/api/corpus-specs${qs({ organism })}`).then((x) => x.specs),
   jobs: (organism) => getJSON(`/api/jobs${qs({ organism })}`).then((x) => x.jobs),
   jobLog: (jobId, offset = 0) => getJSON(`/api/jobs/${encodeURIComponent(jobId)}/log${qs({ offset })}`),
   cancelJob: (jobId) => postJSON(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {}),

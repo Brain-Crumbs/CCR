@@ -401,6 +401,32 @@ test("web front-end source has no public-internet runtime dependency", () => {
   assert.doesNotMatch(html, /https?:\/\//);
 });
 
+test("empty clinic discovers corpus organisms and monitors state-only runs before experiment artifacts exist", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-empty-bootstrap-"));
+  const runsDir = path.join(root, "runs");
+  const corpusRoot = path.join(root, "corpora");
+  fs.mkdirSync(path.join(corpusRoot, "Crafter"), { recursive: true });
+  const active = path.join(runsDir, "Crafter", "first-run");
+  fs.mkdirSync(active, { recursive: true });
+  fs.writeFileSync(path.join(active, "trial_spec.json"), JSON.stringify({ organism: "Crafter", mode: "fresh" }));
+  fs.writeFileSync(path.join(active, "state.json"), JSON.stringify({
+    state: "running", reason: "training", updated_at: "2026-08-05T00:00:00Z",
+  }));
+
+  const server = createServer({ runsDir, corpusRoot, corpusSpecsDir: path.join(root, "no-specs") });
+  await new Promise((resolve) => server.listen(0, resolve));
+  t.after(() => server.close());
+  const port = server.address().port;
+
+  const catalog = await get(port, "/api/catalog");
+  assert.deepEqual(catalog.body.organisms, ["Crafter"]);
+  assert.deepEqual(catalog.body.runs, []);
+  const factory = await get(port, "/api/factory-runs?organism=Crafter");
+  assert.equal(factory.status, 200);
+  assert.equal(factory.body.runs[0].run, "first-run");
+  assert.equal(factory.body.runs[0].state, "running");
+});
+
 // The job-launch API (Model Factory clinic redesign, control-plane
 // foundation): POST /api/jobs/*, /api/preview/*, GET /api/corpora,
 // GET /api/factory-meta. Every subtest below shells out to
@@ -409,12 +435,16 @@ test("web front-end source has no public-internet runtime dependency", () => {
 // above -- several of which rely on a real python3 for quality_cli, or on
 // its absence degrading gracefully -- are never affected by which python
 // these subtests see.
-const FAKE_PYTHON = path.join(__dirname, "fixtures", "fake-python.sh");
+const FAKE_PYTHON = process.execPath;
+const FAKE_PYTHON_PREFIX = JSON.stringify([path.join(__dirname, "fixtures", "fake-python.js")]);
 
 test("job-launch API", async (t) => {
-  let originalPython;
-  t.before(() => { originalPython = process.env.PYTHON; process.env.PYTHON = FAKE_PYTHON; });
-  t.after(() => { process.env.PYTHON = originalPython; });
+  let originalPython, originalPrefix;
+  t.before(() => {
+    originalPython = process.env.PYTHON; originalPrefix = process.env.CCR_PYTHON_PREFIX_ARGS;
+    process.env.PYTHON = FAKE_PYTHON; process.env.CCR_PYTHON_PREFIX_ARGS = FAKE_PYTHON_PREFIX;
+  });
+  t.after(() => { process.env.PYTHON = originalPython; process.env.CCR_PYTHON_PREFIX_ARGS = originalPrefix; });
 
   function fixtureRunsDir() {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-jobs-api-"));
@@ -649,6 +679,42 @@ test("job-launch API", async (t) => {
     }]);
     assert.equal((await get(port, "/api/corpora")).body.corpora.length, 1);
     assert.equal((await get(port, `/api/corpora?organism=${encodeURIComponent("../../etc")}`)).status, 400);
+  });
+
+  await t.test("an empty workspace can launch a corpus recipe as its first monitored job", async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-corpus-bootstrap-"));
+    const runsDir = path.join(root, "runs");
+    const corpusRoot = path.join(root, "corpora");
+    const corpusSpecsDir = path.join(root, "specs");
+    fs.mkdirSync(corpusSpecsDir, { recursive: true });
+    fs.writeFileSync(path.join(corpusSpecsDir, "starter.yaml"), [
+      "corpus_id: starter-corpus", "organism: Test", "generator:", "  world: crafter",
+    ].join("\n"));
+
+    const server = createServer({ runsDir, corpusRoot, corpusSpecsDir });
+    await new Promise((resolve) => server.listen(0, resolve));
+    t.after(() => server.close());
+    const port = server.address().port;
+
+    assert.deepEqual((await get(port, "/api/catalog")).body, {
+      runs_dir: path.resolve(runsDir), episode_cache_dir: path.resolve(path.join(__dirname, "../..", "notebooks", "episode_cache")),
+      organisms: ["Test"], runs: [],
+    });
+    assert.deepEqual((await get(port, "/api/corpus-specs?organism=Test")).body.specs, [{
+      spec_id: "starter.yaml", corpus_id: "starter-corpus", organism: "Test",
+    }]);
+    assert.equal((await post(port, "/api/jobs/corpus", { organism: "Test", spec_id: "missing.yaml" })).status, 404);
+
+    const launched = await post(port, "/api/jobs/corpus", { organism: "Test", spec_id: "starter.yaml" });
+    assert.equal(launched.status, 200);
+    assert.equal(launched.body.kind, "corpus");
+    assert.deepEqual(launched.body.run_ids, []);
+    assert.match(launched.body.argv.join(" "), /factory corpus build .*starter\.yaml --root/);
+    const finished = await waitFor(async () => {
+      const current = await get(port, "/api/jobs?organism=Test");
+      return current.body.jobs[0]?.status !== "running" ? current.body.jobs[0] : null;
+    });
+    assert.equal(finished.status, "completed");
   });
 
   await t.test("POST /api/preview/{search,breed} dry-runs via the CLI, validates like a launch, and cleans up its temp spec", async (t) => {

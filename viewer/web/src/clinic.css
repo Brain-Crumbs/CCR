@@ -47,6 +47,10 @@ h4 { font-size: .85rem; margin: 18px 0 8px; text-transform: uppercase; letter-sp
 .lede { color: var(--text-secondary); margin-top: 4px; }
 .empty { margin-top: 36px; padding: 24px; border: 1px dashed var(--line); border-radius: 12px; color: var(--text-secondary); }
 .no-data { color: var(--text-secondary); font-style: italic; }
+.empty--onboarding { margin-top: 18px; }
+.corpus-bootstrap { margin: 12px 0 18px; padding: 16px; border: 1px solid var(--amber-fg); border-radius: 10px; background: var(--surface-2); }
+.corpus-bootstrap p { margin: 6px 0 0; color: var(--text-secondary); }
+.corpus-bootstrap .pickers { align-items: center; margin: 14px 0 0; }
 
 /* Pickers */
 .pickers { display: flex; flex-wrap: wrap; gap: 12px; margin: 24px 0 8px; }

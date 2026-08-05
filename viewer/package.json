@@ -2,7 +2,7 @@
   "name": "ccr-clinic",
   "version": "0.2.0",
   "private": true,
-  "description": "Zero-dependency Node/HTTP read-only API over streams-v2 Record sessions and Model Factory runs (server.js), plus a React presentation layer (web/) built into public/.",
+  "description": "Zero-dependency Node/HTTP control plane and viewer for streams-v2 sessions and Model Factory runs, plus a React front end built into public/.",
   "license": "MIT",
   "main": "server.js",
   "scripts": {

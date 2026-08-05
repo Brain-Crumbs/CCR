@@ -34,6 +34,7 @@ function route(url) {
   if (path.startsWith("/api/factory-runs")) return jsonResponse(FACTORY_RUNS);
   if (path.startsWith("/api/factory-meta")) return jsonResponse({ modes: ["fresh", "clone", "resume", "fine_tune"], objectives: ["windowed_rollout"], genome_schemas: [], backbones: ["transformer"] });
   if (path.startsWith("/api/corpora")) return jsonResponse({ corpora: [] });
+  if (path.startsWith("/api/corpus-specs")) return jsonResponse({ specs: [] });
   if (path.startsWith("/api/jobs")) return jsonResponse({ jobs: [] });
   if (path.startsWith("/api/sessions") && path.includes("/episodes/") && path.endsWith("/frames") || path.includes("/frames?")) return jsonResponse(FRAMES);
   if (path.includes("/predictions")) return jsonResponse({ error: "no recorded predictions" }, false);
@@ -96,5 +97,38 @@ describe("App", () => {
     expect(screen.getByLabelText("Breed organism").value).toBe("Crafter");
     expect(screen.getByText(/no completed runs to breed from yet/)).toBeInTheDocument();
     expect(screen.getByText(/select two different completed runs to check/)).toBeInTheDocument();
+  });
+
+  it("opens Build and keeps all control tabs reachable when the run catalog is empty", async () => {
+    vi.mocked(fetch).mockImplementation((url) => {
+      const path = String(url);
+      if (path.startsWith("/api/catalog")) return jsonResponse({ organisms: ["Crafter"], runs: [] });
+      if (path.startsWith("/api/factory-meta")) return jsonResponse({
+        modes: ["fresh", "clone", "resume", "fine_tune"], objectives: ["windowed_rollout"],
+        genome_schemas: ["generic_action_effects_v1"], architecture_genome_schemas: ["architecture_search_v1"],
+        backbones: ["transformer"],
+      });
+      if (path.startsWith("/api/corpus-specs")) return jsonResponse({
+        specs: [{ spec_id: "generic-action-effects-v1.yaml", corpus_id: "crafter-generic-action-effects-v1", organism: "Crafter" }],
+      });
+      if (path.startsWith("/api/corpora")) return jsonResponse({ corpora: [] });
+      if (path.startsWith("/api/factory-runs")) return jsonResponse({ organism: "Crafter", runs: [] });
+      if (path.startsWith("/api/registry")) return jsonResponse(REGISTRY);
+      if (path.startsWith("/api/jobs")) return jsonResponse({ jobs: [] });
+      return jsonResponse({ error: "unhandled" }, false);
+    });
+
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("Build mode")).toBeInTheDocument());
+    expect(screen.getByText(/No experiment runs yet/)).toBeInTheDocument();
+    expect(screen.getAllByLabelText("Organism")[0].value).toBe("Crafter");
+    await waitFor(() => expect(screen.getByLabelText("Corpus recipe")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("tab", { name: "Factory" }));
+    expect(screen.getByText(/no factory runs found/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "Evolve" }));
+    await waitFor(() => expect(screen.getByLabelText("Evolve organism")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("tab", { name: "Breed" }));
+    await waitFor(() => expect(screen.getByLabelText("Breed organism")).toBeInTheDocument());
   });
 });

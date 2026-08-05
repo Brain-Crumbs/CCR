@@ -39,6 +39,7 @@ function makeRoute(posted) {
     }
     if (path.startsWith("/api/factory-meta")) return jsonResponse(META);
     if (path.startsWith("/api/corpora")) return jsonResponse({ corpora: CORPORA });
+    if (path.startsWith("/api/corpus-specs")) return jsonResponse({ specs: [] });
     if (path.startsWith("/api/factory-runs")) return jsonResponse(FACTORY_RUNS);
     if (path.startsWith("/api/jobs")) return jsonResponse({ jobs: [] });
     return jsonResponse({ error: "unhandled" }, false);
@@ -101,5 +102,35 @@ describe("BuildPanel", () => {
     await waitFor(() => expect(posted).toHaveLength(1));
     expect(posted[0].kind).toBe("resume");
     expect(posted[0].body.run).toBe("run-1");
+  });
+
+  it("bootstraps a missing corpus from a repository recipe before enabling the first trial", async () => {
+    vi.stubGlobal("fetch", vi.fn((url, init) => {
+      const path = String(url);
+      if (init?.method === "POST" && path === "/api/jobs/corpus") {
+        const body = JSON.parse(init.body);
+        posted.push({ kind: "corpus", body });
+        return jsonResponse({ job_id: "corpus-job", kind: "corpus", status: "running", organism: body.organism, run_ids: [] });
+      }
+      if (path.startsWith("/api/factory-meta")) return jsonResponse(META);
+      if (path.startsWith("/api/corpus-specs")) return jsonResponse({
+        specs: [{ spec_id: "generic-action-effects-v1.yaml", corpus_id: "crafter-generic-action-effects-v1", organism: "Crafter" }],
+      });
+      if (path.startsWith("/api/corpora")) return jsonResponse({ corpora: [] });
+      if (path.startsWith("/api/factory-runs")) return jsonResponse({ organism: "Crafter", runs: [] });
+      if (path.startsWith("/api/jobs")) return jsonResponse({ jobs: [] });
+      return jsonResponse({ error: "unhandled" }, false);
+    }));
+
+    render(<BuildPanel catalog={{ organisms: ["Crafter"], runs: [] }} organism="Crafter" />);
+    await waitFor(() => expect(screen.getByLabelText("Corpus recipe").value).toBe("generic-action-effects-v1.yaml"));
+    expect(screen.getByRole("button", { name: "Launch" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Build corpus" }));
+
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0]).toEqual({
+      kind: "corpus",
+      body: { organism: "Crafter", spec_id: "generic-action-effects-v1.yaml" },
+    });
   });
 });
