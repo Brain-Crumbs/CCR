@@ -645,6 +645,22 @@ def test_balanced_transition_weights_caps_the_stationary_fraction():
     assert blocked_weight / total <= 0.30  # capped near the 0.25 target, with slack for rounding
 
 
+def test_stationary_cap_remains_true_after_scenario_normalization():
+    labels = (
+        [TransitionLabel("mostly-blocked", False, "blocked", "absent") for _ in range(90)]
+        + [TransitionLabel("mostly-blocked", True, "continuing", "absent") for _ in range(10)]
+        + [TransitionLabel("moving", True, "continuing", "absent") for _ in range(10)]
+    )
+    weights = balanced_transition_weights(labels, max_stationary_fraction=0.2)
+    blocked_weight = sum(w for w, label in zip(weights, labels) if label.movement_state == "blocked")
+    assert blocked_weight / sum(weights) <= 0.2 + 1e-9
+
+
+def test_stationary_cap_one_is_valid_and_does_not_divide_by_zero():
+    labels = [TransitionLabel("s", False, "blocked", "absent")]
+    assert balanced_transition_weights(labels, max_stationary_fraction=1.0) == [1.0]
+
+
 def test_balanced_transition_weights_balances_entity_present_and_absent():
     labels = (
         [TransitionLabel("s", True, "continuing", "present") for _ in range(80)]

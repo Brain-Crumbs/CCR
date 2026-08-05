@@ -213,7 +213,7 @@ cognitive_runtime/training/model_factory/
   runner.py        # fresh, clone, resume, fine-tune trial execution
   evaluator.py     # validation/test evaluation and paired comparison
   registry.py      # JSON-backed champion and lineage registry
-  search.py        # random and successive-halving trial proposal
+  search.py        # candidate generation plus filter/select/breed populations
 ```
 
 The runner calls the existing `run_nursery_joint`,
@@ -682,11 +682,14 @@ action-effects schema may include only bounded training genes such as:
 optimizer.lr                         log-uniform range
 optimizer.weight_decay               bounded range
 scheduled_sampling_p                 [0.0, 0.5]
-closed_loop_pixel_loss_weight        bounded range
-closed_loop_latent_loss_weight       bounded range
+loss_weights.pixel                  [0.0, 2.0]
+loss_weights.latent                 [0.0, 2.0]
+loss_weights.semantic               [0.0, 2.0]
+loss_weights.closed_loop_pixel_loss_weight   bounded range
+loss_weights.closed_loop_latent_loss_weight  bounded range
 rollout_frames                       allowed integers
 warmup_frames                        allowed integers subject to rollout validity
-transition_balance parameters        bounded range
+transition_balance_policy.stationary_cap     [0.0, 1.0]
 ```
 
 Each gene declares a type, range or choices, default, mutation distribution,
@@ -996,9 +999,12 @@ ccr factory clone crafter-baseline-0001 \
 ccr factory compare crafter-baseline-0001 child-a child-b
 ccr factory promote child-b
 
-# Bounded search and breeding are currently Python APIs rather than CLI
-# subcommands. See docs/how-to/using-model-factory.md for propose(),
-# run_successive_halving(), breed(), and confirm_across_seeds().
+# Run bounded search and breed a configuration-only child.
+ccr factory search specs/crafter-baseline.yaml --population-size 8 --populations 4
+ccr factory breed child-a child-b --seed 19
+
+# Independent training-seed confirmation remains a Python API. See
+# docs/how-to/using-model-factory.md for confirm_across_seeds().
 ```
 
 The notebook remains a useful visualization and diagnosis surface. The factory

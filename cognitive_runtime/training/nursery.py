@@ -2154,6 +2154,10 @@ def balanced_transition_weights(
     n = len(labels)
     if n == 0:
         return []
+    if not 0.0 <= max_stationary_fraction <= 1.0:
+        raise ValueError("max_stationary_fraction must be in [0, 1]")
+    if not 0.0 <= entity_balance_target <= 1.0:
+        raise ValueError("entity_balance_target must be in [0, 1]")
 
     #: Applied as a sequence of rebalancing passes, each targeting a
     #: fraction of the *current* running total (not a fraction of the raw
@@ -2196,7 +2200,8 @@ def balanced_transition_weights(
     if blocked_idx:
         blocked_total = sum(weights[i] for i in blocked_idx)
         other_total = sum(weights) - blocked_total
-        if blocked_total > 0 and other_total > 0:
+        if (blocked_total > 0 and other_total > 0
+                and max_stationary_fraction < 1.0):
             target_blocked_total = (
                 max_stationary_fraction / (1.0 - max_stationary_fraction)
             ) * other_total
@@ -2218,6 +2223,23 @@ def balanced_transition_weights(
             continue
         for i in idx:
             final_weights[i] = weights[i] / total / n_scenarios
+
+    # Scenario normalization can change the global stationary fraction when
+    # scenarios contain different blocked/non-blocked mixes. Re-apply the
+    # explicit cap last so the user-configured guarantee remains true in the
+    # weights the trainer actually receives. (A corpus containing no
+    # non-stationary transition cannot satisfy a cap below 1, so it is left
+    # sampleable rather than returning an all-zero distribution.)
+    blocked_total = sum(final_weights[i] for i in blocked_idx)
+    other_total = sum(final_weights) - blocked_total
+    if (blocked_total > 0 and other_total > 0
+            and max_stationary_fraction < 1.0):
+        target_blocked_total = (
+            max_stationary_fraction / (1.0 - max_stationary_fraction)
+        ) * other_total
+        scale = min(1.0, target_blocked_total / blocked_total)
+        for i in blocked_idx:
+            final_weights[i] *= scale
     return final_weights
 
 

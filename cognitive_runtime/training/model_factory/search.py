@@ -97,10 +97,11 @@ from cognitive_runtime.training.model_factory.runner import (
     _selection_metric_mode,
     run_trial,
 )
-from cognitive_runtime.training.model_factory.state import STATE_FAILED
+from cognitive_runtime.training.model_factory.state import STATE_FAILED, load_state, state_path
 from cognitive_runtime.training.model_factory.spec import (
     ExperimentSpec,
     _thaw,
+    resolve as resolve_spec,
 )
 from cognitive_runtime.training.model_factory.spec import validate as validate_spec
 
@@ -331,7 +332,7 @@ def propose(
 
 
 SUCCESSIVE_HALVING_FORMAT = "model-factory-successive-halving-v1"
-EVOLUTIONARY_SEARCH_FORMAT = "model-factory-evolutionary-search-v1"
+EVOLUTIONARY_SEARCH_FORMAT = "model-factory-evolutionary-search-v2"
 
 #: successive_halving's/evolutionary search's own gate set (epic #212 §13.2,
 #: clinic redesign): a candidate that fails any of these is eliminated at
@@ -545,6 +546,7 @@ class EvolutionarySearchReport:
     population_size: int
     population_count: int
     mutation_rate: float
+    seed_run_ids: Tuple[str, ...]
     populations: Tuple[PopulationReport, ...]
     total_trials_started: int
     total_epochs_executed: int
@@ -562,6 +564,7 @@ class EvolutionarySearchReport:
             "population_size": self.population_size,
             "population_count": self.population_count,
             "mutation_rate": self.mutation_rate,
+            "seed_run_ids": list(self.seed_run_ids),
             "populations": [population.to_dict() for population in self.populations],
             "total_trials_started": self.total_trials_started,
             "total_epochs_executed": self.total_epochs_executed,
@@ -582,6 +585,8 @@ class _EvolutionMember:
     evaluation: Optional[EvolutionCandidateResult] = None
     parent_record: Optional[ParentRecord] = None
     breeding_lineage: Optional[BreedingLineage] = None
+    validation_episode_ids: Optional[Tuple[str, ...]] = None
+    seeded: bool = False
 
 
 def _training_value(training: Mapping[str, Any], dotted_path: str) -> Any:
@@ -591,6 +596,184 @@ def _training_value(training: Mapping[str, Any], dotted_path: str) -> Any:
             raise SearchError(f"training block is missing genome gene path {dotted_path!r}")
         cursor = cursor[part]
     return cursor
+
+
+def _training_without_genes(
+    training: Mapping[str, Any], genome_schema: GenomeSchema,
+) -> Dict[str, Any]:
+    """Return the fixed training contract after removing exact gene leaves."""
+    fixed = _thaw(training)
+    for dotted_path in genome_schema.genes:
+        parts = dotted_path.split(".")
+        cursor: Any = fixed
+        for part in parts[:-1]:
+            if not isinstance(cursor, dict) or part not in cursor:
+                cursor = None
+                break
+            cursor = cursor[part]
+        if isinstance(cursor, dict):
+            cursor.pop(parts[-1], None)
+    return fixed
+
+
+def _validate_seed_spec_compatibility(
+    run_id: str,
+    seed_spec: ExperimentSpec,
+    base_spec: ExperimentSpec,
+    genome_schema: GenomeSchema,
+    *,
+    seed_data_contract_hash: str,
+    expected_data_contract_hash: str,
+    min_episode_frames: Optional[int],
+) -> Dict[str, Any]:
+    """Validate one prior run against the campaign it will seed."""
+    mismatches: List[str] = []
+    if seed_spec.organism != base_spec.organism:
+        mismatches.append(f"organism ({seed_spec.organism!r} != {base_spec.organism!r})")
+    if _thaw(seed_spec.data) != _thaw(base_spec.data):
+        mismatches.append("data/corpus specification")
+    if _thaw(seed_spec.model) != _thaw(base_spec.model):
+        mismatches.append("model/architecture specification")
+    if _thaw(seed_spec.evaluation) != _thaw(base_spec.evaluation):
+        mismatches.append("evaluation contract")
+    if _training_without_genes(seed_spec.training, genome_schema) != _training_without_genes(
+        base_spec.training, genome_schema,
+    ):
+        mismatches.append("non-genome training contract")
+    if seed_data_contract_hash != expected_data_contract_hash:
+        mismatches.append(
+            f"data_contract_hash ({seed_data_contract_hash!r} != {expected_data_contract_hash!r})"
+        )
+    if not _window_fits(seed_spec, min_episode_frames):
+        mismatches.append(
+            "warmup_frames + rollout_frames does not fit the current corpus's shortest episode"
+        )
+
+    genome: Dict[str, Any] = {}
+    for name, gene in genome_schema.genes.items():
+        value = _training_value(seed_spec.training, name)
+        canonical = gene.clip(value)
+        if canonical != value:
+            mismatches.append(
+                f"gene {name!r} value {value!r} is outside {genome_schema.version!r}"
+            )
+        genome[name] = value
+    if mismatches:
+        raise SearchError(
+            f"seed run {run_id!r} is incompatible with this search: " + "; ".join(mismatches)
+        )
+    return genome
+
+
+def _load_seed_member(
+    run_id: str,
+    *,
+    root: Union[str, Path],
+    base_spec: ExperimentSpec,
+    genome_schema: GenomeSchema,
+    expected_data_contract_hash: str,
+    selection_metric: str,
+    ticks_per_frame: float,
+    min_episode_frames: Optional[int],
+) -> _EvolutionMember:
+    """Load one completed run as an already-evaluated population-zero member."""
+    directory = Path(root) / base_spec.organism / run_id
+    try:
+        state = load_state(state_path(directory))
+    except (FileNotFoundError, ValueError) as exc:
+        raise SearchError(f"cannot seed from run {run_id!r}: {exc}") from exc
+    if state.state != "completed":
+        raise SearchError(
+            f"cannot seed from run {run_id!r}: state is {state.state!r}, expected 'completed'"
+        )
+
+    def read_json(path: Path) -> Dict[str, Any]:
+        try:
+            with path.open(encoding="utf-8") as handle:
+                return json.load(handle)
+        except (FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+            raise SearchError(f"cannot seed from run {run_id!r}: could not read {path.name}: {exc}") from exc
+
+    seed_spec = resolve_spec(read_json(directory / "trial_spec.json"))
+    contracts = read_json(directory / "contracts.json")
+    genome = _validate_seed_spec_compatibility(
+        run_id,
+        seed_spec,
+        base_spec,
+        genome_schema,
+        seed_data_contract_hash=str(contracts.get("data_contract_hash")),
+        expected_data_contract_hash=expected_data_contract_hash,
+        min_episode_frames=min_episode_frames,
+    )
+
+    validation = _restore_numeric_keys(read_json(directory / "metrics" / "validation.json"))
+    episode_ids = tuple(str(value) for value in validation.get("episode_ids") or ())
+    if not episode_ids:
+        raise SearchError(f"cannot seed from run {run_id!r}: validation report has no episode_ids")
+    try:
+        rollout_metrics = validation["rollout"]
+        gate_results = tuple(gate(rollout_metrics) for gate in _HALVING_GATES)
+        metric_value, _ = _resolve_selection_metric(
+            validation, selection_metric, ticks_per_frame,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SearchError(
+            f"cannot seed from run {run_id!r}: stored validation evidence is incompatible: {exc}"
+        ) from exc
+    gate_dicts = tuple(gate.to_dict() for gate in gate_results)
+    quality_passed = all(gate.passed for gate in gate_results)
+    reason = (
+        "seeded from a completed prior run; passed all quality filters"
+        if quality_passed else
+        "seeded from a completed prior run; "
+        + "; ".join(gate.reason for gate in gate_results if not gate.passed)
+    )
+
+    checkpoint_path = directory / "checkpoints" / "best-validation.pt"
+    try:
+        checkpoint_sha = read_factory_checkpoint_metadata(str(checkpoint_path))["checkpoint_sha256"]
+    except (FileNotFoundError, OSError, KeyError, ValueError) as exc:
+        raise SearchError(
+            f"cannot seed from run {run_id!r}: best-validation checkpoint is unavailable: {exc}"
+        ) from exc
+    parent = ParentRecord(
+        run_id=run_id,
+        genome_schema_version=genome_schema.version,
+        architecture_hash=str(contracts.get("architecture_hash")),
+        data_contract_hash=str(contracts.get("data_contract_hash")),
+        corpus_id=seed_spec.data.get("corpus_id"),
+        tier="evolutionary-search",
+        evaluation_contract=dict(seed_spec.evaluation),
+        genome=genome,
+        checkpoint_name=checkpoint_path.name,
+        checkpoint_sha256=str(checkpoint_sha),
+        spec=seed_spec,
+    )
+    evaluation = EvolutionCandidateResult(
+        candidate_index=0,
+        run_id=run_id,
+        origin_population=0,
+        mode=seed_spec.mode,
+        state=state.state,
+        epochs_executed=0,
+        metric_value=float(metric_value),
+        gates=gate_dicts,
+        quality_passed=quality_passed,
+        retained=False,
+        carried=True,
+        configuration_parents=tuple(
+            (seed_spec.evolution or {}).get("configuration_parents") or ()
+        ),
+        reason=reason,
+    )
+    return _EvolutionMember(
+        spec=seed_spec,
+        origin_population=0,
+        evaluation=evaluation,
+        parent_record=parent,
+        validation_episode_ids=episode_ids,
+        seeded=True,
+    )
 
 
 def _minimum_episode_frame_count(corpus: Any, *, split: str = "train") -> Optional[int]:
@@ -775,14 +958,18 @@ def run_evolutionary_search(
     trace_dir: Optional[Union[str, Path]] = None,
     heartbeat_timeout_seconds: Optional[float] = None,
     champion_run_id: Optional[str] = None,
+    seed_run_ids: Sequence[str] = (),
     min_episode_length: Optional[int] = None,
     stage_budget_seconds: Optional[float] = None,
     cost_model: Callable[[Mapping[str, Any]], float] = project_cost_seconds,
 ) -> EvolutionarySearchReport:
     """Run a bounded evolutionary Model Factory campaign.
 
-    Population zero is sampled with :func:`propose`. Each new member is
-    trained exactly once and evaluated on the corpus's fixed validation set.
+    Population zero starts with any completed, compatible ``seed_run_ids``
+    followed by enough :func:`propose` samples to reach ``population_size``.
+    Seed runs reuse their stored validation evidence and checkpoint without
+    retraining. Each new member is trained exactly once and evaluated on the
+    corpus's fixed validation set.
     In each population, incomplete trials and candidates that fail either
     rollout quality gate are removed first. The remaining candidates are
     sorted by the configured model-prediction metric in its supported
@@ -808,6 +995,14 @@ def run_evolutionary_search(
         raise SearchError(
             f"min_episode_length must leave room for an input and target frame; got {min_episode_length!r}"
         )
+    resolved_seed_run_ids = tuple(str(run_id) for run_id in seed_run_ids)
+    if len(set(resolved_seed_run_ids)) != len(resolved_seed_run_ids):
+        raise SearchError("seed_run_ids must not contain duplicates")
+    if len(resolved_seed_run_ids) > population_size:
+        raise SearchError(
+            f"received {len(resolved_seed_run_ids)} seed runs for a population of "
+            f"{population_size}; seed runs cannot exceed population_size"
+        )
 
     corpus = resolve_corpus(
         base_spec.data["corpus_id"], allow_record=False, root=corpus_root, organism=base_spec.organism,
@@ -820,24 +1015,60 @@ def run_evolutionary_search(
             if effective_min_episode_frames is None
             else min(min_episode_length, effective_min_episode_frames)
         )
-    initial_specs = _propose_valid_population(
-        base_spec,
-        genome_schema,
-        population_size,
-        seed,
-        method=method,
-        min_episode_frames=effective_min_episode_frames,
-        stage_budget_seconds=stage_budget_seconds,
-        cost_model=cost_model,
-    )
-    members = [
-        _EvolutionMember(spec=replace(spec, mode="fresh", parent=None), origin_population=0)
-        for spec in initial_specs
-    ]
-
     ticks_per_frame = float(corpus.data_contract.ticks_per_frame)
     selection_metric = base_spec.evaluation["selection_metric"]
     selection_mode = _selection_metric_mode(selection_metric)
+    seed_members = [
+        _load_seed_member(
+            run_id,
+            root=root,
+            base_spec=base_spec,
+            genome_schema=genome_schema,
+            expected_data_contract_hash=corpus.data_contract.hash,
+            selection_metric=selection_metric,
+            ticks_per_frame=ticks_per_frame,
+            min_episode_frames=effective_min_episode_frames,
+        )
+        for run_id in resolved_seed_run_ids
+    ]
+    if seed_members:
+        architecture_hashes = {
+            member.parent_record.architecture_hash
+            for member in seed_members if member.parent_record is not None
+        }
+        if len(architecture_hashes) != 1:
+            raise SearchError(
+                "seed runs are incompatible with each other: architecture hashes differ"
+            )
+        validation_sets = {member.validation_episode_ids for member in seed_members}
+        if len(validation_sets) != 1:
+            raise SearchError(
+                "seed runs are incompatible with each other: validation episode sets differ"
+            )
+
+    fresh_count = population_size - len(seed_members)
+    initial_specs = (
+        _propose_valid_population(
+            base_spec,
+            genome_schema,
+            fresh_count,
+            seed,
+            method=method,
+            min_episode_frames=effective_min_episode_frames,
+            stage_budget_seconds=stage_budget_seconds,
+            cost_model=cost_model,
+        )
+        if fresh_count else []
+    )
+    members = seed_members + [
+        _EvolutionMember(spec=replace(spec, mode="fresh", parent=None), origin_population=0)
+        for spec in initial_specs
+    ]
+    generation_offset = max(
+        (int((member.spec.evolution or {}).get("generation") or 0) for member in seed_members),
+        default=0,
+    )
+
     prefix = run_id_prefix or f"evo{seed}"
     reports: List[PopulationReport] = []
     final_survivors: List[_EvolutionMember] = []
@@ -854,13 +1085,26 @@ def run_evolutionary_search(
 
         for candidate_index, member in enumerate(members):
             if member.evaluation is not None:
+                if member.validation_episode_ids is not None:
+                    if reference_episode_ids is None:
+                        reference_episode_ids = member.validation_episode_ids
+                    elif member.validation_episode_ids != reference_episode_ids:
+                        raise SearchError(
+                            "evolutionary search requires the identical validation episode set for "
+                            f"every candidate; seed run {member.evaluation.run_id!r} evaluated "
+                            f"{member.validation_episode_ids!r}, expected {reference_episode_ids!r}"
+                        )
                 carried = replace(
                     member.evaluation,
                     candidate_index=candidate_index,
                     retained=False,
                     carried=True,
                     epochs_executed=0,
-                    reason="carried forward from the preceding population without retraining",
+                    reason=(
+                        "seeded from a completed prior run without retraining"
+                        if population_index == 0 and member.seeded else
+                        "carried forward from the preceding population without retraining"
+                    ),
                 )
                 member.evaluation = carried
                 evaluated.append(member)
@@ -1047,7 +1291,7 @@ def run_evolutionary_search(
                             parent_b.parent_record,
                             genome_schema,
                             objective=str(base_spec.training["objective"]),
-                            generation=population_index + 1,
+                            generation=generation_offset + population_index + 1,
                             seed=breeding_seed,
                             mutation_rate=mutation_rate,
                             min_episode_length=effective_min_episode_frames,
@@ -1098,6 +1342,7 @@ def run_evolutionary_search(
         population_size=population_size,
         population_count=population_count,
         mutation_rate=mutation_rate,
+        seed_run_ids=resolved_seed_run_ids,
         populations=tuple(reports),
         total_trials_started=total_trials_started,
         total_epochs_executed=total_epochs_executed,
