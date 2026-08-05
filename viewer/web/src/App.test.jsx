@@ -87,4 +87,14 @@ describe("App", () => {
     expect(screen.getByLabelText("Build organism").value).toBe("Crafter");
     expect(screen.getByText(/no jobs launched yet/)).toBeInTheDocument();
   });
+
+  it("switches to the Breed tab, which offers no parents until the organism has completed runs", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("Crafter / run-1 / run/seed-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("tab", { name: "Breed" }));
+    await waitFor(() => expect(screen.getByLabelText("Parent A")).toBeInTheDocument());
+    expect(screen.getByLabelText("Breed organism").value).toBe("Crafter");
+    expect(screen.getByText(/no completed runs to breed from yet/)).toBeInTheDocument();
+    expect(screen.getByText(/select two different completed runs to check/)).toBeInTheDocument();
+  });
 });

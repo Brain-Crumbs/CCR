@@ -134,6 +134,26 @@ Per selected organism/run, tabbed by concern:
   offspring slot and names the survivors from the offspring's own
   `lineage.json` parents. It re-reads only what the campaign wrote to disk;
   no selection or breeding decision is re-derived in the browser.
+- **Breed** -- cross two completed runs of one organism into a single
+  explicit-lineage child (`ccr factory breed`). Both parent pickers offer
+  only `completed` runs, because breeding reads a parent's frozen genome and
+  checkpoint and refuses anything that never finished evaluation -- the same
+  gate promotion enforces. Editing any parent, checkpoint, schema, seed,
+  mutation rate, objective, tier, generation or weight donor re-runs
+  `POST /api/preview/breed` (the CLI's own torch-free `--dry-run`) after a
+  short debounce, so the panel always shows either the exact child these
+  settings would produce or why they cannot: an incompatible pair renders
+  `check_compatible`'s own message verbatim, which names *every* mismatched
+  dimension at once (architecture hash, corpus, stage, budget tier,
+  evaluation contract) rather than just the first. The child preview is
+  read straight out of the dry run's `breeding_lineage`: one row per gene
+  with both parents' values, which parent uniform crossover took it from,
+  and the child's value, flagged where mutation or repair then moved it --
+  plus the resolved child spec's mode, weight-donor parent and checkpoint,
+  corpus, objective and selection metric. **Breed child** stays disabled
+  until a preview succeeds, and launches the same subcommand minus
+  `--dry-run` as a `POST /api/jobs/breed` job, tracked in the shared Jobs
+  panel. The same seed, parents and schema always reproduce the same child.
 
 Each recording also shows its `record/quality.py` green/amber/red verdict
 before you ever train on it.
@@ -149,7 +169,7 @@ viewer/
     src/
       lib/             # pure data transforms (frame/prediction math, diagnostics, actions, format)
       hooks/           # usePixelHorizonData, useDarkMode
-      components/      # PixelHorizonViewer, SeenFramePanel, ActionTimeline, EEGPanel, BuildPanel, EvolvePanel, PopulationBoard, JobsPanel, ...
+      components/      # PixelHorizonViewer, SeenFramePanel, ActionTimeline, EEGPanel, BuildPanel, EvolvePanel, PopulationBoard, BreedPanel, JobsPanel, ...
       App.jsx
   test/                # server.js contract tests (node:test)
 ```

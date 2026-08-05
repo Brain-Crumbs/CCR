@@ -418,9 +418,23 @@ test("job-launch API", async (t) => {
       });
       assert.equal(traversalCheckpoint.status, 400, `${field} should reject a traversal-shaped name`);
     }
+    // breed names one checkpoint per parent, on the same footing.
+    for (const field of ["checkpoint_a", "checkpoint_b"]) {
+      const traversalCheckpoint = await post(port, "/api/jobs/breed", {
+        organism: "Test", parent_a: "run-a", parent_b: "run-b", options: { [field]: "../../../etc/passwd" },
+      });
+      assert.equal(traversalCheckpoint.status, 400, `${field} should reject a traversal-shaped name`);
+    }
     // The legitimate default still clears it.
     assert.equal(
       (await post(port, "/api/jobs/clone", { organism: "Test", run: "run-a", options: { checkpoint: "best-validation.pt" } })).status,
+      200,
+    );
+    assert.equal(
+      (await post(port, "/api/jobs/breed", {
+        organism: "Test", parent_a: "run-a", parent_b: "run-b",
+        options: { checkpoint_a: "best-validation.pt", checkpoint_b: "last.pt" },
+      })).status,
       200,
     );
   });
