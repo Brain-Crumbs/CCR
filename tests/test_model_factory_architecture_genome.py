@@ -8,6 +8,7 @@ mergeable before anything touches a GPU.
 
 from __future__ import annotations
 
+import json
 import random
 from dataclasses import fields as dataclass_fields
 
@@ -19,11 +20,14 @@ from cognitive_runtime.training.model_factory.architecture_genome import (
     ARCHITECTURE_SEARCH_V1,
     BACKBONE_PRESET_GENE,
     BACKBONE_PRESETS,
+    INERT_GENES_BY_BACKBONE,
     ArchitectureGenomeError,
     apply_architecture_genome,
     backbone_preset_for,
     build_architecture_schema,
+    canonicalize_architecture_genome,
     default_architecture_genome,
+    inert_genes_for,
     extract_architecture_genome,
     get_architecture_schema,
     resolve_backbone_preset,
@@ -210,6 +214,109 @@ def test_preset_kwargs_are_copied_not_aliased():
 def test_unknown_preset_is_a_hard_error():
     with pytest.raises(ArchitectureGenomeError, match="unknown backbone preset"):
         resolve_backbone_preset("transformer_h8_l8")
+
+
+# ------------------------------------------------- inert genes / canonicalization
+
+
+def test_context_length_is_inert_under_the_gru_and_live_under_windowed_backbones():
+    """The GRU ignores context_length; the windowed backbones do not.
+
+    Documented in ``ActionWorldModelConfig.context_length`` ("ignored by
+    'gru'") and structurally true via ``TemporalBackbone.context_length_max``,
+    which only the windowed backbones set.
+    """
+    assert inert_genes_for({BACKBONE_PRESET_GENE: "gru", "context_length": 16}) == (
+        "context_length",
+    )
+    for preset in ("dilated_conv", "transformer_h2_l1", "transformer_h4_l2"):
+        assert inert_genes_for({BACKBONE_PRESET_GENE: preset, "context_length": 16}) == ()
+
+
+def test_inert_genes_are_empty_when_the_schema_does_not_evolve_the_backbone():
+    assert inert_genes_for({"hidden_dim": 256}) == ()
+
+
+def test_canonicalizing_collapses_gru_genomes_that_build_the_same_model():
+    """Four GRU genomes differing only in context_length are one architecture.
+
+    Left uncollapsed they would carry four distinct genomes, four distinct
+    architecture_hash values (context_length is an ArchitectureContract
+    field) and -- in a nested campaign -- four separate full inner budgets
+    spent re-measuring one architecture.
+    """
+    canonical = {
+        json.dumps(
+            canonicalize_architecture_genome(ARCHITECTURE_SEARCH_V1, {
+                BACKBONE_PRESET_GENE: "gru",
+                "latent_width": 128,
+                "hidden_dim": 256,
+                "action_embed_dim": 8,
+                "context_length": context_length,
+            }),
+            sort_keys=True,
+        )
+        for context_length in ARCHITECTURE_SEARCH_V1.genes["context_length"].choices
+    }
+    assert len(canonical) == 1
+    assert json.loads(canonical.pop())["context_length"] == (
+        ARCHITECTURE_SEARCH_V1.genes["context_length"].default
+    )
+
+
+def test_canonicalizing_leaves_a_windowed_backbones_context_length_alone():
+    genome = {
+        BACKBONE_PRESET_GENE: "transformer_h4_l2",
+        "latent_width": 128,
+        "hidden_dim": 256,
+        "action_embed_dim": 8,
+        "context_length": 16,
+    }
+    assert canonicalize_architecture_genome(ARCHITECTURE_SEARCH_V1, genome) == genome
+
+
+def test_canonicalizing_never_drops_a_declared_gene():
+    """Every operator in genome.py requires a complete genome."""
+    canonical = canonicalize_architecture_genome(
+        ARCHITECTURE_SEARCH_V1, default_architecture_genome(ARCHITECTURE_SEARCH_V1),
+    )
+    assert set(canonical) == set(ARCHITECTURE_SEARCH_V1.gene_names)
+
+
+def test_canonicalized_values_stay_within_their_genes_declared_choices():
+    for preset in BACKBONE_PRESETS:
+        genome = dict(default_architecture_genome(ARCHITECTURE_SEARCH_V1))
+        genome[BACKBONE_PRESET_GENE] = preset
+        genome["context_length"] = 16
+        canonical = canonicalize_architecture_genome(ARCHITECTURE_SEARCH_V1, genome)
+        for name, gene in ARCHITECTURE_SEARCH_V1.genes.items():
+            assert canonical[name] in gene.choices
+
+
+def test_inert_gene_declaration_matches_the_real_backbones():
+    """Guard the hand-maintained mirror against drift.
+
+    ``architecture_genome`` cannot import ``brain.cortex.backbones`` (it
+    imports torch, and this module must stay usable in the core-only
+    install), so :data:`INERT_GENES_BY_BACKBONE` restates that module's
+    ``context_length_max`` contract by hand. This test is the thing that
+    keeps the restatement true.
+    """
+    pytest.importorskip("torch")
+    from brain.cortex.backbones import build_backbone
+
+    for preset_name, preset in BACKBONE_PRESETS.items():
+        backbone = build_backbone(
+            preset["backbone"], input_dim=8, hidden_dim=16, context_length=8,
+            **dict(preset["backbone_kwargs"]),
+        )
+        ignores_context = backbone.context_length_max is None
+        declared = "context_length" in INERT_GENES_BY_BACKBONE.get(preset["backbone"], ())
+        assert declared == ignores_context, (
+            f"{preset_name}: INERT_GENES_BY_BACKBONE says context_length inert={declared}, "
+            f"but the built backbone reports context_length_max="
+            f"{backbone.context_length_max!r}"
+        )
 
 
 # --------------------------------------------------------------- extraction

@@ -104,6 +104,35 @@ BACKBONE_PRESETS: Mapping[str, Mapping[str, Any]] = MappingProxyType({
 #: expands into.
 BACKBONE_PRESET_FIELDS: Tuple[str, ...] = ("backbone", "backbone_kwargs")
 
+#: Genes a given backbone *ignores*, keyed by backbone name.
+#:
+#: ``context_length`` is a build-time ring-buffer capacity for the windowed
+#: backbones and is documented as ignored by the GRU in both
+#: ``ActionWorldModelConfig.context_length`` (``action_world_model.py``) and
+#: ``PredictiveCortex``'s own config (``brain/cortex/predictive.py``); the
+#: structural statement of the same fact is
+#: ``TemporalBackbone.context_length_max``, which only ``_WindowedBackbone``
+#: ever sets (``brain/cortex/backbones.py``), and ``GRUBackbone.__init__``
+#: swallows the kwarg via ``**_unused``.
+#:
+#: This matters here because an inert gene is not free -- it is *worse* than
+#: free. Four GRU genomes differing only in ``context_length`` build four
+#: identical models, but they would carry four distinct genomes, four
+#: distinct ``architecture_hash`` values (``context_length`` is an
+#: ``ArchitectureContract`` field), and, in
+#: ``architecture_search``, four separate full inner campaigns -- so the
+#: outer loop would spend four budgets re-measuring one architecture and
+#: then rank the training noise between them as if it were architectural
+#: signal. :func:`canonicalize_architecture_genome` collapses them instead.
+#:
+#: Mirrored by hand because ``brain.cortex.backbones`` imports torch and this
+#: module must stay importable in the core-only install; a torch-gated test
+#: asserts this declaration against each backbone's real
+#: ``context_length_max`` so the mirror cannot drift silently.
+INERT_GENES_BY_BACKBONE: Mapping[str, Tuple[str, ...]] = MappingProxyType({
+    "gru": ("context_length",),
+})
+
 #: Which preset a model block declaring a bare ``{backbone, backbone_kwargs:
 #: {}}`` pair is, for backbones whose preset above spells out the
 #: constructor's *own* defaults rather than overriding them.
@@ -366,6 +395,53 @@ def apply_architecture_genome(
     return merged
 
 
+def inert_genes_for(genome: Mapping[str, Any]) -> Tuple[str, ...]:
+    """Which of ``genome``'s genes its chosen backbone actually ignores.
+
+    Empty for a genome with no :data:`BACKBONE_PRESET_GENE` (a schema is
+    free not to evolve the backbone at all, in which case nothing is
+    conditional) and for any backbone that ignores nothing.
+    """
+    preset = genome.get(BACKBONE_PRESET_GENE)
+    if preset is None:
+        return ()
+    backbone = resolve_backbone_preset(str(preset))["backbone"]
+    return tuple(
+        name for name in INERT_GENES_BY_BACKBONE.get(str(backbone), ()) if name in genome
+    )
+
+
+def canonicalize_architecture_genome(
+    schema: ArchitectureGenomeSchema, genome: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Snap every gene the chosen backbone ignores to its declared default.
+
+    The architecture analogue of :func:`.genome.repair`'s joint constraints:
+    a gene value that cannot change the built model must not be allowed to
+    make two identical architectures look different. Two genomes that build
+    the same model canonicalize to the same genome, so
+    :mod:`.architecture_search`'s duplicate rejection sees them as the one
+    architecture they are, and the recorded genome never claims a
+    ``context_length`` for a model that ignores it.
+
+    The gene's *declared default* is the canonical value rather than, say,
+    dropping the key: the genome must stay complete (every operator in
+    :mod:`.genome` requires every declared gene to be present), and a
+    default is by construction always among the gene's allowed choices.
+
+    Deliberately separate from :func:`.genome.repair` rather than folded
+    into it: repair is generic over any schema and rejects invalid genomes,
+    while this encodes one specific schema family's knowledge of which
+    backbone reads which field.
+    """
+    canonical = dict(genome)
+    for name in inert_genes_for(canonical):
+        gene = schema.genes.get(name)
+        if gene is not None:
+            canonical[name] = gene.default
+    return canonical
+
+
 def _get_nested(mapping: Mapping[str, Any], dotted_path: str) -> Any:
     cursor: Any = mapping
     consumed = []
@@ -434,6 +510,7 @@ __all__ = [
     "BACKBONE_PRESET_GENE",
     "BACKBONE_PRESETS",
     "BACKBONE_PRESET_FIELDS",
+    "INERT_GENES_BY_BACKBONE",
     "FREE_MODEL_FIELDS",
     "ARCHITECTURE_GENE_ROOTS",
     "ArchitectureGenomeSchema",
@@ -442,6 +519,8 @@ __all__ = [
     "ARCHITECTURE_GENOME_SCHEMAS",
     "get_architecture_schema",
     "resolve_backbone_preset",
+    "inert_genes_for",
+    "canonicalize_architecture_genome",
     "apply_architecture_genome",
     "backbone_preset_for",
     "extract_architecture_genome",

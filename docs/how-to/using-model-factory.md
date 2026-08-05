@@ -253,6 +253,14 @@ choices and are not evolvable; `reconstruction_size` is excluded from v1
 because changing decoder output resolution across candidates would make raw
 pixel MSE comparisons unfair.
 
+A gene the chosen backbone ignores is snapped to its declared default before
+a candidate is built — `context_length` is a windowed-backbone ring-buffer
+capacity that the GRU ignores, so GRU candidates always record the default.
+Without that, four GRU genomes differing only in `context_length` would build
+one identical model but spend four full inner budgets and carry four
+different `architecture_hash` values, and the outer loop would rank the
+training noise between them as architectural signal.
+
 An architecture-changing child **trains from scratch** (`mode: fresh`, no
 `parent` block): there is no compatible checkpoint to inherit, and the
 factory never averages or splices weights across parents. Its lineage still

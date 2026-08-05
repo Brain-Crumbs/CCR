@@ -70,6 +70,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
 from cognitive_runtime.training.model_factory.architecture_genome import (
     ArchitectureGenomeSchema,
     apply_architecture_genome,
+    canonicalize_architecture_genome,
 )
 from cognitive_runtime.training.model_factory.breeding import (
     _crossover_with_provenance,
@@ -349,7 +350,13 @@ def breed_architecture(
         architecture_schema, crossed_genome, objective=objective, rng=rng,
         mutation_rate=mutation_rate,
     )
-    child_genome = repair(architecture_schema, mutated_genome, objective=objective)
+    # Canonicalized for the same reason the initial population is: a child
+    # that crosses a windowed parent's context_length onto a GRU backbone
+    # would otherwise record a value its own model ignores, and could
+    # "differ" from a sibling it is in fact identical to.
+    child_genome = canonicalize_architecture_genome(
+        architecture_schema, repair(architecture_schema, mutated_genome, objective=objective),
+    )
     repairs = {
         name: {"from": mutated_genome[name], "to": child_genome[name]}
         for name in architecture_schema.genes
@@ -641,6 +648,14 @@ def _distinct_architecture_genomes(
     identical architectures would each spend a complete inner campaign
     proving the same thing. Redraws are deterministic (a fixed prime seed
     stride), so a given ``seed`` always yields the same initial population.
+
+    "Distinct" means *builds a different model*, not merely "has a different
+    genome": genomes are canonicalized
+    (:func:`.architecture_genome.canonicalize_architecture_genome`) before
+    the comparison, so sampled values of a gene the chosen backbone ignores
+    -- ``context_length`` under the GRU -- collapse into one candidate
+    instead of spending a full inner budget each and then being ranked
+    against each other on training noise.
     """
     if method not in ("random", "lhs"):
         raise ArchitectureSearchError(f"unknown method {method!r}; expected one of ('random', 'lhs')")
@@ -655,7 +670,10 @@ def _distinct_architecture_genomes(
             else _random_genomes(architecture_schema, outer_population_size, rng)
         )
         for genome in batch:
-            canonical = repair(architecture_schema, genome, objective=base_spec.training["objective"])
+            canonical = canonicalize_architecture_genome(
+                architecture_schema,
+                repair(architecture_schema, genome, objective=base_spec.training["objective"]),
+            )
             identity = tuple(sorted((name, str(value)) for name, value in canonical.items()))
             if identity in seen:
                 continue

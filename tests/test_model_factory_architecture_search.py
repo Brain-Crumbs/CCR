@@ -220,6 +220,83 @@ def test_preview_is_deterministic_for_a_fixed_seed():
     assert [c.genome for c in first.candidates] == [c.genome for c in second.candidates]
 
 
+def test_genes_the_chosen_backbone_ignores_never_split_one_architecture_in_two():
+    """A GRU's context_length is inert, so it must not create extra candidates.
+
+    Without canonicalization the sampler would happily return
+    ``gru @ context_length=4`` and ``gru @ context_length=16`` as two
+    "distinct" architectures, each spending a full inner campaign building
+    the identical model and then being ranked against the other on nothing
+    but training noise.
+    """
+    gru_only = build_architecture_schema("gru-only-architecture-v1", {
+        BACKBONE_PRESET_GENE: {
+            "type": "categorical", "choices": ("gru",), "default": "gru",
+            "mutation": {"distribution": "categorical_resample"},
+        },
+        "context_length": {
+            "type": "int", "choices": (4, 8, 12, 16), "default": 8,
+            "mutation": {"distribution": "categorical_resample"},
+        },
+    })
+    # Four context lengths, one buildable architecture: asking for two
+    # distinct candidates is genuinely unsatisfiable, and saying so beats
+    # silently burning a second inner budget on a duplicate.
+    with pytest.raises(ArchitectureSearchError, match="distinct architectures"):
+        preview_architecture_search(
+            _base_spec(), gru_only, INNER_SCHEMA,
+            outer_population_size=2, outer_population_count=1,
+            inner_population_size=2, inner_population_count=1, seed=2, method="random",
+        )
+
+
+def test_a_sampled_gru_candidate_records_the_canonical_context_length():
+    preview = preview_architecture_search(
+        _base_spec(), ARCHITECTURE_SEARCH_V1, INNER_SCHEMA,
+        outer_population_size=4, outer_population_count=1,
+        inner_population_size=2, inner_population_count=1, seed=5, method="lhs",
+    )
+    gru_candidates = [
+        candidate for candidate in preview.candidates
+        if candidate.genome[BACKBONE_PRESET_GENE] == "gru"
+    ]
+    assert gru_candidates, "expected LHS to place at least one GRU candidate"
+    default_context = ARCHITECTURE_SEARCH_V1.genes["context_length"].default
+    for candidate in gru_candidates:
+        assert candidate.genome["context_length"] == default_context
+        # The spec's model block agrees with the recorded genome, so the
+        # run's architecture_hash cannot encode an inert difference.
+        assert candidate.spec.model["context_length"] == default_context
+
+
+def test_a_child_that_crosses_onto_a_gru_canonicalizes_the_inert_gene():
+    """Crossover can hand a windowed parent's context_length to a GRU child."""
+    windowed = build_architecture_schema("crossover-canonicalization-v1", {
+        BACKBONE_PRESET_GENE: {
+            "type": "categorical", "choices": ("gru", "transformer_h2_l1"), "default": "gru",
+            "mutation": {"distribution": "categorical_resample"},
+        },
+        "context_length": {
+            "type": "int", "choices": (4, 8, 12, 16), "default": 8,
+            "mutation": {"distribution": "categorical_resample"},
+        },
+    })
+    gru_parent = _parent("a0", "run-a", {BACKBONE_PRESET_GENE: "gru", "context_length": 8}, 0.1)
+    windowed_parent = _parent(
+        "a1", "run-b", {BACKBONE_PRESET_GENE: "transformer_h2_l1", "context_length": 16}, 0.2,
+    )
+
+    # Sweep seeds so the assertion covers whichever crossover draw happens.
+    for seed in range(24):
+        result = breed_architecture(
+            gru_parent, windowed_parent, windowed, _base_spec(),
+            objective="windowed_rollout", generation=1, seed=seed, mutation_rate=0.0,
+        )
+        if result.child_genome[BACKBONE_PRESET_GENE] == "gru":
+            assert result.child_genome["context_length"] == 8
+            assert result.child_spec.model["context_length"] == 8
+
+
 def test_requesting_more_architectures_than_the_space_holds_is_refused():
     tiny = build_architecture_schema("tiny-architecture-v1", {
         "hidden_dim": {
