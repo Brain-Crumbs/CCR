@@ -139,6 +139,30 @@ tr.is-current, li.is-current { background: var(--surface-3); }
 /* Champion registry */
 .champion-slot { background: var(--surface-3); }
 
+/* Build form */
+.build-form { margin-top: 8px; }
+.build-form__help { color: var(--text-secondary); font-size: .8rem; margin: 4px 0 12px; }
+.build-form__hint { color: var(--text-secondary); font-size: .78rem; margin: -6px 0 8px; }
+.field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 8px; }
+.field { display: flex; flex-direction: column; gap: 4px; color: var(--text-secondary); font-size: .78rem; font-weight: 600; }
+.field input, .field select { font-size: .85rem; padding: 5px 7px; }
+.field--checkbox { flex-direction: row; align-items: center; gap: 8px; }
+.overrides { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.overrides__row { display: flex; align-items: center; gap: 6px; }
+.overrides__row input { flex: 1 1 160px; }
+.build-form button[type="submit"] { margin-top: 8px; font-weight: 700; }
+
+/* Jobs panel */
+.job-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.job-row { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.job-row__header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.job-row__toggle { background: transparent; border: none; padding: 2px 0; font-weight: 650; }
+.job-row__started { color: var(--text-secondary); font-size: .74rem; margin-left: auto; }
+.job-row__runs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.job-run { display: inline-flex; align-items: center; gap: 6px; background: var(--surface-3); border-radius: 6px; padding: 2px 8px; font-size: .78rem; }
+.job-run__id { font-family: ui-monospace, monospace; }
+.job-log { margin-top: 8px; padding: 8px; background: var(--surface-1); border: 1px solid var(--line); border-radius: 6px; max-height: 260px; overflow: auto; font-size: .74rem; white-space: pre-wrap; }
+
 /* Pixel horizon viewer */
 .pixel-horizon-viewer { margin-top: 18px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); overflow-x: auto; font-size: 13px; }
 .pixel-horizon-viewer .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 10px; }

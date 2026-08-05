@@ -94,6 +94,16 @@ Per selected organism/run, tabbed by concern:
   case), since their prediction exports land in the same session
   directories; otherwise the side without a matching export falls back to
   baselines.
+- **Build** -- launch a Model Factory trial without leaving the browser:
+  pick an organism and a mode (fresh / clone / fine_tune / resume, sourced
+  from `GET /api/factory-meta`), fill in a form over `spec.data`/`model`/
+  `training`/`evaluation` (fresh) or a completed run plus checkpoint and
+  `--set` overrides (clone/fine_tune/resume), and launch it as a
+  `POST /api/jobs/{baseline,clone,resume}` job. A Jobs panel underneath
+  tracks every job launched for the organism -- status, each precomputed
+  run's live state, a log tail, and a cancel action -- polling the exact
+  routes described below rather than the hand-edited-dict notebook
+  workflow this supersedes.
 
 Each recording also shows its `record/quality.py` green/amber/red verdict
 before you ever train on it.
@@ -109,7 +119,7 @@ viewer/
     src/
       lib/             # pure data transforms (frame/prediction math, diagnostics, actions, format)
       hooks/           # usePixelHorizonData, useDarkMode
-      components/      # PixelHorizonViewer, SeenFramePanel, ActionTimeline, EEGPanel, ...
+      components/      # PixelHorizonViewer, SeenFramePanel, ActionTimeline, EEGPanel, BuildPanel, JobsPanel, ...
       App.jsx
   test/                # server.js contract tests (node:test)
 ```

@@ -67,7 +67,18 @@ function flagsFromOptions(options) {
     if (value === null || value === undefined || value === false) continue;
     const flag = `--${key.replace(/_/g, "-")}`;
     if (value === true) { argv.push(flag); continue; }
-    if (Array.isArray(value)) { argv.push(flag, ...value.map(String)); continue; }
+    if (Array.isArray(value)) {
+      // "set" is argparse's one action="append" option among these (baseline/
+      // search/clone all declare it that way): each element needs its own
+      // `--set value` occurrence. Every other array-valued option here is a
+      // single nargs="+" flag (e.g. `--budgets 5 10 20`), where one flag
+      // instance trails every element -- the two shapes are not
+      // interchangeable, so this needs the one explicit special case rather
+      // than a single generic rule for both.
+      if (key === "set") { for (const item of value) argv.push(flag, String(item)); continue; }
+      argv.push(flag, ...value.map(String));
+      continue;
+    }
     argv.push(flag, String(value));
   }
   return argv;

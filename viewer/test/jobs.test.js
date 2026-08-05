@@ -75,6 +75,16 @@ test("jobs", async (t) => {
     assert.match(entry.argv.join(" "), /factory clone parent-1 --root .* --factory-run-id clone-1/);
   });
 
+  await t.test("launchJob(clone) repeats --set once per override, matching argparse's action=\"append\" contract", () => {
+    const runsDir = fixtureRunsRoot();
+    const entry = jobs.launchJob("clone", {
+      organism: "Crafter", run: "parent-1",
+      options: { set: ["training.seed=1", "training.batch_size=64"] },
+    }, { runsDir });
+    const argv = entry.argv.join(" ");
+    assert.match(argv, /--set training\.seed=1 --set training\.batch_size=64/);
+  });
+
   await t.test("launchJob(resume) uses the existing run's own id, never a fresh one", () => {
     const runsDir = fixtureRunsRoot();
     const entry = jobs.launchJob("resume", { organism: "Crafter", run: "interrupted-1" }, { runsDir });

@@ -9,6 +9,17 @@ async function getJSON(path) {
   return body;
 }
 
+async function postJSON(path, payload) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload ?? {}),
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(body?.error || `request failed (${res.status})`);
+  return body;
+}
+
 function qs(params = {}) {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
@@ -30,6 +41,17 @@ export const api = {
     getJSON(`/api/sessions/${encodeURIComponent(sessionId)}/episodes/${encodeURIComponent(episodeId)}/streams${qs({ organism, run })}`).then((x) => x.records),
   decisions: (sessionId, episodeId, organism, run) =>
     getJSON(`/api/sessions/${encodeURIComponent(sessionId)}/episodes/${encodeURIComponent(episodeId)}/decisions${qs({ organism, run })}`).then((x) => x.records),
+
+  // Control-plane (clinic redesign, Build tab and beyond): factory-meta and
+  // corpora are read-only GETs; jobs/preview are the write surface, mirrored
+  // one-for-one onto viewer/server.js's job-launch routes with no reshaping.
+  factoryMeta: () => getJSON("/api/factory-meta"),
+  corpora: (organism) => getJSON(`/api/corpora${qs({ organism })}`).then((x) => x.corpora),
+  jobs: (organism) => getJSON(`/api/jobs${qs({ organism })}`).then((x) => x.jobs),
+  jobLog: (jobId, offset = 0) => getJSON(`/api/jobs/${encodeURIComponent(jobId)}/log${qs({ offset })}`),
+  cancelJob: (jobId) => postJSON(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {}),
+  launchJob: (kind, body) => postJSON(`/api/jobs/${kind}`, body),
+  previewJob: (kind, body) => postJSON(`/api/preview/${kind}`, body),
 };
 
 /** URLs (not fetched here) for the pixel-frame/prediction endpoints the
@@ -41,4 +63,4 @@ export function episodeUrls(sessionId, episodeId, { organism = null, run = null,
   return { frames: `${base}/frames${params}`, predictions: `${base}/predictions${params}` };
 }
 
-export { getJSON, qs };
+export { getJSON, postJSON, qs };
