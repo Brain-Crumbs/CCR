@@ -182,6 +182,37 @@ td.population-cell.is-current { box-shadow: inset 3px 0 0 var(--good-fg); }
 td.population-cell.is-current .population-cell__metric { color: var(--good-fg); font-weight: 700; }
 .evolve-preview td:nth-child(2) { font-family: ui-monospace, monospace; font-size: .72rem; white-space: nowrap; }
 
+/* Evolve tab, architecture (NAS) mode */
+.evolve-mode { display: flex; gap: 0; margin: 0 0 12px; }
+.evolve-mode button { border-radius: 0; }
+.evolve-mode button:first-child { border-radius: 6px 0 0 6px; }
+.evolve-mode button:last-child { border-radius: 0 6px 6px 0; }
+.evolve-mode button.is-active { background: var(--info-bg); color: var(--info-fg); font-weight: 700; }
+/* The one deliberately loud block in this UI: a nested campaign's budgets
+   multiply, so its cost is stated as a figure rather than a hint, and the
+   launch button stays disabled until the checkbox below acknowledges it. */
+.evolve-cost { margin: 8px 0 12px; padding: 10px 12px; border: 1px solid var(--amber-fg); border-radius: 8px; background: var(--amber-bg); }
+.evolve-cost h4 { margin: 0 0 4px; }
+.evolve-cost__figure { margin: 0 0 4px; font-size: 1.05rem; color: var(--amber-fg); }
+.evolve-cost__breakdown { margin: 0 0 6px; font-size: .78rem; color: var(--text-secondary); }
+.evolve-cost__confirm { display: flex; align-items: flex-start; gap: 8px; font-size: .82rem; font-weight: 600; }
+
+/* Architecture board: outer generations of architectures, each expandable
+   into that architecture's own inner population grid. */
+.architecture-generation { margin-top: 12px; }
+.architecture-generation h4 { margin: 0 0 6px; }
+.architecture-grid td, .architecture-grid th { vertical-align: top; }
+.architecture-row__id { font-family: ui-monospace, monospace; font-size: .72rem; word-break: break-all; }
+.architecture-row__metric { font-variant-numeric: tabular-nums; font-size: .78rem; }
+.architecture-row__toggle { background: none; border: none; padding: 0; font: inherit; font-weight: 700; cursor: pointer; color: var(--text-primary); }
+tr.architecture-row.is-current > td, tr.architecture-row.is-current > th { box-shadow: inset 0 3px 0 var(--good-fg); }
+tr.architecture-row.is-current .architecture-row__metric { color: var(--good-fg); font-weight: 700; }
+/* An expanded inner grid is a whole nested panel; strip the shell it would
+   otherwise draw inside an already-framed table cell. */
+.architecture-row__inner > td { padding: 0 0 12px; }
+.architecture-row__inner .population-board { margin: 0; border: none; background: none; box-shadow: none; }
+.architecture-row__inner .population-board h3 { font-size: .9rem; }
+
 /* Breed tab */
 .breed-preview { margin-top: 16px; }
 /* check_compatible names every mismatched dimension at once, so its message

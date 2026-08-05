@@ -134,6 +134,32 @@ Per selected organism/run, tabbed by concern:
   offspring slot and names the survivors from the offspring's own
   `lineage.json` parents. It re-reads only what the campaign wrote to disk;
   no selection or breeding decision is re-derived in the browser.
+
+  An **Architecture (NAS)** toggle switches the tab to the nested campaign
+  (`ccr factory search --genome architecture`): an outer evolutionary loop
+  over model architectures, each scored by a complete inner training-gene
+  campaign of its own. The outer loop gets its own schema registry
+  (`architecture_genome.ARCHITECTURE_GENOME_SCHEMAS`, offered separately
+  from the training schemas because the two are mutually exclusive by
+  construction), population size, generations and mutation rate; the
+  existing population/generation/mutation fields keep their meaning as that
+  *inner* campaign's parameters, exactly as the CLI declares them. Because
+  the two budgets multiply, the cost bound
+  (`outer_size × outer_generations × inner_size × inner_generations`, times
+  the base spec's own `training.max_training_seconds`) is stated as a figure
+  rather than a hint, and **Launch campaign** stays disabled until an
+  explicit checkbox acknowledges it -- any edit that changes the cost
+  withdraws the acknowledgement. The dry run is free and stays available
+  either way; once it returns, the figure quoted is
+  `architecture_search.estimate_cost`'s own rather than the client-side one.
+  After launch an **architecture board** replaces the population board:
+  one row per architecture per outer generation, with its inner campaign's
+  aggregate state and best selection-metric value, each expandable into that
+  architecture's own population grid (the same component, fed from the one
+  organism-wide poll rather than opening a poller per expanded row). An
+  architecture retained into the next outer generation is not re-trained, so
+  its later-generation cell is empty -- the campaign's own JSON report is
+  what distinguishes "carried" from "not reached yet".
 - **Breed** -- cross two completed runs of one organism into a single
   explicit-lineage child (`ccr factory breed`). Both parent pickers offer
   only `completed` runs, because breeding reads a parent's frozen genome and
@@ -172,7 +198,7 @@ viewer/
     src/
       lib/             # pure data transforms (frame/prediction math, diagnostics, actions, format)
       hooks/           # usePixelHorizonData, useDarkMode
-      components/      # PixelHorizonViewer, SeenFramePanel, ActionTimeline, EEGPanel, BuildPanel, EvolvePanel, PopulationBoard, BreedPanel, JobsPanel, ...
+      components/      # PixelHorizonViewer, SeenFramePanel, ActionTimeline, EEGPanel, BuildPanel, EvolvePanel, PopulationBoard, ArchitectureBoard, BreedPanel, JobsPanel, ...
       App.jsx
   test/                # server.js contract tests (node:test)
 ```
@@ -251,7 +277,7 @@ see Security above before exposing them beyond localhost.
 | `POST /api/jobs/:id/cancel` | asks every one of the job's runs to stop gracefully, then `SIGTERM`s the subprocess |
 | `GET /api/corpora?organism=` | frozen Model Factory corpora under `--corpus-root` (id, data contract hash, session counts per split) |
 | `POST /api/preview/{search,breed}` | the same CLI invocation a launch would use, plus `--dry-run` -- candidate specs or the resolved child + lineage, no run allocated |
-| `GET /api/factory-meta` | the factory's own declared modes/objectives/genome schema versions/backbones (`ccr factory meta`), so a form can source its options from the backend instead of duplicating them |
+| `GET /api/factory-meta` | the factory's own declared modes/objectives/genome schema versions (training *and* architecture)/backbone presets (`ccr factory meta`), so a form can source its options from the backend instead of duplicating them |
 
 ## Reusing PixelHorizonViewer
 

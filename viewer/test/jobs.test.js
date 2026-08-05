@@ -126,6 +126,44 @@ test("jobs", async (t) => {
     assert.deepEqual(entry.run_ids, ["sh-preview-r0-c0", "sh-preview-r0-c1"]);
   });
 
+  await t.test("launchJob(search --genome architecture) precomputes the nested outer × inner grid", () => {
+    const runsDir = fixtureRunsRoot();
+    const entry = jobs.launchJob("search", {
+      organism: "Crafter", spec: { organism: "Crafter" },
+      options: {
+        genome: "architecture", outer_schema: "architecture_search_v1",
+        outer_population_size: 2, outer_populations: 2,
+        outer_mutation_rate: 0.3, population_size: 2, populations: 1,
+        run_id_prefix: "arch7",
+      },
+    }, { runsDir });
+    // Outer generation 0's architectures are all sampled up front, so its
+    // whole slab of inner run ids is exact ahead of the subprocess; later
+    // outer generations depend on retention/breeding decisions and are left
+    // to /api/factory-runs' own catalog scan, exactly as the flat case does.
+    assert.deepEqual(entry.run_ids, [
+      "arch7-arch0-a0-p0-c0", "arch7-arch0-a0-p0-c1",
+      "arch7-arch0-a1-p0-c0", "arch7-arch0-a1-p0-c1",
+    ]);
+    const argv = entry.argv.join(" ");
+    assert.match(argv, /--genome architecture/);
+    assert.match(argv, /--outer-schema architecture_search_v1/);
+    assert.match(argv, /--outer-population-size 2/);
+    assert.match(argv, /--outer-populations 2/);
+    assert.match(argv, /--outer-mutation-rate 0\.3/);
+  });
+
+  await t.test("launchJob(search --genome architecture) defaults the outer size to the CLI's own default", () => {
+    const runsDir = fixtureRunsRoot();
+    const entry = jobs.launchJob("search", {
+      organism: "Crafter", spec: { organism: "Crafter" },
+      options: { genome: "architecture", population_size: 2, run_id_prefix: "arch0" },
+    }, { runsDir });
+    assert.equal(entry.run_ids.length, 8);
+    assert.equal(entry.run_ids[0], "arch0-arch0-a0-p0-c0");
+    assert.equal(entry.run_ids.at(-1), "arch0-arch0-a3-p0-c1");
+  });
+
   await t.test("launchJob rejects an unknown kind without spawning anything", () => {
     const runsDir = fixtureRunsRoot();
     assert.throws(() => jobs.launchJob("evolve-forever", { organism: "Crafter" }, { runsDir }), /unknown job kind/);
