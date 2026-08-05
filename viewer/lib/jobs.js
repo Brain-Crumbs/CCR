@@ -123,6 +123,12 @@ function buildLaunch(kind, body, { runsDir, corpusRoot = null, jobId }) {
   const options = { ...(body.options || {}) };
   const root = ["--root", path.resolve(runsDir)];
 
+  // A clinic may point at a non-default corpus root. Every training command
+  // must resolve the same corpora the UI lists and creates there.
+  if (corpusRoot && new Set(["baseline", "clone", "resume", "search", "breed"]).has(kind)) {
+    options.corpus_root = path.resolve(corpusRoot);
+  }
+
   if (kind === "baseline" || kind === "clone" || kind === "breed") {
     // baseline/clone/breed auto-generate a run id unless one is pinned;
     // the job registry must know it up front to precompute run_ids, so

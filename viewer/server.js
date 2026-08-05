@@ -161,9 +161,16 @@ function validateJobBody(clinic, body) {
     return { status: 404, error: "unknown organism" };
   }
   const corpusId = body.spec?.data?.corpus_id;
-  if (typeof corpusId === "string" && corpusId && !corpusCatalog(clinic.corpusRoot, body.organism)
-    .some((entry) => entry.corpus_id === corpusId)) {
-    return { status: 404, error: `unknown corpus: ${corpusId}` };
+  if (typeof corpusId === "string" && corpusId) {
+    const corpus = corpusCatalog(clinic.corpusRoot, body.organism)
+      .find((entry) => entry.corpus_id === corpusId);
+    if (!corpus) return { status: 404, error: `unknown corpus: ${corpusId}` };
+    if (body.spec?.mode === "fresh" && corpus.requires_parent_checkpoint) {
+      return {
+        status: 400,
+        error: `corpus ${corpusId} is fine-tune-only; build and select a generic action-effects corpus for the fresh baseline`,
+      };
+    }
   }
   for (const field of ["run", "parent_a", "parent_b"]) {
     if (typeof body[field] !== "string") continue;
@@ -479,6 +486,7 @@ function corpusCatalog(corpusRoot, organism = null) {
         corpus_id: String(manifest.corpus_id ?? corpusName),
         organism: name,
         data_contract_hash: manifest.data_contract_hash ?? null,
+        requires_parent_checkpoint: Boolean(manifest.data_contract?.retention_policy),
         session_counts: Object.fromEntries(["train", "validation", "test"].map((split) => [
           split, Array.isArray(sessions[split]) ? sessions[split].length : 0,
         ])),
@@ -505,6 +513,8 @@ function corpusSpecCatalog(corpusSpecsDir, organism = null) {
         spec_id: entry.name,
         corpus_id: String(document?.corpus_id ?? scalar(text, "corpus_id") ?? ""),
         organism: String(document?.organism ?? scalar(text, "organism") ?? ""),
+        requires_parent_checkpoint: Boolean(document?.retention_policy)
+          || /^retention_policy:[ \t]*(?:#.*)?$/m.test(text),
         file,
       };
       if (!isPlainId(item.corpus_id) || !isPlainId(item.organism)) return [];
@@ -831,7 +841,9 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
         const previewId = `preview-${crypto.randomUUID()}`;
         let launch;
         try {
-          launch = jobs.buildLaunch(kind, body, { runsDir: clinic.runsDir, jobId: previewId });
+          launch = jobs.buildLaunch(kind, body, {
+            runsDir: clinic.runsDir, corpusRoot: clinic.corpusRoot, jobId: previewId,
+          });
         } catch (err) {
           return sendJSON(res, 400, { error: String(err.message || err) });
         }

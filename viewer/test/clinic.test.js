@@ -682,10 +682,36 @@ test("job-launch API", async (t) => {
     assert.equal(listed.status, 200);
     assert.deepEqual(listed.body.corpora, [{
       corpus_id: "corpus-1", organism: "Test", data_contract_hash: "hash-1",
+      requires_parent_checkpoint: false,
       session_counts: { train: 3, validation: 1, test: 0 },
     }]);
     assert.equal((await get(port, "/api/corpora")).body.corpora.length, 1);
     assert.equal((await get(port, `/api/corpora?organism=${encodeURIComponent("../../etc")}`)).status, 400);
+  });
+
+  await t.test("a fresh baseline rejects a navigation retention corpus before spawning", async (t) => {
+    const runsDir = fixtureRunsDir();
+    const corpusRoot = path.join(path.dirname(runsDir), "corpora");
+    const navigation = path.join(corpusRoot, "Test", "navigation-corpus");
+    fs.mkdirSync(navigation, { recursive: true });
+    fs.writeFileSync(path.join(navigation, "corpus_manifest.json"), JSON.stringify({
+      format: "model-factory-corpus-manifest-v1",
+      corpus_id: "navigation-corpus",
+      data_contract_hash: "navigation-hash",
+      data_contract: { retention_policy: { corpus_id: "generic-corpus" } },
+      sessions: { train: [1], validation: [1], test: [] },
+    }));
+
+    const server = createServer({ runsDir, corpusRoot });
+    await new Promise((resolve) => server.listen(0, resolve));
+    t.after(() => server.close());
+    const response = await post(server.address().port, "/api/jobs/baseline", {
+      organism: "Test",
+      spec: { organism: "Test", mode: "fresh", data: { corpus_id: "navigation-corpus" } },
+    });
+
+    assert.equal(response.status, 400);
+    assert.match(response.body.error, /fine-tune-only.*generic action-effects corpus/);
   });
 
   await t.test("an empty workspace can launch a corpus recipe as its first monitored job", async (t) => {
@@ -697,6 +723,9 @@ test("job-launch API", async (t) => {
     fs.writeFileSync(path.join(corpusSpecsDir, "starter.yaml"), [
       "corpus_id: starter-corpus", "organism: Test", "generator:", "  world: crafter",
     ].join("\n"));
+    fs.writeFileSync(path.join(corpusSpecsDir, "navigation.yaml"), [
+      "corpus_id: navigation-corpus", "organism: Test", "retention_policy:", "  corpus_id: starter-corpus",
+    ].join("\n"));
 
     const server = createServer({ runsDir, corpusRoot, corpusSpecsDir });
     await new Promise((resolve) => server.listen(0, resolve));
@@ -707,9 +736,16 @@ test("job-launch API", async (t) => {
       runs_dir: path.resolve(runsDir), episode_cache_dir: path.resolve(path.join(__dirname, "../..", "notebooks", "episode_cache")),
       organisms: ["Test"], runs: [],
     });
-    assert.deepEqual((await get(port, "/api/corpus-specs?organism=Test")).body.specs, [{
-      spec_id: "starter.yaml", corpus_id: "starter-corpus", organism: "Test",
-    }]);
+    assert.deepEqual((await get(port, "/api/corpus-specs?organism=Test")).body.specs, [
+      {
+        spec_id: "navigation.yaml", corpus_id: "navigation-corpus", organism: "Test",
+        requires_parent_checkpoint: true,
+      },
+      {
+        spec_id: "starter.yaml", corpus_id: "starter-corpus", organism: "Test",
+        requires_parent_checkpoint: false,
+      },
+    ]);
     assert.equal((await post(port, "/api/jobs/corpus", { organism: "Test", spec_id: "missing.yaml" })).status, 404);
 
     const launched = await post(port, "/api/jobs/corpus", { organism: "Test", spec_id: "starter.yaml" });

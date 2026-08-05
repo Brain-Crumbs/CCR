@@ -33,8 +33,9 @@ test("jobs", async (t) => {
 
   await t.test("launchJob(baseline) registers a running job, then reconciles to completed", async () => {
     const runsDir = fixtureRunsRoot();
+    const corpusRoot = path.join(path.dirname(runsDir), "custom-corpora");
     const spec = { organism: "Crafter", mode: "fresh" };
-    const entry = jobs.launchJob("baseline", { organism: "Crafter", spec }, { runsDir });
+    const entry = jobs.launchJob("baseline", { organism: "Crafter", spec }, { runsDir, corpusRoot });
 
     assert.equal(entry.kind, "baseline");
     assert.equal(entry.organism, "Crafter");
@@ -45,6 +46,7 @@ test("jobs", async (t) => {
     // The spec document was written to a temp file and named as the
     // positional argument, not inlined into argv.
     assert.match(entry.argv.join(" "), /factory baseline .*\.spec\.json --root/);
+    assert.equal(entry.argv[entry.argv.indexOf("--corpus-root") + 1], path.resolve(corpusRoot));
     const specFile = entry.argv[entry.argv.indexOf("baseline") + 1];
     assert.deepEqual(JSON.parse(fs.readFileSync(specFile, "utf8")), spec);
 

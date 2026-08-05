@@ -101,7 +101,10 @@ Per selected organism/run, tabbed by concern:
   mode (fresh / clone / fine_tune / resume, sourced
   from `GET /api/factory-meta`). On a clean workspace, first launch one of
   the repository's corpus recipes and follow that corpus build in the same
-  Jobs panel. Then fill in a form over `spec.data`/`model`/
+  Jobs panel. The corpus builder remains available after the first corpus:
+  a fresh baseline requires the generic action-effects recipe, while a
+  goal-navigation corpus is fine-tune-only because it requires a parent
+  checkpoint for retention measurement. Then fill in a form over `spec.data`/`model`/
   `training`/`evaluation` (fresh) or a completed run plus checkpoint and
   `--set` overrides (clone/fine_tune/resume), and launch it as a
   `POST /api/jobs/{baseline,clone,resume}` job. A Jobs panel underneath

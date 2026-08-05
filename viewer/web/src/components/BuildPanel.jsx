@@ -174,8 +174,12 @@ export function BuildPanel({ catalog, organism: initialOrganism, onOrganismCreat
         const list = await api.corpora(organism);
         if (cancelled) return;
         setCorpora(list);
-        setForm((current) => (list.some((item) => item.corpus_id === current.corpusId)
-          ? current : { ...current, corpusId: list[0]?.corpus_id ?? "" }));
+        setForm((current) => {
+          const selected = list.find((item) => item.corpus_id === current.corpusId);
+          if (selected && !selected.requires_parent_checkpoint) return current;
+          const baselineCorpus = list.find((item) => !item.requires_parent_checkpoint);
+          return { ...current, corpusId: baselineCorpus?.corpus_id ?? "" };
+        });
       } catch {
         if (!cancelled) setCorpora([]);
       }
@@ -209,6 +213,11 @@ export function BuildPanel({ catalog, organism: initialOrganism, onOrganismCreat
   }, [organism, refreshToken]);
 
   const runOptions = useMemo(() => (factoryRuns?.runs || []).map((r) => r.run), [factoryRuns]);
+  const baselineCorpora = useMemo(
+    () => (corpora || []).filter((item) => !item.requires_parent_checkpoint),
+    [corpora],
+  );
+  const needsBaselineCorpus = corpora !== null && baselineCorpora.length === 0;
   useEffect(() => {
     setForm((current) => (runOptions.includes(current.parentRun) ? current : { ...current, parentRun: runOptions[0] ?? "" }));
   }, [runOptions]);
@@ -237,6 +246,9 @@ export function BuildPanel({ catalog, organism: initialOrganism, onOrganismCreat
     try {
       let entry;
       if (mode === FRESH_MODE) {
+        if (needsBaselineCorpus) {
+          throw new Error("build a generic action-effects corpus before launching a fresh baseline");
+        }
         entry = await api.launchJob("baseline", {
           organism, spec: buildFreshSpec(form, organism), options: launchOptions(form),
         });
@@ -353,34 +365,45 @@ export function BuildPanel({ catalog, organism: initialOrganism, onOrganismCreat
         {mode === FRESH_MODE ? (
           <>
             <h4>Data</h4>
-            {corpora?.length === 0 && (
-              <div className="corpus-bootstrap">
-                <strong>No frozen corpus is available for {organism} yet.</strong>
-                <p>
-                  Build one from a repository corpus spec here. This records and quality-gates the data needed
-                  by both individual trials and evolutionary searches; progress appears in Jobs.
-                </p>
-                <div className="pickers">
-                  <label className="picker">Corpus recipe
-                    <select value={corpusSpecId} onChange={(event) => setCorpusSpecId(event.target.value)} aria-label="Corpus recipe">
-                      {!corpusSpecs?.length && <option value="">{corpusSpecs ? "no corpus recipes found" : "loading…"}</option>}
-                      {corpusSpecs?.map((item) => (
-                        <option key={item.spec_id} value={item.spec_id}>{item.corpus_id}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <button type="button" onClick={handleCorpusBuild} disabled={corpusLaunching || !corpusSpecId}>
-                    {corpusLaunching ? "Starting corpus build…" : "Build corpus"}
-                  </button>
-                </div>
-                {corpusError && <p className="no-data">{corpusError}</p>}
+            <div className="corpus-bootstrap">
+              <strong>
+                {corpora?.length ? `Add another frozen corpus for ${organism}.` : `No frozen corpus is available for ${organism} yet.`}
+              </strong>
+              <p>
+                A fresh baseline requires a generic action-effects corpus. Navigation corpora are fine-tune-only
+                because their retention contract must compare against a parent checkpoint.
+              </p>
+              <div className="pickers">
+                <label className="picker">Corpus recipe
+                  <select value={corpusSpecId} onChange={(event) => setCorpusSpecId(event.target.value)} aria-label="Corpus recipe">
+                    {!corpusSpecs?.length && <option value="">{corpusSpecs ? "no corpus recipes found" : "loading…"}</option>}
+                    {corpusSpecs?.map((item) => (
+                      <option key={item.spec_id} value={item.spec_id}>
+                        {item.corpus_id}{item.requires_parent_checkpoint ? " (fine-tune only)" : " (baseline)"}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button type="button" onClick={handleCorpusBuild} disabled={corpusLaunching || !corpusSpecId}>
+                  {corpusLaunching ? "Starting corpus build…" : "Build corpus"}
+                </button>
               </div>
+              {corpusError && <p className="no-data">{corpusError}</p>}
+            </div>
+            {needsBaselineCorpus && (
+              <p className="no-data">
+                No baseline-compatible corpus exists yet. Choose the generic action-effects recipe above and build it first.
+              </p>
             )}
             <div className="field-grid">
               <label className="field">Corpus
                 <select value={form.corpusId} onChange={(e) => set("corpusId")(e.target.value)} aria-label="Corpus">
                   {!corpora?.length && <option value="">{corpora ? "no corpora found" : "loading…"}</option>}
-                  {corpora?.map((c) => <option key={c.corpus_id} value={c.corpus_id}>{c.corpus_id}</option>)}
+                  {corpora?.map((c) => (
+                    <option key={c.corpus_id} value={c.corpus_id} disabled={c.requires_parent_checkpoint}>
+                      {c.corpus_id}{c.requires_parent_checkpoint ? " (fine-tune only)" : ""}
+                    </option>
+                  ))}
                 </select>
               </label>
               <label className="field">World<input value={form.world} onChange={(e) => set("world")(e.target.value)} /></label>
@@ -506,7 +529,7 @@ export function BuildPanel({ catalog, organism: initialOrganism, onOrganismCreat
         {launchError && <p className="no-data">{launchError}</p>}
         <button
           type="submit"
-          disabled={launching || !organism || (mode === FRESH_MODE ? !form.corpusId : !form.parentRun)}
+          disabled={launching || !organism || (mode === FRESH_MODE ? (!form.corpusId || needsBaselineCorpus) : !form.parentRun)}
         >
           {launching ? "Launching…" : "Launch"}
         </button>

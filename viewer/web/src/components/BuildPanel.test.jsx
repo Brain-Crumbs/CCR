@@ -139,6 +139,50 @@ describe("BuildPanel", () => {
     });
   });
 
+  it("keeps corpus recipes available and blocks a navigation-only fresh baseline", async () => {
+    vi.stubGlobal("fetch", vi.fn((url, init) => {
+      const path = String(url);
+      if (init?.method === "POST" && path === "/api/jobs/corpus") {
+        const body = JSON.parse(init.body);
+        posted.push({ kind: "corpus", body });
+        return jsonResponse({ job_id: "corpus-job", kind: "corpus", status: "running", organism: body.organism, run_ids: [] });
+      }
+      if (path.startsWith("/api/factory-meta")) return jsonResponse(META);
+      if (path.startsWith("/api/corpus-specs")) return jsonResponse({ specs: [
+        {
+          spec_id: "generic-action-effects-v1.yaml", corpus_id: "crafter-generic-action-effects-v1",
+          organism: "Crafter", requires_parent_checkpoint: false,
+        },
+        {
+          spec_id: "goal-navigation-v1.yaml", corpus_id: "crafter-goal-navigation-v1",
+          organism: "Crafter", requires_parent_checkpoint: true,
+        },
+      ] });
+      if (path.startsWith("/api/corpora")) return jsonResponse({ corpora: [{
+        corpus_id: "crafter-goal-navigation-v1", organism: "Crafter",
+        requires_parent_checkpoint: true, session_counts: { train: 16, validation: 8, test: 8 },
+      }] });
+      if (path.startsWith("/api/factory-runs")) return jsonResponse({ organism: "Crafter", runs: [] });
+      if (path.startsWith("/api/jobs")) return jsonResponse({ jobs: [] });
+      return jsonResponse({ error: "unhandled" }, false);
+    }));
+
+    render(<BuildPanel catalog={{ organisms: ["Crafter"], runs: [] }} organism="Crafter" />);
+    await waitFor(() => expect(screen.getByLabelText("Corpus recipe")).toBeInTheDocument());
+
+    expect(screen.getByLabelText("Corpus").value).toBe("");
+    expect([...screen.getByLabelText("Corpus").options].find((option) => option.value === "crafter-goal-navigation-v1")).toBeDisabled();
+    expect(screen.getByText(/No baseline-compatible corpus exists yet/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Launch" })).toBeDisabled();
+    expect(screen.getByLabelText("Corpus recipe").value).toBe("generic-action-effects-v1.yaml");
+
+    fireEvent.click(screen.getByRole("button", { name: "Build corpus" }));
+    await waitFor(() => expect(posted).toEqual([{
+      kind: "corpus",
+      body: { organism: "Crafter", spec_id: "generic-action-effects-v1.yaml" },
+    }]));
+  });
+
   it("creates and selects a new organism without inheriting the Crafter name", async () => {
     const onOrganismCreated = vi.fn();
     render(<BuildPanel catalog={CATALOG} organism="Crafter" onOrganismCreated={onOrganismCreated} />);
