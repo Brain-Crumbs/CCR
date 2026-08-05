@@ -2206,6 +2206,34 @@ def cmd_factory_reconcile(args: argparse.Namespace) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+def cmd_factory_reconcile_kill(args: argparse.Namespace) -> None:
+    """``ccr factory reconcile-kill <run>``: after the caller has itself
+    just killed a run's worker process (e.g. a control plane's forced
+    cancel), atomically transition its state record out of an active state
+    -- ``state.reconcile_after_kill`` never waits on or even checks the
+    heartbeat, unlike ``ccr factory reconcile``'s stale-timeout sweep,
+    since the caller already knows there is no live worker. A no-op
+    (``recovered: false``) if the run was not active to begin with, so
+    calling this after a kill that turns out to have been unnecessary
+    (the worker had already finished on its own) is harmless.
+    """
+    from cognitive_runtime.training.model_factory.state import reconcile_after_kill, state_path
+
+    run_directory = _factory_run_directory(args.root, args.run, args.organism)
+    # reconcile_after_kill's own default reason ("killed_by_operator") is
+    # more useful than a literal None; only override it when --reason was
+    # actually passed, rather than always forwarding argparse's None default.
+    kwargs = {"reason": args.reason} if args.reason is not None else {}
+    result = reconcile_after_kill(state_path(run_directory), to_state=args.state, **kwargs)
+    payload = {
+        "run_id": args.run,
+        "recovered": result is not None,
+        "state": result.state if result else None,
+        "reason": result.reason if result else None,
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
 def cmd_factory_meta(args: argparse.Namespace) -> None:
     """``ccr factory meta``: dump the factory's own declared enums as JSON --
     valid spec modes, training objectives, genome schema versions, and
@@ -3479,6 +3507,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_factory_reconcile.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
                                      help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
     p_factory_reconcile.set_defaults(func=cmd_factory_reconcile)
+
+    p_factory_reconcile_kill = factory_sub.add_parser(
+        "reconcile-kill", help="after killing a run's worker yourself, atomically transition its state "
+                               "out of active (no heartbeat wait, unlike 'reconcile')"
+    )
+    p_factory_reconcile_kill.add_argument("run", help="run id whose worker was just killed")
+    p_factory_reconcile_kill.add_argument("--organism", default=None,
+                                          help="run's organism, only needed if the run id is ambiguous "
+                                               "across organisms under --root")
+    p_factory_reconcile_kill.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                          help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_reconcile_kill.add_argument("--state", default="failed", choices=["failed", "cancelled"],
+                                          help="terminal state to record (default: failed; pass 'cancelled' "
+                                               "when the kill enforces a prior 'factory cancel' request)")
+    p_factory_reconcile_kill.add_argument("--reason", default=None,
+                                          help="optional operator-facing reason recorded in state.json "
+                                               "(default: reconcile_after_kill's own 'killed_by_operator')")
+    p_factory_reconcile_kill.set_defaults(func=cmd_factory_reconcile_kill)
 
     p_factory_meta = factory_sub.add_parser(
         "meta", help="dump the factory's declared modes/objectives/genome schemas/backbones as JSON"

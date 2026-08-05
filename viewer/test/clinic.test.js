@@ -379,6 +379,31 @@ test("job-launch API", async (t) => {
     assert.equal(finished.status, "completed");
   });
 
+  await t.test("baseline/search launches force the temp spec's organism to match the job's, ignoring/overriding a mismatched or missing spec.organism", async (t) => {
+    const runsDir = fixtureRunsDir();
+    const server = createServer({ runsDir }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+    const port = server.address().port;
+
+    // A client that got the two organism fields out of sync (or omitted
+    // spec.organism entirely) must not end up with the CLI subprocess
+    // writing the run under a different directory than the job registry
+    // (and every later GET /api/jobs/POST /cancel lookup) believes it's
+    // in -- Codex review, PR #277.
+    const mismatched = await post(port, "/api/jobs/baseline", {
+      organism: "Test", spec: { organism: "SomethingElse", mode: "fresh" },
+    });
+    assert.equal(mismatched.status, 200);
+    const mismatchedSpecFile = mismatched.body.argv[mismatched.body.argv.indexOf("baseline") + 1];
+    assert.equal(JSON.parse(fs.readFileSync(mismatchedSpecFile, "utf8")).organism, "Test");
+
+    const missing = await post(port, "/api/jobs/search", {
+      organism: "Test", spec: { mode: "fresh" }, options: { population_size: 2 },
+    });
+    assert.equal(missing.status, 200);
+    const missingSpecFile = missing.body.argv[missing.body.argv.indexOf("search") + 1];
+    assert.equal(JSON.parse(fs.readFileSync(missingSpecFile, "utf8")).organism, "Test");
+  });
+
   await t.test("GET /api/jobs/:id/log tails output; unknown and traversal-shaped ids 404, not 500", async (t) => {
     const runsDir = fixtureRunsDir();
     const server = createServer({ runsDir }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());

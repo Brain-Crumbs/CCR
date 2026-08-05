@@ -666,7 +666,7 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
         if (!clinic) return sendJSON(res, 400, { error: "job cancellation requires clinic mode" });
         const jobId = decodeURIComponent(p[2]);
         if (!isPlainId(jobId)) return sendJSON(res, 404, { error: "unknown job id" });
-        const entry = jobs.cancelJob(clinic.runsDir, jobId);
+        const entry = await jobs.cancelJob(clinic.runsDir, jobId);
         if (!entry) return sendJSON(res, 404, { error: "unknown job id" });
         return sendJSON(res, 200, entry);
       }

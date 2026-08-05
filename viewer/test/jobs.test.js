@@ -178,8 +178,16 @@ test("jobs", async (t) => {
       const entry = jobs.launchJob("resume", { organism: "Crafter", run: "slow-run" }, { runsDir });
       await waitFor(() => isProcessRunning(entry.pid) || null, { timeoutMs: 1000 });
 
-      const cancelled = jobs.cancelJob(runsDir, entry.job_id);
+      const startedWaitingAt = Date.now();
+      const cancelled = await jobs.cancelJob(runsDir, entry.job_id);
       assert.equal(cancelled.job_id, entry.job_id);
+      // cancelJob polls (non-blockingly) for the SIGTERM'd subprocess to
+      // actually exit before force-reconciling its state, capped at
+      // killGraceMs (default 3000ms) -- this must return in well under the
+      // full 2000ms FAKE_PYTHON_DELAY_MS a graceful exit would have taken,
+      // proving SIGTERM was honored promptly rather than the call having
+      // simply waited out the fake job's own delay.
+      assert.ok(Date.now() - startedWaitingAt < 1500);
 
       const finished = await waitFor(() => {
         const current = jobs.getJob(runsDir, entry.job_id);
@@ -193,9 +201,25 @@ test("jobs", async (t) => {
     }
   });
 
-  await t.test("cancelJob is a no-op for an unknown job id", () => {
+  await t.test("cancelJob returns promptly (no forced-kill reconciliation) when the subprocess already exited on its own", async () => {
     const runsDir = fixtureRunsRoot();
-    assert.equal(jobs.cancelJob(runsDir, "no-such-job"), null);
+    const entry = jobs.launchJob("resume", { organism: "Crafter", run: "fast-run" }, { runsDir });
+    await waitFor(() => {
+      const current = jobs.getJob(runsDir, entry.job_id);
+      return current.status !== "running" ? current : null;
+    });
+
+    const startedWaitingAt = Date.now();
+    const cancelled = await jobs.cancelJob(runsDir, entry.job_id);
+    assert.equal(cancelled.job_id, entry.job_id);
+    // No live pid to SIGTERM or wait out -- must not pay any of
+    // killGraceMs's grace period.
+    assert.ok(Date.now() - startedWaitingAt < 500);
+  });
+
+  await t.test("cancelJob is a no-op for an unknown job id", async () => {
+    const runsDir = fixtureRunsRoot();
+    assert.equal(await jobs.cancelJob(runsDir, "no-such-job"), null);
   });
 
   await t.test("readJobLog tails new content by byte offset without re-sending what the caller already has", async () => {

@@ -749,6 +749,31 @@ def test_factory_reconcile_reports_nothing_when_no_run_is_stale(tmp_path, capsys
     assert load_state(state_path(run_directory)).state == "running"
 
 
+def test_factory_reconcile_kill_transitions_a_running_run_to_cancelled(tmp_path, capsys):
+    root = tmp_path / "runs"
+    artifacts = _make_run(root, "crafter-baseline-0001", _spec(), state=STATE_RUNNING)
+
+    main(["factory", "reconcile-kill", "--root", str(root), "crafter-baseline-0001", "--state", "cancelled"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "run_id": "crafter-baseline-0001", "recovered": True,
+        "state": "cancelled", "reason": "killed_by_operator",
+    }
+    assert load_state(state_path(artifacts.directory)).state == "cancelled"
+
+
+def test_factory_reconcile_kill_is_a_noop_for_an_already_terminal_run(tmp_path, capsys):
+    root = tmp_path / "runs"
+    artifacts = _make_run(root, "crafter-baseline-0001", _spec(), state=STATE_COMPLETED)
+
+    main(["factory", "reconcile-kill", "--root", str(root), "crafter-baseline-0001", "--state", "cancelled"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"run_id": "crafter-baseline-0001", "recovered": False, "state": None, "reason": None}
+    assert load_state(state_path(artifacts.directory)).state == "completed"
+
+
 # --------------------------------------------------------------------- compare / promote
 
 

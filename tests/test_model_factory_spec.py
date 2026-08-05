@@ -262,6 +262,17 @@ def test_reference_run_without_run_id_is_rejected_naming_the_missing_field():
         resolve(raw)
 
 
+def test_reference_run_without_checkpoint_is_rejected_naming_the_missing_field():
+    """runner._reference_checkpoint_path() indexes reference_run["checkpoint"]
+    unconditionally -- omitting it must fail here, at resolve() time, not
+    surface as a raw KeyError once a trial actually starts (Codex review,
+    PR #277)."""
+    raw = _minimal_raw()
+    raw["evaluation"]["reference_run"] = {"run_id": "crafter-champion-0007", "sha256": "deadbeef"}
+    with pytest.raises(SpecError, match="reference_run.checkpoint"):
+        resolve(raw)
+
+
 def test_reference_run_rejects_an_unknown_key_naming_the_nearest_match():
     raw = _minimal_raw()
     raw["evaluation"]["reference_run"] = {

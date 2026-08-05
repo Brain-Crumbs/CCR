@@ -86,7 +86,17 @@ function writeTempSpec(runsDir, jobId, specDocument) {
  * field is missing); identity validation (does this run/organism/corpus
  * actually exist) is the route handler's job, exactly like server.js's
  * existing read routes already validate organism/run against the
- * enumerated catalog before this is ever called. */
+ * enumerated catalog before this is ever called.
+ *
+ * For baseline/search, body.organism (the job registry's own bookkeeping
+ * field -- what GET /api/jobs and cancelJob key their state.json/heartbeat
+ * lookups on) is force-written into the temp spec document's own
+ * `organism` field before the CLI ever reads it, overriding whatever the
+ * caller put there. The CLI subprocess writes the run under
+ * `<root>/<spec.organism>/<run_id>` regardless of what the registry
+ * believes -- letting the two disagree would silently point every later
+ * status/log/cancel lookup at the wrong (or a nonexistent) directory
+ * (Codex review, PR #277). */
 function buildLaunch(kind, body, { runsDir, jobId }) {
   const options = { ...(body.options || {}) };
   const root = ["--root", path.resolve(runsDir)];
@@ -104,7 +114,7 @@ function buildLaunch(kind, body, { runsDir, jobId }) {
   switch (kind) {
     case "baseline": {
       if (!body.spec) throw new Error("baseline requires a spec document (body.spec)");
-      const specFile = writeTempSpec(runsDir, jobId, body.spec);
+      const specFile = writeTempSpec(runsDir, jobId, { ...body.spec, organism: body.organism });
       return { argv: [specFile, ...root, ...flagsFromOptions(options)], runIds: [options.factory_run_id] };
     }
     case "clone": {
@@ -124,7 +134,7 @@ function buildLaunch(kind, body, { runsDir, jobId }) {
     }
     case "search": {
       if (!body.spec) throw new Error("search requires a spec document (body.spec)");
-      const specFile = writeTempSpec(runsDir, jobId, body.spec);
+      const specFile = writeTempSpec(runsDir, jobId, { ...body.spec, organism: body.organism });
       const prefix = options.run_id_prefix || `job-${jobId}`;
       options.run_id_prefix = prefix;
       const legacyHalving = Array.isArray(options.budgets) && options.budgets.length > 0;
@@ -260,13 +270,33 @@ function listJobs(runsDir, { organism = null } = {}) {
     .sort((a, b) => (b.started_at || "").localeCompare(a.started_at || ""));
 }
 
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
 /** Ask every one of a job's precomputed runs to stop gracefully at their
  * next checkpoint boundary (state.request_cancellation via the CLI, never
  * reimplemented here), then -- since a flag file only helps a worker that
  * is still checking it -- SIGTERM the subprocess itself so a hung or
- * long-idle job still actually stops. Returns the (possibly already
- * terminal) job entry, or null if the job id is unknown. */
-function cancelJob(runsDir, jobId) {
+ * long-idle job still actually stops.
+ *
+ * A SIGTERM'd worker can die before it ever reaches the checkpoint boundary
+ * where it would have honored the cancellation flag itself, which would
+ * otherwise leave state.json reading "running" for a process that no
+ * longer exists until a much-later heartbeat-timeout sweep happens to
+ * notice (Codex review, PR #277). So once the subprocess is confirmed
+ * gone -- polled non-blockingly for up to `killGraceMs`, never a
+ * synchronous sleep, since this runs inside the HTTP server's event loop
+ * and must not stall other requests -- every one of the job's runs is
+ * force-reconciled to "cancelled" via `ccr factory reconcile-kill`
+ * (state.reconcile_after_kill: unconditional on the heartbeat, a no-op if
+ * a run had already reached a terminal state on its own first). If the
+ * worker ignores SIGTERM and is still alive once the grace period elapses,
+ * state.json is left alone rather than risk marking a still-running trial
+ * "cancelled"; the stale-worker watchdog remains the eventual backstop for
+ * that case, same as it always was.
+ *
+ * Returns the (possibly already terminal) job entry, or null if the job id
+ * is unknown. */
+async function cancelJob(runsDir, jobId, { killGraceMs = 3000, pollIntervalMs = 50 } = {}) {
   const entry = getJob(runsDir, jobId);
   if (!entry) return null;
   for (const runId of entry.run_ids) {
@@ -277,6 +307,18 @@ function cancelJob(runsDir, jobId) {
   }
   if (isAlive(entry.pid)) {
     try { process.kill(entry.pid, "SIGTERM"); } catch { /* already gone */ }
+    const deadline = Date.now() + killGraceMs;
+    while (isAlive(entry.pid) && Date.now() < deadline) {
+      await sleep(pollIntervalMs);
+    }
+    if (!isAlive(entry.pid)) {
+      for (const runId of entry.run_ids) {
+        spawnSync(pythonCommand(), [
+          "-m", "cognitive_runtime.cli", "factory", "reconcile-kill", runId,
+          "--root", path.resolve(runsDir), "--organism", entry.organism, "--state", "cancelled",
+        ], { cwd: REPO_DIR });
+      }
+    }
   }
   return entry;
 }

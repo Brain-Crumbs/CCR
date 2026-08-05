@@ -525,7 +525,12 @@ def _validate_evaluation(evaluation: Mapping[str, Any]) -> None:
     reference_run = evaluation.get("reference_run")
     if reference_run is not None:
         _check_unknown_keys("evaluation.reference_run", reference_run, REFERENCE_RUN_KEYS)
-        for required in ("run_id", "sha256"):
+        # "checkpoint" is required alongside run_id/sha256, not merely
+        # optional metadata: runner._reference_checkpoint_path() indexes
+        # reference_run["checkpoint"] unconditionally, so omitting it here
+        # would pass resolve()/validate() cleanly and then crash with a raw
+        # KeyError at trial startup instead of this clear SpecError.
+        for required in ("run_id", "checkpoint", "sha256"):
             if not reference_run.get(required):
                 raise SpecError(f"'evaluation.reference_run.{required}' is required when 'reference_run' is set")
 

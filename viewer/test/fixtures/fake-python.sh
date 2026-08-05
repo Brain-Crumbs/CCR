@@ -27,15 +27,18 @@ case " $* " in
 esac
 
 # The delay only applies to a training-style invocation (baseline/search/
-# clone/resume/breed) -- never to "factory cancel"/"factory reconcile",
-# exactly like the real CLI: a cancellation request is a fast flag-file
-# write regardless of how long the run it targets has been training.
-# cancelJob's own cancel sub-call goes through this same fake python, so
-# without this distinction it would block for the launched job's entire
-# fake delay before ever reaching its SIGTERM fallback.
+# clone/resume/breed) -- never to "factory cancel"/"factory reconcile"/
+# "factory reconcile-kill", exactly like the real CLI: a cancellation
+# request or a state-file reconciliation is a fast local write regardless
+# of how long the run it targets has been training. cancelJob's own
+# cancel/reconcile-kill sub-calls go through this same fake python, so
+# without this distinction they would block for the launched job's entire
+# fake delay -- "reconcile-kill" is its own case (not covered by
+# "reconcile"'s own pattern below) since it is one hyphenated argv token,
+# not "reconcile" followed by a separate "kill" word.
 echo "argv: $*"
 case " $* " in
-  *" cancel "*|*" reconcile "*) ;;
+  *" cancel "*|*" reconcile "*|*" reconcile-kill "*) ;;
   *) if [ -n "$FAKE_PYTHON_DELAY_MS" ]; then
        sleep "$(awk "BEGIN { print $FAKE_PYTHON_DELAY_MS / 1000 }")"
      fi ;;
