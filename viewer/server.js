@@ -346,6 +346,28 @@ function registryDocument(runsDir, organism) {
   return fs.existsSync(file) ? readJSON(file, null) : { format: "model-factory-registry-v1", slots: {} };
 }
 
+/** Every architecture (NAS) campaign's live progress document for one
+ * organism (`architecture_search.campaign_progress_path`).
+ *
+ * The nested campaign is the one workflow whose shape cannot be recovered
+ * from run ids: an architecture retained into the next outer generation is
+ * deliberately not re-run, so it allocates no runs under that generation's
+ * prefix and is indistinguishable, from run directories alone, from one the
+ * campaign has not reached yet. The campaign publishes its own retention and
+ * breeding decisions as it makes them; this route just hands them over. A
+ * campaign that never wrote one (an older run, or a read-only root) simply
+ * isn't listed, and the board falls back to what run ids do say. */
+function architectureCampaignsDocument(runsDir, organism) {
+  const dir = path.join(runsDir, organism, ".architecture-campaigns");
+  if (!fs.existsSync(dir)) return { organism, campaigns: [] };
+  const campaigns = fs.readdirSync(dir)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => readJSON(path.join(dir, name), null))
+    .filter((document) => document?.format === "model-factory-architecture-campaign-progress-v1")
+    .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+  return { organism, campaigns };
+}
+
 /** The Factory tab's organism-wide state view (state.json's convention,
  * `run_directory/state.json`) -- what's queued/running/completed/failed
  * across every run under an organism, which the champion registry alone
@@ -662,6 +684,16 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
         // into a filesystem path, so only a catalogued value is trusted.
         if (!clinic.catalog().some((entry) => entry.organism === organism)) return sendJSON(res, 404, { error: "unknown organism" });
         return sendJSON(res, 200, factoryRunsDocument(clinic.runsDir, organism));
+      }
+      if (p.length === 2 && p[1] === "architecture-campaigns") {
+        if (!clinic) return sendJSON(res, 400, { error: "architecture campaigns require clinic mode" });
+        const organism = url.searchParams.get("organism");
+        if (!organism) return sendJSON(res, 400, { error: "select an organism" });
+        // Same containment discipline as /api/registry and /api/factory-runs:
+        // organism is joined into a filesystem path, so only a catalogued
+        // value is trusted.
+        if (!clinic.catalog().some((entry) => entry.organism === organism)) return sendJSON(res, 404, { error: "unknown organism" });
+        return sendJSON(res, 200, architectureCampaignsDocument(clinic.runsDir, organism));
       }
       if (p.length === 3 && p[1] === "jobs") {
         if (req.method !== "POST") return sendJSON(res, 405, { error: "method not allowed" });

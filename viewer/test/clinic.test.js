@@ -335,6 +335,56 @@ test("frame endpoint maps ordered decision windows in one forward pass", async (
   assert.deepEqual(result.body.frames.map((frame) => frame.tick), [10, 11, 12]);
 });
 
+test("/api/architecture-campaigns serves a nested campaign's own retention decisions", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-arch-campaigns-"));
+  const runsDir = path.join(root, "runs");
+  const run = path.join(runsDir, "Test", "arch7-arch0-a0-p0-c0");
+  fs.mkdirSync(run, { recursive: true });
+  fs.writeFileSync(path.join(run, "experiment.json"), JSON.stringify({ organism: "Test", experiment_id: "arch7-arch0-a0-p0-c0" }));
+  const campaigns = path.join(runsDir, "Test", ".architecture-campaigns");
+  fs.mkdirSync(campaigns, { recursive: true });
+  fs.writeFileSync(path.join(campaigns, "arch7.json"), JSON.stringify({
+    format: "model-factory-architecture-campaign-progress-v1",
+    campaign_id: "arch7", organism: "Test", complete: false, updated_at: "2026-01-03T00:00:00Z",
+    generations: [{ generation_index: 0, complete: true, results: [], survivor_architecture_ids: ["arch7-arch0-a0"], offspring_architecture_ids: [] }],
+  }));
+  fs.writeFileSync(path.join(campaigns, "arch1.json"), JSON.stringify({
+    format: "model-factory-architecture-campaign-progress-v1",
+    campaign_id: "arch1", organism: "Test", complete: true, updated_at: "2026-01-01T00:00:00Z", generations: [],
+  }));
+  // Neither a progress document: a half-written file and something else's
+  // manifest that happens to share the directory must not be served as one.
+  fs.writeFileSync(path.join(campaigns, "broken.json"), "{ not json");
+  fs.writeFileSync(path.join(campaigns, "other.json"), JSON.stringify({ format: "something-else-v1" }));
+
+  const server = createServer({ runsDir }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+  const port = server.address().port;
+
+  const result = await get(port, "/api/architecture-campaigns?organism=Test");
+  assert.equal(result.status, 200);
+  assert.deepEqual(result.body.campaigns.map((c) => c.campaign_id), ["arch7", "arch1"]);
+  assert.deepEqual(result.body.campaigns[0].generations[0].survivor_architecture_ids, ["arch7-arch0-a0"]);
+
+  // The dot-directory holding them is inert to the run catalog, which is
+  // the whole reason it lives there rather than beside the runs.
+  const catalog = await get(port, "/api/catalog");
+  assert.deepEqual(catalog.body.runs.map((r) => r.run), ["arch7-arch0-a0-p0-c0"]);
+
+  // Same containment discipline as the sibling organism-scoped reads.
+  assert.equal((await get(port, "/api/architecture-campaigns?organism=../../etc")).status, 404);
+  assert.equal((await get(port, "/api/architecture-campaigns")).status, 400);
+
+  // An organism that never ran one answers with an empty list, not a 404.
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-arch-empty-"));
+  fs.mkdirSync(path.join(empty, "runs", "Test", "run-a"), { recursive: true });
+  fs.writeFileSync(path.join(empty, "runs", "Test", "run-a", "experiment.json"), JSON.stringify({ organism: "Test", experiment_id: "run-a" }));
+  const bare = createServer({ runsDir: path.join(empty, "runs") });
+  await new Promise((r) => bare.listen(0, r)); t.after(() => bare.close());
+  const bareResult = await get(bare.address().port, "/api/architecture-campaigns?organism=Test");
+  assert.equal(bareResult.status, 200);
+  assert.deepEqual(bareResult.body.campaigns, []);
+});
+
 test("dream strip endpoint serves the Phase 4 export independently per episode", async (t) => {
   const server = createServer({ dataDir: fixture() }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
   const result = await get(server.address().port, "/api/sessions/pixel-session/episodes/episode_00000/predictions?kind=dream");

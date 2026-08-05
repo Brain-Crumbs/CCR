@@ -150,6 +150,26 @@ function buildLaunch(kind, body, { runsDir, jobId }) {
       options.run_id_prefix = prefix;
       const legacyHalving = Array.isArray(options.budgets) && options.budgets.length > 0;
       const populationSize = Math.max(1, Number(options.population_size ?? options.candidates ?? 8));
+      if (options.genome === "architecture") {
+        // The nested NAS campaign (--genome architecture) runs a complete
+        // inner campaign per architecture, under
+        // `architecture_search.architecture_run_id_prefix`'s own
+        // `{prefix}-arch{gen}-a{cand}` inner prefix -- so an inner run id
+        // reads `{prefix}-arch0-a{arch}-p0-c{cand}`. Outer generation 0's
+        // architectures are all sampled up front (never bred), which makes
+        // that whole first slab precomputable, on the same "first
+        // population only" reasoning as the flat case below: a later outer
+        // generation carries retained architectures forward under their
+        // *original* generation's ids and only breeds the rest.
+        const outerSize = Math.max(1, Number(options.outer_population_size ?? 4));
+        const runIds = [];
+        for (let architecture = 0; architecture < outerSize; architecture += 1) {
+          for (let candidate = 0; candidate < populationSize; candidate += 1) {
+            runIds.push(`${prefix}-arch0-a${architecture}-p0-c${candidate}`);
+          }
+        }
+        return { argv: [specFile, ...root, ...flagsFromOptions(options)], runIds };
+      }
       // Only the first population/rung is reliably precomputable without
       // reimplementing search.py's own survivor-selection/breeding
       // decisions in JS: a carried-forward survivor keeps its *original*

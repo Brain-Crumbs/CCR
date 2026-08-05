@@ -134,6 +134,43 @@ Per selected organism/run, tabbed by concern:
   offspring slot and names the survivors from the offspring's own
   `lineage.json` parents. It re-reads only what the campaign wrote to disk;
   no selection or breeding decision is re-derived in the browser.
+
+  An **Architecture (NAS)** toggle switches the tab to the nested campaign
+  (`ccr factory search --genome architecture`): an outer evolutionary loop
+  over model architectures, each scored by a complete inner training-gene
+  campaign of its own. The outer loop gets its own schema registry
+  (`architecture_genome.ARCHITECTURE_GENOME_SCHEMAS`, offered separately
+  from the training schemas because the two are mutually exclusive by
+  construction), population size, generations and mutation rate; the
+  existing population/generation/mutation fields keep their meaning as that
+  *inner* campaign's parameters, exactly as the CLI declares them. Because
+  the two budgets multiply, the cost bound
+  (`outer_size × outer_generations × inner_size × inner_generations`, times
+  the base spec's own `training.max_training_seconds`) is stated as a figure
+  rather than a hint, and **Launch campaign** stays disabled until an
+  explicit checkbox acknowledges it -- any edit that changes the cost
+  withdraws the acknowledgement. The dry run is free and stays available
+  either way; once it returns, the figure quoted is
+  `architecture_search.estimate_cost`'s own rather than the client-side one.
+  After launch an **architecture board** replaces the population board:
+  one row per architecture per outer generation, with its inner campaign's
+  aggregate state and best selection-metric value, each expandable into that
+  architecture's own population grid (the same component, fed from the one
+  organism-wide poll rather than opening a poller per expanded row).
+
+  Retention is the one campaign fact run ids cannot express: an architecture
+  retained into the next outer generation is deliberately not re-trained, so
+  it allocates no runs under that generation's prefix and is
+  indistinguishable, from run directories alone, from one the campaign has
+  not reached yet. So the campaign publishes its own decisions as it makes
+  them, to `<runs>/<organism>/.architecture-campaigns/<campaign>.json`
+  (`architecture_search.campaign_progress_path`; a dot-directory, inert to
+  the run catalog scan), served by `GET /api/architecture-campaigns`. The
+  board reads carried/retained/eliminated from it -- a carried slot is
+  labelled as such, names the architecture whose evidence it carries, and
+  opens onto the inner grid that architecture already ran. A campaign that
+  never published one (an older run, a read-only root) still renders from
+  run ids alone, just without naming its carried slots.
 - **Breed** -- cross two completed runs of one organism into a single
   explicit-lineage child (`ccr factory breed`). Both parent pickers offer
   only `completed` runs, because breeding reads a parent's frozen genome and
@@ -172,7 +209,7 @@ viewer/
     src/
       lib/             # pure data transforms (frame/prediction math, diagnostics, actions, format)
       hooks/           # usePixelHorizonData, useDarkMode
-      components/      # PixelHorizonViewer, SeenFramePanel, ActionTimeline, EEGPanel, BuildPanel, EvolvePanel, PopulationBoard, BreedPanel, JobsPanel, ...
+      components/      # PixelHorizonViewer, SeenFramePanel, ActionTimeline, EEGPanel, BuildPanel, EvolvePanel, PopulationBoard, ArchitectureBoard, BreedPanel, JobsPanel, ...
       App.jsx
   test/                # server.js contract tests (node:test)
 ```
@@ -242,6 +279,7 @@ see Security above before exposing them beyond localhost.
 | `GET /api/experiments?organism=&run=` | the run's Model Factory manifests as-is: `trial_spec`, `contracts`, `lineage`, `data_manifest`, `execution`, `experiment_report`, and `metrics.{validation,test,comparison}` |
 | `GET /api/registry?organism=` | the organism's champion registry (`registry.json`) |
 | `GET /api/factory-runs?organism=` | every run under the organism with its lineage mode, `state.json` state/reason/updated_at, promotion outcome, its own `selection_metric` resolved to a `selection_metric_value` from `metrics/validation.json` (`null` until evaluated), and its `lineage.json` `configuration_parents` -- queued/running/completed/failed across the whole Factory build, not just promoted runs |
+| `GET /api/architecture-campaigns?organism=` | every nested architecture (NAS) campaign's live progress document for the organism, newest first -- the outer loop's own retention/carry/breeding decisions as it makes them, which run ids alone cannot express (a retained architecture is not re-run, so it allocates no runs under the later generation's prefix). Empty for an organism that never ran one |
 | `GET /api/sessions?organism=&run=&name=&...filters` | recordings for the selected run, with quality verdicts |
 | `GET /api/sessions/:id` | one session's streams, decisions, exports, and quality verdict |
 | `GET /api/sessions/:id/episodes/:eid/{streams,decisions,frames,predictions}` | per-episode records; `predictions` accepts `?kind=dream` and `?experiment=` |
@@ -251,7 +289,7 @@ see Security above before exposing them beyond localhost.
 | `POST /api/jobs/:id/cancel` | asks every one of the job's runs to stop gracefully, then `SIGTERM`s the subprocess |
 | `GET /api/corpora?organism=` | frozen Model Factory corpora under `--corpus-root` (id, data contract hash, session counts per split) |
 | `POST /api/preview/{search,breed}` | the same CLI invocation a launch would use, plus `--dry-run` -- candidate specs or the resolved child + lineage, no run allocated |
-| `GET /api/factory-meta` | the factory's own declared modes/objectives/genome schema versions/backbones (`ccr factory meta`), so a form can source its options from the backend instead of duplicating them |
+| `GET /api/factory-meta` | the factory's own declared modes/objectives/genome schema versions (training *and* architecture)/backbone presets (`ccr factory meta`), so a form can source its options from the backend instead of duplicating them |
 
 ## Reusing PixelHorizonViewer
 
