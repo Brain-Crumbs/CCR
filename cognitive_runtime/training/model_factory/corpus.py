@@ -16,7 +16,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import yaml
 
@@ -990,6 +990,63 @@ def resolve_corpus(
     return ResolvedCorpus(str(manifest.get("corpus_id", corpus_id)), directory, manifest, data_contract)
 
 
+def list_corpora(
+    root: Union[str, Path, None] = None, organism: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """List every frozen corpus under ``root`` (default ``corpora``), or
+    just ``organism``'s, as a lightweight summary for a picker UI.
+
+    No session content is re-hashed -- contrast :func:`resolve_corpus`,
+    which authenticates every session on every call and would be far too
+    expensive to run once per corpus just to list them. Returns one entry
+    per corpus with a readable ``corpus_manifest.json``:
+    ``{"corpus_id", "organism", "data_contract_hash", "session_counts":
+    {"train": N, "validation": N, "test": N}}``. A manifest that fails to
+    parse is skipped rather than raising, since listing must survive one
+    corrupt/partial corpus directory without hiding every other one.
+    """
+    base = Path(root) if root is not None else Path("corpora")
+    if not base.is_dir():
+        return []
+    organism_dirs = (
+        [base / organism] if organism is not None
+        else sorted(path for path in base.iterdir() if path.is_dir())
+    )
+    corpora: List[Dict[str, Any]] = []
+    for organism_dir in organism_dirs:
+        if not organism_dir.is_dir():
+            continue
+        for corpus_dir in sorted(organism_dir.iterdir()):
+            manifest_path = corpus_dir / "corpus_manifest.json"
+            if not manifest_path.is_file():
+                continue
+            try:
+                with manifest_path.open(encoding="utf-8") as handle:
+                    manifest = json.load(handle)
+                if not isinstance(manifest, Mapping) or manifest.get("format") != CORPUS_MANIFEST_FORMAT:
+                    continue
+                sessions = manifest.get("sessions")
+                if not isinstance(sessions, Mapping):
+                    sessions = {}
+                corpora.append({
+                    "corpus_id": str(manifest.get("corpus_id", corpus_dir.name)),
+                    "organism": organism_dir.name,
+                    "data_contract_hash": manifest.get("data_contract_hash"),
+                    "session_counts": {
+                        split: len(sessions.get(split) or [])
+                        for split in ("train", "validation", "test")
+                    },
+                })
+            # A manifest that is valid JSON but the wrong shape (e.g. a
+            # top-level list, or a non-list session entry) must be skipped
+            # like any other corrupt/partial corpus directory, not abort
+            # the whole listing and hide every other corpus (Codex review,
+            # PR #277).
+            except (json.JSONDecodeError, OSError, TypeError, AttributeError):
+                continue
+    return corpora
+
+
 __all__ = [
     "CORPUS_SPEC_FORMAT",
     "CORPUS_MANIFEST_FORMAT",
@@ -1000,4 +1057,5 @@ __all__ = [
     "build_corpus",
     "load_corpus_spec",
     "resolve_corpus",
+    "list_corpora",
 ]

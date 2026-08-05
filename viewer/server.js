@@ -2,24 +2,38 @@
 /** Read-only clinic service over streams-v2 Record sessions. */
 "use strict";
 
+const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const jobs = require("./lib/jobs");
 
 const PUBLIC_DIR = path.join(__dirname, "public");
 const REPO_DIR = path.join(__dirname, "..");
 
 function parseArgs(argv) {
-  const args = { dataDir: null, runsDir: null, episodeCacheDir: null, corpusRoot: null, port: 8787 };
+  const args = {
+    dataDir: null, runsDir: null, episodeCacheDir: null, corpusRoot: null, port: 8787,
+    // The job-launch API (POST /api/jobs/*, /api/preview/*) is unauthenticated,
+    // so the server binds to localhost only unless an operator explicitly
+    // opts into wider exposure -- see viewer/README.md's Security section.
+    // Node's own http.Server.listen(port, callback) (no host argument, the
+    // shape this file used before --host existed) binds every interface, not
+    // just localhost, despite the startup message printing a localhost URL.
+    host: "127.0.0.1",
+    maxConcurrentJobs: 2,
+  };
   for (let i = 2; i < argv.length; i++) {
     if (argv[i] === "--data-dir") args.dataDir = argv[++i];
     else if (argv[i] === "--runs-dir") args.runsDir = argv[++i];
     else if (argv[i] === "--episode-cache-dir") args.episodeCacheDir = argv[++i];
     else if (argv[i] === "--corpus-root") args.corpusRoot = argv[++i];
     else if (argv[i] === "--port") args.port = Number(argv[++i]);
+    else if (argv[i] === "--host") args.host = argv[++i];
+    else if (argv[i] === "--max-concurrent-jobs") args.maxConcurrentJobs = Number(argv[++i]);
     else if (argv[i] === "--help" || argv[i] === "-h") {
-      console.log("usage: node server.js [--runs-dir <runs dir>] [--episode-cache-dir <cache dir>] [--corpus-root <corpora dir>] [--data-dir <sessions dir>] [--port 8787]");
+      console.log("usage: node server.js [--runs-dir <runs dir>] [--episode-cache-dir <cache dir>] [--corpus-root <corpora dir>] [--data-dir <sessions dir>] [--port 8787] [--host 127.0.0.1] [--max-concurrent-jobs 2]");
       process.exit(0);
     }
   }
@@ -122,6 +136,65 @@ function inside(root, candidate) {
   return resolved === base || resolved.startsWith(base + path.sep);
 }
 
+/** A client-chosen identifier that will be joined into a run directory path
+ * (a fresh job's run id, a search campaign's run-id prefix, a job id read
+ * back out of a URL) is restricted to the same safe character class
+ * makeStore's own sessionDir uses for session ids. Unlike an organism or an
+ * existing run -- both checked against the already-enumerated catalog --
+ * these name something that doesn't exist yet, so there is no catalog to
+ * check them against; a character-class guard is the equivalent floor. */
+function isPlainId(value) {
+  return typeof value === "string" && /^[\w.-]+$/.test(value) && value !== "." && value !== "..";
+}
+
+/** organism/run/parent_a/parent_b/run_id/run_id_prefix validation shared by
+ * every route that hands a client-supplied job body to jobs.buildLaunch --
+ * a real launch and a dry-run preview carry the same path-safety
+ * requirements, since both end up shelling a subprocess out with these
+ * values. Returns an {status, error} pair to send on failure, or null once
+ * body clears every check. */
+function validateJobBody(clinic, body) {
+  if (!body.organism) return { status: 400, error: "select an organism" };
+  if (!clinic.catalog().some((entry) => entry.organism === body.organism)) {
+    return { status: 404, error: "unknown organism" };
+  }
+  for (const field of ["run", "parent_a", "parent_b"]) {
+    if (typeof body[field] !== "string") continue;
+    if (!clinic.catalog().some((entry) => entry.organism === body.organism && entry.run === body[field])) {
+      return { status: 404, error: `unknown ${field}: ${body[field]}` };
+    }
+  }
+  if (body.run_id !== undefined && !isPlainId(body.run_id)) {
+    return { status: 400, error: "run_id must be a plain identifier" };
+  }
+  if (body.options?.run_id_prefix !== undefined && !isPlainId(body.options.run_id_prefix)) {
+    return { status: 400, error: "options.run_id_prefix must be a plain identifier" };
+  }
+  // `search --champion/--reference-run` name *existing* runs the CLI
+  // subprocess resolves into directories under --root, exactly like the
+  // positional run/parent_a/parent_b above, so they get the same
+  // already-enumerated-catalog check rather than being passed through.
+  for (const field of ["champion", "reference_run"]) {
+    const value = body.options?.[field];
+    if (typeof value !== "string" || !value) continue;
+    if (!clinic.catalog().some((entry) => entry.organism === body.organism && entry.run === value)) {
+      return { status: 404, error: `unknown options.${field}: ${value}` };
+    }
+  }
+  // A checkpoint file name is joined into `<run>/checkpoints/<name>` by the
+  // CLI (breed's --checkpoint-a/--checkpoint-b are two more of exactly
+  // these, one per parent). There is no catalog of checkpoint names to
+  // check against, so the character-class floor applies -- the same
+  // reasoning isPlainId documents for a not-yet-existing run id.
+  for (const field of ["checkpoint", "reference_checkpoint", "checkpoint_a", "checkpoint_b"]) {
+    const value = body.options?.[field];
+    if (value !== undefined && value !== null && !isPlainId(value)) {
+      return { status: 400, error: `options.${field} must be a plain identifier` };
+    }
+  }
+  return null;
+}
+
 function runCatalog(runsDir) {
   if (!fs.existsSync(runsDir)) return [];
   return fs.readdirSync(runsDir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).flatMap((organism) => {
@@ -181,6 +254,69 @@ function runSummary(entry) {
   };
 }
 
+/** runner._SELECTION_METRIC_RE / runner._GOAL_NAVIGATION_METRICS, mirrored
+ * for the one read below. */
+const SELECTION_METRIC_RE = /^(rollout|direct)\.t\+(\d+)\.([a-zA-Z_][a-zA-Z0-9_]*)$/;
+const GOAL_NAVIGATION_METRICS = new Set(["success_rate", "geodesic_efficiency", "collision_rate", "replan_recovery"]);
+
+/** Python's ``round`` -- round-half-to-even -- not JavaScript's
+ * ``Math.round``, which breaks a tie away from zero instead. Mirrored
+ * exactly because the line below reproduces
+ * ``action_world_model.horizons_ticks_to_frames``' own tick-to-frame key
+ * derivation: at a ticks_per_frame that lands a horizon precisely on .5
+ * (2 ticks/frame with a 5-tick horizon, say) the two roundings disagree,
+ * and this would then look up a horizon key the run never recorded and
+ * report "no metric yet" for a run that has one. */
+function pythonRound(value) {
+  const floor = Math.floor(value), remainder = value - floor;
+  if (remainder > 0.5) return floor + 1;
+  if (remainder < 0.5) return floor;
+  return floor % 2 === 0 ? floor : floor + 1;
+}
+
+/** Resolve one run's own ``evaluation.selection_metric`` against its
+ * persisted ``metrics/validation.json`` -- the single number the
+ * evolutionary campaign actually selected that candidate on, which
+ * state.json alone cannot answer.
+ *
+ * A port of ``runner._resolve_selection_metric``'s *scalar* half only (its
+ * per-episode paired-comparison series has no reader here), keyed the same
+ * way: a ``direct.t+N.*`` horizon is tick-denominated as written, while a
+ * ``rollout.t+N.*`` horizon is recorded in frames and needs the run's own
+ * ``contracts.json`` ticks_per_frame to convert -- the same two files
+ * ``registry._load_validation_for_candidate`` reads for exactly this
+ * purpose. Anything unresolvable (no validation.json yet, a horizon that
+ * was not evaluated, a metric shape this port does not cover) is reported
+ * as ``null`` rather than guessed at: a still-running candidate simply has
+ * no metric yet, and the board renders that honestly. */
+function selectionMetric(dir) {
+  const validation = readJSON(path.join(dir, "metrics", "validation.json"), null);
+  const metric = typeof validation?.selection_metric === "string" ? validation.selection_metric : null;
+  if (!metric) return { selection_metric: null, selection_metric_value: null };
+  return { selection_metric: metric, selection_metric_value: resolveSelectionMetric(validation, metric, dir) };
+}
+
+function resolveSelectionMetric(validation, metric, dir) {
+  const finite = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
+  const navigationPrefix = "goal_navigation.";
+  if (metric.startsWith(navigationPrefix)) {
+    const name = metric.slice(navigationPrefix.length);
+    if (!GOAL_NAVIGATION_METRICS.has(name)) return null;
+    return finite(validation.goal_navigation?.[name]);
+  }
+  const match = SELECTION_METRIC_RE.exec(metric);
+  if (!match) return null;
+  const [, report, ticksText, stat] = match;
+  let horizonKey = Number(ticksText);
+  if (report !== "direct") {
+    const contracts = readJSON(path.join(dir, "contracts.json"), null);
+    const ticksPerFrame = Number(contracts?.data_contract?.ticks_per_frame);
+    if (!Number.isFinite(ticksPerFrame) || ticksPerFrame <= 0) return null;
+    horizonKey = Math.max(1, pythonRound(horizonKey / ticksPerFrame));
+  }
+  return finite(validation[report]?.horizons?.[String(horizonKey)]?.[stat]);
+}
+
 const ARTIFACT_FILES = [
   "experiment.json", "trial_spec.json", "contracts.json", "lineage.json",
   "data_manifest.json", "execution.json", "experiment_report.json",
@@ -210,6 +346,28 @@ function registryDocument(runsDir, organism) {
   return fs.existsSync(file) ? readJSON(file, null) : { format: "model-factory-registry-v1", slots: {} };
 }
 
+/** Every architecture (NAS) campaign's live progress document for one
+ * organism (`architecture_search.campaign_progress_path`).
+ *
+ * The nested campaign is the one workflow whose shape cannot be recovered
+ * from run ids: an architecture retained into the next outer generation is
+ * deliberately not re-run, so it allocates no runs under that generation's
+ * prefix and is indistinguishable, from run directories alone, from one the
+ * campaign has not reached yet. The campaign publishes its own retention and
+ * breeding decisions as it makes them; this route just hands them over. A
+ * campaign that never wrote one (an older run, or a read-only root) simply
+ * isn't listed, and the board falls back to what run ids do say. */
+function architectureCampaignsDocument(runsDir, organism) {
+  const dir = path.join(runsDir, organism, ".architecture-campaigns");
+  if (!fs.existsSync(dir)) return { organism, campaigns: [] };
+  const campaigns = fs.readdirSync(dir)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => readJSON(path.join(dir, name), null))
+    .filter((document) => document?.format === "model-factory-architecture-campaign-progress-v1")
+    .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")));
+  return { organism, campaigns };
+}
+
 /** The Factory tab's organism-wide state view (state.json's convention,
  * `run_directory/state.json`) -- what's queued/running/completed/failed
  * across every run under an organism, which the champion registry alone
@@ -227,10 +385,94 @@ function factoryRunsDocument(runsDir, organism) {
         state_reason: state?.reason ?? null,
         updated_at: state?.updated_at ?? null,
         promoted: runSummary(entry).promotion.promoted,
+        // The Evolve tab's population board needs two things state.json
+        // cannot answer: what each candidate scored on the campaign's own
+        // selection metric, and (for a bred offspring) which two survivors
+        // it came from -- lineage.json's `configuration_parents`, which is
+        // how the board reconstructs a generation's survivor set at all,
+        // since a carried-forward survivor keeps its *original* run id
+        // rather than taking a fresh slot-shaped one (see search.py).
+        ...selectionMetric(entry.dir),
+        configuration_parents: Array.isArray(lineage?.configuration_parents) ? lineage.configuration_parents : [],
       };
     })
     .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
   return { organism, runs };
+}
+
+/** A launched job's precomputed run_ids augmented with each run's live
+ * state.json/heartbeat.json, reusing factoryRunsDocument's own read
+ * pattern -- the job registry only knows what it launched (argv, pid, exit
+ * code), not how far training has actually gotten. heartbeat_seconds is
+ * passed through exactly as state.write_heartbeat persists it (raw epoch
+ * seconds), not reshaped into an ISO string that isn't really there. */
+function jobRunStates(runsDir, organism, runIds) {
+  return runIds.map((runId) => {
+    const dir = path.join(runsDir, organism, runId);
+    const state = readJSON(path.join(dir, "state.json"), null);
+    const heartbeat = readJSON(path.join(dir, "heartbeat.json"), null);
+    return {
+      run_id: runId,
+      state: state?.state ?? null,
+      state_reason: state?.reason ?? null,
+      updated_at: state?.updated_at ?? null,
+      heartbeat_seconds: heartbeat?.heartbeat_seconds ?? null,
+    };
+  });
+}
+
+const CORPUS_MANIFEST_FORMAT = "model-factory-corpus-manifest-v1";
+
+/** server.js's own port of corpus.list_corpora -- a pure read of
+ * corpus_manifest.json files the Python side already wrote, mirroring that
+ * function's exact behavior (including which malformed manifests get
+ * silently skipped rather than hiding every other corpus) instead of
+ * shelling out to Python for something this file can already read
+ * directly, the same "read Python-written JSON directly" convention
+ * runArtifacts documents above. */
+function corpusCatalog(corpusRoot, organism = null) {
+  if (!fs.existsSync(corpusRoot)) return [];
+  const organismDirs = organism !== null
+    ? [{ name: organism, dir: path.join(corpusRoot, organism) }]
+    : fs.readdirSync(corpusRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => ({ name: entry.name, dir: path.join(corpusRoot, entry.name) }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+  const corpora = [];
+  for (const { name, dir } of organismDirs) {
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) continue;
+    const corpusNames = fs.readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+    for (const corpusName of corpusNames) {
+      const manifestPath = path.join(dir, corpusName, "corpus_manifest.json");
+      if (!fs.existsSync(manifestPath)) continue;
+      const manifest = readJSON(manifestPath, null);
+      if (!manifest || typeof manifest !== "object" || manifest.format !== CORPUS_MANIFEST_FORMAT) continue;
+      const sessions = manifest.sessions && typeof manifest.sessions === "object" && !Array.isArray(manifest.sessions) ? manifest.sessions : {};
+      corpora.push({
+        corpus_id: String(manifest.corpus_id ?? corpusName),
+        organism: name,
+        data_contract_hash: manifest.data_contract_hash ?? null,
+        session_counts: Object.fromEntries(["train", "validation", "test"].map((split) => [
+          split, Array.isArray(sessions[split]) ? sessions[split].length : 0,
+        ])),
+      });
+    }
+  }
+  return corpora;
+}
+
+/** The factory's own declared modes/objectives/genome schemas/backbones
+ * (`ccr factory meta`, torch-free) -- shelled out to rather than
+ * hardcoded/duplicated here, so the clinic's Build/Evolve forms always
+ * reflect whatever the backend actually accepts. */
+function factoryMeta() {
+  const result = spawnSync(jobs.pythonCommand(), ["-m", "cognitive_runtime.cli", "factory", "meta"], {
+    cwd: REPO_DIR, encoding: "utf8", env: process.env,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error((result.stderr || result.stdout || "ccr factory meta failed").trim());
+  return JSON.parse(result.stdout);
 }
 
 function exportedCacheSessions(cacheDir, experimentId) {
@@ -357,13 +599,38 @@ function livePredictionsFromDecisions(decisions, sid, eid) {
 
 const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
 function sendJSON(res, status, payload) { res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" }); res.end(JSON.stringify(payload)); }
+
+/** Collect and JSON-parse a request body -- the only place server.js reads
+ * one at all, since every route before the job-launch API is GET-only.
+ * Capped well above any real spec/options document to guard against an
+ * unbounded client stream; rejects (never resolves) past that point. */
+function readBody(req, { limit = 2 * 1024 * 1024 } = {}) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0, settled = false;
+    const fail = (err) => { if (!settled) { settled = true; reject(err); } };
+    const done = (value) => { if (!settled) { settled = true; resolve(value); } };
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > limit) { fail(new Error("request body too large")); req.destroy(); return; }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      if (!raw.trim()) return done({});
+      try { done(JSON.parse(raw)); } catch { fail(new Error("invalid JSON request body")); }
+    });
+    req.on("error", fail);
+    req.on("aborted", () => fail(new Error("request aborted")));
+  });
+}
 function serveStatic(res, urlPath) {
   const rel = urlPath === "/" ? "index.html" : urlPath.replace(/^\/+/, ""), file = path.join(PUBLIC_DIR, path.normalize(rel));
   if (!file.startsWith(PUBLIC_DIR + path.sep)) return sendJSON(res, 404, { error: "not found" });
   fs.readFile(file, (err, data) => { if (err) return sendJSON(res, 404, { error: "not found" }); res.writeHead(200, { "Content-Type": MIME[path.extname(file)] || "application/octet-stream" }); res.end(data); });
 }
 
-function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, corpusRoot = null }) {
+function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, corpusRoot = null, maxConcurrentJobs = 2 }) {
   const clinic = dataDir ? null : makeClinicStore(
     runsDir || path.join(REPO_DIR, "runs"),
     episodeCacheDir || path.join(REPO_DIR, "notebooks", "episode_cache"),
@@ -375,7 +642,7 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
     const organism = url.searchParams.get("organism"), run = url.searchParams.get("run");
     return organism && run ? clinic.selected(organism, run)?.store : null;
   }
-  return http.createServer((req, res) => {
+  return http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost"), p = url.pathname.split("/").filter(Boolean);
     try {
       if (p[0] !== "api") return serveStatic(res, url.pathname);
@@ -417,6 +684,117 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
         // into a filesystem path, so only a catalogued value is trusted.
         if (!clinic.catalog().some((entry) => entry.organism === organism)) return sendJSON(res, 404, { error: "unknown organism" });
         return sendJSON(res, 200, factoryRunsDocument(clinic.runsDir, organism));
+      }
+      if (p.length === 2 && p[1] === "architecture-campaigns") {
+        if (!clinic) return sendJSON(res, 400, { error: "architecture campaigns require clinic mode" });
+        const organism = url.searchParams.get("organism");
+        if (!organism) return sendJSON(res, 400, { error: "select an organism" });
+        // Same containment discipline as /api/registry and /api/factory-runs:
+        // organism is joined into a filesystem path, so only a catalogued
+        // value is trusted.
+        if (!clinic.catalog().some((entry) => entry.organism === organism)) return sendJSON(res, 404, { error: "unknown organism" });
+        return sendJSON(res, 200, architectureCampaignsDocument(clinic.runsDir, organism));
+      }
+      if (p.length === 3 && p[1] === "jobs") {
+        if (req.method !== "POST") return sendJSON(res, 405, { error: "method not allowed" });
+        if (!clinic) return sendJSON(res, 400, { error: "job launches require clinic mode" });
+        const kind = p[2];
+        if (!jobs.JOB_KINDS.includes(kind)) return sendJSON(res, 404, { error: "unknown job kind" });
+        let body;
+        try { body = await readBody(req); } catch (err) { return sendJSON(res, 400, { error: String(err.message || err) }); }
+        const invalid = validateJobBody(clinic, body);
+        if (invalid) return sendJSON(res, invalid.status, { error: invalid.error });
+        try {
+          return sendJSON(res, 200, jobs.launchJob(kind, body, { runsDir: clinic.runsDir, maxConcurrent: maxConcurrentJobs }));
+        } catch (err) {
+          if (err instanceof jobs.ConcurrencyLimitError) return sendJSON(res, 409, { error: String(err.message) });
+          return sendJSON(res, 400, { error: String(err.message || err) });
+        }
+      }
+      if (p.length === 3 && p[1] === "preview") {
+        if (req.method !== "POST") return sendJSON(res, 405, { error: "method not allowed" });
+        if (!clinic) return sendJSON(res, 400, { error: "job previews require clinic mode" });
+        const kind = p[2];
+        // Only search/breed declare a --dry-run branch in the CLI (both
+        // torch-free: search's resolves candidate specs via propose(),
+        // breed's crosses/mutates genomes and reads checkpoint metadata
+        // only) -- baseline/clone/resume have nothing to preview, since
+        // there is no proposal/crossover step before they just train.
+        if (kind !== "search" && kind !== "breed") return sendJSON(res, 404, { error: "unknown preview kind" });
+        let body;
+        try { body = await readBody(req); } catch (err) { return sendJSON(res, 400, { error: String(err.message || err) }); }
+        const invalid = validateJobBody(clinic, body);
+        if (invalid) return sendJSON(res, invalid.status, { error: invalid.error });
+        const previewId = `preview-${crypto.randomUUID()}`;
+        let launch;
+        try {
+          launch = jobs.buildLaunch(kind, body, { runsDir: clinic.runsDir, jobId: previewId });
+        } catch (err) {
+          return sendJSON(res, 400, { error: String(err.message || err) });
+        }
+        try {
+          const result = spawnSync(
+            jobs.pythonCommand(), ["-m", "cognitive_runtime.cli", "factory", kind, ...launch.argv, "--dry-run"],
+            { cwd: REPO_DIR, encoding: "utf8", env: process.env },
+          );
+          if (result.error) return sendJSON(res, 500, { error: String(result.error.message || result.error) });
+          if (result.status !== 0) return sendJSON(res, 400, { error: (result.stderr || result.stdout || "preview failed").trim() });
+          try {
+            return sendJSON(res, 200, JSON.parse(result.stdout));
+          } catch {
+            return sendJSON(res, 500, { error: "preview did not return valid JSON" });
+          }
+        } finally {
+          // A preview has no job identity to keep -- baseline/search's own
+          // buildLaunch may have written a temp spec sidecar (never breed's,
+          // which needs none), and nothing else ever reads a "preview-*"
+          // job id, so it is cleaned up right away rather than left in
+          // .clinic-jobs/ to accumulate across repeated preview calls.
+          try { fs.unlinkSync(jobs.jobSpecPath(clinic.runsDir, previewId)); } catch { /* never written, e.g. breed */ }
+        }
+      }
+      if (p.length === 2 && p[1] === "corpora") {
+        if (req.method !== "GET") return sendJSON(res, 405, { error: "method not allowed" });
+        if (!clinic || !clinic.corpusRoot) return sendJSON(res, 400, { error: "corpus listing requires clinic mode with a corpus root" });
+        const organism = url.searchParams.get("organism");
+        if (organism !== null && !isPlainId(organism)) return sendJSON(res, 400, { error: "organism must be a plain identifier" });
+        return sendJSON(res, 200, { corpora: corpusCatalog(clinic.corpusRoot, organism) });
+      }
+      if (p.length === 2 && p[1] === "factory-meta") {
+        if (req.method !== "GET") return sendJSON(res, 405, { error: "method not allowed" });
+        if (!clinic) return sendJSON(res, 400, { error: "factory metadata requires clinic mode" });
+        try {
+          return sendJSON(res, 200, factoryMeta());
+        } catch (err) {
+          return sendJSON(res, 500, { error: String(err.message || err) });
+        }
+      }
+      if (p.length === 2 && p[1] === "jobs") {
+        if (req.method !== "GET") return sendJSON(res, 405, { error: "method not allowed" });
+        if (!clinic) return sendJSON(res, 400, { error: "job status requires clinic mode" });
+        const organism = url.searchParams.get("organism");
+        const entries = jobs.listJobs(clinic.runsDir, { organism });
+        return sendJSON(res, 200, {
+          jobs: entries.map((entry) => ({ ...entry, runs: jobRunStates(clinic.runsDir, entry.organism, entry.run_ids) })),
+        });
+      }
+      if (p.length === 4 && p[1] === "jobs" && p[3] === "log") {
+        if (req.method !== "GET") return sendJSON(res, 405, { error: "method not allowed" });
+        if (!clinic) return sendJSON(res, 400, { error: "job logs require clinic mode" });
+        const jobId = decodeURIComponent(p[2]);
+        if (!isPlainId(jobId)) return sendJSON(res, 404, { error: "unknown job id" });
+        const result = jobs.readJobLog(clinic.runsDir, jobId, { offset: url.searchParams.get("offset") });
+        if (!result) return sendJSON(res, 404, { error: "unknown job id" });
+        return sendJSON(res, 200, result);
+      }
+      if (p.length === 4 && p[1] === "jobs" && p[3] === "cancel") {
+        if (req.method !== "POST") return sendJSON(res, 405, { error: "method not allowed" });
+        if (!clinic) return sendJSON(res, 400, { error: "job cancellation requires clinic mode" });
+        const jobId = decodeURIComponent(p[2]);
+        if (!isPlainId(jobId)) return sendJSON(res, 404, { error: "unknown job id" });
+        const entry = await jobs.cancelJob(clinic.runsDir, jobId);
+        if (!entry) return sendJSON(res, 404, { error: "unknown job id" });
+        return sendJSON(res, 200, entry);
       }
       if (p.length === 2 && p[1] === "sessions") {
         const activeStore = selectedStore(url);
@@ -470,6 +848,6 @@ function createServer({ dataDir = null, runsDir = null, episodeCacheDir = null, 
 
 if (require.main === module) {
   const args = parseArgs(process.argv);
-  createServer(args).listen(args.port, () => console.log(`CCR clinic: http://localhost:${args.port}  (${args.dataDir ? `Record: ${args.dataDir}` : `Runs: ${args.runsDir}; cache: ${args.episodeCacheDir}`})`));
+  createServer(args).listen(args.port, args.host, () => console.log(`CCR clinic: http://${args.host}:${args.port}  (${args.dataDir ? `Record: ${args.dataDir}` : `Runs: ${args.runsDir}; cache: ${args.episodeCacheDir}`})`));
 }
 module.exports = { createServer, livePredictionsFromDecisions, makeStore, makeClinicStore, runSummary, runArtifacts, registryDocument, factoryRunsDocument };

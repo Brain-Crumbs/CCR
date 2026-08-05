@@ -15,19 +15,25 @@ testable, independently blocking gates pass:
    :mod:`cognitive_runtime.training.model_factory.comparison`). A candidate
    whose improvement is statistically significant but smaller than the
    margin is held, not promoted.
-4. ``safety_metrics`` -- no configured safety metric regresses beyond its
+4. ``reference_comparison`` -- only checked when the trial declared
+   ``evaluation.reference_run`` (clinic redesign: a configurable comparison
+   baseline, not just copy-last-frame): the candidate must beat that
+   declared reference model (``beats_reference``) at every evaluated
+   horizon. Not applicable, and never blocking, for a trial that declared
+   no reference_run.
+5. ``safety_metrics`` -- no configured safety metric regresses beyond its
    own allowed margin.
-5. ``generic_retention`` -- a ``goal_navigation_v1`` fine-tune supplies the
+6. ``generic_retention`` -- a ``goal_navigation_v1`` fine-tune supplies the
    existing CI-refereed forgetting report for ``generic_action_effects_v1``
    and stays within its DataContract's declared regression allowance.
-6. ``training_time_budget`` -- the run completed within its stage's
+7. ``training_time_budget`` -- the run completed within its stage's
    declared training-time budget (never ``budget_exceeded``, ``failed``,
    ``cancelled``, or ``timeout_unrecoverable``).
-7. ``metric_schema`` -- raw and stratified metrics satisfy their versioned
-   schema: the copy-last ratio (``model_over_copy_last_mse``) and the
-   event-stratified rate (``cow_false_positive_rate``) are never present
-   without the raw errors/counts they are computed from.
-8. ``durable_test_confirmation`` -- only checked when the caller declares
+8. ``metric_schema`` -- raw and stratified metrics satisfy their versioned
+   schema: a derived ratio/rate (``model_over_copy_last_mse``,
+   ``model_over_reference_mse``, ``cow_false_positive_rate``) is never
+   present without the raw errors/counts it is computed from.
+9. ``durable_test_confirmation`` -- only checked when the caller declares
    ``durable=True``: a final sealed-test action (MF-C5, issue #227) must
    have confirmed the candidate before it may become a *durable* champion.
 
@@ -266,6 +272,35 @@ def _rollout_beats_copy_last_gate(rollout_metrics: Mapping[str, Any]) -> GateRes
     return GateResult("rollout_beats_copy_last", ok, reason)
 
 
+def _reference_comparison_gate(rollout_metrics: Mapping[str, Any]) -> GateResult:
+    """Gate 4: when the trial declared ``evaluation.reference_run``, the
+    candidate must beat that declared reference model at every evaluated
+    horizon (clinic redesign: a configurable comparison baseline, not just
+    copy-last-frame).
+
+    Detected from the report itself (a ``beats_reference`` key present on
+    any horizon) rather than a separate boolean parameter: whether a
+    reference was configured is a fact about the trial that already ran,
+    not a promotion-time policy choice, so there is nothing for a caller
+    to additionally declare here.
+    """
+    horizons = rollout_metrics.get("horizons") or {}
+    if not any("beats_reference" in (values or {}) for values in horizons.values()):
+        return GateResult(
+            "reference_comparison", True,
+            "no evaluation.reference_run was declared for this trial", applicable=False,
+        )
+    failing = sorted(
+        str(horizon) for horizon, values in horizons.items() if not (values or {}).get("beats_reference", False)
+    )
+    ok = not failing
+    reason = (
+        "model beats its declared reference_run at every evaluated horizon" if ok
+        else f"model does not beat its declared reference_run at horizon(s) {failing!r}"
+    )
+    return GateResult("reference_comparison", ok, reason)
+
+
 def _rollout_health_gate(rollout_metrics: Mapping[str, Any]) -> GateResult:
     health = rollout_metrics.get("rollout_health") or {}
     state = health.get("state")
@@ -328,7 +363,7 @@ def _representation_gate(representation: Optional[Mapping[str, Any]]) -> GateRes
 def _metric_schema_gate(
     rollout_metrics: Mapping[str, Any], event_stratified_metrics: Mapping[str, Any],
 ) -> GateResult:
-    """Gate 6: a derived ratio/rate is never reported without its raw errors."""
+    """Gate 8: a derived ratio/rate is never reported without its raw errors."""
     problems = []
     for horizon, values in (rollout_metrics.get("horizons") or {}).items():
         values = values or {}
@@ -337,6 +372,12 @@ def _metric_schema_gate(
             problems.append(
                 f"rollout horizon {horizon!r} carries model_over_copy_last_mse without its raw "
                 "model_mse/copy_last_mse"
+            )
+        reference_ratio = values.get("model_over_reference_mse")
+        if reference_ratio is not None and (values.get("model_mse") is None or values.get("reference_mse") is None):
+            problems.append(
+                f"rollout horizon {horizon!r} carries model_over_reference_mse without its raw "
+                "model_mse/reference_mse"
             )
     for horizon, values in (event_stratified_metrics or {}).items():
         entity = ((values or {}).get("entity")) or {}
@@ -612,6 +653,7 @@ def evaluate_promotion(
         _split_overlap_gate(split_overlap),
         _representation_gate(representation),
         _rollout_beats_copy_last_gate(rollout_metrics),
+        _reference_comparison_gate(rollout_metrics),
         _rollout_health_gate(rollout_metrics),
         _event_stratified_evaluability_gate(event_stratified_metrics),
         _metric_schema_gate(rollout_metrics, event_stratified_metrics),

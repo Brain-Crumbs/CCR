@@ -54,6 +54,7 @@ from cognitive_runtime.training.model_factory.artifacts import (
 from cognitive_runtime.training.model_factory.budget import (
     BUDGET_TIERS,
     STATUS_BUDGET_EXCEEDED,
+    STATUS_CANCELLED,
     STATUS_COMPLETED,
     EpochTimer,
     TrainingBudget,
@@ -77,15 +78,16 @@ from cognitive_runtime.training.model_factory.spec import ExperimentSpec
 from cognitive_runtime.training.model_factory.spec import resolve as resolve_spec
 from cognitive_runtime.training.model_factory.spec import validate as validate_spec
 from cognitive_runtime.training.model_factory.state import (
-    ACTIVE_STATES,
     STATE_BUDGET_EXCEEDED,
+    STATE_CANCELLED,
     STATE_COMPLETED,
     STATE_FAILED,
     STATE_RUNNING,
+    StateError,
+    cancellation_requested,
+    claim_stale_worker,
     create_state,
     heartbeat_path,
-    is_stale,
-    load_state,
     release_devices,
     reserve_devices,
     state_path,
@@ -366,6 +368,38 @@ def _parent_checkpoint_path(root: Union[str, Path], spec: ExperimentSpec) -> Pat
     return Path(root) / spec.organism / str(parent["run_id"]) / "checkpoints" / str(parent["checkpoint"])
 
 
+def _reference_checkpoint_path(root: Union[str, Path], spec: ExperimentSpec) -> Path:
+    reference_run = spec.evaluation.get("reference_run") or {}
+    return Path(root) / spec.organism / str(reference_run["run_id"]) / "checkpoints" / str(reference_run["checkpoint"])
+
+
+def _load_reference_model(root: Union[str, Path], spec: ExperimentSpec) -> Optional[Any]:
+    """Load ``evaluation.reference_run``'s checkpoint for read-only
+    comparison, or ``None`` if the spec declares none.
+
+    Unlike a ``parent`` weight donor, a reference model is never loaded
+    against the candidate's own architecture/data/training contracts --
+    ``load_factory_checkpoint`` with no ``mode``/``model`` given just
+    reconstructs the model the checkpoint itself declares (the same
+    "plain inspect" call other read-only reloads in this module use, e.g.
+    ``best_eval``'s reconstruction fallback below), matching the docstring
+    at spec.py's ``REFERENCE_RUN_KEYS``: read-only comparison, never a
+    weight donor.
+    """
+    reference_run = spec.evaluation.get("reference_run")
+    if reference_run is None:
+        return None
+    reference_path = str(_reference_checkpoint_path(root, spec))
+    declared_sha = str(reference_run["sha256"])
+    actual_sha = read_factory_checkpoint_metadata(reference_path).get("checkpoint_sha256")
+    if actual_sha != declared_sha:
+        raise ValueError(
+            f"reference_run checkpoint sha256 mismatch for {reference_run.get('run_id')!r}: "
+            f"spec declares {declared_sha!r}, file is {actual_sha!r}"
+        )
+    return load_factory_checkpoint(reference_path).model
+
+
 def _load_existing_run_artifacts(root: Union[str, Path], organism: str, run_id: str) -> RunArtifacts:
     """Reopen an already-allocated run directory for a resume trial.
 
@@ -412,11 +446,12 @@ def _evaluate(
     cfg: Any,
     *,
     navigation_metrics: Optional[Mapping[str, Any]] = None,
+    reference_model: Optional[Any] = None,
 ) -> Dict[str, Any]:
     awm = _action_world_model_module()
     result = awm.evaluate_action_world_model_milestone(
         model, dataset, tuple(int(tick) for tick in spec.data["horizons_ticks"]),
-        warmup_frames=cfg.warmup_frames,
+        warmup_frames=cfg.warmup_frames, reference_model=reference_model,
     )
     if navigation_metrics is not None:
         result["goal_navigation"] = dict(navigation_metrics)
@@ -898,8 +933,12 @@ def run_trial(
                 target_encoder_state_dict=trainer_state.get("target_encoder_state_dict"),
             )
 
+    reference_model = _load_reference_model(root, resolved_spec)
+
     if retention_dataset is not None:
-        retention_before_eval = _evaluate(model, retention_dataset, resolved_spec, cfg)
+        retention_before_eval = _evaluate(
+            model, retention_dataset, resolved_spec, cfg, reference_model=reference_model,
+        )
 
     if resolved_spec.mode == "resume":
         artifacts = _load_existing_run_artifacts(root, resolved_spec.organism, run_id)
@@ -924,30 +963,19 @@ def run_trial(
         # for a resume to pick back up (epic #212 §16; state.py's own
         # module docstring: a stale/failed record is never silently
         # reopened, only a still-active one is a legitimate resume target).
-        existing_state = load_state(trial_state_path)
-        if existing_state.state not in ACTIVE_STATES:
-            raise ValueError(
-                f"cannot resume run {artifacts.run_id!r}: trial state is "
-                f"{existing_state.state!r}, not an active (interrupted) run"
-            )
-        # An active state alone does not distinguish an interrupted worker
-        # from one that is still training: a fresh heartbeat means the
-        # original worker is (or very recently was) alive, and racing it
-        # with a second resumed worker would let both write the same
-        # checkpoints/state concurrently. Only a heartbeat that has actually
-        # exceeded its declared watchdog timeout is a legitimate resume
-        # target (mirrors what recover_stale_worker checks before failing
-        # a run, just without writing that failed transition itself).
-        if not is_stale(existing_state, trial_heartbeat_path):
-            raise ValueError(
-                f"cannot resume run {artifacts.run_id!r}: its heartbeat is still current, "
-                "so the original worker may still be running; wait for its watchdog "
-                "timeout (or fail it explicitly via recover_stale_worker) before resuming"
-            )
+        # claim_stale_worker checks staleness and claims the run (by
+        # writing a fresh heartbeat) as one locked critical section, so two
+        # concurrent resume attempts can never both pass the check and both
+        # proceed to train against the same run directory (Codex review,
+        # PR #277).
+        try:
+            claim_stale_worker(trial_state_path, trial_heartbeat_path, run_id=artifacts.run_id)
+        except StateError as exc:
+            raise ValueError(str(exc)) from exc
     else:
         create_state(trial_state_path, artifacts.run_id, heartbeat_timeout_seconds=resolved_heartbeat_timeout)
         transition(trial_state_path, STATE_RUNNING)
-    write_heartbeat(trial_heartbeat_path, run_id=artifacts.run_id)
+        write_heartbeat(trial_heartbeat_path, run_id=artifacts.run_id)
 
     try:
         if devices:
@@ -961,7 +989,7 @@ def run_trial(
             if resolved_spec.mode in ("clone", "fine_tune"):
                 baseline_eval = _evaluate(
                     model, validation_dataset, resolved_spec, cfg,
-                    navigation_metrics=navigation_evaluation,
+                    navigation_metrics=navigation_evaluation, reference_model=reference_model,
                 )
 
             total_epochs = int(resolved_spec.training.get("epoch_budget") or DEFAULT_EPOCH_BUDGET)
@@ -1043,7 +1071,7 @@ def run_trial(
 
                 eval_result = _evaluate(
                     model, validation_dataset, resolved_spec, cfg,
-                    navigation_metrics=navigation_evaluation,
+                    navigation_metrics=navigation_evaluation, reference_model=reference_model,
                 )
                 metric_value, _ = _resolve_selection_metric(
                     eval_result, resolved_spec.evaluation["selection_metric"], train_dataset.ticks_per_frame,
@@ -1063,8 +1091,15 @@ def run_trial(
                     )
                     best_eval = eval_result
 
-                if decision.should_stop_now:
-                    completion_status = STATUS_BUDGET_EXCEEDED
+                # A cancellation request is honored at this same checkpoint
+                # boundary as a graceful budget-exceeded stop: the chunk
+                # just completed is still evaluated and checkpointed above,
+                # only the next chunk never starts. Cancellation takes
+                # priority in the unlikely event both fire on the same
+                # chunk -- it is the more specific, deliberate request.
+                cancelled = cancellation_requested(artifacts.directory)
+                if decision.should_stop_now or cancelled:
+                    completion_status = STATUS_CANCELLED if cancelled else STATUS_BUDGET_EXCEEDED
                     break
 
             if best_eval is None:
@@ -1077,7 +1112,7 @@ def run_trial(
                 existing_best = load_factory_checkpoint(str(artifacts.checkpoints_dir / "best-validation.pt"))
                 best_eval = _evaluate(
                     existing_best.model, validation_dataset, resolved_spec, cfg,
-                    navigation_metrics=navigation_evaluation,
+                    navigation_metrics=navigation_evaluation, reference_model=reference_model,
                 )
             total_trial_seconds = time.monotonic() - trial_started
             budget_report = build_budget_report(
@@ -1118,6 +1153,7 @@ def run_trial(
                 best_checkpoint = load_factory_checkpoint(str(checkpoint_path))
                 retention_after_eval = _evaluate(
                     best_checkpoint.model, retention_dataset, resolved_spec, cfg,
+                    reference_model=reference_model,
                 )
                 forgetting = compute_forgetting_metric(
                     _per_episode_retention_losses(retention_before_eval),
@@ -1155,7 +1191,11 @@ def run_trial(
             report_path = str(artifacts.directory / "experiment_report.json")
             _statistical_evaluation_module().write_experiment_report(report_path, experiment_report)
 
-        final_state = STATE_COMPLETED if completion_status == STATUS_COMPLETED else STATE_BUDGET_EXCEEDED
+        final_state = {
+            STATUS_COMPLETED: STATE_COMPLETED,
+            STATUS_BUDGET_EXCEEDED: STATE_BUDGET_EXCEEDED,
+            STATUS_CANCELLED: STATE_CANCELLED,
+        }[completion_status]
         transition(trial_state_path, final_state, reason=completion_status)
     except Exception as exc:
         transition(trial_state_path, STATE_FAILED, reason=f"{type(exc).__name__}: {exc}")

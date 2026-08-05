@@ -62,4 +62,31 @@ describe("CompareView", () => {
     fireEvent.change(screen.getByLabelText("Run B"), { target: { value: "run-a" } });
     await waitFor(() => expect(screen.getByLabelText("Run B").value).toBe("run-a"));
   });
+
+  it("defaults the reference picker to none, and offers no reference option in either strip", async () => {
+    render(<CompareView catalog={CATALOG} organism="Crafter" defaultRunA="run-a" />);
+    await waitFor(() => expect(screen.getByLabelText("Reference baseline run").value).toBe("(none)"));
+    await waitFor(() => expect(screen.getAllByLabelText("prediction source")).toHaveLength(2));
+    for (const select of screen.getAllByLabelText("prediction source")) {
+      expect([...select.options].map((o) => o.value)).not.toContain("reference");
+    }
+  });
+
+  it("picking a reference run offers it as a baseline in both strips, even the one with no export of its own", async () => {
+    render(<CompareView catalog={CATALOG} organism="Crafter" defaultRunA="run-a" />);
+    // Run B ("run-b") has no prediction export in this fixture, so its own
+    // strip never gets a "model" option -- proving the reference option
+    // comes from the independently picked reference run, not from Run B's
+    // own (absent) export.
+    await waitFor(() => expect(screen.getAllByLabelText("prediction source")).toHaveLength(2));
+    const [sourceA, sourceB] = screen.getAllByLabelText("prediction source");
+    expect([...sourceB.options].map((o) => o.value)).not.toContain("model");
+
+    fireEvent.change(screen.getByLabelText("Reference baseline run"), { target: { value: "run-a" } });
+
+    await waitFor(() => {
+      expect([...sourceA.options].map((o) => o.value)).toContain("reference");
+      expect([...sourceB.options].map((o) => o.value)).toContain("reference");
+    });
+  });
 });

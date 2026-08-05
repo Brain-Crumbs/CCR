@@ -1930,6 +1930,74 @@ def _best_recurrence_lag(targets, max_lag: int = 60) -> Optional[int]:
     return best_lag
 
 
+def _reference_model_direct_mse(
+    reference_model: Any,
+    dataset: ActionSequenceDataset,
+    ticks: Sequence[int],
+    frames: Sequence[int],
+    *,
+    warmup_frames: int,
+    max_starts_per_episode: Optional[int] = None,
+) -> Dict[int, List[float]]:
+    """Per-horizon direct-head MSE for a second, already-trained model
+    evaluated over the same dataset -- the read-only ``reference_run``
+    comparison a spec may configure (clinic redesign: "beat this model, not
+    just copy-last"), never a weight donor and never part of the contract
+    this model's own report is scored against.
+
+    Deliberately a separate pass over the dataset rather than interleaved
+    into :func:`evaluate_action_world_model_direct`'s own loop: the
+    reference model has its own encoder/vocabulary/reconstruction space and
+    must never perturb the primary model's evaluation. The reference model
+    must share the candidate's action vocabulary (a ``KeyError`` on a
+    missing action surfaces as a clear ``ValueError`` instead) and should
+    share its reconstruction size for the resulting MSE ratio to be
+    meaningful -- a mismatched resolution is not rejected here, since nothing
+    about a direct-head MSE pass can detect it structurally.
+    """
+    torch, F = _torch()
+    action_index = {name: i for i, name in enumerate(reference_model.action_keys)}
+    samples: Dict[int, List[float]] = {tick: [] for tick in ticks}
+    max_horizon = max(frames)
+    was_training = reference_model.training
+    reference_model.eval()
+    with torch.no_grad():
+        for episode, pixels, targets, actions in _episode_tensors(
+            dataset, reference_model.reconstruction_shape, device=_model_device(reference_model)
+        ):
+            n = pixels.shape[0]
+            if n <= max_horizon + warmup_frames:
+                continue
+            try:
+                remap = torch.tensor(
+                    [action_index[dataset.action_keys[a]] for a in episode.actions],
+                    dtype=torch.long, device=pixels.device,
+                )
+            except KeyError as exc:
+                raise ValueError(
+                    f"reference model action vocabulary is missing {exc.args[0]!r}; "
+                    "a reference_run must share the candidate's action vocabulary"
+                ) from None
+            workspace = _episode_workspace_tensors(episode, dataset, reference_model, actions=remap)
+            latents = reference_model.encode_workspace(pixels, workspace).unsqueeze(0)
+            hidden = reference_model.forward_sequence(latents[:, :-1], remap.unsqueeze(0))
+            starts = range(warmup_frames, n - max_horizon)
+            if max_starts_per_episode is not None:
+                starts = list(starts)[:max_starts_per_episode]
+            for t in starts:
+                for tick, frame in zip(ticks, frames):
+                    prediction = reference_model.sequence_prediction(hidden[:, t : t + 1], tick)
+                    visual = reference_model.decode_prediction(
+                        prediction.latent[0], reference_frame=targets[t:t + 1],
+                        reference_spatial=reference_model.encode_visual(pixels[t:t + 1]).spatial,
+                    )
+                    target = targets[t + frame]
+                    samples[tick].append(float(F.mse_loss(visual["vision"][0], target)))
+    if was_training:
+        reference_model.train()
+    return samples
+
+
 def evaluate_action_world_model_direct(
     model: Any,
     dataset: ActionSequenceDataset,
@@ -1937,6 +2005,7 @@ def evaluate_action_world_model_direct(
     *,
     warmup_frames: int = 3,
     max_starts_per_episode: Optional[int] = None,
+    reference_model: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Evaluate direct autoregressive horizon heads in pixel space.
 
@@ -2064,6 +2133,13 @@ def evaluate_action_world_model_direct(
     if was_training:
         model.train()
 
+    reference_samples = (
+        _reference_model_direct_mse(
+            reference_model, dataset, ticks, frames,
+            warmup_frames=warmup_frames, max_starts_per_episode=max_starts_per_episode,
+        ) if reference_model is not None else None
+    )
+
     report: Dict[int, Dict[str, Any]] = {}
     for tick, frame in zip(ticks, frames):
         entry = samples[tick]
@@ -2080,6 +2156,13 @@ def evaluate_action_world_model_direct(
             "model_over_oracle_mse": _ratio(model_mse, oracle_mse),
             "beats_copy_last": bool(model_mse < copy_mse), "beats_mean_frame": bool(model_mse < mean_mse),
         }
+        if reference_samples is not None:
+            reference_mse = _mean(reference_samples[tick]) if reference_samples[tick] else None
+            report[tick]["reference_mse"] = reference_mse
+            report[tick]["model_over_reference_mse"] = _ratio(model_mse, reference_mse)
+            report[tick]["beats_reference"] = (
+                bool(model_mse < reference_mse) if reference_mse is not None else None
+            )
     workspace_report = {
         name: {tick: {"n_samples": len(values["model"]), "model_mse": _mean(values["model"]),
                        "copy_last_mse": _mean(values["copy_last"]),
@@ -2106,6 +2189,73 @@ def evaluate_action_world_model_direct(
     }
 
 
+def _reference_model_rollout_mse(
+    reference_model: Any,
+    dataset: ActionSequenceDataset,
+    horizons_sorted: Sequence[int],
+    *,
+    warmup_frames: int,
+    max_starts_per_episode: Optional[int] = None,
+) -> Dict[int, List[float]]:
+    """Per-horizon closed-loop rollout MSE for a second, already-trained
+    model evaluated over the same dataset.
+
+    See :func:`_reference_model_direct_mse`'s docstring for why this is a
+    separate pass rather than interleaved into
+    :func:`evaluate_action_world_model`'s own loop, and for the vocabulary/
+    reconstruction-space expectations placed on ``reference_model``.
+    """
+    torch, F = _torch()
+    max_horizon = horizons_sorted[-1]
+    action_index = {name: i for i, name in enumerate(reference_model.action_keys)}
+    samples: Dict[int, List[float]] = {h: [] for h in horizons_sorted}
+    was_training = reference_model.training
+    reference_model.eval()
+    with torch.no_grad():
+        for episode, pixels, targets, actions in _episode_tensors(
+            dataset, reference_model.reconstruction_shape, device=_model_device(reference_model)
+        ):
+            n = pixels.shape[0]
+            if n <= max_horizon + warmup_frames:
+                continue
+            try:
+                remap = torch.tensor(
+                    [action_index[dataset.action_keys[a]] for a in episode.actions],
+                    dtype=torch.long, device=pixels.device,
+                )
+            except KeyError as exc:
+                raise ValueError(
+                    f"reference model action vocabulary is missing {exc.args[0]!r}; "
+                    "a reference_run must share the candidate's action vocabulary"
+                ) from None
+            workspace = _episode_workspace_tensors(episode, dataset, reference_model, actions=remap)
+            latents = reference_model.encode_workspace(pixels, workspace)
+
+            hiddens = [reference_model.initial_state(1)]
+            hidden = hiddens[0]
+            for i in range(n - 1):
+                _pred, hidden = reference_model.step(latents[i : i + 1], remap[i : i + 1], hidden)
+                hiddens.append(hidden)
+
+            starts = range(warmup_frames, n - max_horizon)
+            if max_starts_per_episode is not None:
+                starts = list(starts)[:max_starts_per_episode]
+            for t in starts:
+                reference_encoding = reference_model.encode_visual(pixels[t : t + 1])
+                rollout = reference_model.forward_horizons(
+                    latents[t : t + 1], remap[t : t + max_horizon].unsqueeze(0), hiddens[t],
+                    horizon_frames=horizons_sorted,
+                    reference_frame=targets[t : t + 1], reference_spatial=reference_encoding.spatial,
+                )
+                for h in horizons_sorted:
+                    decoded = rollout[h].decoded.squeeze(0)
+                    target = targets[t + h]
+                    samples[h].append(float(F.mse_loss(decoded, target)))
+    if was_training:
+        reference_model.train()
+    return samples
+
+
 def evaluate_action_world_model(
     model: Any,
     dataset: ActionSequenceDataset,
@@ -2113,6 +2263,7 @@ def evaluate_action_world_model(
     *,
     warmup_frames: int = 3,
     max_starts_per_episode: Optional[int] = None,
+    reference_model: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Closed-loop multi-horizon evaluation with baseline-relative metrics
     and the frozen-rollout detector.
@@ -2301,6 +2452,13 @@ def evaluate_action_world_model(
     if was_training:
         model.train()
 
+    reference_samples = (
+        _reference_model_rollout_mse(
+            reference_model, dataset, horizons_sorted,
+            warmup_frames=warmup_frames, max_starts_per_episode=max_starts_per_episode,
+        ) if reference_model is not None else None
+    )
+
     report: Dict[int, Dict[str, Any]] = {}
     for h in horizons_sorted:
         entry = samples[h]
@@ -2326,6 +2484,11 @@ def evaluate_action_world_model(
             "beats_copy_last": bool(model_mse < copy_mse),
             "beats_mean_frame": bool(model_mse < mean_mse),
         }
+        if reference_samples is not None:
+            reference_mse = _mean(reference_samples[h]) if reference_samples[h] else None
+            report[h]["reference_mse"] = reference_mse
+            report[h]["model_over_reference_mse"] = _ratio(model_mse, reference_mse)
+            report[h]["beats_reference"] = bool(model_mse < reference_mse) if reference_mse is not None else None
 
     pred_disp = _mean(prediction_dispersion) if prediction_dispersion else 0.0
     tgt_disp = _mean(target_dispersion) if target_dispersion else 0.0
@@ -2386,21 +2549,26 @@ def evaluate_action_world_model_milestone(
     horizons_ticks: Sequence[int],
     *,
     warmup_frames: int = 3,
+    reference_model: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Evaluate both prediction paths and select the trained path as primary.
 
     Compatibility aliases (``horizons`` and ``per_episode_model_mse``) point
     at the primary report; consumers which need an unambiguous artifact use
-    ``direct``/``rollout`` and ``primary_mode``.
+    ``direct``/``rollout`` and ``primary_mode``. ``reference_model``, if
+    given, is forwarded to both passes, so ``reference_mse``/
+    ``model_over_reference_mse``/``beats_reference`` appear in every
+    horizon entry of both ``direct`` and ``rollout`` (see
+    :func:`evaluate_action_world_model_direct`'s docstring).
     """
     direct = evaluate_action_world_model_direct(
-        model, dataset, horizons_ticks, warmup_frames=warmup_frames
+        model, dataset, horizons_ticks, warmup_frames=warmup_frames, reference_model=reference_model,
     )
     # Rollout has one prediction per *frame* step, whereas direct heads keep
     # every tick identity even when two heads target the same recorded frame.
     frames = sorted(set(direct["horizons_frames"]))
     rollout = evaluate_action_world_model(
-        model, dataset, frames, warmup_frames=warmup_frames
+        model, dataset, frames, warmup_frames=warmup_frames, reference_model=reference_model,
     )
     primary_mode: PredictionMode = (
         "direct" if getattr(model, "training_objective", None) == "autoregressive" else "rollout"

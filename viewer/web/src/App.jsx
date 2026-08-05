@@ -15,6 +15,9 @@ import { PairedComparisonPanel } from "./components/PairedComparisonPanel.jsx";
 import { ChampionRegistryPanel } from "./components/ChampionRegistryPanel.jsx";
 import { FactoryRunsPanel } from "./components/FactoryRunsPanel.jsx";
 import { CompareView } from "./components/CompareView.jsx";
+import { BuildPanel } from "./components/BuildPanel.jsx";
+import { EvolvePanel } from "./components/EvolvePanel.jsx";
+import { BreedPanel } from "./components/BreedPanel.jsx";
 
 const TABS = [
   ["episode", "Episode"],
@@ -22,6 +25,9 @@ const TABS = [
   ["experiment", "Experiment"],
   ["factory", "Factory"],
   ["compare", "Compare"],
+  ["build", "Build"],
+  ["evolve", "Evolve"],
+  ["breed", "Breed"],
 ];
 
 /**
@@ -132,48 +138,59 @@ export function App() {
 
       {!sessions ? (
         <p className="empty">Loading sessions…</p>
-      ) : !sessions.length ? (
-        <p className="empty">No recordings are associated with this run yet.</p>
+      ) : sessions.length ? (
+        <div className="session-row">
+          <SessionList sessions={sessions} selectedId={sessionId} onSelect={(id) => {
+            const next = sessions.find((s) => s.id === id);
+            setSessionId(id);
+            setEpisode(next?.episodes[0] ?? null);
+          }} />
+          {sessionDetail?.session?.episodes?.length > 1 && (
+            <Picker label="Episode" ariaLabel="Episode" value={episode} options={sessionDetail.session.episodes} onChange={setEpisode} />
+          )}
+        </div>
       ) : (
+        <p className="empty">No recordings are associated with this run yet.</p>
+      )}
+
+      {/* Tabs beyond Episode/Development don't depend on this run having any
+          recorded sessions -- Factory/Compare/Build all operate at the
+          organism level (or launch a brand-new run), so they stay reachable
+          even for a run with none yet. */}
+      <Tabs tabs={TABS} active={tab} onChange={setTab} />
+
+      {tab === "episode" && sessions?.length > 0 && urls && (
         <>
-          <div className="session-row">
-            <SessionList sessions={sessions} selectedId={sessionId} onSelect={(id) => {
-              const next = sessions.find((s) => s.id === id);
-              setSessionId(id);
-              setEpisode(next?.episodes[0] ?? null);
-            }} />
-            {sessionDetail?.session?.episodes?.length > 1 && (
-              <Picker label="Episode" ariaLabel="Episode" value={episode} options={sessionDetail.session.episodes} onChange={setEpisode} />
-            )}
-          </div>
-
-          <Tabs tabs={TABS} active={tab} onChange={setTab} />
-
-          {tab === "episode" && urls && (
-            <>
-              <PixelHorizonViewer framesSrc={urls.frames} predictionsSrc={urls.predictions} decisions={decisions} tick={tick} onTickChange={setTick} />
-              <ActionTimeline decisions={decisions} tick={tick} onTickChange={setTick} />
-              <EEGPanel records={records} decisions={decisions} tick={tick} onTickChange={setTick} />
-              <AttentionPanel records={records} decisions={decisions} tick={tick} onTickChange={setTick} />
-            </>
-          )}
-          {tab === "development" && <DevelopmentPanel session={sessionDetail?.session || {}} />}
-          {tab === "experiment" && (
-            <>
-              <ExperimentDetail artifacts={artifacts} summary={summary} />
-              <PairedComparisonPanel comparison={artifacts?.metrics?.comparison} />
-            </>
-          )}
-          {tab === "factory" && (
-            <>
-              <FactoryRunsPanel factoryRuns={factoryRuns} />
-              <ChampionRegistryPanel registry={registry} />
-            </>
-          )}
-          {tab === "compare" && (
-            <CompareView catalog={catalog} organism={organism} defaultRunA={run} />
-          )}
+          <PixelHorizonViewer framesSrc={urls.frames} predictionsSrc={urls.predictions} decisions={decisions} tick={tick} onTickChange={setTick} />
+          <ActionTimeline decisions={decisions} tick={tick} onTickChange={setTick} />
+          <EEGPanel records={records} decisions={decisions} tick={tick} onTickChange={setTick} />
+          <AttentionPanel records={records} decisions={decisions} tick={tick} onTickChange={setTick} />
         </>
+      )}
+      {tab === "development" && sessions?.length > 0 && <DevelopmentPanel session={sessionDetail?.session || {}} />}
+      {tab === "experiment" && (
+        <>
+          <ExperimentDetail artifacts={artifacts} summary={summary} />
+          <PairedComparisonPanel comparison={artifacts?.metrics?.comparison} />
+        </>
+      )}
+      {tab === "factory" && (
+        <>
+          <FactoryRunsPanel factoryRuns={factoryRuns} />
+          <ChampionRegistryPanel registry={registry} />
+        </>
+      )}
+      {tab === "compare" && (
+        <CompareView catalog={catalog} organism={organism} defaultRunA={run} />
+      )}
+      {tab === "build" && (
+        <BuildPanel catalog={catalog} organism={organism} />
+      )}
+      {tab === "evolve" && (
+        <EvolvePanel catalog={catalog} organism={organism} />
+      )}
+      {tab === "breed" && (
+        <BreedPanel catalog={catalog} organism={organism} />
       )}
     </main>
   );

@@ -136,7 +136,7 @@ def _install_controls(
     state_overrides = state_overrides or {}
 
     real_run_trial = search_module.run_trial
-    real_beats_copy_last, real_health = search_module._HALVING_GATES
+    real_beats_copy_last, real_health, real_reference_comparison = search_module._HALVING_GATES
     metric_by_eval: Dict[int, float] = {}
     gate_by_rollout: Dict[int, bool] = {}
 
@@ -172,7 +172,12 @@ def _install_controls(
     real_resolve = search_module._resolve_selection_metric
     monkeypatch.setattr(search_module, "run_trial", _wrapped_run_trial)
     monkeypatch.setattr(search_module, "_resolve_selection_metric", _wrapped_resolve)
-    monkeypatch.setattr(search_module, "_HALVING_GATES", (_fake_beats_copy_last, _fake_health))
+    # No test spec here ever declares evaluation.reference_run, so the real
+    # gate is always not-applicable/passing regardless of what's forced for
+    # the other two -- nothing to fake.
+    monkeypatch.setattr(
+        search_module, "_HALVING_GATES", (_fake_beats_copy_last, _fake_health, real_reference_comparison),
+    )
 
 
 def _permissive_controls(monkeypatch, run_ids):

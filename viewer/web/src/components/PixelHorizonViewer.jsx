@@ -32,9 +32,16 @@ const DEFAULT_HORIZONS = [1, 10, 100];
  * leading seen-frame cell with the action taken at that same tick, so the
  * strip reads as one sequence: pixels + action at t, then each model's
  * prediction at t+h.
+ *
+ * `referencePredictionsSrc`/`referenceLabel` (clinic redesign): a second,
+ * independently picked run's predictions for this same session/episode,
+ * offered as a "reference" baseline alongside the client-computed
+ * copy-last/mean-frame ones -- the caller (e.g. CompareView's reference
+ * picker) resolves which run and passes its predictions URL; this
+ * component only needs to load and offer it.
  */
-export function PixelHorizonViewer({ framesSrc, predictionsSrc, decisions = [], horizons: horizonsProp, scale = 6, tick = null, onTickChange }) {
-  const data = usePixelHorizonData(framesSrc, predictionsSrc);
+export function PixelHorizonViewer({ framesSrc, predictionsSrc, referencePredictionsSrc = null, referenceLabel = null, decisions = [], horizons: horizonsProp, scale = 6, tick = null, onTickChange }) {
+  const data = usePixelHorizonData(framesSrc, predictionsSrc, referencePredictionsSrc);
   const [t, setT] = useState(0);
   const [source, setSource] = useState("copy-last");
   const [playing, setPlaying] = useState(false);
@@ -44,7 +51,10 @@ export function PixelHorizonViewer({ framesSrc, predictionsSrc, decisions = [], 
     () => (data.pred?.horizons?.length ? data.pred.horizons : (horizonsProp || DEFAULT_HORIZONS)),
     [data.pred, horizonsProp],
   );
-  const ctx = useMemo(() => ({ frames: data.frames || [], pred: data.pred, meanFrame: data.meanFrame, shape: data.shape }), [data]);
+  const ctx = useMemo(
+    () => ({ frames: data.frames || [], pred: data.pred, referencePred: data.referencePred, meanFrame: data.meanFrame, shape: data.shape }),
+    [data],
+  );
   const maxT = useMemo(() => {
     if (!data.frames) return 0;
     return Math.max(0, data.frames.length - 1 - Math.max(...horizons));
@@ -122,10 +132,12 @@ export function PixelHorizonViewer({ framesSrc, predictionsSrc, decisions = [], 
   if (data.status === "error") return <div className="status">failed to load frames: {data.error}</div>;
 
   const hasModel = !!data.pred;
+  const hasReference = !!data.referencePred;
   const sourceOptions = [
     ...(hasModel ? [["model", modelSourceLabel(data.pred)]] : []),
     ["copy-last", "copy-last baseline"],
     ["mean-frame", "mean-frame baseline"],
+    ...(hasReference ? [["reference", `reference: ${referenceLabel || modelSourceLabel(data.referencePred)}`]] : []),
   ];
   // Model targets are pooled to the export's reconstruction shape (e.g.
   // 16x16 for a native 33x33 episode); a mismatched shape lays the smaller

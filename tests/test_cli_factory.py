@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -33,13 +34,17 @@ import pytest
 from cognitive_runtime.cli import build_parser, main
 from cognitive_runtime.training.model_factory.artifacts import RunArtifacts, allocate_run_artifacts
 from cognitive_runtime.training.model_factory.contracts import ArchitectureContract, DataContract, TrainingContract
-from cognitive_runtime.training.model_factory.spec import ExperimentSpec, resolve
+from cognitive_runtime.training.model_factory.spec import ExperimentSpec, dump_canonical_json, resolve
 from cognitive_runtime.training.model_factory.state import (
     STATE_COMPLETED,
     STATE_RUNNING,
+    cancel_request_path,
     create_state,
+    heartbeat_path,
+    load_state,
     state_path,
     transition,
+    write_heartbeat,
 )
 
 
@@ -195,6 +200,7 @@ FACTORY_DISPATCH = [
     (["factory", "baseline", "spec.yaml"], "cmd_factory_baseline"),
     (["factory", "search", "spec.yaml"], "cmd_factory_search"),
     (["factory", "clone", "some-run"], "cmd_factory_clone"),
+    (["factory", "resume", "some-run"], "cmd_factory_resume"),
     (["factory", "breed", "parent-a", "parent-b"], "cmd_factory_breed"),
     (["factory", "compare", "run-a", "run-b"], "cmd_factory_compare"),
     (["factory", "promote", "some-run"], "cmd_factory_promote"),
@@ -218,6 +224,7 @@ HELP_ARGVS = [
     ["factory", "baseline", "--help"],
     ["factory", "search", "--help"],
     ["factory", "clone", "--help"],
+    ["factory", "resume", "--help"],
     ["factory", "breed", "--help"],
     ["factory", "compare", "--help"],
     ["factory", "promote", "--help"],
@@ -307,6 +314,170 @@ def test_factory_search_dry_run_accepts_repeatable_seed_runs(capsys):
     ]
 
 
+def test_factory_search_dry_run_resolves_reference_run_checkpoint_sha256(tmp_path, capsys):
+    """--reference-run is a convenience wholly analogous to clone/resume's
+    own parent-block construction: a human should never have to look up
+    and type a checkpoint's sha256 by hand."""
+    root = tmp_path / "runs"
+    reference = _make_run(root, "champion-0001", _spec(organism="Crafter"))
+    _write_checkpoint_metadata(reference, sha256="c" * 64, name="best-validation.pt")
+
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    main([
+        "factory", "search", str(spec_path), "--root", str(root),
+        "--candidates", "2", "--seed", "13", "--budgets", "1", "2",
+        "--run-id-prefix", "preview-13", "--dry-run", "--no-trace",
+        "--reference-run", "champion-0001",
+        "--set", "evaluation.selection_metric=rollout.t+2.model_over_copy_last_mse",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["candidates"], "dry-run must still propose candidates"
+    for candidate in payload["candidates"]:
+        assert candidate["spec"]["evaluation"]["reference_run"] == {
+            "run_id": "champion-0001", "checkpoint": "best-validation.pt", "sha256": "c" * 64,
+        }
+
+
+def test_factory_search_reference_run_defaults_to_the_best_validation_checkpoint(tmp_path, capsys):
+    root = tmp_path / "runs"
+    reference = _make_run(root, "champion-0001", _spec(organism="Crafter"))
+    _write_checkpoint_metadata(reference, sha256="d" * 64, name="best-validation.pt")
+
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    main([
+        "factory", "search", str(spec_path), "--root", str(root),
+        "--candidates", "2", "--seed", "13", "--budgets", "1",
+        "--run-id-prefix", "preview-13", "--dry-run", "--no-trace",
+        "--reference-run", "champion-0001",
+        "--set", "evaluation.selection_metric=rollout.t+2.model_over_copy_last_mse",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["candidates"][0]["spec"]["evaluation"]["reference_run"]["checkpoint"] == "best-validation.pt"
+
+
+def test_factory_search_unknown_reference_run_is_a_concise_cli_error(tmp_path):
+    root = tmp_path / "runs"
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    with pytest.raises(SystemExit, match="no run 'no-such-run'"):
+        main([
+            "factory", "search", str(spec_path), "--root", str(root), "--dry-run", "--no-trace",
+            "--reference-run", "no-such-run",
+        ])
+
+
+def test_factory_search_missing_reference_checkpoint_names_the_checkpoint_not_the_spec(tmp_path):
+    """A --reference-run whose checkpoint header is absent must say so.
+
+    The run exists and its spec file reads fine, so blaming "spec file not
+    found: <spec>" -- as a single broad ``except FileNotFoundError`` around
+    both reads did -- names a file that was read successfully and hides the
+    one that is actually missing. The clinic's Evolve tab offers a
+    reference-run picker over every completed run, including runs with no
+    checkpoint on disk, and shows this string to a human verbatim.
+    """
+    root = tmp_path / "runs"
+    _make_run(root, "champion-0001", _spec(organism="Crafter"))  # no checkpoint written
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    with pytest.raises(SystemExit) as excinfo:
+        main([
+            "factory", "search", str(spec_path), "--root", str(root), "--dry-run", "--no-trace",
+            "--reference-run", "champion-0001",
+        ])
+    message = str(excinfo.value)
+    assert "best-validation.pt" in message
+    assert "spec file not found" not in message
+
+
+def test_factory_search_architecture_dry_run_previews_the_outer_population(capsys):
+    """``--genome architecture`` previews architectures, not training genes."""
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    main([
+        "factory", "search", str(spec_path), "--genome", "architecture",
+        "--outer-population-size", "3", "--outer-populations", "2",
+        "--population-size", "2", "--populations", "1",
+        "--seed", "13", "--run-id-prefix", "preview-13", "--dry-run", "--no-trace",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["workflow"] == "architecture"
+    assert payload["dry_run"] is True
+    assert payload["campaign_id"] == "preview-13"
+    assert payload["architecture_schema_version"] == "architecture_search_v1"
+    assert payload["hyperparameter_schema_version"] == "generic_action_effects_v2"
+    assert [candidate["architecture_id"] for candidate in payload["candidates"]] == [
+        "preview-13-arch0-a0", "preview-13-arch0-a1", "preview-13-arch0-a2",
+    ]
+    # Each previewed candidate's genome is genuinely merged into its spec's
+    # model block -- the outer axis, never the training block.
+    for candidate in payload["candidates"]:
+        assert candidate["spec"]["model"]["hidden_dim"] == candidate["genome"]["hidden_dim"]
+        assert candidate["spec"]["mode"] == "fresh"
+        assert candidate["spec"]["parent"] is None
+
+
+def test_factory_search_architecture_always_prints_the_multiplicative_cost_bound(capsys):
+    """The cost bound is the one thing this workflow must never launch without.
+
+    Printed to stderr so stdout stays the single JSON document every other
+    factory subcommand prints.
+    """
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    main([
+        "factory", "search", str(spec_path), "--genome", "architecture",
+        "--outer-population-size", "4", "--outer-populations", "2",
+        "--population-size", "3", "--populations", "1",
+        "--seed", "1", "--dry-run", "--no-trace",
+    ])
+    captured = capsys.readouterr()
+
+    assert "24 trial(s)" in captured.err
+    assert "4 architectures x 2 outer generation(s) x 3 candidates" in captured.err
+    assert json.loads(captured.out)["estimate"]["estimated_max_trials"] == 24
+
+
+def test_factory_search_architecture_rejects_the_legacy_halving_flag(tmp_path):
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    with pytest.raises(SystemExit, match="--budgets"):
+        main([
+            "factory", "search", str(spec_path), "--genome", "architecture",
+            "--budgets", "1", "2", "--dry-run", "--no-trace",
+        ])
+
+
+def test_factory_search_architecture_rejects_an_unknown_outer_schema(tmp_path):
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    with pytest.raises(SystemExit, match="unknown architecture genome schema"):
+        main([
+            "factory", "search", str(spec_path), "--genome", "architecture",
+            "--outer-schema", "architecture_search_v99", "--dry-run", "--no-trace",
+        ])
+
+
+def test_factory_meta_declares_the_architecture_schemas_and_backbone_presets(capsys):
+    """The Evolve tab's NAS mode sources its options from the backend's enums."""
+    main(["factory", "meta", "--no-trace"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["architecture_genome_schemas"] == ["architecture_search_v1"]
+    assert payload["backbone_presets"]["transformer_h4_l2"] == {
+        "backbone": "transformer", "backbone_kwargs": {"n_heads": 4, "n_layers": 2},
+    }
+    assert payload["backbone_presets"]["gru"] == {"backbone": "gru", "backbone_kwargs": {}}
+    # The two schema registries stay separate: neither can be offered where
+    # the other is expected.
+    assert not set(payload["architecture_genome_schemas"]) & set(payload["genome_schemas"])
+
+
+def test_factory_search_missing_spec_file_still_names_the_spec(tmp_path):
+    with pytest.raises(SystemExit, match="spec file not found"):
+        main([
+            "factory", "search", str(tmp_path / "no-such-spec.json"),
+            "--root", str(tmp_path / "runs"), "--dry-run", "--no-trace",
+        ])
+
+
 def test_factory_search_dry_run_rejects_invalid_budget_schedule():
     spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
     with pytest.raises(SystemExit, match="strictly increasing"):
@@ -363,6 +534,118 @@ def test_factory_breed_dry_run_prints_explicit_parent_and_weight_donor_lineage(t
     assert sorted(path.name for path in (root / "crafter-baseline").iterdir() if path.is_dir()) == [
         "parent-a", "parent-b",
     ]
+
+
+def _fake_trial_result(run_id, directory):
+    """A run_trial() stand-in shaped just enough for _print_trial_result --
+    used to test CLI wiring (argument threading) without importing torch."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        run_id=run_id, display_name="fake-display", mode="fresh", state="completed", directory=directory,
+        architecture_hash="a" * 8, data_contract_hash="b" * 8, training_contract_hash="c" * 8,
+        checkpoint_path=str(directory / "checkpoints" / "best-validation.pt"), checkpoint_sha256="d" * 64,
+        training_stats={}, evaluation={}, budget_report={}, comparison=None, experiment_report_path=None,
+    )
+
+
+def test_factory_baseline_passes_an_explicit_run_id_through_to_run_trial(tmp_path, capsys, monkeypatch):
+    """--run-id (added alongside Phase 2's job registry, which must be able
+    to precompute a launched job's run id before run_trial's own
+    auto-naming would otherwise decide it) threads straight through."""
+    import cognitive_runtime.training.model_factory.runner as runner_module
+
+    captured = {}
+
+    def fake_run_trial(spec, **kwargs):
+        captured.update(kwargs)
+        return _fake_trial_result(kwargs.get("run_id") or "auto-named", tmp_path)
+
+    monkeypatch.setattr(runner_module, "run_trial", fake_run_trial)
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_bytes(dump_canonical_json(_spec()))
+
+    main(["factory", "baseline", str(spec_path), "--factory-run-id", "explicit-run-7", "--no-trace"])
+
+    assert captured["run_id"] == "explicit-run-7"
+    assert "run_id: explicit-run-7" in capsys.readouterr().out
+
+
+def test_factory_clone_passes_an_explicit_run_id_through_to_run_trial(tmp_path, monkeypatch):
+    import cognitive_runtime.training.model_factory.runner as runner_module
+
+    root = tmp_path / "runs"
+    artifacts = _make_run(root, "crafter-baseline-0001", _spec())
+    _write_checkpoint_metadata(artifacts)
+    captured = {}
+
+    def fake_run_trial(spec, **kwargs):
+        captured.update(kwargs)
+        return _fake_trial_result(kwargs.get("run_id") or "auto-named", tmp_path)
+
+    monkeypatch.setattr(runner_module, "run_trial", fake_run_trial)
+
+    main([
+        "factory", "clone", "--root", str(root), "crafter-baseline-0001",
+        "--factory-run-id", "clone-child-1", "--no-trace",
+    ])
+
+    assert captured["run_id"] == "clone-child-1"
+
+
+def test_factory_breed_passes_an_explicit_run_id_through_to_run_trial(tmp_path, monkeypatch):
+    import cognitive_runtime.training.model_factory.runner as runner_module
+
+    root = tmp_path / "runs"
+    base_doc = _spec().to_dict()
+    base_doc["training"] = dict(base_doc["training"])
+    base_doc["training"].update({
+        "max_training_seconds": 600.0,
+        "scheduled_sampling_p": 0.1,
+        "loss_weights": {
+            "closed_loop_pixel_loss_weight": 0.2,
+            "closed_loop_latent_loss_weight": 0.3,
+            # generic_action_effects_v2 (the default schema) also varies the
+            # three reconstruction weights, and breeding requires every gene
+            # path the schema declares to be present on both parents.
+            "pixel": 1.0,
+            "latent": 1.0,
+            "semantic": 1.0,
+        },
+        "transition_balance_policy": {"stationary_cap": 0.4},
+    })
+    parent_a = _make_run(root, "parent-a", resolve(base_doc))
+    base_doc["training"]["optimizer"] = {"name": "adamw", "lr": 0.001, "weight_decay": 0.00001}
+    base_doc["training"]["scheduled_sampling_p"] = 0.4
+    parent_b = _make_run(root, "parent-b", resolve(base_doc))
+    for artifacts, sha in ((parent_a, "a" * 64), (parent_b, "b" * 64)):
+        _write_checkpoint_metadata(artifacts, sha256=sha)
+        _write_budget_report(artifacts, tier="fast")
+    captured = {}
+
+    def fake_run_trial(spec, **kwargs):
+        captured.update(kwargs)
+        run_id = kwargs.get("run_id") or "auto-named"
+        # cmd_factory_breed enriches lineage.json right after run_trial
+        # returns (record_breeding_lineage); a real run_trial call would
+        # have allocated it via allocate_run_artifacts, so this stand-in
+        # writes the same minimal stub.
+        child_directory = tmp_path / run_id
+        child_directory.mkdir(parents=True, exist_ok=True)
+        (child_directory / "lineage.json").write_text(json.dumps({
+            "format": "model-factory-lineage-v1", "mode": "clone", "parent": None,
+            "configuration_parents": ["parent-a", "parent-b"], "weight_donor": "parent-b",
+        }))
+        return _fake_trial_result(run_id, child_directory)
+
+    monkeypatch.setattr(runner_module, "run_trial", fake_run_trial)
+
+    main([
+        "factory", "breed", "parent-a", "parent-b", "--root", str(root),
+        "--seed", "19", "--weight-donor", "parent-b", "--factory-run-id", "bred-child-1", "--no-trace",
+    ])
+
+    assert captured["run_id"] == "bred-child-1"
 
 
 # --------------------------------------------------------------------- show
@@ -513,6 +796,128 @@ def test_factory_clone_rejects_unknown_nested_field_with_nearest_match(tmp_path)
         ])
     assert "corpus_i" in str(excinfo.value)
     assert "corpus_id" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------- resume
+
+
+def test_factory_build_resume_spec_reopens_the_same_run_from_its_last_checkpoint(tmp_path):
+    from cognitive_runtime.cli import _factory_build_resume_spec
+
+    root = tmp_path / "runs"
+    spec = _spec()
+    artifacts = _make_run(root, "crafter-baseline-0001", spec, state=STATE_RUNNING)
+    _write_checkpoint_metadata(artifacts, sha256="b" * 64, name="last.pt")
+
+    resume_doc = _factory_build_resume_spec(artifacts.directory, "crafter-baseline-0001")
+
+    assert resume_doc["mode"] == "resume"
+    assert resume_doc["organism"] == spec.organism
+    assert resume_doc["parent"] == {
+        "run_id": "crafter-baseline-0001", "checkpoint": "last.pt", "sha256": "b" * 64,
+    }
+
+    # The resume doc must itself resolve/validate cleanly -- run_trial calls
+    # resolve() on exactly this shape before it ever checks state.json -- and,
+    # once resolved, its data/model/training/evaluation blocks must be
+    # byte-identical to the original run's: resume requires an exact
+    # continuation of the same architecture/data/training contracts, never a
+    # modified sibling (run_trial rebuilds the model from these blocks and
+    # checks it against the checkpoint's own recorded contracts).
+    resolved = resolve(resume_doc)
+    assert resolved.mode == "resume"
+    assert resolved.parent == {"run_id": "crafter-baseline-0001", "checkpoint": "last.pt", "sha256": "b" * 64}
+    assert resolved.data == spec.data
+    assert resolved.model == spec.model
+    assert resolved.training == spec.training
+    assert resolved.evaluation == spec.evaluation
+
+
+def test_factory_resume_missing_last_checkpoint_is_a_concise_cli_error(tmp_path):
+    root = tmp_path / "runs"
+    _make_run(root, "crafter-baseline-0001", _spec(), state=STATE_RUNNING)
+    # No checkpoints/last.pt.json written -- only a genuinely interrupted
+    # run (one that reached at least one checkpoint chunk) is resumable.
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["factory", "resume", "--root", str(root), "crafter-baseline-0001", "--no-trace"])
+    assert "last.pt" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------- cancel / reconcile
+
+
+def test_factory_cancel_writes_the_cancellation_flag(tmp_path, capsys):
+    root = tmp_path / "runs"
+    artifacts = _make_run(root, "crafter-baseline-0001", _spec(), state=STATE_RUNNING)
+
+    main(["factory", "cancel", "--root", str(root), "crafter-baseline-0001", "--reason", "operator requested"])
+
+    payload = json.loads(cancel_request_path(artifacts.directory).read_text())
+    assert payload["reason"] == "operator requested"
+    assert "cancellation requested" in capsys.readouterr().out
+
+
+def test_factory_cancel_unknown_run_is_a_concise_cli_error(tmp_path):
+    root = tmp_path / "runs"
+    with pytest.raises(SystemExit, match="run 'missing' was not found"):
+        main(["factory", "cancel", "--root", str(root), "missing"])
+
+
+def test_factory_reconcile_reports_recovered_runs_as_json(tmp_path, capsys):
+    root = tmp_path / "runs"
+    run_directory = root / "Crafter" / "stale-run"
+    run_directory.mkdir(parents=True)
+    create_state(state_path(run_directory), "stale-run", heartbeat_timeout_seconds=300.0)
+    transition(state_path(run_directory), STATE_RUNNING)
+    write_heartbeat(heartbeat_path(run_directory), run_id="stale-run", clock=lambda: time.time() - 10_000)
+
+    main(["factory", "reconcile", "--root", str(root), "Crafter"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["organism"] == "Crafter"
+    assert payload["recovered"] == [{"run_id": "stale-run", "reason": "stale_worker_watchdog_timeout"}]
+    assert load_state(state_path(run_directory)).state == "failed"
+
+
+def test_factory_reconcile_reports_nothing_when_no_run_is_stale(tmp_path, capsys):
+    root = tmp_path / "runs"
+    run_directory = root / "Crafter" / "fresh-run"
+    run_directory.mkdir(parents=True)
+    create_state(state_path(run_directory), "fresh-run", heartbeat_timeout_seconds=300.0)
+    transition(state_path(run_directory), STATE_RUNNING)
+    write_heartbeat(heartbeat_path(run_directory), run_id="fresh-run")
+
+    main(["factory", "reconcile", "--root", str(root), "Crafter"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["recovered"] == []
+    assert load_state(state_path(run_directory)).state == "running"
+
+
+def test_factory_reconcile_kill_transitions_a_running_run_to_cancelled(tmp_path, capsys):
+    root = tmp_path / "runs"
+    artifacts = _make_run(root, "crafter-baseline-0001", _spec(), state=STATE_RUNNING)
+
+    main(["factory", "reconcile-kill", "--root", str(root), "crafter-baseline-0001", "--state", "cancelled"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "run_id": "crafter-baseline-0001", "recovered": True,
+        "state": "cancelled", "reason": "killed_by_operator",
+    }
+    assert load_state(state_path(artifacts.directory)).state == "cancelled"
+
+
+def test_factory_reconcile_kill_is_a_noop_for_an_already_terminal_run(tmp_path, capsys):
+    root = tmp_path / "runs"
+    artifacts = _make_run(root, "crafter-baseline-0001", _spec(), state=STATE_COMPLETED)
+
+    main(["factory", "reconcile-kill", "--root", str(root), "crafter-baseline-0001", "--state", "cancelled"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"run_id": "crafter-baseline-0001", "recovered": False, "state": None, "reason": None}
+    assert load_state(state_path(artifacts.directory)).state == "completed"
 
 
 # --------------------------------------------------------------------- compare / promote

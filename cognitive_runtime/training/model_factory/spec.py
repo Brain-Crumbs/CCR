@@ -103,7 +103,14 @@ TRAINING_KEYS: Tuple[str, ...] = (
     "early_stopping_policy",
 )
 
-EVALUATION_KEYS: Tuple[str, ...] = ("selection_metric", "gates", "confidence")
+EVALUATION_KEYS: Tuple[str, ...] = ("selection_metric", "gates", "confidence", "reference_run")
+
+#: Same shape as ``PARENT_KEYS`` -- a checkpoint reference with a declared
+#: hash -- but ``reference_run`` is loaded read-only for evaluation-time
+#: comparison (epic clinic redesign, "beat this model, not just
+#: copy-last"), never as a weight donor: it is unrelated to ``mode``/
+#: ``parent`` and coexists with ``mode: fresh``.
+REFERENCE_RUN_KEYS: Tuple[str, ...] = ("run_id", "checkpoint", "sha256")
 
 EVOLUTION_KEYS: Tuple[str, ...] = (
     "generation",
@@ -514,6 +521,18 @@ def _validate_evaluation(evaluation: Mapping[str, Any]) -> None:
             "parse into a resolvable metric path (e.g. "
             "'rollout.t+4.model_over_copy_last_mse')"
         )
+
+    reference_run = evaluation.get("reference_run")
+    if reference_run is not None:
+        _check_unknown_keys("evaluation.reference_run", reference_run, REFERENCE_RUN_KEYS)
+        # "checkpoint" is required alongside run_id/sha256, not merely
+        # optional metadata: runner._reference_checkpoint_path() indexes
+        # reference_run["checkpoint"] unconditionally, so omitting it here
+        # would pass resolve()/validate() cleanly and then crash with a raw
+        # KeyError at trial startup instead of this clear SpecError.
+        for required in ("run_id", "checkpoint", "sha256"):
+            if not reference_run.get(required):
+                raise SpecError(f"'evaluation.reference_run.{required}' is required when 'reference_run' is set")
 
 
 def _validate_evaluation_horizons(spec: ExperimentSpec) -> None:

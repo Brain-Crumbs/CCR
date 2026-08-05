@@ -1862,106 +1862,6 @@ def _factory_slot_defaults(run_directory: Path, trial_spec: Mapping[str, Any]) -
     return family, tier
 
 
-def _factory_genome_value(training: Mapping[str, Any], dotted_path: str) -> Any:
-    """Read one declared genome field from a resolved training block."""
-    value: Any = training
-    for part in dotted_path.split("."):
-        if not isinstance(value, Mapping) or part not in value:
-            raise ValueError(f"resolved training block is missing declared genome field {dotted_path!r}")
-        value = value[part]
-    return value
-
-
-def _factory_present_genome_fields(
-    training: Mapping[str, Any], declared_fields: Sequence[str],
-) -> Tuple[str, ...]:
-    """Keep only schema-declared paths represented by this spec generation.
-
-    A schema can contain an inactive or not-yet-materialized optional field;
-    it is not a diversity dimension for a run that has no resolved value for
-    it.  The retained fields are still declared schema fields, never runtime
-    state or an inferred implementation detail.
-    """
-    present = []
-    for field in declared_fields:
-        try:
-            _factory_genome_value(training, field)
-        except ValueError:
-            continue
-        present.append(field)
-    if not present:
-        raise ValueError("no declared genome fields are present in the resolved training specification")
-    return tuple(present)
-
-
-def _factory_compute_ledger(run_directory: Path, *, seen: Optional[set[str]] = None) -> Any:
-    """Recover inclusive compute cost along the one checkpoint-donor lineage."""
-    from cognitive_runtime.training.model_factory.population import ComputeLedger
-
-    seen = set() if seen is None else set(seen)
-    run_id = run_directory.name
-    if run_id in seen:
-        raise ValueError(f"cycle while recovering compute lineage for {run_id!r}")
-    seen.add(run_id)
-    with (run_directory / "metrics" / "budget_report.json").open(encoding="utf-8") as handle:
-        budget = json.load(handle)
-    trial_compute = float(budget.get("total_trial_seconds", budget.get("measured_training_seconds", 0.0)))
-    lineage_path = run_directory / "lineage.json"
-    if not lineage_path.is_file():
-        return ComputeLedger.fresh(trial_compute)
-    with lineage_path.open(encoding="utf-8") as handle:
-        lineage = json.load(handle)
-    donor_run_id = lineage.get("weight_donor") or (lineage.get("parent") or {}).get("run_id")
-    if not donor_run_id:
-        return ComputeLedger.fresh(trial_compute)
-    return ComputeLedger.child(
-        trial_compute,
-        _factory_compute_ledger(run_directory.parent / str(donor_run_id), seen=seen),
-    )
-
-
-def _factory_population_candidate(
-    run_directory: Path,
-    *,
-    objective: str,
-    declared_genome_fields: Sequence[str],
-    gates: Optional[Mapping[str, bool]] = None,
-) -> Any:
-    """Build a validation-only D5 candidate from persisted run artifacts."""
-    from cognitive_runtime.training.model_factory.population import PopulationCandidate
-    from cognitive_runtime.training.model_factory.runner import _resolve_selection_metric
-
-    with (run_directory / "trial_spec.json").open(encoding="utf-8") as handle:
-        trial_spec = json.load(handle)
-    validation, ticks_per_frame = _factory_load_validation(run_directory)
-    primary_metric, _ = _resolve_selection_metric(validation, objective, ticks_per_frame)
-    retention_metric = float(primary_metric)
-    retention_path = run_directory / "metrics" / "retention.json"
-    if retention_path.is_file():
-        with retention_path.open(encoding="utf-8") as handle:
-            retention_payload = json.load(handle)
-        retention_metric = float(retention_payload["forgetting_amount"])
-    with (run_directory / "metrics" / "budget_report.json").open(encoding="utf-8") as handle:
-        budget = json.load(handle)
-    return PopulationCandidate(
-        run_id=run_directory.name,
-        resolved_spec={key: value for key, value in trial_spec.items() if key != "format"},
-        genome={
-            field: _factory_genome_value(trial_spec["training"], field)
-            for field in declared_genome_fields
-        },
-        primary_metric=float(primary_metric),
-        runtime=float(budget.get("total_trial_seconds", budget.get("measured_training_seconds", 0.0))),
-        # Generic dynamics has no separate report and retains its validation
-        # objective here. Navigation fine-tunes use the CI-refereed forgetting
-        # amount written by the runner instead.
-        retention_metric=retention_metric,
-        ledger=_factory_compute_ledger(run_directory),
-        gates=dict(gates or {}),
-        completion_status=str(budget.get("completion_status", "completed")),
-    )
-
-
 def _print_trial_result(result: Any) -> None:
     print(f"run_id: {result.run_id}")
     print(f"display_name: {result.display_name}")
@@ -1999,12 +1899,82 @@ def cmd_factory_baseline(args: argparse.Namespace) -> None:
 
         result = run_trial(
             resolved, root=args.root, corpus_root=args.corpus_root, naming_seed=args.naming_seed,
+            run_id=args.factory_run_id,
             export_predictions=not args.no_export_predictions,
             export_predictions_max_episodes=args.export_predictions_max,
         )
     except ImportError as exc:
         sys.exit(f"'ccr factory baseline' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
     _print_trial_result(result)
+
+
+def _run_architecture_campaign(
+    args: argparse.Namespace,
+    base_spec: Any,
+    outer_schema: Any,
+    inner_schema: Any,
+    preview: Any,
+    run_architecture_search: Any,
+) -> None:
+    """``ccr factory search --genome architecture``'s tail: cost, then campaign.
+
+    Split out of :func:`cmd_factory_search` rather than inlined so the
+    nested workflow's one genuinely distinctive obligation is impossible to
+    miss: the cost bound is *always* printed, dry run or not, before a
+    single trial starts. Outer and inner budgets multiply
+    (``architecture_search.estimate_cost``), so a "modest" 4x2 over 3x1 is
+    already 24 full trainings; the estimate goes to stderr so stdout stays
+    the single JSON document every other factory subcommand prints.
+    """
+    estimate = preview.estimate
+    seconds = estimate.estimated_max_seconds
+    print(
+        f"architecture search cost bound: {estimate.estimated_max_trials} trial(s) "
+        f"({estimate.outer_population_size} architectures x {estimate.outer_population_count} outer "
+        f"generation(s) x {estimate.inner_population_size} candidates x "
+        f"{estimate.inner_population_count} inner population(s)); "
+        + (
+            f"up to {seconds:.0f}s of training at "
+            f"{estimate.max_training_seconds_per_trial:.0f}s per trial"
+            if seconds is not None else
+            "no wall-clock bound -- this spec declares no training.max_training_seconds"
+        ),
+        file=sys.stderr,
+    )
+
+    if args.dry_run:
+        print(json.dumps(_factory_json_ready({
+            **preview.to_dict(),
+            "workflow": "architecture",
+            "architecture_schema_hash": outer_schema.content_hash,
+            "hyperparameter_schema_hash": inner_schema.content_hash,
+        }), indent=2, sort_keys=True))
+        return
+
+    try:
+        report = run_architecture_search(
+            base_spec, outer_schema, inner_schema,
+            outer_population_size=args.outer_population_size,
+            outer_population_count=args.outer_population_count,
+            inner_population_size=args.population_size,
+            inner_population_count=args.population_count,
+            seed=args.seed, method=args.method,
+            outer_mutation_rate=args.outer_mutation_rate,
+            inner_mutation_rate=args.mutation_rate,
+            root=args.root, corpus_root=args.corpus_root,
+            run_id_prefix=preview.campaign_id, naming_seed=args.naming_seed,
+            champion_run_id=args.champion,
+            min_episode_length=args.min_episode_length,
+            stage_budget_seconds=args.stage_budget_seconds,
+        )
+    except ImportError as exc:
+        sys.exit(f"'ccr factory search' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+    payload = report.to_dict()
+    payload["campaign_id"] = preview.campaign_id
+    payload["workflow"] = "architecture"
+    payload["architecture_schema_hash"] = outer_schema.content_hash
+    payload["hyperparameter_schema_hash"] = inner_schema.content_hash
+    print(json.dumps(_factory_json_ready(payload), indent=2, sort_keys=True))
 
 
 def cmd_factory_search(args: argparse.Namespace) -> None:
@@ -2014,7 +1984,21 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
     specs and prints them without resolving a corpus or launching training.
     Supplying the deprecated ``--budgets`` option explicitly retains the old
     successive-halving workflow for reproducibility of existing campaigns.
+
+    ``--genome architecture`` switches to the nested NAS campaign
+    (:mod:`~.model_factory.architecture_search`): an outer evolutionary loop
+    over architectures, each scored by a complete inner training-gene
+    campaign. ``--population-size``/``--populations``/``--mutation-rate``
+    keep their meaning as that *inner* campaign's parameters -- the inner
+    engine is ``run_evolutionary_search`` unchanged -- and the outer loop has
+    its own ``--outer-*`` flags.
     """
+    from cognitive_runtime.training.model_factory.architecture_genome import get_architecture_schema
+    from cognitive_runtime.training.model_factory.architecture_search import (
+        preview_architecture_search,
+        run_architecture_search,
+    )
+    from cognitive_runtime.training.model_factory.checkpoint import read_factory_checkpoint_metadata
     from cognitive_runtime.training.model_factory.genome import get_schema
     from cognitive_runtime.training.model_factory.search import (
         propose,
@@ -2025,11 +2009,58 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
 
     try:
         raw = load_spec(args.spec)
+    except FileNotFoundError:
+        # Narrowed to this one call deliberately. The broader ``try`` below
+        # also reads a --reference-run's checkpoint header, whose own
+        # FileNotFoundError used to surface here as "spec file not found:
+        # <spec>" -- naming a file that was in fact read fine and hiding the
+        # checkpoint that was actually missing. The clinic's Evolve tab
+        # (which offers a reference-run picker over every completed run,
+        # including ones with no checkpoint on disk) shows this string to a
+        # human verbatim, so it has to name the right file.
+        sys.exit(f"invalid factory search: spec file not found: {args.spec}")
+
+    try:
         if args.set:
             raw = apply_overrides(raw, args.set)
+        if args.reference_run:
+            # A convenience wholly analogous to clone/resume's own parent-block
+            # construction: a human should never have to look up and type a
+            # checkpoint's sha256 by hand. Applied after --set (and as a
+            # wholesale replacement, not a merge) so this flag always wins
+            # over an incomplete/conflicting --set evaluation.reference_run.*.
+            reference_directory = _factory_run_directory(args.root, args.reference_run, raw.get("organism"))
+            reference_checkpoint_path = reference_directory / "checkpoints" / args.reference_checkpoint
+            reference_sha256 = read_factory_checkpoint_metadata(
+                str(reference_checkpoint_path)
+            ).get("checkpoint_sha256")
+            raw = dict(raw)
+            raw["evaluation"] = {
+                **(raw.get("evaluation") or {}),
+                "reference_run": {
+                    "run_id": args.reference_run, "checkpoint": args.reference_checkpoint,
+                    "sha256": reference_sha256,
+                },
+            }
         legacy_halving = args.budgets is not None
         budgets = tuple(args.budgets or ())
+        architecture_mode = args.genome == "architecture"
+        if architecture_mode and legacy_halving:
+            raise ValueError(
+                "--budgets runs the legacy successive-halving workflow, which has no "
+                "architecture mode; drop --budgets to run the nested architecture campaign"
+            )
         seed_run_ids = tuple(args.seed_run or ())
+        if architecture_mode and seed_run_ids:
+            # A seed run pins one *existing* run as a population member, which
+            # only makes sense against a single fixed architecture: every
+            # inner campaign here runs under its own outer architecture
+            # candidate, so there is no one population for a seed to join.
+            raise ValueError(
+                "--seed-run seeds a single-architecture population, which the nested "
+                "architecture campaign has no equivalent of; drop --genome architecture "
+                "to seed an evolutionary search"
+            )
         if legacy_halving:
             if seed_run_ids:
                 raise ValueError("--seed-run is supported by evolutionary search, not legacy --budgets")
@@ -2051,6 +2082,7 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
             )
         base_spec = resolve(raw)
         schema = get_schema(args.schema)
+        outer_schema = get_architecture_schema(args.outer_schema) if architecture_mode else None
         fresh_count = args.population_size - len(seed_run_ids)
         proposals = (
             propose(
@@ -2058,12 +2090,35 @@ def cmd_factory_search(args: argparse.Namespace) -> None:
                 min_episode_length=args.min_episode_length,
                 stage_budget_seconds=args.stage_budget_seconds,
             )
-            if args.dry_run and fresh_count else ()
+            if args.dry_run and fresh_count and not architecture_mode else ()
         )
-    except FileNotFoundError:
-        sys.exit(f"invalid factory search: spec file not found: {args.spec}")
+        architecture_preview = (
+            preview_architecture_search(
+                base_spec, outer_schema, schema,
+                outer_population_size=args.outer_population_size,
+                outer_population_count=args.outer_population_count,
+                inner_population_size=args.population_size,
+                inner_population_count=args.population_count,
+                seed=args.seed, method=args.method,
+                outer_mutation_rate=args.outer_mutation_rate,
+                inner_mutation_rate=args.mutation_rate,
+                run_id_prefix=args.run_id_prefix,
+            )
+            if architecture_mode else None
+        )
+    except FileNotFoundError as exc:
+        # OSError's own branch below would render this as a bare errno
+        # string; `filename` is the part that tells a human which artifact
+        # to go build (almost always a --reference-run checkpoint header).
+        sys.exit(f"invalid factory search: file not found: {exc.filename or exc}")
     except (OSError, SpecError, ValueError) as exc:
         sys.exit(f"invalid factory search: {exc}")
+
+    if architecture_mode:
+        _run_architecture_campaign(
+            args, base_spec, outer_schema, schema, architecture_preview, run_architecture_search,
+        )
+        return
 
     campaign_id = args.run_id_prefix or (f"sh{args.seed}" if legacy_halving else f"evo{args.seed}")
     if args.dry_run:
@@ -2187,12 +2242,193 @@ def cmd_factory_clone(args: argparse.Namespace) -> None:
 
         result = run_trial(
             resolved, root=args.root, corpus_root=args.corpus_root, naming_seed=args.naming_seed,
+            run_id=args.factory_run_id,
             export_predictions=not args.no_export_predictions,
             export_predictions_max_episodes=args.export_predictions_max,
         )
     except ImportError as exc:
         sys.exit(f"'ccr factory clone' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
     _print_trial_result(result)
+
+
+def _factory_build_resume_spec(
+    parent_directory: Path, run_id: str, checkpoint: str = "last.pt",
+) -> Dict[str, Any]:
+    """Build a ``mode: resume`` spec that reopens ``run_id``'s own interrupted run.
+
+    Copies ``organism``/``data``/``model``/``training``/``evaluation``
+    verbatim from the run's own ``trial_spec.json`` -- resume must be an
+    exact continuation of the same architecture/data/training contracts,
+    never a modified sibling (``run_trial`` rebuilds the model from these
+    blocks and checks it against the checkpoint's own recorded contracts) --
+    and points ``parent`` at the run's own last checkpoint: ``last.pt``
+    carries the resumable trainer state (epoch, optimizer, RNG);
+    ``best-validation.pt`` does not, so resume never defaults to it.
+    """
+    with (parent_directory / "trial_spec.json").open(encoding="utf-8") as handle:
+        original_spec = json.load(handle)
+
+    from cognitive_runtime.training.model_factory.checkpoint import read_factory_checkpoint_metadata
+
+    checkpoint_path = parent_directory / "checkpoints" / checkpoint
+    try:
+        checkpoint_meta = read_factory_checkpoint_metadata(str(checkpoint_path))
+    except OSError as exc:
+        sys.exit(f"cannot read checkpoint metadata at {checkpoint_path}: {exc}")
+
+    return {
+        "organism": original_spec["organism"],
+        "mode": "resume",
+        "data": original_spec["data"],
+        "model": original_spec["model"],
+        "training": original_spec["training"],
+        "evaluation": original_spec["evaluation"],
+        "parent": {
+            "run_id": run_id,
+            "checkpoint": checkpoint,
+            "sha256": checkpoint_meta.get("checkpoint_sha256"),
+        },
+    }
+
+
+def cmd_factory_resume(args: argparse.Namespace) -> None:
+    """``ccr factory resume <run>``: reopen an interrupted run's own directory
+    and continue training from its last checkpoint.
+
+    Unlike clone/fine_tune, a resume is not a new run: it appends to the
+    same ``run_id``, and none of its immutable manifests (``trial_spec.json``
+    included) are rewritten -- only read back (epic #212 Sec 11/16).
+    ``run_trial`` itself is what decides whether this run is a legitimate
+    resume target (an active state with a stale heartbeat); this command
+    does not duplicate that check, it only lets the error surface.
+    """
+    parent_directory = _factory_run_directory(args.root, args.run, args.organism)
+    resume_doc = _factory_build_resume_spec(parent_directory, args.run)
+
+    from cognitive_runtime.training.model_factory.spec import SpecError, resolve
+
+    try:
+        resolved = resolve(resume_doc)
+    except SpecError as exc:
+        sys.exit(f"invalid resume: {exc}")
+
+    try:
+        from cognitive_runtime.training.model_factory.runner import run_trial
+
+        result = run_trial(
+            resolved, root=args.root, corpus_root=args.corpus_root,
+            export_predictions=not args.no_export_predictions,
+            export_predictions_max_episodes=args.export_predictions_max,
+        )
+    except ImportError as exc:
+        sys.exit(f"'ccr factory resume' needs PyTorch ({exc}). Install it with 'pip install -e .[neural]'.")
+    _print_trial_result(result)
+
+
+def cmd_factory_cancel(args: argparse.Namespace) -> None:
+    """``ccr factory cancel <run>``: ask a running/checkpointing trial to
+    stop gracefully at its next checkpoint boundary.
+
+    A plain flag file (``state.request_cancellation``) -- the trial's own
+    training loop is what notices it and transitions to ``cancelled``; this
+    command never touches ``state.json`` directly, and is a no-op (not an
+    error) even if the run has already finished, since a terminal run never
+    reads the flag again. Pure Python, no torch import, so this always
+    works even without the ``neural`` extra installed.
+    """
+    from cognitive_runtime.training.model_factory.state import request_cancellation
+
+    run_directory = _factory_run_directory(args.root, args.run, args.organism)
+    request_cancellation(run_directory, reason=args.reason)
+    print(f"cancellation requested for {args.run!r}; it will stop at its next checkpoint boundary")
+
+
+def cmd_factory_reconcile(args: argparse.Namespace) -> None:
+    """``ccr factory reconcile <organism>``: sweep every run under
+    ``<organism>`` and fail any whose worker has gone stale -- a heartbeat
+    past its declared watchdog timeout (``state.reconcile_stale_runs``).
+
+    Exposed as its own command so a control plane (or a cron-style sweep)
+    can trigger this opportunistically without reimplementing the
+    staleness check itself. A no-op for every run whose heartbeat is still
+    current, so calling this liberally is cheap and safe.
+    """
+    from cognitive_runtime.training.model_factory.state import reconcile_stale_runs
+
+    recovered = reconcile_stale_runs(args.root, args.organism)
+    payload = {
+        "organism": args.organism,
+        "recovered": [{"run_id": state.run_id, "reason": state.reason} for state in recovered],
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def cmd_factory_reconcile_kill(args: argparse.Namespace) -> None:
+    """``ccr factory reconcile-kill <run>``: after the caller has itself
+    just killed a run's worker process (e.g. a control plane's forced
+    cancel), atomically transition its state record out of an active state
+    -- ``state.reconcile_after_kill`` never waits on or even checks the
+    heartbeat, unlike ``ccr factory reconcile``'s stale-timeout sweep,
+    since the caller already knows there is no live worker. A no-op
+    (``recovered: false``) if the run was not active to begin with, so
+    calling this after a kill that turns out to have been unnecessary
+    (the worker had already finished on its own) is harmless.
+    """
+    from cognitive_runtime.training.model_factory.state import reconcile_after_kill, state_path
+
+    run_directory = _factory_run_directory(args.root, args.run, args.organism)
+    # reconcile_after_kill's own default reason ("killed_by_operator") is
+    # more useful than a literal None; only override it when --reason was
+    # actually passed, rather than always forwarding argparse's None default.
+    kwargs = {"reason": args.reason} if args.reason is not None else {}
+    result = reconcile_after_kill(state_path(run_directory), to_state=args.state, **kwargs)
+    payload = {
+        "run_id": args.run,
+        "recovered": result is not None,
+        "state": result.state if result else None,
+        "reason": result.reason if result else None,
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def cmd_factory_meta(args: argparse.Namespace) -> None:
+    """``ccr factory meta``: dump the factory's own declared enums as JSON --
+    valid spec modes, training objectives, genome schema versions, and
+    backbone choices -- so a caller (the clinic control plane, in
+    particular) can source its form options from the one place each is
+    actually declared instead of duplicating them. Pure Python, no torch
+    import, no run directory touched.
+    """
+    from cognitive_runtime.training.model_factory.architecture_genome import (
+        ARCHITECTURE_GENOME_SCHEMAS,
+        BACKBONE_PRESETS,
+    )
+    from cognitive_runtime.training.model_factory.genome import GENOME_SCHEMAS, OBJECTIVES
+    from cognitive_runtime.training.model_factory.spec import VALID_MODES
+
+    payload = {
+        "modes": list(VALID_MODES),
+        "objectives": list(OBJECTIVES),
+        "genome_schemas": sorted(GENOME_SCHEMAS),
+        # The architecture (NAS) axis is a separate schema registry on
+        # purpose (`architecture_genome.ARCHITECTURE_GENOME_SCHEMAS`): the
+        # two families are mutually exclusive by construction, so a caller
+        # must never be able to offer one where the other is expected.
+        "architecture_genome_schemas": sorted(ARCHITECTURE_GENOME_SCHEMAS),
+        "backbone_presets": {
+            name: {
+                "backbone": preset["backbone"],
+                "backbone_kwargs": dict(preset["backbone_kwargs"]),
+            }
+            for name, preset in BACKBONE_PRESETS.items()
+        },
+        # Mirrors the choices already declared for `ccr nursery joint/bench`
+        # (ActionWorldModelConfig.backbone, issue #93) -- not centralized as
+        # a shared constant there, so named again here rather than reaching
+        # into that parser's local list.
+        "backbones": ["gru", "dilated_conv", "transformer"],
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def cmd_factory_breed(args: argparse.Namespace) -> None:
@@ -2277,7 +2513,7 @@ def cmd_factory_breed(args: argparse.Namespace) -> None:
 
         result = run_trial(
             breeding.child_spec, root=args.root, corpus_root=args.corpus_root,
-            naming_seed=args.naming_seed,
+            naming_seed=args.naming_seed, run_id=args.factory_run_id,
             export_predictions=not args.no_export_predictions,
             export_predictions_max_episodes=args.export_predictions_max,
         )
@@ -2351,8 +2587,6 @@ def cmd_factory_promote(args: argparse.Namespace) -> None:
     selection metric."""
     from cognitive_runtime.training.model_factory.checkpoint import read_factory_checkpoint_metadata
     from cognitive_runtime.training.model_factory.corpus import resolve_corpus
-    from cognitive_runtime.training.model_factory.genome import GENERIC_ACTION_EFFECTS_V1
-    from cognitive_runtime.training.model_factory.population import PopulationPolicy
     from cognitive_runtime.training.model_factory.promotion import (
         PromotionPolicy,
         TestConfirmation,
@@ -2361,9 +2595,9 @@ def cmd_factory_promote(args: argparse.Namespace) -> None:
     from cognitive_runtime.training.model_factory.registry import (
         GOAL_NAVIGATION_V1,
         RegistryError,
+        assemble_population_candidates,
         hold,
         leading_champion,
-        population,
         promote,
     )
     from cognitive_runtime.training.model_factory.runner import _resolve_selection_metric
@@ -2469,26 +2703,11 @@ def cmd_factory_promote(args: argparse.Namespace) -> None:
         checkpoint_meta = read_factory_checkpoint_metadata(str(checkpoint_path))
         validation_payload, ticks_per_frame = _factory_load_validation(run_directory)
         metric_value, _ = _resolve_selection_metric(validation_payload, objective, ticks_per_frame)
-        population_policy = PopulationPolicy(declared_genome_fields=_factory_present_genome_fields(
-            trial_spec["training"], GENERIC_ACTION_EFFECTS_V1.gene_names,
-        ))
-        existing_members = population(
+        population_policy, candidates = assemble_population_candidates(
             registry_root, family=family, tier=tier, objective=objective,
+            new_run_directory=run_directory, new_run_id=args.run,
+            new_run_gates={gate.name: gate.passed for gate in verdict.gates},
         )
-        candidates = [
-            _factory_population_candidate(
-                registry_root / entry.run_id,
-                objective=objective,
-                declared_genome_fields=population_policy.declared_genome_fields,
-            )
-            for entry in existing_members if entry.run_id != args.run
-        ]
-        candidates.append(_factory_population_candidate(
-            run_directory,
-            objective=objective,
-            declared_genome_fields=population_policy.declared_genome_fields,
-            gates={gate.name: gate.passed for gate in verdict.gates},
-        ))
         candidate_ledger = candidates[-1].ledger
         slot = promote(
             registry_root, family=family, tier=tier, objective=objective, run_id=args.run,
@@ -3326,6 +3545,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_factory_baseline.add_argument("--naming-seed", default=None,
                                     help="seed the run's cosmetic display name deterministically "
                                          "(default: a fresh random seed)")
+    p_factory_baseline.add_argument("--factory-run-id", default=None,
+                                    help="explicit Model Factory run id (default: auto-generated) -- "
+                                         "distinct from the global --run-id, which only names this "
+                                         "invocation's trace directory. Lets a caller that must know the "
+                                         "run id before launch completes -- e.g. the clinic control plane "
+                                         "-- precompute it")
     p_factory_baseline.add_argument("--export-predictions-max", type=int, default=3, metavar="N",
                                     help="clinic (viewer/) prediction export: up to N validation episodes "
                                          "from the promoted checkpoint (default: 3)")
@@ -3337,8 +3562,28 @@ def build_parser() -> argparse.ArgumentParser:
         "search", help="evolve candidate populations through quality filtering, selection, and breeding"
     )
     p_factory_search.add_argument("spec", help="base experiment spec file (.yaml/.yml/.json)")
+    p_factory_search.add_argument("--genome", choices=["training", "architecture"], default="training",
+                                  help="which axis to evolve: 'training' (default) evolves training genes "
+                                       "against one fixed architecture; 'architecture' runs a nested "
+                                       "NAS campaign whose outer loop evolves the architecture and whose "
+                                       "inner loop is a complete training-gene campaign per candidate")
     p_factory_search.add_argument("--schema", default="generic_action_effects_v2",
-                                  help="versioned genome schema (default: generic_action_effects_v2)")
+                                  help="versioned genome schema (default: generic_action_effects_v2). "
+                                       "With --genome architecture this is the *inner* (training) schema")
+    p_factory_search.add_argument("--outer-schema", default="architecture_search_v1",
+                                  help="--genome architecture only: versioned architecture genome schema "
+                                       "for the outer loop (default: architecture_search_v1)")
+    p_factory_search.add_argument("--outer-population-size", type=int, default=4,
+                                  help="--genome architecture only: architectures maintained per outer "
+                                       "generation (default: 4). --population-size stays the inner size")
+    p_factory_search.add_argument("--outer-populations", "--outer-generations",
+                                  dest="outer_population_count", type=int, default=2,
+                                  help="--genome architecture only: outer generations to evaluate, "
+                                       "including the initial one (default: 2)")
+    p_factory_search.add_argument("--outer-mutation-rate", type=float, default=0.2,
+                                  help="--genome architecture only: per-gene mutation probability for "
+                                       "structural children (default: 0.2). --mutation-rate stays the "
+                                       "inner rate")
     p_factory_search.add_argument("--population-size", "--candidates", "-n", dest="population_size",
                                   type=int, default=8,
                                   help="candidate count maintained in each population (default: 8)")
@@ -3357,9 +3602,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_factory_search.add_argument("--halving-factor", type=int, default=2,
                                   help="candidate reduction factor per rung (default: 2)")
     p_factory_search.add_argument("--run-id-prefix", default=None,
-                                  help="stable campaign/run prefix (default: evo<seed>)")
+                                  help="stable campaign/run prefix (default: evo<seed>, or arch<seed> "
+                                       "with --genome architecture)")
     p_factory_search.add_argument("--champion", default=None,
                                   help="optional champion run id for the final paired comparison")
+    p_factory_search.add_argument("--reference-run", default=None, metavar="RUN_ID",
+                                  help="optional run whose checkpoint every candidate is evaluated against "
+                                       "(evaluation.reference_run) -- a configurable comparison baseline "
+                                       "beyond copy-last-frame; auto-resolves its checkpoint sha256")
+    p_factory_search.add_argument("--reference-checkpoint", default="best-validation.pt", metavar="NAME",
+                                  help="checkpoint file within --reference-run to compare against "
+                                       "(default: best-validation.pt)")
     p_factory_search.add_argument(
         "--seed-run", action="append", default=None, metavar="RUN_ID",
         help="completed compatible run to carry into population zero without retraining (repeatable)",
@@ -3401,12 +3654,80 @@ def build_parser() -> argparse.ArgumentParser:
                                  help=f"corpora root directory (default: {_FACTORY_CORPORA_ROOT_DEFAULT!r})")
     p_factory_clone.add_argument("--naming-seed", default=None,
                                  help="seed the child's cosmetic display name deterministically")
+    p_factory_clone.add_argument("--factory-run-id", default=None,
+                                 help="explicit Model Factory run id (default: auto-generated) -- distinct "
+                                      "from the global --run-id, which only names this invocation's trace "
+                                      "directory. Lets a caller that must know the run id before launch "
+                                      "completes -- e.g. the clinic control plane -- precompute it")
     p_factory_clone.add_argument("--export-predictions-max", type=int, default=3, metavar="N",
                                  help="clinic (viewer/) prediction export: up to N validation episodes "
                                       "from the promoted checkpoint (default: 3)")
     p_factory_clone.add_argument("--no-export-predictions", action="store_true",
                                  help="skip the clinic prediction export")
     p_factory_clone.set_defaults(func=cmd_factory_clone)
+
+    p_factory_resume = factory_sub.add_parser(
+        "resume", help="reopen an interrupted run's own directory and continue training "
+                       "from its last checkpoint"
+    )
+    p_factory_resume.add_argument("run", help="run id to resume (must be active with a stale heartbeat)")
+    p_factory_resume.add_argument("--organism", default=None,
+                                  help="run's organism, only needed if the run id is ambiguous "
+                                       "across organisms under --root")
+    p_factory_resume.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                  help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_resume.add_argument("--corpus-root", default=None,
+                                  help=f"corpora root directory (default: {_FACTORY_CORPORA_ROOT_DEFAULT!r})")
+    p_factory_resume.add_argument("--export-predictions-max", type=int, default=3, metavar="N",
+                                  help="clinic (viewer/) prediction export: up to N validation episodes "
+                                       "from the promoted checkpoint (default: 3)")
+    p_factory_resume.add_argument("--no-export-predictions", action="store_true",
+                                  help="skip the clinic prediction export")
+    p_factory_resume.set_defaults(func=cmd_factory_resume)
+
+    p_factory_cancel = factory_sub.add_parser(
+        "cancel", help="ask a running/checkpointing trial to stop gracefully at its next checkpoint boundary"
+    )
+    p_factory_cancel.add_argument("run", help="run id to cancel")
+    p_factory_cancel.add_argument("--organism", default=None,
+                                  help="run's organism, only needed if the run id is ambiguous "
+                                       "across organisms under --root")
+    p_factory_cancel.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                  help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_cancel.add_argument("--reason", default=None,
+                                  help="optional operator-facing reason recorded in the cancellation flag")
+    p_factory_cancel.set_defaults(func=cmd_factory_cancel)
+
+    p_factory_reconcile = factory_sub.add_parser(
+        "reconcile", help="sweep an organism's runs and fail any whose worker has gone stale"
+    )
+    p_factory_reconcile.add_argument("organism", help="organism to sweep")
+    p_factory_reconcile.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                     help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_reconcile.set_defaults(func=cmd_factory_reconcile)
+
+    p_factory_reconcile_kill = factory_sub.add_parser(
+        "reconcile-kill", help="after killing a run's worker yourself, atomically transition its state "
+                               "out of active (no heartbeat wait, unlike 'reconcile')"
+    )
+    p_factory_reconcile_kill.add_argument("run", help="run id whose worker was just killed")
+    p_factory_reconcile_kill.add_argument("--organism", default=None,
+                                          help="run's organism, only needed if the run id is ambiguous "
+                                               "across organisms under --root")
+    p_factory_reconcile_kill.add_argument("--root", default=_FACTORY_RUNS_ROOT_DEFAULT,
+                                          help=f"runs root directory (default: {_FACTORY_RUNS_ROOT_DEFAULT!r})")
+    p_factory_reconcile_kill.add_argument("--state", default="failed", choices=["failed", "cancelled"],
+                                          help="terminal state to record (default: failed; pass 'cancelled' "
+                                               "when the kill enforces a prior 'factory cancel' request)")
+    p_factory_reconcile_kill.add_argument("--reason", default=None,
+                                          help="optional operator-facing reason recorded in state.json "
+                                               "(default: reconcile_after_kill's own 'killed_by_operator')")
+    p_factory_reconcile_kill.set_defaults(func=cmd_factory_reconcile_kill)
+
+    p_factory_meta = factory_sub.add_parser(
+        "meta", help="dump the factory's declared modes/objectives/genome schemas/backbones as JSON"
+    )
+    p_factory_meta.set_defaults(func=cmd_factory_meta)
 
     p_factory_breed = factory_sub.add_parser(
         "breed", help="breed two compatible completed runs and launch one explicit-lineage child"
@@ -3445,6 +3766,11 @@ def build_parser() -> argparse.ArgumentParser:
                                  help=f"corpora root directory (default: {_FACTORY_CORPORA_ROOT_DEFAULT!r})")
     p_factory_breed.add_argument("--naming-seed", default=None,
                                  help="seed the child's cosmetic display name deterministically")
+    p_factory_breed.add_argument("--factory-run-id", default=None,
+                                 help="explicit Model Factory run id (default: auto-generated) -- distinct "
+                                      "from the global --run-id, which only names this invocation's trace "
+                                      "directory. Lets a caller that must know the run id before launch "
+                                      "completes -- e.g. the clinic control plane -- precompute it")
     p_factory_breed.add_argument("--export-predictions-max", type=int, default=3, metavar="N",
                                  help="clinic prediction export episode limit (default: 3)")
     p_factory_breed.add_argument("--no-export-predictions", action="store_true",

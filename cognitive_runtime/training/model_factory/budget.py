@@ -47,6 +47,7 @@ BUDGET_TIERS: Dict[str, float] = {"fast": 600.0, "scale": 1200.0}
 STATUS_COMPLETED = "completed"
 STATUS_BUDGET_EXCEEDED = "budget_exceeded"
 STATUS_TIMEOUT_UNRECOVERABLE = "timeout_unrecoverable"
+STATUS_CANCELLED = "cancelled"
 
 #: The full §16 completion vocabulary a resolved spec may record.
 COMPLETION_STATUSES: Tuple[str, ...] = (
@@ -54,7 +55,7 @@ COMPLETION_STATUSES: Tuple[str, ...] = (
     STATUS_BUDGET_EXCEEDED,
     STATUS_TIMEOUT_UNRECOVERABLE,
     "failed",
-    "cancelled",
+    STATUS_CANCELLED,
 )
 
 BUDGET_REPORT_FORMAT = "model-factory-budget-report-v1"
@@ -313,6 +314,7 @@ __all__ = [
     "STATUS_COMPLETED",
     "STATUS_BUDGET_EXCEEDED",
     "STATUS_TIMEOUT_UNRECOVERABLE",
+    "STATUS_CANCELLED",
     "COMPLETION_STATUSES",
     "BUDGET_REPORT_FORMAT",
     "budget_seconds_for_tier",

@@ -28,12 +28,18 @@ from cognitive_runtime.training.model_factory.state import (
     IllegalTransitionError,
     IncompleteRunError,
     StateError,
+    cancel_request_path,
+    cancellation_requested,
+    claim_stale_worker,
     create_state,
     heartbeat_path,
     is_stale,
     load_state,
+    reconcile_after_kill,
+    reconcile_stale_runs,
     recover_stale_worker,
     release_devices,
+    request_cancellation,
     require_completed_for_promotion,
     reserve_devices,
     retry_failed_run,
@@ -383,6 +389,170 @@ def test_a_sigkilled_worker_is_classified_stale_by_the_watchdog_and_never_comple
         transition(state_file, STATE_COMPLETED)
 
 
+# --------------------------------------------------------------------- stale-run sweep
+
+
+def _make_active_run(root, organism, run_id, *, heartbeat_age_seconds=0.0, timeout_seconds=300.0):
+    directory = root / organism / run_id
+    path = state_path(directory)
+    create_state(path, run_id, heartbeat_timeout_seconds=timeout_seconds)
+    transition(path, STATE_RUNNING)
+    write_heartbeat(heartbeat_path(directory), run_id=run_id, clock=lambda: time.time() - heartbeat_age_seconds)
+    return directory
+
+
+def test_reconcile_stale_runs_fails_only_the_stale_ones_across_an_organism(tmp_path):
+    root = tmp_path / "runs"
+    stale_dir = _make_active_run(root, "Org", "stale-run", heartbeat_age_seconds=10_000, timeout_seconds=300.0)
+    fresh_dir = _make_active_run(root, "Org", "fresh-run", heartbeat_age_seconds=0.0, timeout_seconds=300.0)
+
+    # A queued run (no worker expected yet) and a run directory with no
+    # state.json at all (not yet allocated) must never be touched, and must
+    # never make the sweep raise.
+    queued_path = state_path(root / "Org" / "queued-run")
+    create_state(queued_path, "queued-run", heartbeat_timeout_seconds=300.0)
+    (root / "Org" / "not-a-run-yet").mkdir(parents=True)
+
+    recovered = reconcile_stale_runs(root, "Org")
+
+    assert [state.run_id for state in recovered] == ["stale-run"]
+    assert load_state(state_path(stale_dir)).state == STATE_FAILED
+    assert load_state(state_path(stale_dir)).reason == "stale_worker_watchdog_timeout"
+    assert load_state(state_path(fresh_dir)).state == STATE_RUNNING
+    assert load_state(queued_path).state == STATE_QUEUED
+
+
+def test_reconcile_stale_runs_is_a_no_op_for_an_organism_with_no_runs_yet(tmp_path):
+    assert reconcile_stale_runs(tmp_path / "runs", "NoSuchOrganism") == ()
+
+
+def test_reconcile_stale_runs_is_idempotent(tmp_path):
+    root = tmp_path / "runs"
+    _make_active_run(root, "Org", "stale-run", heartbeat_age_seconds=10_000, timeout_seconds=300.0)
+
+    first_pass = reconcile_stale_runs(root, "Org")
+    second_pass = reconcile_stale_runs(root, "Org")
+
+    assert [state.run_id for state in first_pass] == ["stale-run"]
+    # Already-failed by the first pass: the second pass finds nothing left
+    # to recover, exactly recover_stale_worker's own no-op-on-terminal rule.
+    assert second_pass == ()
+
+
+# --------------------------------------------------------------------- cancellation
+
+
+def test_cancellation_is_not_requested_until_asked(tmp_path):
+    assert cancellation_requested(tmp_path) is False
+
+
+def test_request_cancellation_writes_a_flag_the_run_directory_can_be_polled_for(tmp_path):
+    request_cancellation(tmp_path, reason="operator requested stop")
+    assert cancellation_requested(tmp_path) is True
+    assert cancel_request_path(tmp_path).is_file()
+
+    payload = json.loads(cancel_request_path(tmp_path).read_text())
+    assert payload["reason"] == "operator requested stop"
+    assert payload["requested_at"]
+
+
+def test_request_cancellation_is_idempotent(tmp_path):
+    request_cancellation(tmp_path, reason="first")
+    first_payload = json.loads(cancel_request_path(tmp_path).read_text())
+    request_cancellation(tmp_path, reason="second")
+    second_payload = json.loads(cancel_request_path(tmp_path).read_text())
+
+    assert cancellation_requested(tmp_path) is True
+    assert first_payload["reason"] == "first"
+    assert second_payload["reason"] == "second"
+
+
+def test_reconcile_after_kill_fails_a_running_trial_by_default(tmp_path):
+    path = state_path(tmp_path)
+    create_state(path, "run-a")
+    transition(path, STATE_RUNNING)
+
+    reconciled = reconcile_after_kill(path)
+
+    assert reconciled is not None
+    assert reconciled.state == STATE_FAILED
+    assert reconciled.reason == "killed_by_operator"
+
+
+def test_reconcile_after_kill_can_target_cancelled_to_enforce_a_prior_request(tmp_path):
+    path = state_path(tmp_path)
+    create_state(path, "run-a")
+    transition(path, STATE_RUNNING)
+    transition(path, STATE_CHECKPOINTING)
+
+    reconciled = reconcile_after_kill(path, to_state=STATE_CANCELLED, reason="cancel_requested_forced")
+
+    assert reconciled is not None
+    assert reconciled.state == STATE_CANCELLED
+    assert reconciled.reason == "cancel_requested_forced"
+
+
+def test_reconcile_after_kill_is_a_no_op_for_a_non_active_run(tmp_path):
+    path = state_path(tmp_path)
+    create_state(path, "run-a")
+    transition(path, STATE_RUNNING)
+    transition(path, STATE_COMPLETED)
+
+    assert reconcile_after_kill(path) is None
+    # A no-op must never disturb the terminal record it declined to touch.
+    assert load_state(path).state == STATE_COMPLETED
+
+
+def test_reconcile_after_kill_rejects_a_non_terminal_target_state(tmp_path):
+    path = state_path(tmp_path)
+    create_state(path, "run-a")
+    transition(path, STATE_RUNNING)
+
+    with pytest.raises(StateError):
+        reconcile_after_kill(path, to_state=STATE_RUNNING)
+
+
+# --------------------------------------------------------------------- claim_stale_worker (resume)
+
+
+def test_claim_stale_worker_rejects_a_non_active_run(tmp_path):
+    path = state_path(tmp_path)
+    heartbeat_file = heartbeat_path(tmp_path)
+    create_state(path, "run-a")
+
+    with pytest.raises(StateError, match="not an active"):
+        claim_stale_worker(path, heartbeat_file, run_id="run-a")
+
+
+def test_claim_stale_worker_rejects_a_run_whose_heartbeat_is_still_current(tmp_path):
+    path = state_path(tmp_path)
+    heartbeat_file = heartbeat_path(tmp_path)
+    create_state(path, "run-a", heartbeat_timeout_seconds=300.0)
+    transition(path, STATE_RUNNING)
+    write_heartbeat(heartbeat_file, run_id="run-a")
+
+    with pytest.raises(StateError, match="still current"):
+        claim_stale_worker(path, heartbeat_file, run_id="run-a")
+    # A refused claim must never itself refresh the heartbeat -- that would
+    # let a second, equally-unentitled caller believe it just claimed a
+    # live run.
+    assert is_stale(load_state(path), heartbeat_file, timeout_seconds=300.0) is False
+
+
+def test_claim_stale_worker_claims_a_genuinely_stale_run_by_refreshing_its_heartbeat(tmp_path):
+    path = state_path(tmp_path)
+    heartbeat_file = heartbeat_path(tmp_path)
+    create_state(path, "run-a", heartbeat_timeout_seconds=300.0)
+    transition(path, STATE_RUNNING)
+    write_heartbeat(heartbeat_file, run_id="run-a", clock=lambda: time.time() - 10_000)
+    assert is_stale(load_state(path), heartbeat_file, timeout_seconds=300.0) is True
+
+    claimed = claim_stale_worker(path, heartbeat_file, run_id="run-a")
+
+    assert claimed.state == STATE_RUNNING
+    assert is_stale(claimed, heartbeat_file, timeout_seconds=300.0) is False
+
+
 # --------------------------------------------------------------------- AC3: concurrent writers
 
 
@@ -471,6 +641,94 @@ def test_concurrent_transition_from_two_real_subprocesses_is_serialized(tmp_path
     assert final.state == STATE_RUNNING
     transitions_to_running = [e for e in final.history if e["to"] == STATE_RUNNING]
     assert len(transitions_to_running) == 1
+
+
+_CLAIM_RACE_WORKER_SCRIPT = textwrap.dedent(
+    """
+    import sys, time
+    sys.path.insert(0, {path!r})
+    from cognitive_runtime.training.model_factory.state import claim_stale_worker
+
+    state_file = {state_file!r}
+    heartbeat_file = {heartbeat_file!r}
+    ready_file = {ready_file!r}
+    go_file = {go_file!r}
+    out_file = {out_file!r}
+
+    with open(ready_file, "w") as handle:
+        handle.write("ready")
+    deadline = time.monotonic() + 30.0
+    while not __import__("os").path.exists(go_file):
+        if time.monotonic() > deadline:
+            raise SystemExit("timed out waiting for go file")
+        pass
+
+    result = {{}}
+    try:
+        claim_stale_worker(state_file, heartbeat_file, run_id="run-a")
+        result["ok"] = True
+    except Exception as exc:  # noqa: BLE001
+        result["ok"] = False
+        result["error"] = f"{{type(exc).__name__}}: {{exc}}"
+
+    import json
+    with open(out_file, "w") as handle:
+        json.dump(result, handle)
+    """
+)
+
+
+def test_concurrent_resume_claims_from_two_real_subprocesses_only_one_wins(tmp_path):
+    """Codex review (PR #277): two operators resuming the same stale run at
+    the same time must not both proceed to train against it -- the
+    check-then-claim (verify staleness, then write the claiming heartbeat)
+    must be one atomic, locked operation, never two separate unlocked
+    steps a second racer could slip between."""
+    repo_root = str(__import__("pathlib").Path(__file__).resolve().parents[1])
+    state_file = tmp_path / "state.json"
+    heartbeat_file = tmp_path / "heartbeat.json"
+    create_state(state_file, "run-a", heartbeat_timeout_seconds=300.0)
+    transition(state_file, STATE_RUNNING)
+    write_heartbeat(heartbeat_file, run_id="run-a", clock=lambda: time.time() - 10_000)
+
+    procs = []
+    outcomes = []
+    for label in ("a", "b"):
+        ready_file = tmp_path / f"claim-ready-{label}"
+        go_file = tmp_path / "claim-go"
+        out_file = tmp_path / f"claim-out-{label}.json"
+        script = _CLAIM_RACE_WORKER_SCRIPT.format(
+            path=repo_root, state_file=str(state_file), heartbeat_file=str(heartbeat_file),
+            ready_file=str(ready_file), go_file=str(go_file), out_file=str(out_file),
+        )
+        proc = subprocess.Popen([sys.executable, "-c", script])
+        procs.append(proc)
+        outcomes.append((ready_file, out_file))
+
+    deadline = time.monotonic() + 30.0
+    for ready_file, _out_file in outcomes:
+        while not ready_file.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    (tmp_path / "claim-go").write_text("go", encoding="utf-8")
+
+    for proc in procs:
+        assert proc.wait(timeout=30) == 0
+
+    results = []
+    for _ready_file, out_file in outcomes:
+        assert out_file.exists()
+        results.append(json.loads(out_file.read_text(encoding="utf-8")))
+
+    successes = [r for r in results if r["ok"]]
+    failures = [r for r in results if not r["ok"]]
+    assert len(successes) == 1, results
+    assert len(failures) == 1, results
+    assert "StateError" in failures[0]["error"], results
+
+    # The claimed run is still running, ready for exactly one resumed
+    # worker to train it -- the loser must never have touched state.json.
+    assert load_state(state_file).state == STATE_RUNNING
 
 
 def test_concurrent_create_state_is_also_serialized(tmp_path):

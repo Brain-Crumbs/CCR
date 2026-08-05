@@ -86,6 +86,7 @@ from cognitive_runtime.training.model_factory.genome import (
     repair,
 )
 from cognitive_runtime.training.model_factory.promotion import (
+    _reference_comparison_gate,
     _rollout_beats_copy_last_gate,
     _rollout_health_gate,
 )
@@ -333,14 +334,18 @@ def propose(
 SUCCESSIVE_HALVING_FORMAT = "model-factory-successive-halving-v1"
 EVOLUTIONARY_SEARCH_FORMAT = "model-factory-evolutionary-search-v2"
 
-#: successive_halving's own gate set (epic #212 §13.2): a candidate that
-#: fails either one is eliminated at that rung regardless of its primary
-#: metric. Mirrors the two rollout-based gates
-#: :mod:`.promotion`/:mod:`.confirmation` already apply -- the corpus's own
-#: data-quality/split-overlap gates and the representation-collapse probe are
-#: stage-level checks already enforced once when the frozen corpus and
-#: schema were built, not re-run per rung.
-_HALVING_GATES = (_rollout_beats_copy_last_gate, _rollout_health_gate)
+#: successive_halving's/evolutionary search's own gate set (epic #212 §13.2,
+#: clinic redesign): a candidate that fails any of these is eliminated at
+#: that rung/population regardless of its primary metric. Mirrors the
+#: rollout-based gates :mod:`.promotion`/:mod:`.confirmation` already apply
+#: -- the corpus's own data-quality/split-overlap gates and the
+#: representation-collapse probe are stage-level checks already enforced
+#: once when the frozen corpus and schema were built, not re-run per rung.
+#: _reference_comparison_gate is a no-op (``applicable=False``, always
+#: passes) for the common case of no ``evaluation.reference_run`` declared;
+#: when one is declared it prevents a campaign from selecting/breeding
+#: forward a candidate that would fail promotion's identical gate anyway.
+_HALVING_GATES = (_rollout_beats_copy_last_gate, _rollout_health_gate, _reference_comparison_gate)
 
 #: A candidate never launched because the campaign's own ``stage_budget_seconds``
 #: was already spent -- distinct from ``run_trial``'s own per-trial

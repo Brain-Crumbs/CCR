@@ -49,6 +49,7 @@ from cognitive_runtime.training.model_factory.budget import watchdog_expired
 STATE_FORMAT = "model-factory-trial-state-v1"
 HEARTBEAT_FORMAT = "model-factory-trial-heartbeat-v1"
 DEVICE_LEDGER_FORMAT = "model-factory-device-ledger-v1"
+CANCEL_REQUEST_FORMAT = "model-factory-cancel-request-v1"
 
 STATE_QUEUED = "queued"
 STATE_RUNNING = "running"
@@ -345,6 +346,34 @@ def write_heartbeat(
     )
 
 
+def cancel_request_path(run_directory: Union[str, Path]) -> Path:
+    """The conventional cancellation-flag path within an MF-A3 run directory."""
+    return Path(run_directory) / "cancel_requested.json"
+
+
+def request_cancellation(run_directory: Union[str, Path], *, reason: Optional[str] = None) -> Path:
+    """Ask a running trial to stop at its next checkpoint boundary.
+
+    A plain flag file, not a state-machine transition: the run stays
+    ``running``/``checkpointing`` until its own training loop notices this
+    request and transitions itself to ``cancelled`` -- the same "honored at
+    the next checkpoint boundary" discipline :mod:`.budget` already uses for
+    a graceful budget-exceeded stop, just triggered by this flag instead of
+    a time/epoch projection. Idempotent: writing this twice (or after the
+    run has already finished) is harmless, since nothing ever deletes it and
+    a terminal run never reads it again.
+    """
+    return atomic_write_json(
+        cancel_request_path(run_directory),
+        {"format": CANCEL_REQUEST_FORMAT, "requested_at": _now_iso(), "reason": reason},
+    )
+
+
+def cancellation_requested(run_directory: Union[str, Path]) -> bool:
+    """Whether :func:`request_cancellation` has been called for this run."""
+    return cancel_request_path(run_directory).exists()
+
+
 def _iso_to_epoch(value: str) -> float:
     return dt.datetime.fromisoformat(value).timestamp()
 
@@ -467,6 +496,111 @@ def recover_stale_worker(
         return updated
 
 
+def claim_stale_worker(
+    path: Union[str, Path],
+    heartbeat_file: Union[str, Path],
+    *,
+    run_id: str,
+    timeout_seconds: Optional[float] = None,
+    clock: Callable[[], float] = time.time,
+) -> TrialState:
+    """Atomically verify a run is a legitimate resume target and claim it
+    by writing a fresh heartbeat, all under one lock -- a resume path's
+    one write path, mirroring :func:`recover_stale_worker`'s locked
+    read-validate-write for the opposite outcome (claiming instead of
+    failing).
+
+    A resume must never check staleness and then write the claiming
+    heartbeat as two separate, unlocked steps: two concurrent resume
+    attempts could both observe the same stale heartbeat and both proceed
+    to train against the same run directory, corrupting it with
+    concurrent checkpoint/metrics writes. Locking the check and the claim
+    into one critical section closes that race -- whichever caller's claim
+    lands second re-validates staleness against the *first* claimant's
+    just-written heartbeat and is correctly refused here, never silently
+    doubled up downstream.
+
+    Raises :class:`StateError` if the run is not active, or if its
+    heartbeat has not actually gone stale (the original worker, or a
+    concurrent resume attempt, may still be alive). ``timeout_seconds``
+    follows :func:`is_stale`'s declared-timeout rule.
+    """
+    target = Path(path)
+    with _locked(_lock_path_for(target)):
+        current = load_state(target)
+        if current.state not in ACTIVE_STATES:
+            raise StateError(
+                f"cannot resume run {current.run_id!r}: trial state is {current.state!r}, "
+                "not an active (interrupted) run"
+            )
+        if not is_stale(current, heartbeat_file, timeout_seconds=timeout_seconds, clock=clock):
+            raise StateError(
+                f"cannot resume run {current.run_id!r}: its heartbeat is still current, so the "
+                "original worker (or a concurrent resume attempt) may still be running; wait for "
+                "its watchdog timeout (or fail it explicitly via recover_stale_worker) before resuming"
+            )
+        write_heartbeat(heartbeat_file, run_id=run_id, clock=clock)
+        return current
+
+
+def reconcile_stale_runs(
+    root: Union[str, Path], organism: str, *, clock: Callable[[], float] = time.time,
+) -> Tuple[TrialState, ...]:
+    """Sweep every run under ``root/organism`` and fail any whose worker has
+    gone stale (:func:`recover_stale_worker`), returning the ones actually
+    recovered.
+
+    Nothing in this package calls :func:`recover_stale_worker` on its own --
+    a caller (a control plane's job-status poll, a periodic maintenance
+    task) must invoke this itself. Cheap and idempotent to call repeatedly:
+    a run with no ``state.json`` yet (not allocated) or a fresh heartbeat is
+    left untouched, exactly :func:`recover_stale_worker`'s own no-op rule,
+    applied across every run directory found rather than one at a time.
+    """
+    organism_root = Path(root) / organism
+    if not organism_root.is_dir():
+        return ()
+    recovered = []
+    for run_directory in sorted(organism_root.iterdir()):
+        candidate_state_path = state_path(run_directory)
+        if not candidate_state_path.is_file():
+            continue
+        result = recover_stale_worker(candidate_state_path, heartbeat_path(run_directory), clock=clock)
+        if result is not None:
+            recovered.append(result)
+    return tuple(recovered)
+
+
+def reconcile_after_kill(
+    path: Union[str, Path], *, to_state: str = STATE_FAILED, reason: str = "killed_by_operator",
+) -> Optional[TrialState]:
+    """Atomically transition a run whose worker process the caller has just
+    killed into a terminal state.
+
+    Unlike :func:`recover_stale_worker`, this never checks the heartbeat --
+    the caller already knows there is no live worker (it just sent the kill
+    signal), so there is nothing to wait out. Use ``to_state=STATE_FAILED``
+    for an unplanned/hung-process kill, or ``to_state=STATE_CANCELLED`` when
+    the kill enforces a prior :func:`request_cancellation` the worker did
+    not reach a checkpoint boundary in time to honor itself. A no-op
+    (returns ``None``) when the run is not in an active state, so a control
+    plane can call this unconditionally after a kill without first
+    re-reading state.json itself.
+    """
+    if to_state not in (STATE_FAILED, STATE_CANCELLED):
+        raise StateError(
+            f"reconcile_after_kill only targets {STATE_FAILED!r} or {STATE_CANCELLED!r}; got {to_state!r}"
+        )
+    target = Path(path)
+    with _locked(_lock_path_for(target)):
+        current = load_state(target)
+        if current.state not in ACTIVE_STATES:
+            return None
+        updated = _apply_transition(current, to_state, reason=reason)
+        atomic_write_json(target, updated.to_dict())
+        return updated
+
+
 def require_completed_for_promotion(state: TrialState) -> None:
     """The promotion path's gate: an incomplete artifact can never enter
     promotion.
@@ -570,6 +704,7 @@ __all__ = [
     "STATE_FORMAT",
     "HEARTBEAT_FORMAT",
     "DEVICE_LEDGER_FORMAT",
+    "CANCEL_REQUEST_FORMAT",
     "STATE_QUEUED",
     "STATE_RUNNING",
     "STATE_CHECKPOINTING",
@@ -587,13 +722,19 @@ __all__ = [
     "TrialState",
     "state_path",
     "heartbeat_path",
+    "cancel_request_path",
     "load_state",
     "create_state",
     "transition",
     "write_heartbeat",
+    "request_cancellation",
+    "cancellation_requested",
     "heartbeat_age_seconds",
     "is_stale",
     "recover_stale_worker",
+    "claim_stale_worker",
+    "reconcile_stale_runs",
+    "reconcile_after_kill",
     "require_completed_for_promotion",
     "retry_failed_run",
     "reserve_devices",

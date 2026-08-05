@@ -139,6 +139,94 @@ tr.is-current, li.is-current { background: var(--surface-3); }
 /* Champion registry */
 .champion-slot { background: var(--surface-3); }
 
+/* Build form */
+.build-form { margin-top: 8px; }
+.build-form__help { color: var(--text-secondary); font-size: .8rem; margin: 4px 0 12px; }
+.build-form__hint { color: var(--text-secondary); font-size: .78rem; margin: -6px 0 8px; }
+.field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 8px; }
+.field { display: flex; flex-direction: column; gap: 4px; color: var(--text-secondary); font-size: .78rem; font-weight: 600; }
+.field input, .field select { font-size: .85rem; padding: 5px 7px; }
+.field--checkbox { flex-direction: row; align-items: center; gap: 8px; }
+.overrides { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.overrides__row { display: flex; align-items: center; gap: 6px; }
+.overrides__row input { flex: 1 1 160px; }
+.build-form button[type="submit"] { margin-top: 8px; font-weight: 700; }
+
+/* Jobs panel */
+.job-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.job-row { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.job-row__header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.job-row__toggle { background: transparent; border: none; padding: 2px 0; font-weight: 650; }
+.job-row__started { color: var(--text-secondary); font-size: .74rem; margin-left: auto; }
+.job-row__runs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.job-run { display: inline-flex; align-items: center; gap: 6px; background: var(--surface-3); border-radius: 6px; padding: 2px 8px; font-size: .78rem; }
+.job-run__id { font-family: ui-monospace, monospace; }
+.job-log { margin-top: 8px; padding: 8px; background: var(--surface-1); border: 1px solid var(--line); border-radius: 6px; max-height: 260px; overflow: auto; font-size: .74rem; white-space: pre-wrap; }
+
+/* Evolve tab + population board */
+.evolve-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.evolve-actions button[type="submit"] { font-weight: 700; }
+.evolve-preview { margin-top: 16px; }
+.population-grid td, .population-grid th { vertical-align: top; }
+.population-cell { min-width: 160px; }
+.population-cell > span { display: block; }
+.population-cell__id { font-family: ui-monospace, monospace; font-size: .72rem; word-break: break-all; }
+.population-cell__metric { color: var(--text-secondary); font-size: .74rem; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.population-cell__lineage { color: var(--text-secondary); font-size: .68rem; margin-top: 2px; word-break: break-all; }
+.population-cell--pending .population-cell__id, .population-cell--absent { color: var(--text-secondary); opacity: .65; }
+.population-cell--carried { background: var(--surface-3); }
+/* The generation's leading candidate. `tr.is-current`'s background is
+   invisible on a carried cell (already surface-3) and would fight the state
+   badge elsewhere, so a cell marks itself with an accent edge instead. */
+td.population-cell.is-current { box-shadow: inset 3px 0 0 var(--good-fg); }
+td.population-cell.is-current .population-cell__metric { color: var(--good-fg); font-weight: 700; }
+.evolve-preview td:nth-child(2) { font-family: ui-monospace, monospace; font-size: .72rem; white-space: nowrap; }
+
+/* Evolve tab, architecture (NAS) mode */
+.evolve-mode { display: flex; gap: 0; margin: 0 0 12px; }
+.evolve-mode button { border-radius: 0; }
+.evolve-mode button:first-child { border-radius: 6px 0 0 6px; }
+.evolve-mode button:last-child { border-radius: 0 6px 6px 0; }
+.evolve-mode button.is-active { background: var(--info-bg); color: var(--info-fg); font-weight: 700; }
+/* The one deliberately loud block in this UI: a nested campaign's budgets
+   multiply, so its cost is stated as a figure rather than a hint, and the
+   launch button stays disabled until the checkbox below acknowledges it. */
+.evolve-cost { margin: 8px 0 12px; padding: 10px 12px; border: 1px solid var(--amber-fg); border-radius: 8px; background: var(--amber-bg); }
+.evolve-cost h4 { margin: 0 0 4px; }
+.evolve-cost__figure { margin: 0 0 4px; font-size: 1.05rem; color: var(--amber-fg); }
+.evolve-cost__breakdown { margin: 0 0 6px; font-size: .78rem; color: var(--text-secondary); }
+.evolve-cost__confirm { display: flex; align-items: flex-start; gap: 8px; font-size: .82rem; font-weight: 600; }
+
+/* Architecture board: outer generations of architectures, each expandable
+   into that architecture's own inner population grid. */
+.architecture-generation { margin-top: 12px; }
+.architecture-generation h4 { margin: 0 0 6px; }
+.architecture-grid td, .architecture-grid th { vertical-align: top; }
+.architecture-row__id { font-family: ui-monospace, monospace; font-size: .72rem; word-break: break-all; }
+.architecture-row__metric { font-variant-numeric: tabular-nums; font-size: .78rem; }
+.architecture-row__toggle { background: none; border: none; padding: 0; font: inherit; font-weight: 700; cursor: pointer; color: var(--text-primary); }
+.architecture-row__note { display: block; color: var(--text-secondary); font-size: .68rem; margin-top: 2px; }
+tr.architecture-row.is-current > td, tr.architecture-row.is-current > th { box-shadow: inset 0 3px 0 var(--good-fg); }
+tr.architecture-row.is-current .architecture-row__metric { color: var(--good-fg); font-weight: 700; }
+/* An expanded inner grid is a whole nested panel; strip the shell it would
+   otherwise draw inside an already-framed table cell. */
+.architecture-row__inner > td { padding: 0 0 12px; }
+.architecture-row__inner .population-board { margin: 0; border: none; background: none; box-shadow: none; }
+.architecture-row__inner .population-board h3 { font-size: .9rem; }
+
+/* Breed tab */
+.breed-preview { margin-top: 16px; }
+/* check_compatible names every mismatched dimension at once, so its message
+   is shown verbatim and wrapped rather than truncated to one line. */
+.breed-error { margin: 4px 0 0; padding: 8px; background: var(--surface-1); border: 1px solid var(--line); border-radius: 6px; font-size: .74rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.gene-table th[scope="row"] { font-family: ui-monospace, monospace; font-size: .72rem; text-align: left; white-space: nowrap; }
+.gene-table td { font-variant-numeric: tabular-nums; }
+.gene-table td .state-badge { margin-left: 6px; }
+/* A gene mutation or repair moved after crossover -- the row a reader
+   scanning the child's genome is actually looking for. */
+.gene-table tr.is-current th[scope="row"] { font-weight: 700; }
+.gene-table tr.is-current { background: var(--surface-3); }
+
 /* Pixel horizon viewer */
 .pixel-horizon-viewer { margin-top: 18px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); overflow-x: auto; font-size: 13px; }
 .pixel-horizon-viewer .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 10px; }

@@ -314,6 +314,45 @@ def test_two_clone_siblings_share_identical_data_manifest_and_report_comparison(
         assert clone.comparison == payload
 
 
+def test_reference_run_adds_comparison_metrics_to_the_validation_report(tmp_path, corpus):
+    """evaluation.reference_run (clinic redesign: a configurable comparison
+    baseline, not just copy-last-frame) makes it into the persisted
+    validation report once it names a real checkpoint."""
+    champion = _run(_spec_dict(corpus.corpus_id), tmp_path, run_id="champion-run")
+
+    doc = _spec_dict(corpus.corpus_id)
+    doc["evaluation"]["reference_run"] = _parent_block(champion)
+    result = _run(doc, tmp_path, run_id="candidate-run")
+
+    validation = json.loads((result.directory / "metrics" / "validation.json").read_text(encoding="utf-8"))
+    for entry in validation["rollout"]["horizons"].values():
+        assert entry["reference_mse"] is not None and entry["reference_mse"] > 0.0
+        assert entry["model_over_reference_mse"] is not None
+        assert isinstance(entry["beats_reference"], bool)
+    for entry in validation["direct"]["horizons"].values():
+        assert entry["reference_mse"] is not None and entry["reference_mse"] > 0.0
+
+
+def test_no_reference_run_omits_comparison_metrics_from_the_validation_report(tmp_path, corpus):
+    result = _run(_spec_dict(corpus.corpus_id), tmp_path)
+
+    validation = json.loads((result.directory / "metrics" / "validation.json").read_text(encoding="utf-8"))
+    for entry in validation["rollout"]["horizons"].values():
+        assert "reference_mse" not in entry
+
+
+def test_reference_run_sha256_mismatch_is_a_clear_error(tmp_path, corpus):
+    champion = _run(_spec_dict(corpus.corpus_id), tmp_path, run_id="champion-run")
+
+    doc = _spec_dict(corpus.corpus_id)
+    doc["evaluation"]["reference_run"] = {
+        "run_id": champion.run_id, "checkpoint": "best-validation.pt", "sha256": "0" * 64,
+    }
+
+    with pytest.raises(ValueError, match="reference_run checkpoint sha256 mismatch"):
+        _run(doc, tmp_path, run_id="candidate-run")
+
+
 def test_fine_tune_mode_continues_weights_under_a_new_training_contract(tmp_path, corpus):
     parent_result = _run(_spec_dict(corpus.corpus_id), tmp_path)
     parent = _parent_block(parent_result)
@@ -361,9 +400,9 @@ def test_navigation_fine_tune_writes_navigation_and_generic_retention_evidence(t
     assert retention["corpus_id"] == corpus.corpus_id
     assert retention["episode_ids"]
     assert isinstance(retention["retained"], bool)
-    from cognitive_runtime.cli import _factory_population_candidate
+    from cognitive_runtime.training.model_factory.registry import _population_candidate
 
-    candidate = _factory_population_candidate(
+    candidate = _population_candidate(
         child.directory,
         objective="goal_navigation.success_rate",
         declared_genome_fields=(),
@@ -582,6 +621,42 @@ def test_failure_mid_trial_leaves_state_failed_not_running(tmp_path, corpus, mon
     with pytest.raises(IncompleteRunError):
         require_completed_for_promotion(state)
     assert not (run_directory / "checkpoints" / "best-validation.pt").exists()
+
+
+def test_cancellation_requested_mid_trial_stops_at_the_next_chunk_boundary(tmp_path, corpus, monkeypatch):
+    """A cancellation request is honored gracefully at the next checkpoint
+    boundary, exactly like a budget-exceeded stop, but records `cancelled`
+    -- and a chunk that would have started after the request must not."""
+    import cognitive_runtime.training.model_factory.runner as runner_module
+
+    calls = []
+
+    def _cancel_from_the_second_boundary_onward(run_directory):
+        calls.append(run_directory)
+        return len(calls) >= 2
+
+    monkeypatch.setattr(runner_module, "cancellation_requested", _cancel_from_the_second_boundary_onward)
+
+    doc = _spec_dict(corpus.corpus_id, training_overrides={"epoch_budget": 3, "checkpoint_cadence_epochs": 1})
+    result = _run(doc, tmp_path, run_id="cancelled-trial")
+
+    assert result.state == "cancelled"
+    assert result.training_stats["completion_status"] == "cancelled"
+    # Three chunks (epoch_budget=3, cadence=1) would reach three checkpoint
+    # boundaries if never cancelled; the request lands at the second, so a
+    # third chunk must never start.
+    assert len(calls) == 2
+
+    state = load_state(state_path(result.directory))
+    assert state.state == "cancelled"
+    assert state.reason == "cancelled"
+
+    budget_report = json.loads((result.directory / "metrics" / "budget_report.json").read_text())
+    assert budget_report["completion_status"] == "cancelled"
+    # A cancelled trial still checkpoints and evaluates the chunk it
+    # completed -- it is a graceful stop, not a crash -- so it remains
+    # inspectable/resumable exactly like a budget_exceeded one.
+    assert (result.directory / "checkpoints" / "last.pt").exists()
 
 
 def test_existing_nursery_and_evaluation_tests_are_unaffected():

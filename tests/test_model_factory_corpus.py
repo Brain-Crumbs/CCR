@@ -238,6 +238,85 @@ def test_explicit_corpus_root_wins_over_an_in_process_duplicate_id(tmp_path, mon
     assert resolved.directory != second.directory
 
 
+def test_list_corpora_summarizes_every_frozen_corpus_under_an_organism(tmp_path, monkeypatch):
+    _install_fake_nursery(monkeypatch, tmp_path / "episode-cache")
+    corpus_module.build_corpus(_spec(tmp_path, "corpus-a"))
+    corpus_module.build_corpus(_spec(tmp_path, "corpus-b"))
+
+    listed = corpus_module.list_corpora(root=tmp_path / "corpora", organism="test-organism")
+
+    assert {entry["corpus_id"] for entry in listed} == {"corpus-a", "corpus-b"}
+    for entry in listed:
+        assert entry["organism"] == "test-organism"
+        assert entry["data_contract_hash"]
+        assert entry["session_counts"] == {"train": 1, "validation": 1, "test": 1}
+
+
+def test_list_corpora_scans_every_organism_when_none_is_given(tmp_path, monkeypatch):
+    _install_fake_nursery(monkeypatch, tmp_path / "episode-cache")
+    root = tmp_path / "corpora"
+    spec_a = _spec(tmp_path, "corpus-a")
+    spec_a["organism"] = "organism-a"
+    spec_b = _spec(tmp_path, "corpus-b")
+    spec_b["organism"] = "organism-b"
+    corpus_module.build_corpus(spec_a)
+    corpus_module.build_corpus(spec_b)
+
+    listed = corpus_module.list_corpora(root=root)
+
+    assert {(entry["organism"], entry["corpus_id"]) for entry in listed} == {
+        ("organism-a", "corpus-a"), ("organism-b", "corpus-b"),
+    }
+
+
+def test_list_corpora_skips_a_corpus_directory_without_a_manifest_yet(tmp_path, monkeypatch):
+    _install_fake_nursery(monkeypatch, tmp_path / "episode-cache")
+    corpus_module.build_corpus(_spec(tmp_path, "corpus-a"))
+    (tmp_path / "corpora" / "test-organism" / "still-building").mkdir(parents=True)
+
+    listed = corpus_module.list_corpora(root=tmp_path / "corpora", organism="test-organism")
+
+    assert [entry["corpus_id"] for entry in listed] == ["corpus-a"]
+
+
+def test_list_corpora_skips_a_manifest_that_is_valid_json_but_not_an_object(tmp_path, monkeypatch):
+    """Codex review (PR #277): a corpus_manifest.json that parses but isn't
+    a mapping (e.g. a top-level JSON array from a corrupt/partial corpus
+    directory) must be skipped like any other bad manifest, not abort the
+    whole listing and hide every other corpus."""
+    _install_fake_nursery(monkeypatch, tmp_path / "episode-cache")
+    corpus_module.build_corpus(_spec(tmp_path, "corpus-a"))
+    corrupt_dir = tmp_path / "corpora" / "test-organism" / "corrupt-corpus"
+    corrupt_dir.mkdir(parents=True)
+    (corrupt_dir / "corpus_manifest.json").write_text("[]", encoding="utf-8")
+
+    listed = corpus_module.list_corpora(root=tmp_path / "corpora", organism="test-organism")
+
+    assert [entry["corpus_id"] for entry in listed] == ["corpus-a"]
+
+
+def test_list_corpora_skips_a_manifest_whose_sessions_field_is_not_a_mapping(tmp_path, monkeypatch):
+    _install_fake_nursery(monkeypatch, tmp_path / "episode-cache")
+    corpus_module.build_corpus(_spec(tmp_path, "corpus-a"))
+    corrupt_dir = tmp_path / "corpora" / "test-organism" / "corrupt-corpus"
+    corrupt_dir.mkdir(parents=True)
+    (corrupt_dir / "corpus_manifest.json").write_text(
+        json.dumps({"format": corpus_module.CORPUS_MANIFEST_FORMAT, "corpus_id": "corrupt-corpus", "sessions": []}),
+        encoding="utf-8",
+    )
+
+    listed = corpus_module.list_corpora(root=tmp_path / "corpora", organism="test-organism")
+
+    by_id = {entry["corpus_id"]: entry for entry in listed}
+    assert set(by_id) == {"corpus-a", "corrupt-corpus"}
+    assert by_id["corrupt-corpus"]["session_counts"] == {"train": 0, "validation": 0, "test": 0}
+
+
+def test_list_corpora_returns_empty_list_for_a_root_that_does_not_exist(tmp_path):
+    assert corpus_module.list_corpora(root=tmp_path / "no-such-root") == []
+    assert corpus_module.list_corpora(root=tmp_path / "no-such-root", organism="none") == []
+
+
 def test_corpus_module_imports_without_torch():
     repo_root = Path(__file__).resolve().parents[1]
     script = """

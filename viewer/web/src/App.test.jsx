@@ -32,6 +32,9 @@ function route(url) {
   if (path.startsWith("/api/experiments")) return jsonResponse(EXPERIMENTS);
   if (path.startsWith("/api/registry")) return jsonResponse(REGISTRY);
   if (path.startsWith("/api/factory-runs")) return jsonResponse(FACTORY_RUNS);
+  if (path.startsWith("/api/factory-meta")) return jsonResponse({ modes: ["fresh", "clone", "resume", "fine_tune"], objectives: ["windowed_rollout"], genome_schemas: [], backbones: ["transformer"] });
+  if (path.startsWith("/api/corpora")) return jsonResponse({ corpora: [] });
+  if (path.startsWith("/api/jobs")) return jsonResponse({ jobs: [] });
   if (path.startsWith("/api/sessions") && path.includes("/episodes/") && path.endsWith("/frames") || path.includes("/frames?")) return jsonResponse(FRAMES);
   if (path.includes("/predictions")) return jsonResponse({ error: "no recorded predictions" }, false);
   if (path.startsWith("/api/sessions/")) return jsonResponse(SESSION_DETAIL);
@@ -74,5 +77,24 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Experiment" }));
     expect(screen.getByText("fresh")).toBeInTheDocument();
     expect(screen.getAllByText("Promoted").length).toBeGreaterThan(0);
+  });
+
+  it("switches to the Build tab and renders the build form sourced from factory-meta", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("Crafter / run-1 / run/seed-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("tab", { name: "Build" }));
+    await waitFor(() => expect(screen.getByLabelText("Build mode")).toBeInTheDocument());
+    expect(screen.getByLabelText("Build organism").value).toBe("Crafter");
+    expect(screen.getByText(/no jobs launched yet/)).toBeInTheDocument();
+  });
+
+  it("switches to the Breed tab, which offers no parents until the organism has completed runs", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("Crafter / run-1 / run/seed-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("tab", { name: "Breed" }));
+    await waitFor(() => expect(screen.getByLabelText("Parent A")).toBeInTheDocument());
+    expect(screen.getByLabelText("Breed organism").value).toBe("Crafter");
+    expect(screen.getByText(/no completed runs to breed from yet/)).toBeInTheDocument();
+    expect(screen.getByText(/select two different completed runs to check/)).toBeInTheDocument();
   });
 });
