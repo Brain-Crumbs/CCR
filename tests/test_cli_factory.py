@@ -341,6 +341,37 @@ def test_factory_search_unknown_reference_run_is_a_concise_cli_error(tmp_path):
         ])
 
 
+def test_factory_search_missing_reference_checkpoint_names_the_checkpoint_not_the_spec(tmp_path):
+    """A --reference-run whose checkpoint header is absent must say so.
+
+    The run exists and its spec file reads fine, so blaming "spec file not
+    found: <spec>" -- as a single broad ``except FileNotFoundError`` around
+    both reads did -- names a file that was read successfully and hides the
+    one that is actually missing. The clinic's Evolve tab offers a
+    reference-run picker over every completed run, including runs with no
+    checkpoint on disk, and shows this string to a human verbatim.
+    """
+    root = tmp_path / "runs"
+    _make_run(root, "champion-0001", _spec(organism="Crafter"))  # no checkpoint written
+    spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
+    with pytest.raises(SystemExit) as excinfo:
+        main([
+            "factory", "search", str(spec_path), "--root", str(root), "--dry-run", "--no-trace",
+            "--reference-run", "champion-0001",
+        ])
+    message = str(excinfo.value)
+    assert "best-validation.pt" in message
+    assert "spec file not found" not in message
+
+
+def test_factory_search_missing_spec_file_still_names_the_spec(tmp_path):
+    with pytest.raises(SystemExit, match="spec file not found"):
+        main([
+            "factory", "search", str(tmp_path / "no-such-spec.json"),
+            "--root", str(tmp_path / "runs"), "--dry-run", "--no-trace",
+        ])
+
+
 def test_factory_search_dry_run_rejects_invalid_budget_schedule():
     spec_path = Path(__file__).resolve().parents[1] / "specs" / "crafter-baseline.yaml"
     with pytest.raises(SystemExit, match="strictly increasing"):

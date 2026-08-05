@@ -205,11 +205,75 @@ test("/api/factory-runs reports queued/running/completed/failed state across an 
   const result = await get(port, "/api/factory-runs?organism=Test");
   assert.equal(result.status, 200);
   assert.deepEqual(result.body.runs.map((r) => r.run), ["run-b", "run-a"]);
-  assert.deepEqual(result.body.runs[1], { run: "run-a", mode: "fresh", state: "completed", state_reason: "completed", updated_at: "2026-01-02T00:00:00Z", promoted: true });
+  assert.deepEqual(result.body.runs[1], {
+    run: "run-a", mode: "fresh", state: "completed", state_reason: "completed",
+    updated_at: "2026-01-02T00:00:00Z", promoted: true,
+    // No metrics/validation.json and no lineage parents: reported as absent
+    // rather than omitted, so the Evolve board can render "no metric yet".
+    selection_metric: null, selection_metric_value: null, configuration_parents: [],
+  });
   assert.equal(result.body.runs[0].state, "running");
   assert.equal(result.body.runs[0].promoted, null);
   assert.equal((await get(port, "/api/factory-runs?organism=Nobody")).status, 404);
   assert.equal((await get(port, "/api/factory-runs")).status, 400);
+});
+
+test("/api/factory-runs resolves each run's own selection metric and breeding parents for the population board", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "clinic-selection-metric-"));
+  const runsDir = path.join(root, "runs");
+  function writeRun(runId, { selectionMetric, ticksPerFrame, horizons, navigation = null, parents = [] }) {
+    const dir = path.join(runsDir, "Test", runId);
+    fs.mkdirSync(path.join(dir, "metrics"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "experiment.json"), JSON.stringify({ organism: "Test", experiment_id: runId }));
+    fs.writeFileSync(path.join(dir, "lineage.json"), JSON.stringify({ mode: "fresh", configuration_parents: parents }));
+    fs.writeFileSync(path.join(dir, "state.json"), JSON.stringify({ state: "completed", updated_at: `2026-01-0${runId.length % 9}T00:00:00Z` }));
+    // ticks_per_frame lives in contracts.json, exactly where
+    // registry._load_validation_for_candidate reads it from.
+    fs.writeFileSync(path.join(dir, "contracts.json"), JSON.stringify({ data_contract: { ticks_per_frame: ticksPerFrame } }));
+    const payload = { selection_metric: selectionMetric, ...horizons };
+    if (navigation) payload.goal_navigation = navigation;
+    fs.writeFileSync(path.join(dir, "metrics", "validation.json"), JSON.stringify(payload));
+    return dir;
+  }
+  // ticks_per_frame 2 puts a t+4 rollout horizon on frame step 2.
+  writeRun("run-rollout", {
+    selectionMetric: "rollout.t+4.model_over_copy_last_mse", ticksPerFrame: 2,
+    horizons: { rollout: { horizons: { 2: { model_over_copy_last_mse: 0.61, model_mse: 0.2 } } } },
+  });
+  // A direct horizon is tick-denominated as written -- never converted.
+  writeRun("run-direct", {
+    selectionMetric: "direct.t+4.model_mse", ticksPerFrame: 2,
+    horizons: { direct: { horizons: { 4: { model_mse: 0.33 } } } },
+  });
+  // A t+5 horizon at 2 ticks/frame lands exactly on 2.5, where Python's
+  // round-half-to-even picks frame 2 and JavaScript's Math.round would pick
+  // 3 -- so this pins the rounding to the one the run itself recorded.
+  writeRun("run-half-tick", {
+    selectionMetric: "rollout.t+5.model_mse", ticksPerFrame: 2,
+    horizons: { rollout: { horizons: { 2: { model_mse: 0.44 }, 3: { model_mse: 0.99 } } } },
+  });
+  writeRun("run-nav", {
+    selectionMetric: "goal_navigation.success_rate", ticksPerFrame: 1, horizons: {},
+    navigation: { success_rate: 0.75 },
+  });
+  // The metric's horizon was not evaluated: null, never a wrong number.
+  writeRun("run-missing-horizon", {
+    selectionMetric: "rollout.t+8.model_mse", ticksPerFrame: 2,
+    horizons: { rollout: { horizons: { 2: { model_mse: 0.5 } } } },
+    parents: ["run-rollout", "run-direct"],
+  });
+  const server = createServer({ runsDir }); await new Promise((r) => server.listen(0, r)); t.after(() => server.close());
+  const byRun = Object.fromEntries(
+    (await get(server.address().port, "/api/factory-runs?organism=Test")).body.runs.map((run) => [run.run, run]),
+  );
+  assert.equal(byRun["run-rollout"].selection_metric, "rollout.t+4.model_over_copy_last_mse");
+  assert.equal(byRun["run-rollout"].selection_metric_value, 0.61);
+  assert.equal(byRun["run-direct"].selection_metric_value, 0.33);
+  assert.equal(byRun["run-half-tick"].selection_metric_value, 0.44);
+  assert.equal(byRun["run-nav"].selection_metric_value, 0.75);
+  assert.equal(byRun["run-missing-horizon"].selection_metric, "rollout.t+8.model_mse");
+  assert.equal(byRun["run-missing-horizon"].selection_metric_value, null);
+  assert.deepEqual(byRun["run-missing-horizon"].configuration_parents, ["run-rollout", "run-direct"]);
 });
 
 test("service discovers sessions nested below the configured runs directory", async (t) => {
@@ -336,6 +400,29 @@ test("job-launch API", async (t) => {
       organism: "Test", spec: {}, options: { run_id_prefix: "../../evil" },
     });
     assert.equal(traversalPrefix.status, 400);
+
+    // search's --champion/--reference-run name existing runs the CLI resolves
+    // into directories, so they get the positional run ids' catalog check.
+    for (const field of ["champion", "reference_run"]) {
+      const unknown = await post(port, "/api/jobs/search", {
+        organism: "Test", spec: {}, options: { [field]: "no-such-run" },
+      });
+      assert.equal(unknown.status, 404, `${field} should 404 for an uncatalogued run`);
+      assert.match(unknown.body.error, new RegExp(`unknown options\\.${field}`));
+    }
+    // A checkpoint file name has no catalog to check against, so it falls
+    // back to the same character-class floor a fresh run id uses.
+    for (const field of ["checkpoint", "reference_checkpoint"]) {
+      const traversalCheckpoint = await post(port, "/api/jobs/clone", {
+        organism: "Test", run: "run-a", options: { [field]: "../../../etc/passwd" },
+      });
+      assert.equal(traversalCheckpoint.status, 400, `${field} should reject a traversal-shaped name`);
+    }
+    // The legitimate default still clears it.
+    assert.equal(
+      (await post(port, "/api/jobs/clone", { organism: "Test", run: "run-a", options: { checkpoint: "best-validation.pt" } })).status,
+      200,
+    );
   });
 
   await t.test("a launched job is registered, completes, and is visible via GET /api/jobs with live run state", async (t) => {

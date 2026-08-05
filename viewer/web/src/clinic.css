@@ -163,6 +163,25 @@ tr.is-current, li.is-current { background: var(--surface-3); }
 .job-run__id { font-family: ui-monospace, monospace; }
 .job-log { margin-top: 8px; padding: 8px; background: var(--surface-1); border: 1px solid var(--line); border-radius: 6px; max-height: 260px; overflow: auto; font-size: .74rem; white-space: pre-wrap; }
 
+/* Evolve tab + population board */
+.evolve-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.evolve-actions button[type="submit"] { font-weight: 700; }
+.evolve-preview { margin-top: 16px; }
+.population-grid td, .population-grid th { vertical-align: top; }
+.population-cell { min-width: 160px; }
+.population-cell > span { display: block; }
+.population-cell__id { font-family: ui-monospace, monospace; font-size: .72rem; word-break: break-all; }
+.population-cell__metric { color: var(--text-secondary); font-size: .74rem; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.population-cell__lineage { color: var(--text-secondary); font-size: .68rem; margin-top: 2px; word-break: break-all; }
+.population-cell--pending .population-cell__id, .population-cell--absent { color: var(--text-secondary); opacity: .65; }
+.population-cell--carried { background: var(--surface-3); }
+/* The generation's leading candidate. `tr.is-current`'s background is
+   invisible on a carried cell (already surface-3) and would fight the state
+   badge elsewhere, so a cell marks itself with an accent edge instead. */
+td.population-cell.is-current { box-shadow: inset 3px 0 0 var(--good-fg); }
+td.population-cell.is-current .population-cell__metric { color: var(--good-fg); font-weight: 700; }
+.evolve-preview td:nth-child(2) { font-family: ui-monospace, monospace; font-size: .72rem; white-space: nowrap; }
+
 /* Pixel horizon viewer */
 .pixel-horizon-viewer { margin-top: 18px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); overflow-x: auto; font-size: 13px; }
 .pixel-horizon-viewer .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 10px; }
