@@ -53,21 +53,36 @@ function isAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+/** The one array-valued factory flag declared argparse `nargs="+"` (one
+ * flag occurrence, space-separated values) rather than `action="append"`
+ * (the flag repeated once per value, e.g. `--set a=1 --set b=2`) -- which
+ * every other array-valued flag reachable here (`--set`, `--seed-run`) is.
+ * This is CLI argv *syntax* knowledge (which shape argparse declared), not
+ * business logic, so encoding just this one exception is a deliberate,
+ * narrow departure from "never duplicate Python logic in JS" rather than a
+ * reimplementation of anything argparse itself validates. */
+const SPACE_JOINED_ARRAY_KEYS = new Set(["budgets"]);
+
 /** Convert a flat options map into CLI flags: a snake_case key becomes a
- * --kebab-case flag; an array repeats/spaces the flag's values (nargs="+"
- * style); `true` passes the bare flag (argparse action="store_true");
- * `false`/null/undefined are omitted entirely, never passed as a literal
- * string. Every subcommand's own argparse (and, beneath that,
- * spec.resolve()/validate()) is what actually validates these values --
- * this is a thin, generic passthrough, not a reimplementation of any
- * command's argument schema. */
+ * --kebab-case flag; an array repeats the flag once per value (matching
+ * argparse `action="append"`), except SPACE_JOINED_ARRAY_KEYS which space-
+ * join under one flag occurrence (`nargs="+"`); `true` passes the bare
+ * flag (argparse `action="store_true"`); `false`/null/undefined are
+ * omitted entirely, never passed as a literal string. Every subcommand's
+ * own argparse (and, beneath that, spec.resolve()/validate()) is what
+ * actually validates these values -- this is a thin, generic passthrough,
+ * not a reimplementation of any command's argument schema. */
 function flagsFromOptions(options) {
   const argv = [];
   for (const [key, value] of Object.entries(options || {})) {
     if (value === null || value === undefined || value === false) continue;
     const flag = `--${key.replace(/_/g, "-")}`;
     if (value === true) { argv.push(flag); continue; }
-    if (Array.isArray(value)) { argv.push(flag, ...value.map(String)); continue; }
+    if (Array.isArray(value)) {
+      if (SPACE_JOINED_ARRAY_KEYS.has(key)) argv.push(flag, ...value.map(String));
+      else for (const item of value) argv.push(flag, String(item));
+      continue;
+    }
     argv.push(flag, String(value));
   }
   return argv;

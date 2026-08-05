@@ -114,6 +114,17 @@ test("jobs", async (t) => {
       options: { run_id_prefix: "sh-preview", candidates: 2, budgets: [1, 2] },
     }, { runsDir });
     assert.deepEqual(entry.run_ids, ["sh-preview-r0-c0", "sh-preview-r0-c1"]);
+    // --budgets is argparse nargs="+" -- one flag, space-separated values.
+    assert.match(entry.argv.join(" "), /--budgets 1 2\b/);
+  });
+
+  await t.test("flagsFromOptions repeats an array-valued flag once per value, except nargs=\"+\" --budgets", () => {
+    assert.deepEqual(
+      jobs.flagsFromOptions({ set: ["training.foo=1", "training.bar=2"] }),
+      ["--set", "training.foo=1", "--set", "training.bar=2"],
+    );
+    assert.deepEqual(jobs.flagsFromOptions({ seed_run: ["run-a", "run-b"] }), ["--seed-run", "run-a", "--seed-run", "run-b"]);
+    assert.deepEqual(jobs.flagsFromOptions({ budgets: [1, 2, 4] }), ["--budgets", "1", "2", "4"]);
   });
 
   await t.test("launchJob rejects an unknown kind without spawning anything", () => {
