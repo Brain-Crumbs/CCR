@@ -35,6 +35,7 @@ from cognitive_runtime.training.model_factory.contracts import (
 )
 
 DOCUMENT_FORMAT = "model-factory-spec-v1"
+TASK_DOCUMENT_FORMAT = "model-factory-task-spec-v1"
 
 VALID_MODES: Tuple[str, ...] = ("fresh", "clone", "resume", "fine_tune")
 
@@ -263,6 +264,9 @@ class ExperimentSpec(_ContractMixin):
 
     @property
     def training_contract_hash(self) -> str:
+        if self.format == TASK_DOCUMENT_FORMAT:
+            from .task_contracts import TaskTrainingContract
+            return TaskTrainingContract(self.training).hash
         return TrainingContract(**dict(self.training)).hash
 
 
@@ -380,6 +384,8 @@ def resolve(
     and its current defaults").
     """
     raw = dict(spec)
+    if raw.get("format") == TASK_DOCUMENT_FORMAT:
+        return _resolve_task_spec(raw)
 
     for key in LAUNCH_ASSIGNED_KEYS:
         if key in raw:
@@ -422,6 +428,9 @@ def validate(spec: ExperimentSpec) -> None:
     Raises :class:`SpecError` with an actionable message on the first
     violation found.
     """
+    if spec.format == TASK_DOCUMENT_FORMAT:
+        _validate_task_spec(spec)
+        return
     if spec.format != DOCUMENT_FORMAT:
         raise SpecError(
             f"unsupported spec format {spec.format!r}; expected {DOCUMENT_FORMAT!r}"
@@ -601,3 +610,45 @@ __all__ = [
     "validate",
     "dump_canonical_json",
 ]
+
+
+def _resolve_task_spec(raw: Mapping[str, Any]) -> ExperimentSpec:
+    _check_unknown_keys("spec", raw, TOP_LEVEL_KEYS)
+    resolved = ExperimentSpec(
+        format=TASK_DOCUMENT_FORMAT, organism=raw.get("organism"), mode=raw.get("mode", "fresh"),
+        data=raw.get("data", {}), model=raw.get("model", {}),
+        training=_deep_merge({"device": "cpu", "precision": "fp32", "determinism_policy": {"seed": 0},
+                              "max_training_seconds": 60.0}, raw.get("training", {})),
+        evaluation=raw.get("evaluation", {}), parent=raw.get("parent"), evolution=raw.get("evolution"),
+    )
+    _validate_task_spec(resolved)
+    return resolved
+
+
+def _validate_task_spec(spec: ExperimentSpec) -> None:
+    from .task_registry import backend_registration, LEGACY_BACKEND
+    import math
+    if not isinstance(spec.organism, str) or not spec.organism:
+        raise SpecError("'organism' is required")
+    if spec.mode not in VALID_MODES:
+        raise SpecError(f"invalid mode {spec.mode!r}")
+    _validate_parent(spec)
+    if spec.parent and not spec.parent.get("checkpoint"):
+        raise SpecError("neutral continuation requires parent.checkpoint")
+    if not spec.data.get("corpus_id"):
+        raise SpecError("'data.corpus_id' is required")
+    entry = backend_registration(spec.model.get("backend"))
+    if entry.identity.backend == LEGACY_BACKEND:
+        raise SpecError("Crafter uses model-factory-spec-v1 to preserve legacy semantics")
+    if spec.mode != "fresh" and spec.mode not in entry.capabilities:
+        raise SpecError(f"backend does not support {spec.mode!r}")
+    if spec.evolution is not None:
+        raise SpecError("neutral task evolution is not implemented")
+    if spec.training.get("device") != "cpu" or spec.training.get("precision") != "fp32":
+        raise SpecError("neutral Factory currently supports cpu/fp32 only")
+    seconds = spec.training.get("max_training_seconds")
+    if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0:
+        raise SpecError("max_training_seconds must be finite and positive")
+    # Backend-specific keys are validated by the selected backend before allocation.
+    # Hashing also rejects non-JSON configuration and nonfinite values.
+    _ = spec.hash

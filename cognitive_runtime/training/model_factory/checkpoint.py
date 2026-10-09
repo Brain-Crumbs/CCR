@@ -138,7 +138,7 @@ def read_factory_checkpoint_metadata(path: str) -> Dict[str, Any]:
     """Read the compatibility header without deserializing tensors."""
     with open(factory_checkpoint_metadata_path(path), encoding="utf-8") as handle:
         header = json.load(handle)
-    if not isinstance(header, dict) or header.get("format") != HEADER_FORMAT:
+    if not isinstance(header, dict) or header.get("format") not in (HEADER_FORMAT, "model-factory-task-checkpoint-v1"):
         raise ValueError(f"invalid factory checkpoint compatibility header for {path!r}")
     return header
 
@@ -514,7 +514,7 @@ def _model_definition(model: Any) -> Dict[str, Any]:
     }
 
 
-def _build_model(definition: Mapping[str, Any]) -> Any:
+def _build_legacy_model(definition: Mapping[str, Any]) -> Any:
     from cognitive_runtime.training.action_world_model import (
         ActionWorldModelConfig,
         build_action_world_model,
@@ -541,6 +541,18 @@ def _build_model(definition: Mapping[str, Any]) -> Any:
     )
     model.training_visual_config = dict(visual)
     return model
+
+
+
+def _build_model(definition: Mapping[str, Any]) -> Any:
+    from .task_registry import LEGACY_BACKEND, load_backend
+    if definition.get("format") == "model-factory-model-definition-v1":
+        from .task_contracts import ModelDefinition
+        backend = load_backend(definition["task_identity"]["backend"])
+        if definition["task_identity"] != backend.identity.to_dict():
+            raise ValueError("model definition task identity differs from registered backend")
+        return backend.build(ModelDefinition(**definition))
+    return load_backend(LEGACY_BACKEND).build_legacy_model(definition)
 
 
 def save_factory_checkpoint(
@@ -653,6 +665,14 @@ def load_factory_checkpoint(
     A legacy v2 checkpoint has no resumable state, so it can only be inspected
     or cloned and receives an explicit remediation error for resume attempts.
     """
+    sidecar = Path(factory_checkpoint_metadata_path(path))
+    if sidecar.exists():
+        metadata = read_factory_checkpoint_metadata(path)
+        if metadata.get("format") == "model-factory-task-checkpoint-v1":
+            return load_task_checkpoint(path, mode=mode or ("resume" if resume else None),
+                                        architecture_contract=architecture_contract,
+                                        data_contract_hash=data_contract_hash,
+                                        training_contract=training_contract)
     if mode is not None and mode not in _CONTINUATION_MODES:
         raise ValueError(f"unsupported continuation mode {mode!r}")
     if mode is not None and resume and mode != "resume":
@@ -816,3 +836,59 @@ def _load_model_state(model: Any, state_dict: Mapping[str, Any]) -> None:
         if unexpected:
             details.append(f"unexpected keys: {sorted(unexpected)}")
         raise ValueError("incompatible factory checkpoint (" + "; ".join(details) + ")")
+
+
+TASK_CHECKPOINT_FORMAT = "model-factory-task-checkpoint-v1"
+
+
+def save_task_checkpoint(path, backend, model, definition, data_contract, training_contract):
+    """JSON state boundary: no pickle, torch, or unregistered constructor imports."""
+    payload = {
+        "format": TASK_CHECKPOINT_FORMAT, "task_identity": backend.identity.to_dict(),
+        "model_definition": definition.to_dict(), "architecture_hash": definition.hash,
+        "data_contract_hash": data_contract.hash, "training_contract_hash": training_contract.hash,
+        "state": backend.save(model),
+    }
+    # Validate canonical state before touching either file.
+    from .contracts import canonical_json
+    canonical_json(payload)
+    _atomic_json_dump(str(path), payload)
+    digest = _checkpoint_sha256(str(path))
+    header = {k: v for k, v in payload.items() if k != "state"}
+    header["checkpoint_sha256"] = digest
+    _atomic_json_dump(factory_checkpoint_metadata_path(str(path)), header)
+    return digest
+
+
+def load_task_checkpoint(path, *, mode=None, architecture_contract=None,
+                         data_contract_hash=None, training_contract=None):
+    from .task_contracts import ModelDefinition
+    from .task_registry import load_backend
+    header = read_factory_checkpoint_metadata(str(path))
+    if header.get("format") != TASK_CHECKPOINT_FORMAT:
+        raise ValueError("cross-domain clone/resume is forbidden: expected neutral task checkpoint")
+    if mode not in (None, "clone", "resume", "fine_tune"):
+        raise ValueError(f"unsupported continuation mode {mode!r}")
+    if mode is not None:
+        if architecture_contract is None:
+            raise ValueError("continuation requires expected model definition")
+        if _jsonable(architecture_contract.to_dict()) != header["model_definition"]:
+            raise ValueError("cross-domain or incompatible model definition in clone/resume")
+        if mode in ("resume", "clone") and _data_contract_hash(data_contract_hash) != header["data_contract_hash"]:
+            raise ValueError("continuation data contract differs")
+        if mode == "resume" and (training_contract is None or training_contract.hash != header["training_contract_hash"]):
+            raise ValueError("resume training contract differs")
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != header.get("checkpoint_sha256"):
+        raise ValueError("task checkpoint bytes do not match compatibility header")
+    payload = json.loads(raw)
+    if {k: v for k, v in payload.items() if k != "state"} != {k: v for k, v in header.items() if k != "checkpoint_sha256"}:
+        raise ValueError("task checkpoint header binding differs")
+    definition = ModelDefinition(**payload["model_definition"])
+    if definition.hash != payload["architecture_hash"]:
+        raise ValueError("task model definition hash differs")
+    backend = load_backend(payload["task_identity"]["backend"])
+    if _jsonable(backend.identity.to_dict()) != payload["task_identity"] or payload["task_identity"] != payload["model_definition"]["task_identity"]:
+        raise ValueError("checkpoint task identity differs from registered backend")
+    model = backend.load(definition, payload["state"], resume=mode == "resume")
+    return FactoryCheckpoint(payload=payload, model=model, resumed=mode == "resume")

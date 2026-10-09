@@ -30,6 +30,9 @@ dev = ["pytest>=7", "jsonschema>=4.18", "pytest-xdist>=3.6"]
 # trainer and every heuristic encoder) runs without it. Only the pixel CNN,
 # its trainer and the neural policy import torch, always lazily.
 neural = ["torch>=2"]
+# Neutral Factory contracts/registry have no extra dependencies. The lazy
+# built-in Crafter adapter uses [neural]; future backends must declare their
+# own extra in BackendRegistration and import it only at selection time.
 
 [project.scripts]
 ccr = "cognitive_runtime.cli:main"
