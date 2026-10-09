@@ -37,6 +37,9 @@ No text model/provider extra is introduced before an implementation needs it.
 3. `fit` receives training inputs/targets, effective supported configuration and
    `TaskControl`; a resume-capable backend must restore its complete optimizer,
    RNG and cursor state, while clone loads weights with fresh training state.
+   Call `control.checkpoint()` at resumable boundaries during fit. Factory
+   persists state and its header under checkpointing/running transitions. A killed
+   worker can continue from that boundary; work after it may need replay.
 4. `predict` receives **exactly** `InferenceInput`: feature schema, opaque sample
    IDs and finite numeric feature vectors. It receives no training/evaluation
    container or generic metadata mapping. `require_inference_input` rejects

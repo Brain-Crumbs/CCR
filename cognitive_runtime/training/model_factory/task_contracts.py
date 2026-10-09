@@ -93,10 +93,16 @@ class TaskCancelled(Exception):
 @dataclass(frozen=True)
 class TaskControl:
     is_cancelled: Callable[[], bool]
+    save_checkpoint: Callable[[], ArtifactReference]
 
     def check(self) -> None:
         if self.is_cancelled():
             raise TaskCancelled("task cancellation requested")
+
+    def checkpoint(self) -> ArtifactReference:
+        """Persist a resumable boundary chosen by the backend during fit."""
+        self.check()
+        return self.save_checkpoint()
 
 
 class TaskBackend(Protocol):

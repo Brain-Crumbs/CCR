@@ -8,7 +8,7 @@ from brain.cortex.model_contracts import require_inference_input
 from .artifacts import allocate_run_artifacts, atomic_write_json, _jsonable
 from .checkpoint import load_task_checkpoint, read_factory_checkpoint_metadata, save_task_checkpoint
 from .contracts import contract_hash
-from .task_contracts import TaskCancelled, TaskControl, TaskTrainingContract
+from .task_contracts import ArtifactReference, TaskCancelled, TaskControl, TaskTrainingContract
 from .state import (cancellation_requested, claim_stale_worker, create_state, heartbeat_path,
                     state_path, transition, write_heartbeat)
 
@@ -74,14 +74,23 @@ def run_backend_trial(spec, backend, *, root, corpus_root, run_id, naming_seed,
             raise TaskBudgetExceeded("task cooperative wall-clock budget exceeded")
         return cancellation_requested(artifacts.directory)
 
-    control = TaskControl(cancelled)
+    def persist_checkpoint():
+        nonlocal digest
+        transition(state_path(artifacts.directory), "checkpointing")
+        try:
+            digest = save_task_checkpoint(checkpoint, backend, model, definition, data, training)
+        finally:
+            transition(state_path(artifacts.directory), "running")
+        return ArtifactReference("checkpoint", str(checkpoint.relative_to(artifacts.directory)), digest)
+
+    control = TaskControl(cancelled, persist_checkpoint)
     try:
         control.check()
         fitted = backend.fit(model, prepared.training, spec.training, control, resume=spec.mode == "resume")
         contract_hash(fitted)
         stats = fitted
         control.check()
-        digest = save_task_checkpoint(checkpoint, backend, model, definition, data, training)
+        control.checkpoint()
         # This is the only input object crossing the inference boundary.
         predictions = backend.predict(model, require_inference_input(prepared.validation.inputs))
         control.check()

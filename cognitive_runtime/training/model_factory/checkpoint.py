@@ -665,6 +665,10 @@ def load_factory_checkpoint(
     A legacy v2 checkpoint has no resumable state, so it can only be inspected
     or cloned and receives an explicit remediation error for resume attempts.
     """
+    if mode is not None and mode not in _CONTINUATION_MODES:
+        raise ValueError(f"unsupported continuation mode {mode!r}")
+    if mode is not None and resume and mode != "resume":
+        raise ValueError("resume=True conflicts with continuation mode " + repr(mode))
     sidecar = Path(factory_checkpoint_metadata_path(path))
     if sidecar.exists():
         metadata = read_factory_checkpoint_metadata(path)
@@ -673,10 +677,6 @@ def load_factory_checkpoint(
                                         architecture_contract=architecture_contract,
                                         data_contract_hash=data_contract_hash,
                                         training_contract=training_contract)
-    if mode is not None and mode not in _CONTINUATION_MODES:
-        raise ValueError(f"unsupported continuation mode {mode!r}")
-    if mode is not None and resume and mode != "resume":
-        raise ValueError("resume=True conflicts with continuation mode " + repr(mode))
     requested_mode = mode or ("resume" if resume else None)
     continuation: Optional[ContinuationDecision] = None
     header: Optional[Dict[str, Any]] = None
@@ -863,7 +863,7 @@ def save_task_checkpoint(path, backend, model, definition, data_contract, traini
 def load_task_checkpoint(path, *, mode=None, architecture_contract=None,
                          data_contract_hash=None, training_contract=None):
     from .task_contracts import ModelDefinition
-    from .task_registry import load_backend
+    from .task_registry import load_backend, backend_registration
     header = read_factory_checkpoint_metadata(str(path))
     if header.get("format") != TASK_CHECKPOINT_FORMAT:
         raise ValueError("cross-domain clone/resume is forbidden: expected neutral task checkpoint")
@@ -887,6 +887,11 @@ def load_task_checkpoint(path, *, mode=None, architecture_contract=None,
     definition = ModelDefinition(**payload["model_definition"])
     if definition.hash != payload["architecture_hash"]:
         raise ValueError("task model definition hash differs")
+    entry = backend_registration(payload["task_identity"]["backend"])
+    if mode is not None and mode not in entry.capabilities:
+        raise ValueError(f"backend does not support {mode!r}")
+    if _jsonable(entry.identity.to_dict()) != payload["task_identity"]:
+        raise ValueError("checkpoint task identity differs from registered backend")
     backend = load_backend(payload["task_identity"]["backend"])
     if _jsonable(backend.identity.to_dict()) != payload["task_identity"] or payload["task_identity"] != payload["model_definition"]["task_identity"]:
         raise ValueError("checkpoint task identity differs from registered backend")

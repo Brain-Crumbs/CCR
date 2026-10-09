@@ -59,3 +59,28 @@ Remote submitted head/tree, base and independent review findings are recorded in
 the draft PR and handoff after publication. Any new head invalidates head-specific
 review/CI evidence. Parent owns fresh requirements/protection/CI gates, merge,
 main verification and tracking completion.
+
+## First submitted revision and corrections
+
+- Draft [PR #302](https://github.com/Brain-Crumbs/CCR/pull/302), submitted head
+  `29808106dd030cfb0a8930fea93f9ae555cb5409`, tree
+  `b88b93dcf477e851f38114779b3f120f9fc0ba26`. Remote and local staged trees matched.
+- [Hosted run 37998519615](https://github.com/Brain-Crumbs/CCR/actions/runs/37998519615)
+  provided actual base-environment evidence: CLI smoke and collection passed;
+  core 1,185 passed / 2 failed / 256 skipped, 38.201 seconds; second seed 596
+  passed / 2 failed / 10 skipped, 8.634 seconds. Both failures were new lifecycle
+  assertions expecting training cursor restoration during weights-only inspection.
+  Correction retains the saved-cursor assertion on payload and expects the reset
+  cursor on the inspected model. These failed lanes are not passing gate evidence.
+- Independent submitted-head review found two P2 defects: neutral dispatch preceded
+  the shared `mode`/`resume` conflict check; direct checkpoint loading did not enforce
+  registered continuation capabilities. Both are corrected with public-loader
+  regressions. Review also identified limited interruption realism.
+- Added `TaskControl.checkpoint()` and a real subprocess death during fit. Its
+  resume test compares uninterrupted weights, cursor, momentum and RNG state,
+  preserving original manifests. Only heartbeat age is adjusted to avoid waiting
+  300 seconds; no completed state is rewritten into an interrupted state.
+- The manual, 5-minute Factory smoke workflow now includes a separately bounded
+  30-second neutral GRU compatibility node. It remains opt-in, not default CI.
+- Corrected head requires fresh CI and review; optional CPU-torch compatibility
+  remains unrun locally. No standalone/mock success is substituted for that gate.

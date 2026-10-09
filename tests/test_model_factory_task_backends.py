@@ -121,7 +121,8 @@ def test_both_domains_use_real_factory_lifecycle(tmp_path, backends, index):
     paths = [Path(result.checkpoint_path), Path(result.checkpoint_path + ".json"), result.directory / "trial_spec.json"]
     before = [p.read_bytes() for p in paths]
     loaded = load_factory_checkpoint(result.checkpoint_path)
-    assert loaded.model == {"value": 3.0, "steps": 1}
+    assert loaded.model == {"value": 3.0, "steps": 0}  # inspection loads weights, not training progress
+    assert loaded.payload["state"] == {"value": 3.0, "steps": 1}
     assert [p.read_bytes() for p in paths] == before
     clone = run_trial(continuation(spec(backend), result), root=tmp_path, run_id="clone", naming_seed=286)
     assert clone.state == "completed" and clone.training_stats["steps"] == 1
@@ -136,21 +137,68 @@ def test_cross_domain_rejected_before_prepare(tmp_path, backends):
     assert len(list((tmp_path / "ContractTest").iterdir())) >= 1
 
 
-def test_resume_restores_state_and_preserves_manifests(tmp_path, backends):
-    backend = backends[1]
-    result = run_trial(spec(backend), root=tmp_path, run_id="interrupted")
-    # Simulate a worker killed after checkpoint persistence and before its terminal transition.
-    state = json.loads(state_path(result.directory).read_text())
-    state["state"] = "running"
-    state_path(result.directory).write_text(json.dumps(state))
-    heartbeat = json.loads(heartbeat_path(result.directory).read_text())
+class CursorBackend(FakeBackend):
+    """Two deterministic updates with explicit cursor, momentum and RNG state."""
+    stop_after = None
+
+    def build(self, definition):
+        return {"value": 0.0, "steps": 0, "momentum": 0.0, "rng": 285}
+
+    def load(self, definition, state, *, resume):
+        if resume:
+            return dict(state)
+        model = self.build(definition)
+        model["value"] = state["value"]
+        return model
+
+    def fit(self, model, data, configuration, control, *, resume):
+        import os
+        while model["steps"] < 2:
+            control.check()
+            model["rng"] = (1664525 * model["rng"] + 1013904223) % (2 ** 32)
+            model["momentum"] = 0.9 * model["momentum"] + model["rng"] / (2 ** 32)
+            model["value"] += model["momentum"]
+            model["steps"] += 1
+            control.checkpoint()
+            if model["steps"] == self.stop_after:
+                os._exit(23)  # actual dead worker: no finally/terminal transition
+        return {"steps": model["steps"]}
+
+
+def test_resume_restores_state_and_preserves_manifests(tmp_path, backends, monkeypatch):
+    backend = CursorBackend()
+    monkeypatch.setitem(registry._REGISTRY, backend.identity.backend,
+                        registry.BackendRegistration(backend.identity, lambda: backend, backend.capabilities))
+    code = """
+import sys
+from tests.test_model_factory_task_backends import CursorBackend, spec
+from cognitive_runtime.training.model_factory import task_registry as registry
+from cognitive_runtime.training.model_factory.runner import run_trial
+backend = CursorBackend()
+backend.stop_after = 1
+registry.register_backend(registry.BackendRegistration(backend.identity, lambda: backend, backend.capabilities))
+run_trial(spec(backend), root=sys.argv[1], run_id='interrupted')
+"""
+    child = subprocess.run([sys.executable, "-c", code, str(tmp_path)], timeout=20)
+    assert child.returncode == 23
+    directory = tmp_path / "ContractTest/interrupted"
+    assert load_state(state_path(directory)).state == "running"
+    assert not (directory / "experiment_report.json").exists()
+    # Advance only the persisted heartbeat age to avoid a 300-second test wait.
+    heartbeat = json.loads(heartbeat_path(directory).read_text())
     heartbeat["heartbeat_seconds"] = 0
-    heartbeat_path(result.directory).write_text(json.dumps(heartbeat))
-    immutable = [result.directory / name for name in ("trial_spec.json", "contracts.json", "data_manifest.json", "execution.json")]
+    heartbeat_path(directory).write_text(json.dumps(heartbeat))
+    immutable = [directory / name for name in ("trial_spec.json", "contracts.json", "data_manifest.json", "execution.json")]
     before = [p.read_bytes() for p in immutable]
-    resumed = run_trial(continuation(spec(backend), result, "resume"), root=tmp_path)
-    assert resumed.run_id == result.run_id and resumed.training_stats["steps"] == 2
-    assert "load-resume" in backend.calls and "fit-resume" in backend.calls
+    sha = json.loads((directory / "checkpoints/last.json.json").read_text())["checkpoint_sha256"]
+    raw = {**spec(backend), "mode": "resume", "parent": {
+        "run_id": "interrupted", "checkpoint": "last.json", "sha256": sha}}
+    resumed = run_trial(raw, root=tmp_path)
+    assert resumed.run_id == "interrupted" and resumed.training_stats["steps"] == 2
+    uninterrupted = run_trial(spec(backend), root=tmp_path, run_id="uninterrupted")
+    actual = load_factory_checkpoint(resumed.checkpoint_path).payload["state"]
+    expected = load_factory_checkpoint(uninterrupted.checkpoint_path).payload["state"]
+    assert actual == expected  # weights, cursor, optimizer-like momentum and RNG
     assert [p.read_bytes() for p in immutable] == before
     with pytest.raises(Exception, match="not an active"):
         run_trial(continuation(spec(backend), resumed, "resume"), root=tmp_path)
@@ -271,3 +319,23 @@ def test_changed_model_and_data_reject_continuation(tmp_path, backends, monkeypa
     monkeypatch.setattr(backend, "prepare", changed_data)
     with pytest.raises(ValueError, match="data contract differs"):
         run_trial(continuation(spec(backend), result), root=tmp_path)
+
+
+def test_public_checkpoint_loader_enforces_modes_and_capabilities(tmp_path, backends, monkeypatch):
+    from cognitive_runtime.training.model_factory.task_contracts import TaskTrainingContract
+    backend = backends[1]
+    result = run_trial(spec(backend), root=tmp_path)
+    with pytest.raises(ValueError, match="conflicts"):
+        load_factory_checkpoint(result.checkpoint_path, mode="clone", resume=True)
+    backend.capabilities = backend.capabilities - {"resume"}
+    monkeypatch.setitem(registry._REGISTRY, backend.identity.backend,
+                        registry.BackendRegistration(backend.identity, lambda: backend, backend.capabilities))
+    resolved = resolve(spec(backend))
+    prepared = backend.prepare(resolved, corpus_root=None)
+    backend.calls.clear()
+    with pytest.raises(ValueError, match="does not support 'resume'"):
+        load_factory_checkpoint(result.checkpoint_path, mode="resume",
+                                architecture_contract=prepared.model_definition,
+                                data_contract_hash=prepared.data_contract,
+                                training_contract=TaskTrainingContract(resolved.training))
+    assert "load-resume" not in backend.calls
