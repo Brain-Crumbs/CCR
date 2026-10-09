@@ -1,0 +1,217 @@
+{
+  "$defs": {
+    "EntityEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "ambiguous": {
+          "type": "boolean"
+        },
+        "confidence": {
+          "type": "string"
+        },
+        "instrument_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "issuer_id": {
+          "type": "string"
+        },
+        "supporting_span": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "issuer_id",
+        "instrument_ids",
+        "confidence",
+        "ambiguous",
+        "supporting_span"
+      ],
+      "type": "object"
+    },
+    "NewsEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "availability_basis": {
+          "enum": [
+            "synthetic_ground_truth",
+            "evidenced_historical",
+            "collector_observation_proxy",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "availability_confidence": {
+          "type": "string"
+        },
+        "available_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dedup_cluster_id": {
+          "type": "string"
+        },
+        "deleted": {
+          "type": "boolean"
+        },
+        "entities": {
+          "items": {
+            "$ref": "#/$defs/EntityEvidence"
+          },
+          "type": "array"
+        },
+        "event_at": {
+          "type": "string"
+        },
+        "extraction_model_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "first_seen_at": {
+          "type": "string"
+        },
+        "ingested_at": {
+          "type": "string"
+        },
+        "links": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "original_published_at": {
+          "type": "string"
+        },
+        "original_timezone": {
+          "type": "string"
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "record_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "schema_name": {
+          "const": "NewsEvent"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "source_record_id": {
+          "type": "string"
+        },
+        "supersedes_record_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timestamp_precision": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_name",
+        "schema_version",
+        "record_id",
+        "source_id",
+        "source_record_id",
+        "revision",
+        "supersedes_record_id",
+        "event_at",
+        "available_at",
+        "observed_at",
+        "ingested_at",
+        "availability_basis",
+        "availability_confidence",
+        "original_timezone",
+        "timestamp_precision",
+        "provenance",
+        "original_published_at",
+        "first_seen_at",
+        "title",
+        "text",
+        "links",
+        "entities",
+        "dedup_cluster_id",
+        "deleted",
+        "extraction_model_id"
+      ],
+      "type": "object"
+    },
+    "Provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_version": {
+          "type": "string"
+        },
+        "license": {
+          "type": "string"
+        },
+        "raw_sha256": {
+          "type": "string"
+        },
+        "rights": {
+          "type": "string"
+        },
+        "synthetic": {
+          "type": "boolean"
+        },
+        "untrusted_source_text": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "raw_sha256",
+        "adapter_version",
+        "rights",
+        "license",
+        "synthetic",
+        "untrusted_source_text"
+      ],
+      "type": "object"
+    }
+  },
+  "$ref": "#/$defs/NewsEvent",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

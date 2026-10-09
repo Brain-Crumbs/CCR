@@ -1,0 +1,191 @@
+{
+  "$defs": {
+    "PredictionContractState": {
+      "additionalProperties": false,
+      "properties": {
+        "availability_basis": {
+          "enum": [
+            "synthetic_ground_truth",
+            "evidenced_historical",
+            "collector_observation_proxy",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "availability_confidence": {
+          "type": "string"
+        },
+        "available_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "currency": {
+          "type": "string"
+        },
+        "event_at": {
+          "type": "string"
+        },
+        "ingested_at": {
+          "type": "string"
+        },
+        "lifecycle": {
+          "type": "string"
+        },
+        "listing_id": {
+          "type": "string"
+        },
+        "market_id": {
+          "type": "string"
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "original_timezone": {
+          "type": "string"
+        },
+        "payout_scale": {
+          "type": "string"
+        },
+        "probability_price": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "question": {
+          "type": "string"
+        },
+        "question_version": {
+          "type": "string"
+        },
+        "quote_basis": {
+          "enum": [
+            "trade",
+            "bid",
+            "ask",
+            "mid"
+          ],
+          "type": "string"
+        },
+        "record_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "scheduled_expiry_at": {
+          "type": "string"
+        },
+        "schema_name": {
+          "const": "PredictionContractState"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "side": {
+          "type": "string"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "source_record_id": {
+          "type": "string"
+        },
+        "supersedes_record_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timestamp_precision": {
+          "type": "string"
+        },
+        "token_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_name",
+        "schema_version",
+        "record_id",
+        "source_id",
+        "source_record_id",
+        "revision",
+        "supersedes_record_id",
+        "event_at",
+        "available_at",
+        "observed_at",
+        "ingested_at",
+        "availability_basis",
+        "availability_confidence",
+        "original_timezone",
+        "timestamp_precision",
+        "provenance",
+        "market_id",
+        "token_id",
+        "listing_id",
+        "side",
+        "question",
+        "question_version",
+        "payout_scale",
+        "currency",
+        "quote_basis",
+        "lifecycle",
+        "scheduled_expiry_at",
+        "probability_price"
+      ],
+      "type": "object"
+    },
+    "Provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_version": {
+          "type": "string"
+        },
+        "license": {
+          "type": "string"
+        },
+        "raw_sha256": {
+          "type": "string"
+        },
+        "rights": {
+          "type": "string"
+        },
+        "synthetic": {
+          "type": "boolean"
+        },
+        "untrusted_source_text": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "raw_sha256",
+        "adapter_version",
+        "rights",
+        "license",
+        "synthetic",
+        "untrusted_source_text"
+      ],
+      "type": "object"
+    }
+  },
+  "$ref": "#/$defs/PredictionContractState",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

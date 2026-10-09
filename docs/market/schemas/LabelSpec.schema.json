@@ -1,0 +1,238 @@
+{
+  "$defs": {
+    "Horizon": {
+      "additionalProperties": false,
+      "properties": {
+        "calendar_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "calendar_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "clock": {
+          "enum": [
+            "exchange_trading_hours",
+            "exchange_sessions",
+            "utc_elapsed_seconds"
+          ],
+          "type": "string"
+        },
+        "count": {
+          "type": "integer"
+        },
+        "origin": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "clock",
+        "count",
+        "calendar_id",
+        "calendar_version"
+      ],
+      "type": "object"
+    },
+    "LabelSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "action_policy": {
+          "type": "string"
+        },
+        "anchor_max_age_seconds": {
+          "type": "integer"
+        },
+        "anchor_policy": {
+          "type": "string"
+        },
+        "availability_basis": {
+          "enum": [
+            "synthetic_ground_truth",
+            "evidenced_historical",
+            "collector_observation_proxy",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "availability_confidence": {
+          "type": "string"
+        },
+        "available_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "currency": {
+          "type": "string"
+        },
+        "endpoint_policy": {
+          "type": "string"
+        },
+        "endpoint_tolerance_seconds": {
+          "type": "integer"
+        },
+        "event_at": {
+          "type": "string"
+        },
+        "feed": {
+          "type": "string"
+        },
+        "horizon": {
+          "$ref": "#/$defs/Horizon"
+        },
+        "ingested_at": {
+          "type": "string"
+        },
+        "mark": {
+          "enum": [
+            "trade",
+            "bid",
+            "ask",
+            "mid"
+          ],
+          "type": "string"
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "original_timezone": {
+          "type": "string"
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "record_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "schema_name": {
+          "const": "LabelSpec"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "source_record_id": {
+          "type": "string"
+        },
+        "supersedes_record_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "target": {
+          "enum": [
+            "equity_simple_return",
+            "contract_absolute_probability_price_change"
+          ],
+          "type": "string"
+        },
+        "terminal_policy": {
+          "type": "string"
+        },
+        "timestamp_precision": {
+          "type": "string"
+        },
+        "unit": {
+          "enum": [
+            "return_fraction",
+            "probability_price_fraction"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_name",
+        "schema_version",
+        "record_id",
+        "source_id",
+        "source_record_id",
+        "revision",
+        "supersedes_record_id",
+        "event_at",
+        "available_at",
+        "observed_at",
+        "ingested_at",
+        "availability_basis",
+        "availability_confidence",
+        "original_timezone",
+        "timestamp_precision",
+        "provenance",
+        "target",
+        "unit",
+        "horizon",
+        "currency",
+        "feed",
+        "mark",
+        "anchor_policy",
+        "anchor_max_age_seconds",
+        "endpoint_policy",
+        "endpoint_tolerance_seconds",
+        "action_policy",
+        "terminal_policy"
+      ],
+      "type": "object"
+    },
+    "Provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_version": {
+          "type": "string"
+        },
+        "license": {
+          "type": "string"
+        },
+        "raw_sha256": {
+          "type": "string"
+        },
+        "rights": {
+          "type": "string"
+        },
+        "synthetic": {
+          "type": "boolean"
+        },
+        "untrusted_source_text": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "raw_sha256",
+        "adapter_version",
+        "rights",
+        "license",
+        "synthetic",
+        "untrusted_source_text"
+      ],
+      "type": "object"
+    }
+  },
+  "$ref": "#/$defs/LabelSpec",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

@@ -1,0 +1,214 @@
+{
+  "$defs": {
+    "Provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_version": {
+          "type": "string"
+        },
+        "license": {
+          "type": "string"
+        },
+        "raw_sha256": {
+          "type": "string"
+        },
+        "rights": {
+          "type": "string"
+        },
+        "synthetic": {
+          "type": "boolean"
+        },
+        "untrusted_source_text": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "raw_sha256",
+        "adapter_version",
+        "rights",
+        "license",
+        "synthetic",
+        "untrusted_source_text"
+      ],
+      "type": "object"
+    },
+    "ProviderCapabilityManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "access": {
+          "type": "string"
+        },
+        "authentication": {
+          "type": "string"
+        },
+        "availability_basis": {
+          "enum": [
+            "synthetic_ground_truth",
+            "evidenced_historical",
+            "collector_observation_proxy",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "availability_confidence": {
+          "type": "string"
+        },
+        "available_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "endpoint_allowlist": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "event_at": {
+          "type": "string"
+        },
+        "evidence_at": {
+          "type": "string"
+        },
+        "evidence_urls": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "free_entitlement": {
+          "type": "string"
+        },
+        "history_quality": {
+          "type": "string"
+        },
+        "identity_quality": {
+          "type": "string"
+        },
+        "ingested_at": {
+          "type": "string"
+        },
+        "latency_seconds": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "original_timezone": {
+          "type": "string"
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "provider_budget_usd": {
+          "type": "string"
+        },
+        "record_id": {
+          "type": "string"
+        },
+        "requests_per_minute": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "revision_quality": {
+          "type": "string"
+        },
+        "schema_name": {
+          "const": "ProviderCapabilityManifest"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "source_record_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "supersedes_record_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timestamp_precision": {
+          "type": "string"
+        },
+        "timestamp_quality": {
+          "type": "string"
+        },
+        "usage_rights": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_name",
+        "schema_version",
+        "record_id",
+        "source_id",
+        "source_record_id",
+        "revision",
+        "supersedes_record_id",
+        "event_at",
+        "available_at",
+        "observed_at",
+        "ingested_at",
+        "availability_basis",
+        "availability_confidence",
+        "original_timezone",
+        "timestamp_precision",
+        "provenance",
+        "provider",
+        "status",
+        "authentication",
+        "free_entitlement",
+        "usage_rights",
+        "access",
+        "endpoint_allowlist",
+        "requests_per_minute",
+        "latency_seconds",
+        "timestamp_quality",
+        "revision_quality",
+        "history_quality",
+        "identity_quality",
+        "evidence_at",
+        "evidence_urls",
+        "provider_budget_usd"
+      ],
+      "type": "object"
+    }
+  },
+  "$ref": "#/$defs/ProviderCapabilityManifest",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

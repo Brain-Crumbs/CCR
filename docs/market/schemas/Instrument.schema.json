@@ -1,0 +1,195 @@
+{
+  "$defs": {
+    "Instrument": {
+      "additionalProperties": false,
+      "properties": {
+        "availability_basis": {
+          "enum": [
+            "synthetic_ground_truth",
+            "evidenced_historical",
+            "collector_observation_proxy",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "availability_confidence": {
+          "type": "string"
+        },
+        "available_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "currency": {
+          "type": "string"
+        },
+        "effective_from": {
+          "type": "string"
+        },
+        "effective_to": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "event_at": {
+          "type": "string"
+        },
+        "external_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "ingested_at": {
+          "type": "string"
+        },
+        "issuer_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "listing_id": {
+          "type": "string"
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "original_timezone": {
+          "type": "string"
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "record_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "schema_name": {
+          "const": "Instrument"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "security_id": {
+          "type": "string"
+        },
+        "share_class": {
+          "type": "string"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "source_record_id": {
+          "type": "string"
+        },
+        "successor_security_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "supersedes_record_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timestamp_precision": {
+          "type": "string"
+        },
+        "universe_id": {
+          "type": "string"
+        },
+        "venue": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_name",
+        "schema_version",
+        "record_id",
+        "source_id",
+        "source_record_id",
+        "revision",
+        "supersedes_record_id",
+        "event_at",
+        "available_at",
+        "observed_at",
+        "ingested_at",
+        "availability_basis",
+        "availability_confidence",
+        "original_timezone",
+        "timestamp_precision",
+        "provenance",
+        "issuer_id",
+        "security_id",
+        "listing_id",
+        "share_class",
+        "venue",
+        "currency",
+        "kind",
+        "successor_security_id",
+        "external_ids",
+        "effective_from",
+        "effective_to",
+        "universe_id"
+      ],
+      "type": "object"
+    },
+    "Provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_version": {
+          "type": "string"
+        },
+        "license": {
+          "type": "string"
+        },
+        "raw_sha256": {
+          "type": "string"
+        },
+        "rights": {
+          "type": "string"
+        },
+        "synthetic": {
+          "type": "boolean"
+        },
+        "untrusted_source_text": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "raw_sha256",
+        "adapter_version",
+        "rights",
+        "license",
+        "synthetic",
+        "untrusted_source_text"
+      ],
+      "type": "object"
+    }
+  },
+  "$ref": "#/$defs/Instrument",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}
