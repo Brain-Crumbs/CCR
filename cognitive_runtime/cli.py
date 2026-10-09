@@ -3567,8 +3567,8 @@ def build_parser() -> argparse.ArgumentParser:
                                        "against one fixed architecture; 'architecture' runs a nested "
                                        "NAS campaign whose outer loop evolves the architecture and whose "
                                        "inner loop is a complete training-gene campaign per candidate")
-    p_factory_search.add_argument("--schema", default="generic_action_effects_v2",
-                                  help="versioned genome schema (default: generic_action_effects_v2). "
+    p_factory_search.add_argument("--schema", default="generic_action_effects_v3",
+                                  help="versioned genome schema (default: generic_action_effects_v3). "
                                        "With --genome architecture this is the *inner* (training) schema")
     p_factory_search.add_argument("--outer-schema", default="architecture_search_v1",
                                   help="--genome architecture only: versioned architecture genome schema "
@@ -3734,8 +3734,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_factory_breed.add_argument("parent_a", help="first configuration parent run id")
     p_factory_breed.add_argument("parent_b", help="second configuration parent run id")
-    p_factory_breed.add_argument("--schema", default="generic_action_effects_v2",
-                                 help="versioned genome schema (default: generic_action_effects_v2)")
+    p_factory_breed.add_argument("--schema", default="generic_action_effects_v3",
+                                 help="versioned genome schema (default: generic_action_effects_v3)")
     p_factory_breed.add_argument("--tier", default=None,
                                  help="shared budget tier (default: infer from both budget reports)")
     p_factory_breed.add_argument("--objective", default=None,

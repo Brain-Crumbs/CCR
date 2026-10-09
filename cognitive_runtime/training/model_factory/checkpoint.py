@@ -330,6 +330,8 @@ def _checkpoint_header(payload: Mapping[str, Any], *, checkpoint_sha256: Optiona
         "data_contract_hash": payload["data_contract_hash"],
         "training_contract": _normalise_training(payload["training_contract"]),
         "parent_checkpoint_sha": payload.get("parent_checkpoint_sha"),
+        "effective_optimizer": payload.get("effective_optimizer"),
+        "effective_config_hash": payload.get("effective_config_hash"),
     }
     if checkpoint_sha256 is not None:
         header["checkpoint_sha256"] = checkpoint_sha256
@@ -346,7 +348,7 @@ def _verify_header_binding(header: Mapping[str, Any], payload: Mapping[str, Any]
             "retry after the checkpoint writer has finished"
         )
     payload_header = _checkpoint_header(payload)
-    for field in ("architecture_contract", "data_contract_hash", "training_contract"):
+    for field in ("architecture_contract", "data_contract_hash", "training_contract", "effective_optimizer", "effective_config_hash"):
         if header.get(field) != payload_header[field]:
             raise ValueError(
                 "factory checkpoint payload contracts do not match its compatibility header; "
@@ -450,6 +452,7 @@ class TrainerResumeState:
     rng_state: Dict[str, Any]
     best_validation_metric: Optional[float] = None
     target_encoder_state_dict: Optional[Dict[str, Any]] = None
+    effective_optimizer: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -553,8 +556,25 @@ def save_factory_checkpoint(
     parent_checkpoint_sha: Optional[str] = None,
     training_stats: Optional[Mapping[str, Any]] = None,
     rng_state: Optional[Mapping[str, Any]] = None,
+    effective_config: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Save a factory checkpoint that can be resumed without state loss."""
+    from cognitive_runtime.training.optimizer_config import optimizer_manifest, resolve_optimizer
+
+    effective_optimizer = optimizer_manifest(model, optimizer)
+    if effective_config is not None and _jsonable(effective_config).get("optimizer") != effective_optimizer:
+        raise ValueError("effective configuration optimizer disagrees with observed optimizer")
+    declared_optimizer = _contract_payload(training_contract).get("optimizer", {})
+    if declared_optimizer.get("format") == "torch-optimizer-v2":
+        resolved_optimizer = resolve_optimizer(declared_optimizer)
+        if effective_optimizer["class"].lower() != resolved_optimizer["name"]:
+            raise ValueError("effective optimizer class disagrees with training contract")
+        for group in effective_optimizer["parameter_groups"]:
+            for key in ("lr", "betas", "eps", "weight_decay", "amsgrad"):
+                if group[key] != resolved_optimizer[key]:
+                    raise ValueError(f"effective optimizer {key} disagrees with training contract")
+        if scheduler is not None:
+            raise ValueError("configured Factory scheduler is unsupported")
     torch = _torch()
     progress = dict(trainer_state or {})
     for field in ("epoch", "global_step", "best_validation_metric"):
@@ -568,6 +588,9 @@ def save_factory_checkpoint(
         "checkpoint_id": uuid.uuid4().hex,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "effective_optimizer": effective_optimizer,
+        "effective_config": _jsonable(effective_config) if effective_config is not None else None,
+        "effective_config_hash": contract_hash(effective_config) if effective_config is not None else None,
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "trainer_state": progress,
         "rng_state": dict(rng_state) if rng_state is not None else capture_rng_state(),
@@ -616,6 +639,7 @@ def load_factory_checkpoint(
     architecture_contract: Any = None,
     data_contract_hash: Any = None,
     training_contract: Any = None,
+    effective_config: Optional[Mapping[str, Any]] = None,
 ) -> FactoryCheckpoint:
     """Load a factory checkpoint, or inspect/clone a legacy AWM checkpoint.
 
@@ -672,6 +696,16 @@ def load_factory_checkpoint(
             )
             if not continuation.approved:
                 raise ValueError(continuation.message)
+            if requested_mode == "resume":
+                from cognitive_runtime.training.optimizer_config import verify_optimizer_manifest
+
+                if model is None or optimizer is None:
+                    raise ValueError("resume requires model and optimizer instances to verify effective configuration")
+                verify_optimizer_manifest(model, optimizer, header.get("effective_optimizer"))
+                if header.get("effective_config_hash") is not None and effective_config is None:
+                    raise ValueError("resume requires expected effective_config for this checkpoint")
+                if effective_config is not None and header.get("effective_config_hash") != contract_hash(effective_config):
+                    raise ValueError("resume effective configuration differs; use clone/fine_tune for a new run")
 
     torch = _torch()
     payload = torch.load(path, map_location=map_location, weights_only=False)
@@ -709,6 +743,13 @@ def load_factory_checkpoint(
         if not payload_decision.approved:
             raise ValueError(payload_decision.message)
         continuation = payload_decision
+    if payload.get("effective_config") is not None and payload.get("effective_config_hash") != contract_hash(payload["effective_config"]):
+        raise ValueError("checkpoint effective configuration hash is invalid")
+    if requested_mode == "resume":
+        if payload.get("effective_config_hash") is not None and effective_config is None:
+            raise ValueError("resume requires expected effective_config for this checkpoint")
+        if effective_config is not None and payload.get("effective_config_hash") != contract_hash(effective_config):
+            raise ValueError("resume effective configuration differs; use clone/fine_tune for a new run")
     architecture = dict(payload["architecture_contract"])
     stored_hash = architecture.pop("hash", None)
     if stored_hash != contract_hash(architecture):
@@ -740,7 +781,9 @@ def load_factory_checkpoint(
     if requested_mode == "resume":
         if optimizer is None:
             raise ValueError("resume requires an optimizer instance to restore")
-        optimizer.load_state_dict(payload["optimizer_state_dict"])
+        from cognitive_runtime.training.optimizer_config import restore_optimizer
+
+        restore_optimizer(restored_model, optimizer, payload["optimizer_state_dict"], payload.get("effective_optimizer"))
         if payload["scheduler_state_dict"] is not None:
             if scheduler is None:
                 raise ValueError("resume requires a scheduler instance to restore")

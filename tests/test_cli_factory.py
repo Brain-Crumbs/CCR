@@ -280,7 +280,10 @@ def test_factory_search_defaults_to_evolutionary_populations(capsys):
     payload = json.loads(capsys.readouterr().out)
 
     assert payload["workflow"] == "evolutionary"
-    assert payload["schema"] == "generic_action_effects_v2"
+    assert payload["schema"] == "generic_action_effects_v3"
+    from cognitive_runtime.training.model_factory.effective_config import validate_execution_spec
+    for candidate in payload["candidates"]:
+        validate_execution_spec(resolve(candidate["spec"]))
     assert payload["population_size"] == 4
     assert payload["population_count"] == 2
     assert "budgets" not in payload
@@ -288,7 +291,7 @@ def test_factory_search_defaults_to_evolutionary_populations(capsys):
         "preview-13-p0-c0", "preview-13-p0-c1", "preview-13-p0-c2", "preview-13-p0-c3",
     ]
     assert all(
-        {"pixel", "latent", "semantic"}
+        {"pixel", "latent"}
         <= set(candidate["spec"]["training"]["loss_weights"])
         for candidate in payload["candidates"]
     )
@@ -405,7 +408,7 @@ def test_factory_search_architecture_dry_run_previews_the_outer_population(capsy
     assert payload["dry_run"] is True
     assert payload["campaign_id"] == "preview-13"
     assert payload["architecture_schema_version"] == "architecture_search_v1"
-    assert payload["hyperparameter_schema_version"] == "generic_action_effects_v2"
+    assert payload["hyperparameter_schema_version"] == "generic_action_effects_v3"
     assert [candidate["architecture_id"] for candidate in payload["candidates"]] == [
         "preview-13-arch0-a0", "preview-13-arch0-a1", "preview-13-arch0-a2",
     ]
@@ -508,7 +511,6 @@ def test_factory_breed_dry_run_prints_explicit_parent_and_weight_donor_lineage(t
             "closed_loop_latent_loss_weight": 0.3,
             "pixel": 1.0,
             "latent": 1.0,
-            "semantic": 1.0,
         },
         "transition_balance_policy": {"stationary_cap": 0.4},
     })
@@ -605,12 +607,11 @@ def test_factory_breed_passes_an_explicit_run_id_through_to_run_trial(tmp_path, 
         "loss_weights": {
             "closed_loop_pixel_loss_weight": 0.2,
             "closed_loop_latent_loss_weight": 0.3,
-            # generic_action_effects_v2 (the default schema) also varies the
+            # generic_action_effects_v3 (the default schema) also varies the
             # three reconstruction weights, and breeding requires every gene
             # path the schema declares to be present on both parents.
             "pixel": 1.0,
             "latent": 1.0,
-            "semantic": 1.0,
         },
         "transition_balance_policy": {"stationary_cap": 0.4},
     })

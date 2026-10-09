@@ -50,6 +50,7 @@ from cognitive_runtime.training.model_factory.artifacts import (
     RunArtifacts,
     allocate_run_artifacts,
     atomic_write_json,
+    _jsonable,
 )
 from cognitive_runtime.training.model_factory.budget import (
     BUDGET_TIERS,
@@ -74,6 +75,10 @@ from cognitive_runtime.training.model_factory.comparison import compare_paired_e
 from cognitive_runtime.training.model_factory.contracts import ArchitectureContract, TrainingContract
 from cognitive_runtime.training.model_factory.corpus import resolve_corpus
 from cognitive_runtime.training.model_factory.navigation_metrics import evaluate_navigation_sessions
+from cognitive_runtime.training.optimizer_config import (
+    OPTIMIZER_FORMAT, action_optimizer_config, build_optimizer, optimizer_manifest, restore_optimizer, effective_hash,
+)
+from cognitive_runtime.training.model_factory.effective_config import resolve_loss_weights, validate_execution_spec
 from cognitive_runtime.training.model_factory.spec import ExperimentSpec
 from cognitive_runtime.training.model_factory.spec import resolve as resolve_spec
 from cognitive_runtime.training.model_factory.spec import validate as validate_spec
@@ -226,17 +231,12 @@ def _action_world_model_config(spec: ExperimentSpec) -> Any:
     """Map a resolved spec's ``model``/``training``/``data`` blocks onto
     ``ActionWorldModelConfig``.
 
-    Not every declared training-contract field is threaded into the real
-    trainer: ``train_action_world_model`` always builds
-    ``torch.optim.Adam(model.parameters(), lr=cfg.lr)``, so
-    ``training.optimizer.name``/``weight_decay`` are recorded for contract
-    identity but do not change the optimizer actually used -- an existing
-    property of the reused trainer, not something this runner introduces.
+    The same versioned optimizer block constructs every live optimizer.
     """
+    validate_execution_spec(spec)
     awm = _action_world_model_module()
     model_block = spec.model
     training_block = spec.training
-    valid_fields = {field.name for field in dataclasses.fields(awm.ActionWorldModelConfig)}
     kwargs: Dict[str, Any] = dict(
         latent_width=int(model_block["latent_width"]),
         hidden_dim=int(model_block["hidden_dim"]),
@@ -248,6 +248,8 @@ def _action_world_model_config(spec: ExperimentSpec) -> Any:
         horizons_ticks=tuple(int(tick) for tick in spec.data["horizons_ticks"]),
         training_objective=str(training_block["objective"]),
         lr=float(training_block["optimizer"]["lr"]),
+        optimizer_behavior=OPTIMIZER_FORMAT,
+        optimizer=dict(training_block["optimizer"]),
         batch_size=int(training_block["batch_size"]),
         seed=int(training_block["seed"]),
         rollout_frames=int(training_block["rollout_frames"]),
@@ -257,27 +259,26 @@ def _action_world_model_config(spec: ExperimentSpec) -> Any:
         device=str(training_block["device"]),
         epochs=int(training_block.get("epoch_budget") or DEFAULT_EPOCH_BUDGET),
     )
-    # Factory specs use concise public names while ActionWorldModelConfig
-    # retains the older explicit field names. Preserve support for callers
-    # already using the explicit names, but make the documented/spec-shipped
-    # aliases actually reach the loss calculation.
-    loss_weight_aliases = {
-        "pixel": "pixel_loss_weight",
-        "latent": "latent_loss_weight",
-        "semantic": "semantic_loss_weight",
-    }
-    loss_weights = dict(training_block.get("loss_weights") or {})
-    for alias, field_name in loss_weight_aliases.items():
-        if alias in loss_weights and field_name in loss_weights:
-            raise ValueError(
-                f"training.loss_weights declares both {alias!r} and {field_name!r}; "
-                "use only one name for the same loss weight"
-            )
-    for key, value in loss_weights.items():
-        field_name = loss_weight_aliases.get(key, key)
-        if field_name in valid_fields:
-            kwargs[field_name] = value
+    kwargs.update(resolve_loss_weights(training_block))
     return awm.ActionWorldModelConfig(**kwargs)
+
+
+def _effective_configuration(spec: ExperimentSpec, cfg: Any, model: Any, optimizer: Any) -> Dict[str, Any]:
+    """Observed optimizer plus fully materialized trainer/model execution contract."""
+    from cognitive_runtime.training.action_world_model import _resolve_training_device
+    effective = {
+        "format": "model-factory-effective-config-v2",
+        "optimizer": optimizer_manifest(model, optimizer),
+        "scheduler": None,
+        "checkpoint_selection": {"metric": spec.evaluation["selection_metric"], "mode": _selection_metric_mode(spec.evaluation["selection_metric"])},
+        "determinism_policy": dict(spec.training["determinism_policy"]),
+        "precision": "fp32",
+        "device": str(_resolve_training_device(cfg.device)),
+        "model_backend": f"{type(model).__module__}.{type(model).__qualname__}",
+        "model": spec.to_dict()["model"],
+        "trainer": dataclasses.asdict(cfg),
+    }
+    return _jsonable(effective)
 
 
 def _transition_balance_weights(
@@ -678,14 +679,14 @@ def _per_episode_retention_losses(eval_result: Mapping[str, Any]) -> List[float]
     return [statistics.fmean(float(values[index]) for values in series) for index in range(episode_count)]
 
 
-def _optimizer_for_state(model: Any, lr: float, optimizer_state_dict: Optional[Mapping[str, Any]]) -> Any:
+def _optimizer_for_state(model: Any, cfg: Any, optimizer_state_dict: Optional[Mapping[str, Any]], effective_optimizer: Any = None) -> Any:
     """A throwaway optimizer whose ``state_dict()`` matches a trainer chunk's
     ``resume_state`` -- ``save_factory_checkpoint`` needs a live optimizer
     object, but the trainer's own internal optimizer is not returned."""
     torch = _torch()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = build_optimizer(torch, model.parameters(), action_optimizer_config(cfg))
     if optimizer_state_dict is not None:
-        optimizer.load_state_dict(optimizer_state_dict)
+        restore_optimizer(model, optimizer, optimizer_state_dict, effective_optimizer)
     return optimizer
 
 
@@ -801,6 +802,7 @@ def run_trial(
     """
     resolved_spec = spec if isinstance(spec, ExperimentSpec) else resolve_spec(spec)
     validate_spec(resolved_spec)
+    validate_execution_spec(resolved_spec)
     # A resume trial appends to its own interrupted run directory (epic
     # #212 §11: "only resume may append to an interrupted run") rather than
     # creating a sibling -- its declared parent *is* that same run, so the
@@ -885,14 +887,20 @@ def run_trial(
     torch = _torch()
     expected_workspace_modalities = awm._workspace_modalities(train_dataset, cfg.workspace_enabled)
     expected_workspace_layout = train_dataset.workspace_layout_hash if expected_workspace_modalities else None
-    candidate_model = awm.build_action_world_model(
-        train_dataset.pixel_shape, train_dataset.action_keys, cfg,
-        workspace_modalities=expected_workspace_modalities,
-        workspace_layout_hash=expected_workspace_layout,
-    )
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(cfg.seed)
+        candidate_model = awm.build_action_world_model(
+            train_dataset.pixel_shape, train_dataset.action_keys, cfg,
+            workspace_modalities=expected_workspace_modalities,
+            workspace_layout_hash=expected_workspace_layout,
+        )
+    candidate_model.float()  # Factory currently supports fp32 only, regardless of global defaults.
     architecture_contract = _architecture_contract(candidate_model)
     training_contract = TrainingContract(**dict(resolved_spec.training))
 
+    observed_optimizer = build_optimizer(torch, candidate_model.parameters(), action_optimizer_config(cfg))
+    effective = _effective_configuration(resolved_spec, cfg, candidate_model, observed_optimizer)
+    effective_config_hash = effective_hash(effective)
     model = candidate_model
     resume_state: Optional[TrainerResumeState] = None
     parent_checkpoint_sha: Optional[str] = None
@@ -913,11 +921,12 @@ def run_trial(
         # dict it restores is read back out of the loaded payload below and
         # handed to the trainer's own stop-and-continue mechanism instead
         # (train_action_world_model constructs its own internal optimizer).
-        optimizer = torch.optim.Adam(candidate_model.parameters(), lr=cfg.lr)
+        optimizer = build_optimizer(torch, candidate_model.parameters(), action_optimizer_config(cfg))
         loaded = load_factory_checkpoint(
             parent_path, model=candidate_model, optimizer=optimizer,
             mode=resolved_spec.mode, architecture_contract=architecture_contract,
             data_contract_hash=corpus.data_contract, training_contract=training_contract,
+            effective_config=effective,
         )
         model = loaded.model
         parent_checkpoint_sha = declared_sha
@@ -926,6 +935,7 @@ def run_trial(
             resume_state = TrainerResumeState(
                 epoch=int(trainer_state["epoch"]), global_step=int(trainer_state["global_step"]),
                 optimizer_state_dict=loaded.payload["optimizer_state_dict"],
+                effective_optimizer=loaded.payload.get("effective_optimizer"),
                 rng_state=loaded.payload["rng_state"],
                 best_validation_metric=trainer_state.get("best_validation_metric"),
                 # See the matching comment where this is saved: it lives
@@ -948,6 +958,23 @@ def run_trial(
             run_id=run_id, naming_seed=naming_seed,
         )
         _write_clinic_session_index(artifacts.directory, train_entries, validation_entries)
+
+    effective_path = artifacts.directory / "effective_config.json"
+    if resolved_spec.mode == "resume":
+        if not effective_path.exists():
+            raise ValueError("resume lacks effective configuration manifest; use clone/fine_tune for a new run")
+        saved_effective = json.loads(effective_path.read_text(encoding="utf-8"))
+        if saved_effective.get("effective") != effective or saved_effective.get("effective_config_hash") != effective_config_hash:
+            raise ValueError("resume effective configuration differs; use clone/fine_tune for a new run")
+    else:
+        atomic_write_json(effective_path, {
+            "format": "model-factory-configuration-manifest-v2",
+            "requested": spec.to_dict() if isinstance(spec, ExperimentSpec) else spec,
+            "resolved": resolved_spec.to_dict(),
+            "effective": effective,
+            "effective_config_hash": effective_config_hash,
+            "training_contract_hash": training_contract.hash,
+        })
 
     device = str(resolved_spec.training["device"])
     devices: Tuple[str, ...] = () if device in ("cpu", "auto") else (device,)
@@ -977,7 +1004,10 @@ def run_trial(
         transition(trial_state_path, STATE_RUNNING)
         write_heartbeat(trial_heartbeat_path, run_id=artifacts.run_id)
 
+    prior_deterministic = torch.are_deterministic_algorithms_enabled()
+    prior_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     try:
+        torch.use_deterministic_algorithms(bool(resolved_spec.training["determinism_policy"].get("deterministic", True)))
         if devices:
             reserve_devices(root, artifacts.run_id, devices)
 
@@ -1058,7 +1088,7 @@ def run_trial(
                     # TrainerResumeState docstring).
                     "target_encoder_state_dict": resume_state.target_encoder_state_dict,
                 }
-                chunk_optimizer = _optimizer_for_state(model, cfg.lr, resume_state.optimizer_state_dict)
+                chunk_optimizer = _optimizer_for_state(model, cfg, resume_state.optimizer_state_dict, resume_state.effective_optimizer)
                 save_factory_checkpoint(
                     str(artifacts.checkpoints_dir / "last.pt"), model, chunk_optimizer,
                     trainer_state=trainer_state_payload,
@@ -1066,6 +1096,7 @@ def run_trial(
                     training_contract=training_contract, parent_checkpoint_sha=parent_checkpoint_sha,
                     training_stats={"epoch": resume_state.epoch, "final_total_loss": _final_loss(stats)},
                     rng_state=resume_state.rng_state,
+                    effective_config=effective,
                 )
                 write_heartbeat(trial_heartbeat_path, run_id=artifacts.run_id)
 
@@ -1088,6 +1119,7 @@ def run_trial(
                             "selection_metric_value": metric_value,
                         },
                         rng_state=resume_state.rng_state,
+                        effective_config=effective,
                     )
                     best_eval = eval_result
 
@@ -1201,6 +1233,7 @@ def run_trial(
         transition(trial_state_path, STATE_FAILED, reason=f"{type(exc).__name__}: {exc}")
         raise
     finally:
+        torch.use_deterministic_algorithms(prior_deterministic, warn_only=prior_warn_only)
         if devices:
             release_devices(root, artifacts.run_id)
 

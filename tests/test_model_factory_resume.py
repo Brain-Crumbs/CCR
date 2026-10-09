@@ -321,9 +321,10 @@ def test_checkpoint_cadence_and_best_validation_fire_independently(tmp_path):
     # earlier epoch (the regression this test guards against).
     loaded_weights = {}
     for epoch, (state, _is_best, path, architecture, data, training) in saved.items():
+        target = type(model)(model.pixel_shape, model.action_keys, model.config)
         loaded = load_factory_checkpoint(
-            str(path), model=type(model)(model.pixel_shape, model.action_keys, model.config),
-            optimizer=torch.optim.Adam(model.parameters()), resume=True,
+            str(path), model=target,
+            optimizer=torch.optim.Adam(target.parameters()), resume=True,
             architecture_contract=architecture, data_contract_hash=data,
             training_contract=training,
         )

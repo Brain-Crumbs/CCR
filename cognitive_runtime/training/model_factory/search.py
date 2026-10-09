@@ -73,6 +73,7 @@ from cognitive_runtime.training.model_factory.checkpoint import read_factory_che
 from cognitive_runtime.training.model_factory.breeding import (
     BreedingLineage,
     ParentRecord,
+    _extract_genome,
     breed,
     record_breeding_lineage,
 )
@@ -322,7 +323,8 @@ def propose(
             stage_budget_seconds=stage_budget_seconds,
             cost_model=cost_model,
         )
-        training = _apply_genome(base_spec.training, repaired)
+        active = set(genome_schema.active_gene_names(objective))
+        training = _apply_genome(base_spec.training, {key: value for key, value in repaired.items() if key in active})
         for field in _FIXED_BUDGET_FIELDS:
             training[field] = base_spec.training.get(field)
         candidate = replace(base_spec, training=training)
@@ -649,9 +651,9 @@ def _validate_seed_spec_compatibility(
             "warmup_frames + rollout_frames does not fit the current corpus's shortest episode"
         )
 
-    genome: Dict[str, Any] = {}
+    genome = _extract_genome(genome_schema, seed_spec.training)
     for name, gene in genome_schema.genes.items():
-        value = _training_value(seed_spec.training, name)
+        value = genome[name]
         canonical = gene.clip(value)
         if canonical != value:
             mismatches.append(
@@ -862,7 +864,7 @@ def _parent_record_from_result(
         corpus_id=spec.data.get("corpus_id"),
         tier="evolutionary-search",
         evaluation_contract=dict(spec.evaluation),
-        genome={name: _training_value(spec.training, name) for name in genome_schema.genes},
+        genome=_extract_genome(genome_schema, spec.training),
         checkpoint_name=checkpoint_path.name,
         checkpoint_sha256=checkpoint_sha,
         spec=spec,

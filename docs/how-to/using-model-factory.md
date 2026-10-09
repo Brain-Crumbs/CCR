@@ -190,7 +190,7 @@ corpus or starting PyTorch:
 
 ```bash
 ccr factory search specs/crafter-baseline.yaml \
-  --schema generic_action_effects_v2 \
+  --schema generic_action_effects_v3 \
   --population-size 8 --populations 4 --mutation-rate 0.2 \
   --seed 7 --run-id-prefix crafter-evo-7 --dry-run
 ```
@@ -286,9 +286,9 @@ Breed two compatible completed parents after inspecting the child first:
 
 ```bash
 ccr factory breed <parent-a> <parent-b> \
-  --schema generic_action_effects_v2 --seed 19 --dry-run
+  --schema generic_action_effects_v3 --seed 19 --dry-run
 ccr factory breed <parent-a> <parent-b> \
-  --schema generic_action_effects_v2 --seed 19
+  --schema generic_action_effects_v3 --seed 19
 ```
 
 The tier is inferred from both parents' budget reports. Use `--tier fast` only
@@ -310,7 +310,7 @@ from cognitive_runtime.training.model_factory.search import (
     run_evolutionary_search,
 )
 
-schema = get_schema("generic_action_effects_v2")
+schema = get_schema("generic_action_effects_v3")
 base_spec = resolve(load_spec("specs/crafter-baseline.yaml"))
 proposals = propose(base_spec, schema, 8, seed=7, method="lhs")
 report = run_evolutionary_search(
@@ -365,7 +365,7 @@ from cognitive_runtime.training.model_factory import (
     run_trial,
 )
 
-schema = get_schema("generic_action_effects_v2")
+schema = get_schema("generic_action_effects_v3")
 parent_a = load_parent("runs", "Crafter", "<parent-a>", schema, tier="fast")
 parent_b = load_parent("runs", "Crafter", "<parent-b>", schema, tier="fast")
 bred = breed(
@@ -407,3 +407,13 @@ Then inspect:
 - `checkpoints/last.pt` for resumable partial work and
   `checkpoints/best-validation.pt` for the selected candidate state;
 - `experiment_report.json` for the resolved training/evaluation summary.
+
+## Effective optimizer settings and migration
+
+Factory now runs the actual Adam/AdamW constructor requested by its versioned
+optimizer block. See [configuration truth](../market/configuration-truth.md)
+for defaults, the `effective_config.json` manifest, unsupported/inactive settings,
+and why older runs remain readable but require a new run rather than exact
+resume. Historical `generic_action_effects_v2` includes an inactive semantic gene. New
+search/breed defaults use `generic_action_effects_v3`, preserving old schema
+hashes while removing that gene and respecting objective-active genes.

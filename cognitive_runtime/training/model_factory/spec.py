@@ -25,6 +25,8 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import yaml
 
+from cognitive_runtime.training.optimizer_config import OPTIMIZER_DEFAULTS, resolve_optimizer
+
 from cognitive_runtime.training.model_factory.contracts import (
     TrainingContract,
     _ContractMixin,
@@ -148,7 +150,7 @@ DEFAULT_MODEL: Mapping[str, Any] = {
 
 DEFAULT_TRAINING: Mapping[str, Any] = {
     "objective": "windowed_rollout",
-    "optimizer": {"name": "adamw", "lr": 0.0003, "weight_decay": 1e-5},
+    "optimizer": OPTIMIZER_DEFAULTS,
     "batch_size": 32,
     "seed": 0,
     "rollout_frames": 8,
@@ -389,6 +391,15 @@ def resolve(
 
     merged = _deep_merge(defaults, raw)
     merged.setdefault("format", DOCUMENT_FORMAT)
+    raw_training = raw.get("training") or {}
+    if "seed" not in (raw_training.get("determinism_policy") or {}):
+        merged["training"]["determinism_policy"]["seed"] = merged["training"]["seed"]
+    if merged["training"].get("objective") == "autoregressive" and "batch_size" not in (raw.get("training") or {}):
+        merged["training"]["batch_size"] = 1
+    try:
+        merged["training"]["optimizer"] = resolve_optimizer(merged["training"]["optimizer"])
+    except (ValueError, TypeError) as exc:
+        raise SpecError(str(exc)) from exc
 
     resolved = ExperimentSpec(
         format=merged.get("format", DOCUMENT_FORMAT),

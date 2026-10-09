@@ -397,12 +397,9 @@ def _verify_schema_integrity(schema: GenomeSchema, expected_content_hash: str) -
 # so a resolved gene value can be merged straight into an ExperimentSpec's
 # `training` block via a dotted-path override.
 #
-# `optimizer.weight_decay` is recorded on TrainingContract for identity but
-# remains a declared-only v1 gene: `runner.py::_action_world_model_config`
-# and the reused trainer's `torch.optim.Adam` construction do not consume it.
-# `transition_balance_policy.stationary_cap`, by contrast, is consumed by
-# the Model Factory runner when it builds the real trainer's per-transition
-# sampling weights.
+# Optimizer genes now reach the shared versioned constructor (#284).
+# Historical genome schema bytes remain pinned; execution rejects knobs
+# inactive for the chosen objective (e.g. autoregressive transition balance).
 _GENERIC_ACTION_EFFECTS_V1_GENES: Dict[str, Dict[str, Any]] = {
     "optimizer.lr": {
         "type": "float",
@@ -411,9 +408,6 @@ _GENERIC_ACTION_EFFECTS_V1_GENES: Dict[str, Dict[str, Any]] = {
         "default": 3e-4,
         "mutation": {"distribution": "log_normal_perturb", "sigma": 0.3},
     },
-    # NOT YET WIRED -- see the module note above. Declared for
-    # TrainingContract identity/schema completeness (issue #229's gene
-    # table); training behavior does not yet depend on this value.
     "optimizer.weight_decay": {
         "type": "float",
         "bounds": (1e-7, 1e-1),
@@ -494,6 +488,14 @@ _GENERIC_ACTION_EFFECTS_V2_GENES: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# v3 removes the semantic gene: Factory has no semantic head. Sampling
+# balance is active only in the windowed trainer. Never rewrite v1/v2.
+_GENERIC_ACTION_EFFECTS_V3_GENES: Dict[str, Dict[str, Any]] = {
+    name: dict(spec) for name, spec in _GENERIC_ACTION_EFFECTS_V2_GENES.items()
+    if name != "loss_weights.semantic"
+}
+_GENERIC_ACTION_EFFECTS_V3_GENES["transition_balance_policy.stationary_cap"]["active_objectives"] = frozenset({"windowed_rollout"})
+
 #: Pinned content hash for ``generic_action_effects_v1`` (see
 #: :func:`_verify_schema_integrity`). Recomputed and asserted at import
 #: time; a change to any gene above without also renaming the schema
@@ -519,9 +521,15 @@ GENERIC_ACTION_EFFECTS_V2: GenomeSchema = _verify_schema_integrity(
 
 #: Registry of every declared per-stage schema (§14.2: "The factory declares
 #: a versioned genome schema per stage.").
+GENERIC_ACTION_EFFECTS_V3: GenomeSchema = _verify_schema_integrity(
+    build_schema("generic_action_effects_v3", _GENERIC_ACTION_EFFECTS_V3_GENES),
+    "8b4659dd6cf5097469530d466dbb610bebbeccdd0d5330f34f998a38809c49c3",
+)
+
 GENOME_SCHEMAS: Dict[str, GenomeSchema] = {
     GENERIC_ACTION_EFFECTS_V1.version: GENERIC_ACTION_EFFECTS_V1,
     GENERIC_ACTION_EFFECTS_V2.version: GENERIC_ACTION_EFFECTS_V2,
+    GENERIC_ACTION_EFFECTS_V3.version: GENERIC_ACTION_EFFECTS_V3,
 }
 
 
@@ -688,6 +696,7 @@ __all__ = [
     "build_schema",
     "GENERIC_ACTION_EFFECTS_V1",
     "GENERIC_ACTION_EFFECTS_V2",
+    "GENERIC_ACTION_EFFECTS_V3",
     "GENOME_SCHEMAS",
     "get_schema",
     "default_genome",
