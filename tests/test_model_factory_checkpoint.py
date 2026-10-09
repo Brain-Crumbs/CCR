@@ -105,8 +105,10 @@ def test_factory_checkpoint_round_trips_every_resumable_state(tmp_path):
     torch.rand(3)
 
     target = _model()
-    target_optimizer = torch.optim.AdamW(target.parameters(), lr=1.0)
+    target_optimizer = torch.optim.AdamW(target.parameters(), lr=0.005, weight_decay=0.01)
     target_scheduler = torch.optim.lr_scheduler.StepLR(target_optimizer, step_size=2)
+    # Exact resume now requires matching effective settings before state load.
+    target_optimizer.param_groups[0]["initial_lr"] = 0.01
     loaded = load_factory_checkpoint(
         str(path), model=target, optimizer=target_optimizer,
         scheduler=target_scheduler, resume=True,
@@ -237,3 +239,74 @@ def test_legacy_v2_can_clone_but_cannot_resume(tmp_path):
     assert cloned.training_stats == {"loss": 1.0}
     with pytest.raises(ValueError, match="cannot be resumed"):
         load_factory_checkpoint(str(path), model=model, resume=True)
+
+
+def test_effective_optimizer_rejects_wrong_class_before_torch_load(tmp_path, monkeypatch):
+    model = _model()
+    architecture, data, training = _contracts(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    path = tmp_path / "effective.pt"
+    save_factory_checkpoint(str(path), model, optimizer, architecture_contract=architecture, data_contract_hash=data, training_contract=training)
+    def forbidden(*args, **kwargs):
+        pytest.fail("mismatch deserialized checkpoint")
+    monkeypatch.setattr(torch, "load", forbidden)
+    with pytest.raises(ValueError, match="effective optimizer"):
+        load_factory_checkpoint(str(path), model=model, optimizer=torch.optim.Adam(model.parameters(), lr=0.01), mode="resume", architecture_contract=architecture, data_contract_hash=data, training_contract=training)
+
+
+def test_full_effective_proof_required_and_cannot_contradict_optimizer(tmp_path):
+    from cognitive_runtime.training.optimizer_config import optimizer_manifest
+    model = _model()
+    architecture, data, training = _contracts(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    path = tmp_path / "effective.pt"
+    effective = {"optimizer": optimizer_manifest(model, optimizer), "precision": "fp32", "scheduler": None, "model_backend": "test"}
+    save_factory_checkpoint(str(path), model, optimizer, architecture_contract=architecture, data_contract_hash=data, training_contract=training, effective_config=effective)
+    with pytest.raises(ValueError, match="requires expected effective_config"):
+        load_factory_checkpoint(str(path), model=model, optimizer=optimizer, mode="resume", architecture_contract=architecture, data_contract_hash=data, training_contract=training)
+    with pytest.raises(ValueError, match="effective configuration differs"):
+        load_factory_checkpoint(str(path), model=model, optimizer=optimizer, mode="resume", architecture_contract=architecture, data_contract_hash=data, training_contract=training, effective_config={**effective, "precision": "bf16"})
+    with pytest.raises(ValueError, match="disagrees with observed optimizer"):
+        save_factory_checkpoint(str(path), model, optimizer, architecture_contract=architecture, data_contract_hash=data, training_contract=training, effective_config={"optimizer": {}})
+    # Read/inspection remains independent of resume proof.
+    assert load_factory_checkpoint(str(path)).model is not None
+
+
+def test_historical_missing_effective_evidence_readable_but_not_resumable(tmp_path, monkeypatch):
+    import json
+    model = _model()
+    architecture, data, training = _contracts(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    path = tmp_path / "historical.pt"
+    payload = save_factory_checkpoint(str(path), model, optimizer, architecture_contract=architecture, data_contract_hash=data, training_contract=training)
+    payload.pop("effective_optimizer")
+    payload.pop("effective_config")
+    payload.pop("effective_config_hash")
+    torch.save(payload, path)
+    header_path = checkpoint_module.factory_checkpoint_metadata_path(str(path))
+    header = checkpoint_module._checkpoint_header(payload, checkpoint_sha256=checkpoint_module._checkpoint_sha256(str(path)))
+    header.pop("effective_optimizer", None)
+    header.pop("effective_config_hash", None)
+    with open(header_path, "w") as handle:
+        json.dump(header, handle)
+    assert load_factory_checkpoint(str(path)).model is not None
+    def forbidden(*args, **kwargs):
+        pytest.fail("historical resume deserialized weights before rejecting")
+    monkeypatch.setattr(torch, "load", forbidden)
+    with pytest.raises(ValueError, match="without effective optimizer evidence"):
+        load_factory_checkpoint(str(path), model=model, optimizer=optimizer, mode="resume", architecture_contract=architecture, data_contract_hash=data, training_contract=training)
+
+
+def test_headerless_resume_cannot_bypass_full_effective_config(tmp_path):
+    from pathlib import Path
+    from cognitive_runtime.training.optimizer_config import optimizer_manifest
+    model = _model()
+    architecture, data, training = _contracts(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    path = tmp_path / "headerless.pt"
+    effective = {"optimizer": optimizer_manifest(model, optimizer), "model_backend": "original"}
+    save_factory_checkpoint(str(path), model, optimizer, architecture_contract=architecture, data_contract_hash=data, training_contract=training, effective_config=effective)
+    Path(checkpoint_module.factory_checkpoint_metadata_path(str(path))).unlink()
+    for expected in (None, {**effective, "model_backend": "different"}):
+        with pytest.raises(ValueError, match="effective_config|effective configuration"):
+            load_factory_checkpoint(str(path), model=model, optimizer=optimizer, resume=True, architecture_contract=architecture, data_contract_hash=data, training_contract=training, effective_config=expected)

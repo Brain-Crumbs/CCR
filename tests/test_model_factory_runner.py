@@ -177,6 +177,13 @@ def test_fresh_trial_completes_and_writes_artifacts(tmp_path, corpus):
     assert (directory / "metrics" / "validation.json").is_file()
     assert (directory / "metrics" / "budget_report.json").is_file()
     assert (directory / "experiment_report.json").is_file()
+    effective = json.loads((directory / "effective_config.json").read_text())
+    assert effective["effective"]["optimizer"]["class"] == "AdamW"
+    assert effective["effective"]["scheduler"] is None
+    assert effective["effective"]["precision"] == "fp32"
+    from cognitive_runtime.training.optimizer_config import effective_hash
+    assert effective_hash(effective["effective"]) == effective["effective_config_hash"]
+    assert effective["effective"]["optimizer"]["parameter_groups"][0]["weight_decay"] == 1e-5
     assert not (directory / "metrics" / "test.json").exists()
     assert not (directory / "metrics" / "comparison.json").exists()
 
@@ -199,13 +206,12 @@ def test_factory_loss_weight_aliases_reach_the_real_trainer_config():
     from cognitive_runtime.training.model_factory.spec import resolve
 
     spec = resolve(_spec_dict("unused", training_overrides={
-        "loss_weights": {"pixel": 0.2, "latent": 0.3, "semantic": 0.4},
+        "loss_weights": {"pixel": 0.2, "latent": 0.3},
     }))
     cfg = _action_world_model_config(spec)
 
     assert cfg.pixel_loss_weight == pytest.approx(0.2)
     assert cfg.latent_loss_weight == pytest.approx(0.3)
-    assert cfg.semantic_loss_weight == pytest.approx(0.4)
 
 
 def test_fresh_trial_writes_clinic_session_index_and_exports_validation_predictions(tmp_path, corpus):
@@ -429,6 +435,7 @@ def test_resume_continues_an_interrupted_run_to_completion(tmp_path, corpus):
     from cognitive_runtime.training.model_factory.runner import (
         _action_world_model_config,
         _architecture_contract,
+        _effective_configuration,
     )
 
     raw = _spec_dict(corpus.corpus_id, training_overrides={"epoch_budget": 3, "checkpoint_cadence_epochs": 1})
@@ -465,8 +472,13 @@ def test_resume_continues_an_interrupted_run_to_completion(tmp_path, corpus):
     partial_cfg = dataclasses.replace(cfg, epochs=1)
     trained_model, stats = awm.train_action_world_model(train_dataset, partial_cfg, initial_model=model)
     resume_state = stats["resume_state"]
-    optimizer = torch.optim.Adam(trained_model.parameters(), lr=cfg.lr)
+    from cognitive_runtime.training.optimizer_config import build_optimizer, effective_hash
+    optimizer = build_optimizer(torch, trained_model.parameters(), cfg.optimizer)
     optimizer.load_state_dict(resume_state.optimizer_state_dict)
+    effective = _effective_configuration(resolved, cfg, trained_model, optimizer)
+    artifacts_module.atomic_write_json(artifacts.directory / "effective_config.json", {
+        "effective": effective, "effective_config_hash": effective_hash(effective),
+    })
     checkpoint_module.save_factory_checkpoint(
         str(artifacts.checkpoints_dir / "last.pt"), trained_model, optimizer,
         trainer_state={
@@ -475,6 +487,7 @@ def test_resume_continues_an_interrupted_run_to_completion(tmp_path, corpus):
         },
         architecture_contract=architecture_contract, data_contract_hash=corpus.data_contract,
         training_contract=training_contract, rng_state=resume_state.rng_state,
+        effective_config=effective,
     )
     # Deliberately do NOT transition to a terminal state: this is the
     # left-running record a crashed worker would leave behind.
@@ -511,6 +524,7 @@ def test_resume_never_regresses_a_better_pre_crash_best_checkpoint(tmp_path, cor
     from cognitive_runtime.training.model_factory.runner import (
         _action_world_model_config,
         _architecture_contract,
+        _effective_configuration,
     )
 
     raw = _spec_dict(corpus.corpus_id, training_overrides={"epoch_budget": 3, "checkpoint_cadence_epochs": 1})
@@ -544,8 +558,13 @@ def test_resume_never_regresses_a_better_pre_crash_best_checkpoint(tmp_path, cor
     partial_cfg = dataclasses.replace(cfg, epochs=1)
     trained_model, stats = awm.train_action_world_model(train_dataset, partial_cfg, initial_model=model)
     resume_state = stats["resume_state"]
-    optimizer = torch.optim.Adam(trained_model.parameters(), lr=cfg.lr)
+    from cognitive_runtime.training.optimizer_config import build_optimizer, effective_hash
+    optimizer = build_optimizer(torch, trained_model.parameters(), cfg.optimizer)
     optimizer.load_state_dict(resume_state.optimizer_state_dict)
+    effective = _effective_configuration(resolved, cfg, trained_model, optimizer)
+    artifacts_module.atomic_write_json(artifacts.directory / "effective_config.json", {
+        "effective": effective, "effective_config_hash": effective_hash(effective),
+    })
     # A real per-episode MSE can never beat this: any post-resume chunk
     # must leave the pre-crash best-validation.pt exactly as it is now.
     unbeatable_metric = -1000.0
@@ -558,12 +577,14 @@ def test_resume_never_regresses_a_better_pre_crash_best_checkpoint(tmp_path, cor
         trainer_state=trainer_state,
         architecture_contract=architecture_contract, data_contract_hash=corpus.data_contract,
         training_contract=training_contract, rng_state=resume_state.rng_state,
+        effective_config=effective,
     )
     checkpoint_module.save_factory_checkpoint(
         str(artifacts.checkpoints_dir / "best-validation.pt"), trained_model, optimizer,
         trainer_state=trainer_state,
         architecture_contract=architecture_contract, data_contract_hash=corpus.data_contract,
         training_contract=training_contract, rng_state=resume_state.rng_state,
+        effective_config=effective,
     )
     pre_resume_best_sha = checkpoint_module.read_factory_checkpoint_metadata(
         str(artifacts.checkpoints_dir / "best-validation.pt")

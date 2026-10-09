@@ -29,13 +29,13 @@ model:
   backbone_kwargs: {n_heads: 2, n_layers: 1}
 training:
   objective: windowed_rollout
-  optimizer: {name: adamw, lr: 0.0003, weight_decay: 0.00001}
+  optimizer: {format: torch-optimizer-v2, name: adamw, lr: 0.0003, weight_decay: 0.00001}
   batch_size: 32
   seed: 0
   rollout_frames: 8
   warmup_frames: 4
   scheduled_sampling_p: 0.25
-  loss_weights: {pixel: 1.0, latent: 1.0, semantic: 1.0}
+  loss_weights: {pixel: 1.0, latent: 1.0}
   checkpoint_selection_policy: {metric: validation_loss, mode: min}
   device: cuda
   precision: fp32

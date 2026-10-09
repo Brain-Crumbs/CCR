@@ -159,8 +159,19 @@ def _get_nested(mapping: Mapping[str, Any], dotted_path: str) -> Any:
 def _extract_genome(schema: GenomeSchema, training: Mapping[str, Any]) -> Dict[str, Any]:
     """Read every one of ``schema``'s declared gene values out of a resolved
     ``ExperimentSpec.training`` block -- the parent's actual historical
-    configuration, never a resampled or default value."""
-    return {name: _get_nested(training, name) for name in schema.genes}
+    configuration. Only omitted inactive genes use canonical placeholders."""
+    genome = {}
+    for name, gene in schema.genes.items():
+        try:
+            genome[name] = _get_nested(training, name)
+        except BreedingError:
+            if gene.is_active(training["objective"]):
+                raise
+            # Inactive genotype placeholders never enter an executable spec.
+            # Canonical defaults make omitted historical inactive genes
+            # reproducible without claiming they affected training.
+            genome[name] = gene.default
+    return genome
 
 
 def _set_nested(mapping: Dict[str, Any], dotted_path: str, value: Any) -> None:
@@ -505,7 +516,8 @@ def breed(
         if mutated_genome[name] != child_genome[name]
     }
 
-    child_training = _apply_genome(donor.spec.training, child_genome)
+    active = set(genome_schema.active_gene_names(objective))
+    child_training = _apply_genome(donor.spec.training, {key: value for key, value in child_genome.items() if key in active})
 
     child_evolution = {
         "generation": generation,

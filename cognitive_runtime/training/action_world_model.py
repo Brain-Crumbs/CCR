@@ -44,6 +44,9 @@ import math
 import random
 import time
 from dataclasses import dataclass, field
+from cognitive_runtime.training.optimizer_config import (
+    LEGACY_BEHAVIOR, action_optimizer_config, build_optimizer, optimizer_manifest, restore_optimizer,
+)
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 log = logging.getLogger("ccr.training.cortex")
@@ -537,6 +540,9 @@ class ActionWorldModelConfig:
     #: the motor efference copy (C2).  Kept configurable for pixel-only A/Bs
     #: and for loading historical checkpoints.
     workspace_enabled: bool = True
+    # Direct/nursery callers retain the explicitly named historical behavior.
+    optimizer_behavior: str = LEGACY_BEHAVIOR
+    optimizer: Optional[Dict[str, Any]] = None
 
 
 def build_action_world_model(
@@ -843,11 +849,11 @@ def _train_autoregressive_objective(
     ):
         raise ValueError("no autoregressive targets: episodes are shorter than the first horizon")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    optimizer = build_optimizer(torch, model.parameters(), action_optimizer_config(cfg))
     start_epoch = 0
     global_step = 0
     if resume_state is not None:
-        optimizer.load_state_dict(resume_state.optimizer_state_dict)
+        restore_optimizer(model, optimizer, resume_state.optimizer_state_dict, resume_state.effective_optimizer)
         start_epoch = resume_state.epoch
         global_step = resume_state.global_step
     curves: Dict[str, List[float]] = {
@@ -1227,6 +1233,7 @@ def train_action_world_model(
     if dataset.pixel_shape is None:
         raise ValueError("dataset has no pixel shape; were frames recorded?")
     cfg = config or ActionWorldModelConfig()
+    action_optimizer_config(cfg)  # Validate before model construction or training.
     if cfg.warmup_frames < 1:
         raise ValueError(f"warmup_frames must be >= 1, got {cfg.warmup_frames}")
     if cfg.rollout_frames < 1:
@@ -1382,6 +1389,7 @@ def train_action_world_model(
             TrainerResumeState(
                 epoch=epochs_completed, global_step=step,
                 optimizer_state_dict=step_optimizer.state_dict(),
+                effective_optimizer=optimizer_manifest(model, step_optimizer),
                 rng_state=capture_trainer_rng_state(generator),
                 best_validation_metric=best_tracker.best,
                 target_encoder_state_dict=(
@@ -1402,12 +1410,14 @@ def train_action_world_model(
         stats["resume_state"] = TrainerResumeState(
             epoch=cfg.epochs, global_step=global_step,
             optimizer_state_dict=optimizer.state_dict(),
+            effective_optimizer=optimizer_manifest(model, optimizer),
             rng_state=capture_trainer_rng_state(generator),
             best_validation_metric=best_tracker.best,
             target_encoder_state_dict=(
                 target_encoder.state_dict() if target_encoder is not None else None
             ),
         )
+        stats["effective_optimizer"] = optimizer_manifest(model, optimizer)
         diagnostics = representation_collapse_diagnostics(model, dataset, config=cfg)
         stats["representation_diagnostics"] = diagnostics
         if cfg.collapse_gate_enabled and diagnostics["gate_evaluable"] and not diagnostics["passed"]:
@@ -1449,11 +1459,11 @@ def train_action_world_model(
             _window_weights(transition_weights, starts, window), dtype=torch.float
         )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    optimizer = build_optimizer(torch, model.parameters(), action_optimizer_config(cfg))
     start_epoch = 0
     global_step = 0
     if resume_state is not None:
-        optimizer.load_state_dict(resume_state.optimizer_state_dict)
+        restore_optimizer(model, optimizer, resume_state.optimizer_state_dict, resume_state.effective_optimizer)
         start_epoch = resume_state.epoch
         global_step = resume_state.global_step
     curves: Dict[str, List[float]] = {
@@ -1895,9 +1905,11 @@ def train_action_world_model(
         "device": str(_model_device(model)),
         "global_step": global_step,
     }
+    stats["effective_optimizer"] = optimizer_manifest(model, optimizer)
     stats["resume_state"] = TrainerResumeState(
         epoch=cfg.epochs, global_step=global_step,
         optimizer_state_dict=optimizer.state_dict(),
+        effective_optimizer=optimizer_manifest(model, optimizer),
         rng_state=capture_trainer_rng_state(generator),
         best_validation_metric=best_tracker.best,
         target_encoder_state_dict=(

@@ -260,7 +260,13 @@ class DataContract(_ContractMixin):
 
 @dataclass(frozen=True)
 class TrainingContract(_ContractMixin):
-    """Optimization procedure identity (epic #212 §5.3)."""
+    """Optimization procedure identity (epic #212 §5.3).
+
+    New Factory runs materialize ``optimizer.format= torch-optimizer-v2``
+    plus all supported constructor settings before hashing. Keep this
+    container permissive for historical artifact inspection; executable
+    validation belongs to spec resolution and effective_config.py.
+    """
 
     objective: str
     optimizer: Mapping[str, Any]
