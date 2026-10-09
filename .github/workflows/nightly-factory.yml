@@ -1,104 +1,74 @@
-name: Nightly Model Factory smoke
+name: Factory CPU smoke (opt-in)
 
-# A micro end-to-end factory trial (issue #242, epic #212).
-#
-# Unit tests prove each component in isolation. This job exists to catch the
-# integration rot they cannot see: a corpus that no longer freezes, a resume
-# that stopped being exact, a budget that stopped firing, a search that
-# started touching the sealed split. It is deliberately tiny — a handful of
-# short episodes and a minimal model — so it stays a smoke test, not a
-# training run.
-
+# Legacy Factory integration repair: #297, #242, epic #212.
+# Manual only: optional torch/training must never enter the base PR gate.
 on:
-  schedule:
-    - cron: '0 4 * * *'   # 04:00 UTC daily
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
-  group: nightly-factory
+  group: factory-smoke-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   smoke:
-    name: micro end-to-end trial
+    name: optional micro Factory trial
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 5
+    env:
+      CUDA_VISIBLE_DEVICES: ''
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      PYTHONHASHSEED: '0'
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
           cache-dependency-path: pyproject.toml
 
-      - name: Install CPU torch
+      - name: Install optional CPU module
         run: |
-          python -m pip install --upgrade pip setuptools wheel
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e ".[dev,neural]"
 
-      - name: Install project
-        run: python -m pip install -e ".[dev,neural]"
+      - name: Freeze corpus, baseline, controlled siblings and paired comparison
+        run: python .github/scripts/run_factory_smoke.py --output factory-smoke
 
-      - name: Detect factory CLI
-        id: detect
+      - name: Resume, budget, immutable corpus and sealed-split regressions
+        # Explicit nodes avoid wildcard collection of unrelated optional modules.
+        # A missing dependency/CLI in the preceding step fails; it cannot skip.
         run: |
-          if ccr factory --help > /dev/null 2>&1; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "`ccr factory` not implemented yet — skipping (issue #228)."
-          fi
+          timeout 90s python -m pytest -q --durations=10 \
+            tests/test_factory_smoke_contract.py \
+            tests/test_model_factory_resume.py::test_resume_matches_uninterrupted_training \
+            tests/test_model_factory_budget.py::test_over_budget_run_requests_stop_as_soon_as_the_full_run_projection_overruns \
+            tests/test_model_factory_budget.py::test_budget_exceeded_checkpoint_is_valid_and_loadable \
+            tests/test_model_factory_budget.py::test_budget_exceeded_experiment_is_never_eligible_for_promotion \
+            tests/test_model_factory_corpus.py::test_resolve_refuses_a_missing_frozen_session_and_names_it \
+            tests/test_model_factory_confirmation.py::test_no_search_step_ever_opens_the_sealed_test_partition
 
-      # MF-A5 (#217): a corpus must freeze session content hashes, and a
-      # controlled trial must then fail rather than re-record a missing one.
-      - name: Build a micro corpus
-        if: steps.detect.outputs.present == 'true'
-        run: |
-          ccr factory corpus build .github/fixtures/micro-corpus.yaml \
-            --log-format json
-
-      # MF-C3 (#225): fresh baseline, then two siblings differing in exactly
-      # one declared field, then a paired comparison.
-      - name: Baseline + controlled A/B siblings
-        if: steps.detect.outputs.present == 'true'
-        run: |
-          ccr factory baseline .github/fixtures/micro-baseline.yaml
-          ccr factory clone micro-baseline-0001 --set training.closed_loop_pixel_loss_weight=0.125
-          ccr factory clone micro-baseline-0001 --set training.closed_loop_pixel_loss_weight=0.500
-          ccr factory compare micro-baseline-0001 micro-baseline-0002 micro-baseline-0003
-
-      # MF-B3 (#220): 3 + 3 epochs must equal 6 epochs. This is the property
-      # most likely to regress when an unrelated RNG consumer is added to the
-      # trainer, and it is invisible to every other test.
-      - name: Resume equivalence
-        if: steps.detect.outputs.present == 'true'
-        run: python -m pytest tests/test_model_factory_resume.py -q
-
-      # MF-B4 (#221): an over-budget run must stop at a checkpoint boundary,
-      # write a loadable last.pt, and be refused by promotion.
-      - name: Budget enforcement
-        if: steps.detect.outputs.present == 'true'
-        run: python -m pytest tests/test_model_factory_budget.py -q
-
-      # MF-C5 (#227): turn "routine search never queries the sealed split"
-      # from a code-review convention into a mechanically enforced property.
-      - name: Sealed-split enforcement
-        if: steps.detect.outputs.present == 'true'
-        run: python -m pytest tests -q -k sealed_split
-
-      - name: Upload run artifacts
-        if: always() && steps.detect.outputs.present == 'true'
+      - name: Upload synthetic evidence
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: factory-smoke-artifacts
+          name: factory-smoke-synthetic-evidence
           path: |
-            runs/**/trial_spec.json
-            runs/**/contracts.json
-            runs/**/lineage.json
-            runs/**/execution.json
-            runs/**/metrics/**
-            runs/**/experiment_report.json
-            corpora/**/corpus_manifest.json
-          if-no-files-found: warn
-          retention-days: 14
+            factory-smoke/smoke-summary.json
+            factory-smoke/*.log
+            factory-smoke/runs/**/trial_spec.json
+            factory-smoke/runs/**/contracts.json
+            factory-smoke/runs/**/lineage.json
+            factory-smoke/runs/**/execution.json
+            factory-smoke/runs/**/metrics/**
+            factory-smoke/runs/**/experiment_report.json
+            factory-smoke/corpora/**/corpus_manifest.json
+            factory-smoke/corpora/**/quality_report.json
+            factory-smoke/corpora/**/split_overlap_report.json
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "created_at": {
+      "format": "date-time",
+      "pattern": "^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])T([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(\\.\\d+)?(Z|[+-]([01]\\d|2[0-3]):[0-5]\\d)$",
+      "type": "string"
+    },
+    "devices": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "format": {
+      "const": "model-factory-trial-state-v1"
+    },
+    "heartbeat_timeout_seconds": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "history": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "pattern": "^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])T([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(\\.\\d+)?(Z|[+-]([01]\\d|2[0-3]):[0-5]\\d)$",
+            "type": "string"
+          },
+          "from": {
+            "enum": [
+              null,
+              "queued",
+              "running",
+              "checkpointing",
+              "completed",
+              "budget_exceeded",
+              "failed",
+              "cancelled"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to": {
+            "enum": [
+              "queued",
+              "running",
+              "checkpointing",
+              "completed",
+              "budget_exceeded",
+              "failed",
+              "cancelled"
+            ]
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "at",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "retried_from": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "run_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "state": {
+      "enum": [
+        "queued",
+        "running",
+        "checkpointing",
+        "completed",
+        "budget_exceeded",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "updated_at": {
+      "format": "date-time",
+      "pattern": "^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])T([01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(\\.\\d+)?(Z|[+-]([01]\\d|2[0-3]):[0-5]\\d)$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "format",
+    "run_id",
+    "state",
+    "created_at",
+    "updated_at",
+    "reason",
+    "devices",
+    "retried_from",
+    "heartbeat_timeout_seconds",
+    "history"
+  ],
+  "title": "Model Factory trial lifecycle v1",
+  "type": "object"
+}

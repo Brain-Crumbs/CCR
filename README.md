@@ -329,3 +329,5 @@ any server or GPU rendering dependencies.
   exact Python/tensor/stream contracts
 - [docs/v2/REVIEW-2026-07-organism-audit.md](docs/v2/REVIEW-2026-07-organism-audit.md) —
   honest assessment of what's assembled vs what's separate pipelines
+
+For the offline PR budget, fixture contract and explicit optional-module commands, see [market testing](docs/market/testing.md).

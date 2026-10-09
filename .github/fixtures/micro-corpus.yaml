@@ -1,0 +1,23 @@
+# Project-authored synthetic recipe; provenance and SHA-256: provenance.json.
+# Six bounded optical-flow episodes. No downloaded data or live service.
+format: model-factory-corpus-spec-v1
+organism: factory-smoke
+corpus_id: micro-crafter-v1
+generator:
+  world: crafter
+  backend: crafter
+  episode_ticks: 6
+  world_size: 16
+  realtime: false
+  data_quality_gate: true
+  expected_pixel_source: crafter
+splits:
+  train:
+    walk_forward_short: [0, 1]
+  validation:
+    walk_forward_short: [100, 101]
+  test:
+    walk_forward_short: [200, 201]
+quality_policy:
+  enabled: true
+  expected_pixel_source: crafter

@@ -24,7 +24,7 @@ license = { text = "MIT" }
 dependencies = ["numpy>=1.23", "PyYAML>=6", "namesgenerator>=0.3", "crafter>=1.8,<2"]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "jsonschema>=4.18", "pytest-xdist>=3.6"]
 # Neural pixel vision (end-to-end behavioral cloning). Optional: the whole
 # pure-Python stack (loop, streams, simulated/remote backends, the linear BC
 # trainer and every heuristic encoder) runs without it. Only the pixel CNN,
@@ -39,3 +39,9 @@ include = ["cognitive_runtime*", "brain*", "sleep*", "motor*", "development*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "market_extended: opt-in offline market integration/property tests",
+    "market_text: opt-in text encoder tests; local artifacts only",
+    "market_jepa: opt-in bounded neural/JEPA tests",
+    "market_live: opt-in live provider tests; rights and credentials required",
+]

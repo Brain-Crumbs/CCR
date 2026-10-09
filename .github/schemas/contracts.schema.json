@@ -1,0 +1,499 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "architecture_contract": {
+      "additionalProperties": false,
+      "properties": {
+        "action_embed_dim": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "action_vocabulary": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "backbone": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "backbone_kwargs": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "context_length": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "direct_horizon_topology": {
+          "items": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "hidden_dim": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "horizons_ticks": {
+          "items": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "latent_width": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "pixel_shape": {
+          "items": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        },
+        "reconstruction_shape": {
+          "items": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "maxItems": 3,
+          "minItems": 3,
+          "type": "array"
+        },
+        "rgb_preprocessing_version": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "semantic_classes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "visual_architecture": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "workspace_layout_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_modalities": {
+          "additionalProperties": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "pixel_shape",
+        "rgb_preprocessing_version",
+        "action_vocabulary",
+        "workspace_modalities",
+        "workspace_layout_hash",
+        "latent_width",
+        "hidden_dim",
+        "action_embed_dim",
+        "reconstruction_shape",
+        "visual_architecture",
+        "semantic_classes",
+        "horizons_ticks",
+        "direct_horizon_topology",
+        "backbone",
+        "context_length",
+        "backbone_kwargs"
+      ],
+      "type": "object"
+    },
+    "architecture_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "data_contract": {
+      "additionalProperties": false,
+      "properties": {
+        "action_effect_label_schema_version": {
+          "type": "string"
+        },
+        "backend": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "behavior_mixture_policy": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "goal_distribution_policy": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "goal_reward_policy": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "oracle_planner_policy": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "pixel_provenance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "preprocessing_version": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "program_config": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "quality_policy": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "retention_policy": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "scenario_code_version": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "scenario_generators": {
+          "additionalProperties": {
+            "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+            "type": "object"
+          },
+          "type": "object"
+        },
+        "scenario_mix_policy": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "scenario_names": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "seed_assignments": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "semantic_vocabulary_version": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "split_overlap_policy": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "split_roles": {
+          "additionalProperties": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "temporal_coverage": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "test_session_hashes": {
+          "items": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "test_session_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "ticks_per_frame": {
+          "exclusiveMinimum": 0,
+          "type": "number"
+        },
+        "train_session_hashes": {
+          "items": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "train_session_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "validation_session_hashes": {
+          "items": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "validation_session_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "world": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "world",
+        "backend",
+        "program_config",
+        "scenario_names",
+        "scenario_code_version",
+        "train_session_ids",
+        "train_session_hashes",
+        "validation_session_ids",
+        "validation_session_hashes",
+        "test_session_ids",
+        "test_session_hashes",
+        "seed_assignments",
+        "pixel_provenance",
+        "semantic_vocabulary_version",
+        "preprocessing_version",
+        "ticks_per_frame",
+        "temporal_coverage",
+        "quality_policy",
+        "split_overlap_policy",
+        "scenario_generators",
+        "action_effect_label_schema_version",
+        "split_roles",
+        "scenario_mix_policy",
+        "goal_distribution_policy",
+        "oracle_planner_policy",
+        "goal_reward_policy",
+        "behavior_mixture_policy",
+        "retention_policy"
+      ],
+      "type": "object"
+    },
+    "data_contract_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "format": {
+      "const": "model-factory-contracts-v1"
+    },
+    "training_contract": {
+      "additionalProperties": false,
+      "properties": {
+        "batch_size": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "checkpoint_cadence_epochs": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "checkpoint_selection_policy": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "determinism_policy": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "device": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "early_stopping_policy": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "ema_target_decay": {
+          "anyOf": [
+            {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "epoch_budget": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "loss_weights": {
+          "additionalProperties": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "type": "object"
+        },
+        "max_training_seconds": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "objective": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "optimizer": {
+          "additionalProperties": true,
+          "properties": {
+            "lr": {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            "name": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "lr"
+          ],
+          "type": "object"
+        },
+        "precision": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "rollout_frames": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "scheduled_sampling_p": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "scheduler": {
+          "anyOf": [
+            {
+              "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "step_budget": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "transition_balance_policy": {
+          "description": "Versioned policy extension mapping; interpreted by its owning contract.",
+          "type": "object"
+        },
+        "warmup_frames": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "objective",
+        "optimizer",
+        "batch_size",
+        "seed",
+        "rollout_frames",
+        "warmup_frames",
+        "scheduled_sampling_p",
+        "loss_weights",
+        "checkpoint_selection_policy",
+        "device",
+        "precision",
+        "determinism_policy",
+        "epoch_budget",
+        "step_budget",
+        "scheduler",
+        "max_training_seconds",
+        "checkpoint_cadence_epochs",
+        "ema_target_decay",
+        "transition_balance_policy",
+        "early_stopping_policy"
+      ],
+      "type": "object"
+    },
+    "training_contract_hash": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "format",
+    "architecture_hash",
+    "data_contract_hash",
+    "training_contract_hash",
+    "architecture_contract",
+    "data_contract",
+    "training_contract"
+  ],
+  "title": "Model Factory contract identities v1",
+  "type": "object"
+}

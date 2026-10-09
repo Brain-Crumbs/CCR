@@ -139,7 +139,7 @@ settings before restoration; an arbitrary throwaway optimizer is no longer safe.
 Default/offline tests: `python -m pytest tests/market/test_effective_config.py -q`.
 These use authored tiny parameter/constructor spies and JSON roundtrips, import
 no torch, and do not train or fetch anything. Optional CPU tests:
-`python -m pytest tests/market/test_effective_config_neural.py -q`.
+`python -m pytest tests/market/test_effective_config_neural.py --run-market=extended -q`.
 They lazily import torch in test bodies and check both Adam and AdamW, both AWM
 objectives, exact resumed weights, and rejected mismatches. Their 4×4 constant
 RGB fixture is generated inline, seed 7, project-authored under MIT. Its SHA-256

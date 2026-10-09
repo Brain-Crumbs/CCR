@@ -1,0 +1,143 @@
+{
+  "architecture_contract": {
+    "action_embed_dim": 2,
+    "action_vocabulary": [
+      "MOVE_UP",
+      "NULL"
+    ],
+    "backbone": "gru",
+    "backbone_kwargs": {},
+    "context_length": 2,
+    "direct_horizon_topology": [
+      1,
+      2
+    ],
+    "hidden_dim": 8,
+    "horizons_ticks": [
+      1,
+      2
+    ],
+    "latent_width": 4,
+    "pixel_shape": [
+      3,
+      8,
+      8
+    ],
+    "reconstruction_shape": [
+      3,
+      8,
+      8
+    ],
+    "rgb_preprocessing_version": "v1",
+    "semantic_classes": 0,
+    "visual_architecture": "spatial_residual_v1",
+    "workspace_layout_hash": null,
+    "workspace_modalities": {}
+  },
+  "clone_parent": {
+    "checkpoint": "checkpoints/synthetic-parent.pt",
+    "run_id": "synthetic-parent-297",
+    "sha256": "93c49bdc61c8c87f41fde9fb2b7d59fb00f9f447f707b89ad2296832576e63b0"
+  },
+  "data_contract": {
+    "backend": "crafter",
+    "pixel_provenance": "project-authored-synthetic-v1",
+    "preprocessing_version": "v1",
+    "program_config": {
+      "seed": 297,
+      "source": "project-authored-synthetic"
+    },
+    "quality_policy": {
+      "min_episode_length": 3
+    },
+    "scenario_code_version": "v1",
+    "scenario_names": [
+      "motor_babbling_open"
+    ],
+    "seed_assignments": {
+      "test": 299,
+      "train": 297,
+      "validation": 298
+    },
+    "semantic_vocabulary_version": "v1",
+    "split_overlap_policy": {
+      "max_overlap": 0.0
+    },
+    "split_roles": {
+      "test": "sealed_test",
+      "train": "generic_training",
+      "validation": "validation"
+    },
+    "temporal_coverage": {
+      "frames_per_session": 3,
+      "max_offset_ticks": 2
+    },
+    "test_session_hashes": [
+      "1a1d4be7c224e5548a1510df6c1f0e2ad354abfd2e65f0c291be54c42cb14109"
+    ],
+    "test_session_ids": [
+      "synthetic-test-297"
+    ],
+    "ticks_per_frame": 1.0,
+    "train_session_hashes": [
+      "1996d111875848ade95aa9f76d8ea67032517bfe0fff38b01de322d10cbe8a62"
+    ],
+    "train_session_ids": [
+      "synthetic-train-297"
+    ],
+    "validation_session_hashes": [
+      "3cdd084c9b630325f773b492760c4497b8e9508f0867fb1dd31a05320d832602"
+    ],
+    "validation_session_ids": [
+      "synthetic-validation-297"
+    ],
+    "world": "crafter"
+  },
+  "format": "ccr-synthetic-factory-inputs-v1",
+  "run_id": "synthetic-factory-seed-297",
+  "seed": 297,
+  "sibling_group": "synthetic-control-297",
+  "spec": {
+    "data": {
+      "corpus_id": "synthetic-corpus-297",
+      "horizons_ticks": [
+        1,
+        2
+      ],
+      "world": "crafter"
+    },
+    "evaluation": {
+      "selection_metric": "validation_loss"
+    },
+    "mode": "fresh",
+    "model": {
+      "action_embed_dim": 2,
+      "backbone": "gru",
+      "context_length": 2,
+      "hidden_dim": 8,
+      "latent_width": 4,
+      "reconstruction_size": 8
+    },
+    "organism": "FixtureCrafter",
+    "training": {
+      "batch_size": 1,
+      "determinism_policy": {
+        "deterministic": true,
+        "seed": 297
+      },
+      "epoch_budget": 1,
+      "loss_weights": {
+        "pixel": 1.0
+      },
+      "rollout_frames": 2,
+      "seed": 297,
+      "warmup_frames": 1
+    }
+  },
+  "timestamps": [
+    "2026-01-01T00:00:00+00:00",
+    "2026-01-01T00:00:01+00:00",
+    "2026-01-01T00:00:02+00:00",
+    "2026-01-01T00:00:03+00:00"
+  ]
+}

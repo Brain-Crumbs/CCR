@@ -1,0 +1,144 @@
+{
+  "architecture_contract": {
+    "action_embed_dim": 2,
+    "action_vocabulary": [
+      "MOVE_UP",
+      "NULL"
+    ],
+    "backbone": "gru",
+    "backbone_kwargs": {},
+    "context_length": 2,
+    "direct_horizon_topology": [
+      1,
+      2
+    ],
+    "hidden_dim": 8,
+    "horizons_ticks": [
+      1,
+      2
+    ],
+    "latent_width": 4,
+    "pixel_shape": [
+      3,
+      8,
+      8
+    ],
+    "reconstruction_shape": [
+      3,
+      8,
+      8
+    ],
+    "rgb_preprocessing_version": "v1",
+    "semantic_classes": 0,
+    "visual_architecture": "spatial_residual_v1",
+    "workspace_layout_hash": null,
+    "workspace_modalities": {}
+  },
+  "architecture_hash": "57bab6ee8cdcaeea167945347f89e3bb2ffa75fe98aa9a77813f5c625fbe484e",
+  "data_contract": {
+    "action_effect_label_schema_version": "",
+    "backend": "crafter",
+    "behavior_mixture_policy": {},
+    "goal_distribution_policy": {},
+    "goal_reward_policy": {},
+    "oracle_planner_policy": {},
+    "pixel_provenance": "project-authored-synthetic-v1",
+    "preprocessing_version": "v1",
+    "program_config": {
+      "seed": 297,
+      "source": "project-authored-synthetic"
+    },
+    "quality_policy": {
+      "min_episode_length": 3
+    },
+    "retention_policy": {},
+    "scenario_code_version": "v1",
+    "scenario_generators": {},
+    "scenario_mix_policy": {},
+    "scenario_names": [
+      "motor_babbling_open"
+    ],
+    "seed_assignments": {
+      "test": 299,
+      "train": 297,
+      "validation": 298
+    },
+    "semantic_vocabulary_version": "v1",
+    "split_overlap_policy": {
+      "max_overlap": 0.0
+    },
+    "split_roles": {
+      "test": "sealed_test",
+      "train": "generic_training",
+      "validation": "validation"
+    },
+    "temporal_coverage": {
+      "frames_per_session": 3,
+      "max_offset_ticks": 2
+    },
+    "test_session_hashes": [
+      "1a1d4be7c224e5548a1510df6c1f0e2ad354abfd2e65f0c291be54c42cb14109"
+    ],
+    "test_session_ids": [
+      "synthetic-test-297"
+    ],
+    "ticks_per_frame": 1.0,
+    "train_session_hashes": [
+      "1996d111875848ade95aa9f76d8ea67032517bfe0fff38b01de322d10cbe8a62"
+    ],
+    "train_session_ids": [
+      "synthetic-train-297"
+    ],
+    "validation_session_hashes": [
+      "3cdd084c9b630325f773b492760c4497b8e9508f0867fb1dd31a05320d832602"
+    ],
+    "validation_session_ids": [
+      "synthetic-validation-297"
+    ],
+    "world": "crafter"
+  },
+  "data_contract_hash": "4d98909403a66948b8d375d538d7d56dd7e7b12b386b0d79c10f8bbdf11079ee",
+  "format": "model-factory-contracts-v1",
+  "training_contract": {
+    "batch_size": 1,
+    "checkpoint_cadence_epochs": null,
+    "checkpoint_selection_policy": {
+      "metric": "validation_loss",
+      "mode": "min"
+    },
+    "determinism_policy": {
+      "deterministic": true,
+      "seed": 297
+    },
+    "device": "cpu",
+    "early_stopping_policy": {},
+    "ema_target_decay": null,
+    "epoch_budget": 1,
+    "loss_weights": {
+      "pixel": 1.0
+    },
+    "max_training_seconds": null,
+    "objective": "windowed_rollout",
+    "optimizer": {
+      "amsgrad": false,
+      "betas": [
+        0.9,
+        0.999
+      ],
+      "eps": 1e-08,
+      "format": "torch-optimizer-v2",
+      "lr": 0.0003,
+      "name": "adamw",
+      "weight_decay": 1e-05
+    },
+    "precision": "fp32",
+    "rollout_frames": 2,
+    "scheduled_sampling_p": 0.0,
+    "scheduler": null,
+    "seed": 297,
+    "step_budget": null,
+    "transition_balance_policy": {},
+    "warmup_frames": 1
+  },
+  "training_contract_hash": "16f7056f2d4d66a242f7d4d7b4e64fcdb74879551ba702e5590cf4814692abda"
+}
