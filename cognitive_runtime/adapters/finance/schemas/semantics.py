@@ -65,12 +65,12 @@ def support(target, anchor):
     if not 0 <= anchor <= 1:
         raise ValueError('contract anchor outside [0,1]')
     with localcontext() as ctx:
-        ctx.prec = 80
+        ctx.prec = 260
         return -anchor, Decimal(1) - anchor
 
 
 def price_change(target: Target, anchor: str, endpoint: str) -> Decimal:
-    """34 significant digits, ROUND_HALF_EVEN, independent of ambient context."""
+    """Exact contract delta; equity rounds once to 34 significant digits, HALF_EVEN."""
     if type(target) is not Target:
         raise TypeError('target must be a Target enum')
     support(target, anchor)
@@ -78,6 +78,12 @@ def price_change(target: Target, anchor: str, endpoint: str) -> Decimal:
     if end < 0 or (target == Target.CONTRACT_CHANGE and end > 1):
         raise ValueError('endpoint outside price support')
     with localcontext() as ctx:
+        # Up to 128 digits on either side of the decimal point; subtraction is
+        # exact before the single equity division rounding (avoid cancellation).
+        ctx.prec = 260
+        difference = end - start
+        if target == Target.CONTRACT_CHANGE:
+            return difference
         ctx.prec = 34
         ctx.rounding = 'ROUND_HALF_EVEN'
-        return end / start - 1 if target == Target.EQUITY_RETURN else end - start
+        return difference / start

@@ -71,6 +71,22 @@ class SchemaContracts(unittest.TestCase):
         with self.assertRaises(ValueError):
             price_change(Target.CONTRACT_CHANGE, '0.5', '1.1')
 
+    def test_extreme_decimal_cancellation_and_exact_contract_support(self):
+        # Expected value calculated as 1 / (10**34 - 2), independent of division-minus-one.
+        actual = price_change(Target.EQUITY_RETURN, '9999999999999999999999999999999998',
+                              '9999999999999999999999999999999999')
+        self.assertEqual(actual, Decimal('1.000000000000000000000000000000000E-34'))
+        anchor = '0.' + '0' * 90 + '1'
+        upper = '0.' + '9' * 91
+        self.assertEqual(price_change(Target.CONTRACT_CHANGE, anchor, '1'), Decimal(upper))
+        forecast = self.e['ForecastDistribution']
+        valid = replace(forecast, anchor_price=anchor, support_lower='-' + anchor, support_upper=upper,
+                        quantiles=(Quantile(level='0.5', value=upper),))
+        with self.assertRaises(ValueError):
+            replace(valid, support_upper='1', quantiles=(Quantile(level='0.5', value='1'),))
+        with self.assertRaises(ValueError):
+            decimal('0.' + '0' * 128 + '1')
+
     def test_timestamp_and_precision_fail_closed(self):
         for bad in ('2025-01-01', '2025-01-01T00:00:00', '2025-01-01T00:00:00+01:00', '2025-01-01T00:00:00.1234567Z'):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
@@ -273,12 +289,25 @@ class SchemaContracts(unittest.TestCase):
         jsonschema.validate(manifest.to_dict(), schema_for(FixtureManifest))
         for entry in manifest.files:
             self.assertEqual(hashlib.sha256((FIXTURES / entry.path).read_bytes()).hexdigest(), entry.sha256)
+        sources = json.loads((FIXTURES / 'sources.json').read_text())
+        for raw_hash, raw_source in sources.items():
+            self.assertEqual(digest(raw_source), raw_hash)
+        records = []
+        for name in ('signal.json', 'null.json'):
+            records.extend(json.loads((FIXTURES / name).read_text())['records'])
+        records.extend(json.loads((FIXTURES / 'examples.json').read_text()).values())
+        records.extend(r for case in json.loads((FIXTURES / 'edge-cases.json').read_text()).values() for r in case['records'])
+        records.append(json.loads((FIXTURES / 'prior-0.9.json').read_text()))
+        for record in records:
+            expected_source = {k: v for k, v in record.items() if k != 'provenance'}
+            self.assertEqual(sources[record['provenance']['raw_sha256']], expected_source)
+
         with tempfile.TemporaryDirectory() as temp:
             rebuilt = write_fixtures(Path(temp))
             self.assertEqual(rebuilt, manifest)
             for file in Path(temp).iterdir():
                 self.assertEqual(file.read_bytes(), (FIXTURES / file.name).read_bytes())
-        self.assertLess(sum(f.stat().st_size for f in FIXTURES.iterdir()), 150000)
+        self.assertLess(sum(f.stat().st_size for f in FIXTURES.iterdir()), 250000)
 
     def test_synthetic_signal_and_null_records_are_real_contracts(self):
         for null in (False, True):

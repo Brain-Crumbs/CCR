@@ -14,7 +14,7 @@ from pathlib import Path
 import random
 from cognitive_runtime.adapters.finance.schemas.base import Strict, decimal, sha256, timestamp
 from cognitive_runtime.adapters.finance.schemas import PriceBar, NewsEvent, PredictionContractState
-from .examples import examples, envelope, T
+from .examples import examples, envelope, T, seal_source, source_payload
 
 GENERATOR_VERSION = 'synthetic-market-v1'
 
@@ -94,7 +94,7 @@ def generate(seed=286, steps=8, lag=1, text_noise=0.1, zero_signal=False):
                        'observed_at': at(step + lag), 'ingested_at': at(step + lag)}, first_seen_at=at(step + lag),
                        original_published_at=time, dedup_cluster_id=f'story:{step}',
                        title=f'Synthetic latent report {step}', text=f'Fictional latent reading {reveal:.6f}.')
-        records.extend([bar.to_dict(), contract.to_dict(), news.to_dict()])
+        records.extend([seal_source(r).to_dict() for r in (bar, contract, news)])
         oracle.append({'step': step, 'latent': latent, 'equity_log': equity_log, 'contract_logit': contract_logit,
                        'text_reading': reveal})
     return {'synthetic': True, 'seed': seed, 'generator_version': GENERATOR_VERSION, 'lag': lag, 'text_noise': text_noise,
@@ -132,7 +132,7 @@ def edge_cases():
         'stale_crossed_outage': ([stale, crossed, missing], 'Explicit stale/crossed/missing masks; crossed quotes rejected at inference boundary.'),
         'early_closure_terminal_trap': ([early, e['ContractTerminalMetadata']], 'Known closure may enter context; actual terminal metadata cannot.'),
     }
-    result = {name: {'records': [x.to_dict() for x in values], 'expected_invariant': invariant} for name, (values, invariant) in scenarios.items()}
+    result = {name: {'records': [seal_source(x).to_dict() for x in values], 'expected_invariant': invariant} for name, (values, invariant) in scenarios.items()}
     # Calendar facts are test inputs, not an implemented calendar engine (#291).
     result['calendar_boundaries'] = {
         'records': [], 'expected_invariant': 'Calendar version and clock stay explicit; elapsed seconds cannot masquerade as exchange sessions.',
@@ -153,7 +153,12 @@ def write_fixtures(output: Path, seed=286, steps=8):
     prior = examples()['Quote'].to_dict()
     prior['schema_version'] = '0.9.0'
     del prior['availability_confidence']
+    prior['provenance']['raw_sha256'] = digest(source_payload(prior))
     payloads['prior-0.9.json'] = prior
+    all_records = [*payloads['signal.json']['records'], *payloads['null.json']['records'],
+                   *payloads['examples.json'].values(), prior,
+                   *(record for case in payloads['edge-cases.json'].values() for record in case['records'])]
+    payloads['sources.json'] = {record['provenance']['raw_sha256']: source_payload(record) for record in all_records}
     files = []
     for name, value in payloads.items():
         raw = canonical(value) + '\n'

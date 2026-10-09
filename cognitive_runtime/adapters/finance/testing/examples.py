@@ -1,5 +1,7 @@
 """Project-authored synthetic examples, shared by docs, schemas and fixture tests."""
 from dataclasses import replace
+import hashlib
+import json
 from cognitive_runtime.adapters.finance.schemas import *
 from cognitive_runtime.adapters.finance.schemas.records import ContextWindow, Quantile, EntityEvidence
 from cognitive_runtime.adapters.finance.labels import LabelSpec, RealizedLabel, ContractTerminalMetadata, FutureTarget
@@ -17,6 +19,18 @@ def envelope(kind, identity=None, at=T):
                 original_timezone='UTC', timestamp_precision='second',
                 provenance=Provenance(raw_sha256=H, adapter_version='synthetic-v1', rights='project-authored-fixture',
                                       license='MIT', synthetic=True, untrusted_source_text=True))
+
+
+def source_payload(record):
+    """Synthetic source is the exact constructor input excluding provenance."""
+    raw = record.to_dict() if hasattr(record, 'to_dict') else dict(record)
+    raw.pop('provenance')
+    return raw
+
+
+def seal_source(record):
+    raw = json.dumps(source_payload(record), sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+    return replace(record, provenance=replace(record.provenance, raw_sha256=hashlib.sha256(raw.encode()).hexdigest()))
 
 
 def examples():
@@ -44,6 +58,7 @@ def examples():
                                        listing_id='contract:demo', side='YES', question='Synthetic signal positive?',
                                        question_version='1', payout_scale='1', currency='USD', quote_basis=Mark.MID,
                                        lifecycle='open', scheduled_expiry_at='2025-01-07T14:30:00Z', probability_price='0.42')
+    bar, news = seal_source(bar), seal_source(news)
     window = ContextWindow(clock='exchange_sessions', count=20, calendar_id='synthetic', calendar_version='1')
     snapshot = ContextSnapshot(**envelope(ContextSnapshot), decision_at=T, as_of_mode='strict_replay',
                                selected_record_ids=(bar.record_id, news.record_id), selected_record_hashes=(bar.hash, news.hash),
@@ -55,6 +70,7 @@ def examples():
                      currency='USD', feed='synthetic', mark=Mark.MID, anchor_policy='last_eligible_at_or_before_decision',
                      anchor_max_age_seconds=60, endpoint_policy='first_at_or_after', endpoint_tolerance_seconds=60,
                      action_policy='none', terminal_policy='censor_without_preterminal_market_price')
+    spec = seal_source(spec)
     label = RealizedLabel(**envelope(RealizedLabel, at=END), spec=spec, listing_id='contract:demo', decision_at=T,
                           anchor_record_id=contract.record_id, endpoint_record_id='contract:demo:end', action_record_ids=(),
                           anchor_price='0.42', endpoint_price='0.47', anchor_at=T, nominal_endpoint_at=END, actual_endpoint_at=END,
@@ -76,6 +92,7 @@ def examples():
     run = RunManifest(**envelope(RunManifest), **{name + '_sha256': H for name in
                       ('code', 'config', 'environment', 'data', 'model', 'calendar', 'split', 'rights')},
                       status='completed', failure=None, provider_budget_usd='0', runtime_seconds='0')
+    run = seal_source(run)
     report = EvaluationReport(**envelope(EvaluationReport), run_id=run.record_id, run_sha256=run.hash, dataset_kind='synthetic',
                               forecast_ids=(), metrics=(), total_count=0, evaluated_count=0, censored_count=0,
                               abstained_count=0, stale_count=0, caveats=('Schema example; no forecasting evaluation performed.',))
@@ -83,5 +100,5 @@ def examples():
                                         resolved_at=END, actual_closed_at=END, payout='1', currency='USD', outcome='YES')
     future = FutureTarget(**envelope(FutureTarget, at=END), split='train', context_snapshot_id=snapshot.record_id,
                           window_start_at=T, window_end_at=END, future_record_ids=('future:synthetic',), stop_gradient=True)
-    return {type(x).__name__: x for x in (instrument, alias, bar, quote, action, news, contract, snapshot, spec, label,
+    return {type(x).__name__: seal_source(x) for x in (instrument, alias, bar, quote, action, news, contract, snapshot, spec, label,
                                          forecast, provider, run, report, terminal, future)}

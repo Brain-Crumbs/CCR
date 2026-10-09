@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from enum import Enum
 import hashlib
 import json
@@ -19,8 +19,8 @@ def decimal(value: str) -> Decimal:
     if type(value) is not str or not re.fullmatch(r'-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?', value):
         raise ValueError('decimal must be a plain decimal string')
     result = Decimal(value)
-    if not result.is_finite() or len(result.as_tuple().digits) > 34:
-        raise ValueError('decimal exceeds finite 34-digit contract')
+    if not result.is_finite() or len(result.as_tuple().digits) > 128 or -result.as_tuple().exponent > 128:
+        raise ValueError('decimal exceeds finite 128-digit/128-fractional-place contract')
     return result
 
 

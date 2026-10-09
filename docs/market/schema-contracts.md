@@ -25,9 +25,10 @@ inference schema contains a resolution-probability prediction.
 ## Prices, targets and clocks
 
 Wire money, prices, quantile levels, probabilities and metrics are finite plain
-**decimal strings**, at most 34 significant digits. Floats/exponents/NaN are
-rejected. Target calculation uses a local Decimal context (34 significant digits,
-ROUND_HALF_EVEN); it is independent of caller precision. Equity target is
+**decimal strings**, at most 128 significant digits and 128 fractional places. Floats/exponents/NaN are
+rejected. Contract subtraction and support bounds are exact within those limits. Equity
+calculation takes an exact difference before division and rounds once to 34
+significant digits (ROUND_HALF_EVEN), independently of caller precision. Equity target is
 `equity_simple_return`, unit `return_fraction`: endpoint / anchor - 1, with a
 positive anchor and lower support -1. Equity labels are split-neutral and exclude
 dividends; raw input prices remain unchanged and split adjustments name actions.
@@ -104,7 +105,9 @@ when a persistence layer is introduced. Legacy CCR hashes are outside this polic
 
 All committed records are project-authored MIT synthetic data. Manifest carries
 seed, generator version, source/rights, per-file SHA256, record hashes, edge cases
-and expected invariants. The default corpus is eight steps per signal/null arm.
+and expected invariants. `sources.json` preserves canonical synthetic constructor
+inputs (excluding provenance); every raw_sha256 is verified against those exact
+source bytes, including revised stories. The default corpus is eight steps per signal/null arm.
 The generator uses a seeded AR(1) latent factor, noisy instrument loadings, equity
 log-price paths, bounded logistic contract prices, and lagged noisy synthetic text.
 The null arm zeros the latent contribution to prices while retaining the text

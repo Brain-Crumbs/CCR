@@ -107,3 +107,4 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | --- | --- | --- | --- |
 | 2026-10-09 | BP-004 | Completion evidence appended | #285 merged in PR #302; exact-head core 1,189 + 600 tests (59.822s), actual six-stage Crafter smoke and neutral GRU compatibility passed per verified issue completion. Earlier proposed/runtime-blocked entry retained as historical evidence. |
 | 2026-10-09 | BP-005 | Proposed | #286 explicit financial schema boundary and decimal/clock/distribution negative cases; local default and opt-in checks passed, submitted-head review pending. |
+| 2026-10-09 | BP-005 | Review regression evidence appended | Independent review of PR #303 head 682b59e4 found cancellation after rounded division, tiny-anchor support rounding, and placeholder raw provenance. Exact bounded arithmetic and preserved hashed synthetic source inputs now have direct regressions; fresh-head review pending. |

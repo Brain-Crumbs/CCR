@@ -100,7 +100,7 @@ class RealizedLabel(Record):
             raise ValueError('endpoint violates selection policy')
         from decimal import localcontext
         with localcontext() as ctx:
-            ctx.prec = 80
+            ctx.prec = 260
             endpoint = decimal(self.endpoint_price) * multiplier
         expected = price_change(self.spec.target, self.anchor_price, format(endpoint, 'f'))
         if decimal(self.value) != expected:

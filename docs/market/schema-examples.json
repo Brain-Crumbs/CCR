@@ -23,7 +23,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "10e8088c5f6a998d2f0c81ddfef3d6a78217fec46c82d3b1a3088f1d1d92e3ed",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -33,8 +33,8 @@
     "schema_name": "ContextSnapshot",
     "schema_version": "1.0.0",
     "selected_record_hashes": [
-      "84b28183534873462d0a4ab02d6ff3da2f055629b9ba2b2923d5b91f4148c607",
-      "333ecc59168493385e4d22bc9b3a34ccec7b90c55102e0b3a23a2b0f9edd2799"
+      "276ee93f90ee56c574f94fa98e1b7748fd55599a4c020bd18b45404368d28229",
+      "a554e2a3cf65d519b5c62648d0a55efb5638ff85aa32121ad62e2d6bb2aaffd9"
     ],
     "selected_record_ids": [
       "PriceBar:demo:r1",
@@ -68,7 +68,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "b7b90b57e85a1373a0f969e7be777fa04740d4d2111c4fcfff35ac1a4e6a8c90",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -105,7 +105,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "d2c721a16323d5192f90c8a9a694f7136e8b87e2c09c61102b4069147a1e9fb2",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -143,7 +143,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "cf9be40a0e9cda3cbef2bb06d2bcf12e9184b332246298b0a613a87c8339fe07",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -151,7 +151,7 @@
     "record_id": "EvaluationReport:demo:r1",
     "revision": 1,
     "run_id": "RunManifest:demo:r1",
-    "run_sha256": "ca4a2118102c68fa8a183a65affb044bb2322376df4e18696ae43e8844e08ca4",
+    "run_sha256": "5497b3fcb4170d9b707a48a975f524040078ca23e37a031e9175ce8ba35daaf6",
     "schema_name": "EvaluationReport",
     "schema_version": "1.0.0",
     "source_id": "synthetic",
@@ -191,7 +191,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "bbe631a390bc396dfca1b469f95534c8ba09601eb689ae649842102eb1fade8e",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -242,7 +242,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "d345358143130e0680744a38e2137766eedea2c4e2e1dc19a9aeb4f7cb345ec7",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -280,7 +280,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "bde03134d5906c615ac648f2517bc1623d0a8b8829abd9a2d657100137e8642f",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -315,7 +315,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "ea59e625c81f141b11279584718cd409ea6bd867c8d19aac15dc38145c332fab",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -356,7 +356,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "2b9c81257eb76066955a4a8772592f95b109c09d0ac699755e5b4045e2623ffd",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -401,7 +401,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "99db65fb5baa1c5e8c95004acfc7f05de48b96fbaca1a1287076e7e372a38e77",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -434,7 +434,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "034ebf2bab19eb55197a684c246a131a97de4a1d1020a42697b0920206e22cc8",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -479,7 +479,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "9ee3c54268392e39abf493aacb754d28bc849c20c3edd5775adcdbedcfbefa80",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -519,7 +519,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "1dbfee8a59708fec96aa3123ab0024c9a57c27cddea08605d27df50fc9281ce1",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -558,7 +558,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "2305a1c87f471defae3682b989a1d79eba81b82a79cdc17704996f162bcd4ef4",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -602,7 +602,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "b3e76e59b3b7ca7ce9777b018a3e0497d2719838c731bf930de7508ae333613b",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true
@@ -639,7 +639,7 @@
       "provenance": {
         "adapter_version": "synthetic-v1",
         "license": "MIT",
-        "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "raw_sha256": "2b9c81257eb76066955a4a8772592f95b109c09d0ac699755e5b4045e2623ffd",
         "rights": "project-authored-fixture",
         "synthetic": true,
         "untrusted_source_text": true
@@ -680,7 +680,7 @@
     "provenance": {
       "adapter_version": "synthetic-v1",
       "license": "MIT",
-      "raw_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "raw_sha256": "ab0ddde972c929ea5ff605787e42811bb6fbeee52cf170a563863293a41d909d",
       "rights": "project-authored-fixture",
       "synthetic": true,
       "untrusted_source_text": true

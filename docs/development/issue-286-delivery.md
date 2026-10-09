@@ -49,3 +49,28 @@ Submitted head/tree, hosted CI, independent exact-head findings and resolution a
 recorded in the draft PR and final handoff. A new head invalidates prior head-specific
 review. Parent must refresh issue versions, main, required checks/protection and
 review conversations immediately before any authorized merge.
+
+### Initial publication and independent review
+
+Draft PR [#303](https://github.com/Brain-Crumbs/CCR/pull/303), initial head
+`682b59e4b4b289617a406b0fd398674ff554078d`, tree
+`371bff63f44206c908714b13151bf36b321a2e70`.
+Independent reviewer verified that published head and tree, ran 28 tests in 6.904s
+(27 pass, real neutral bridge blocked locally by missing namesgenerator), and
+reported three P2 blockers: equity cancellation after rounded division; support
+rounding for tiny contract anchors; zero placeholder synthetic raw provenance.
+
+Fixes: exact subtraction before a single 34-significant-digit equity division;
+explicit 128-significant-digit/128-fractional-place wire limits with exact bounded
+contract arithmetic; preserved canonical synthetic source payloads in sources.json
+with real raw SHA256 binding, including revisions and nested LabelSpec. New tests
+independently assert a 34-digit tiny equity return, 1e-91 anchor upper support and
+rejection outside it, scale limits, and every source digest/payload relationship.
+Generated examples/docs and fixture manifest regenerated.
+
+Initial-head hosted CI [run 38005308259](https://github.com/Brain-Crumbs/CCR/actions/runs/38005308259)
+passed core (1,213 passed, 256 existing skips, 42 subtests), second-seed Factory and
+aggregate core gate (57.818s / 120s). Test-merge SHA
+`59edb61e60c146799a1c847d3bbd9ad2073965e4` binds initial head to base fd471af6.
+The real neutral bridge passed there with installed base dependencies. This is
+historical evidence only; repaired head requires fresh CI and review.
