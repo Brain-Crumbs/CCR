@@ -140,6 +140,13 @@ def test_cross_domain_rejected_before_prepare(tmp_path, backends):
 class CursorBackend(FakeBackend):
     """Two deterministic updates with explicit cursor, momentum and RNG state."""
     stop_after = None
+    stop_on_save = None
+
+    def save(self, model):
+        import os
+        if model["steps"] == self.stop_on_save:
+            os._exit(24)
+        return dict(model)
 
     def build(self, definition):
         return {"value": 0.0, "steps": 0, "momentum": 0.0, "rng": 285}
@@ -165,7 +172,8 @@ class CursorBackend(FakeBackend):
         return {"steps": model["steps"]}
 
 
-def test_resume_restores_state_and_preserves_manifests(tmp_path, backends, monkeypatch):
+@pytest.mark.parametrize("kill_in_save", [False, True])
+def test_resume_restores_state_and_preserves_manifests(tmp_path, backends, monkeypatch, kill_in_save):
     backend = CursorBackend()
     monkeypatch.setitem(registry._REGISTRY, backend.identity.backend,
                         registry.BackendRegistration(backend.identity, lambda: backend, backend.capabilities))
@@ -175,14 +183,17 @@ from tests.test_model_factory_task_backends import CursorBackend, spec
 from cognitive_runtime.training.model_factory import task_registry as registry
 from cognitive_runtime.training.model_factory.runner import run_trial
 backend = CursorBackend()
-backend.stop_after = 1
+if sys.argv[2] == 'save':
+    backend.stop_on_save = 2  # die during second save, retaining first checkpoint
+else:
+    backend.stop_after = 1
 registry.register_backend(registry.BackendRegistration(backend.identity, lambda: backend, backend.capabilities))
 run_trial(spec(backend), root=sys.argv[1], run_id='interrupted')
 """
-    child = subprocess.run([sys.executable, "-c", code, str(tmp_path)], timeout=20)
-    assert child.returncode == 23
+    child = subprocess.run([sys.executable, "-c", code, str(tmp_path), "save" if kill_in_save else "fit"], timeout=20)
+    assert child.returncode == (24 if kill_in_save else 23)
     directory = tmp_path / "ContractTest/interrupted"
-    assert load_state(state_path(directory)).state == "running"
+    assert load_state(state_path(directory)).state == ("checkpointing" if kill_in_save else "running")
     assert not (directory / "experiment_report.json").exists()
     # Advance only the persisted heartbeat age to avoid a 300-second test wait.
     heartbeat = json.loads(heartbeat_path(directory).read_text())

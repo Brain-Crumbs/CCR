@@ -84,3 +84,10 @@ main verification and tracking completion.
   30-second neutral GRU compatibility node. It remains opt-in, not default CI.
 - Corrected head requires fresh CI and review; optional CPU-torch compatibility
   remains unrun locally. No standalone/mock success is substituted for that gate.
+
+- Review of corrected head `7c078330900191f40f46710fcb186d17abd8ef03`
+  confirmed both original fixes and found an interrupted-checkpointing edge:
+  the next callback could attempt an illegal checkpointing-to-checkpointing
+  transition. After an atomic stale-worker claim, the runner now returns that
+  active state to running. The real-death test covers both exit after checkpoint
+  and exit during a later save, recovering the prior valid checkpoint.

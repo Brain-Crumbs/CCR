@@ -54,7 +54,11 @@ def run_backend_trial(spec, backend, *, root, corpus_root, run_id, naming_seed,
         saved = json.loads(artifacts.contracts_path.read_text())
         if (saved["architecture_hash"], saved["data_contract_hash"], saved["training_contract_hash"]) != (definition.hash, data.hash, training.hash):
             raise ValueError("resume run contracts differ from checkpoint/request")
-        claim_stale_worker(state_path(artifacts.directory), heartbeat_path(artifacts.directory), run_id=parent_id)
+        claimed = claim_stale_worker(state_path(artifacts.directory), heartbeat_path(artifacts.directory), run_id=parent_id)
+        if claimed.state == "checkpointing":
+            # A killed writer may leave an earlier valid checkpoint. Loading it
+            # restores that boundary; the new worker resumes normal execution.
+            transition(state_path(artifacts.directory), "running", reason="resume prior valid checkpoint")
     else:
         artifacts = allocate_run_artifacts(root, spec, definition, data, training,
                                           run_id=run_id, naming_seed=naming_seed)
