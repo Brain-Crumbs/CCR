@@ -16,7 +16,7 @@ python -m pip install -e '.[dev]'
 python .github/scripts/validate_artifact_schemas.py
 python .github/scripts/run_core_tests.py --collect-only --report /tmp/core-collection.json
 python .github/scripts/run_core_tests.py --report /tmp/core-tests.json
-PYTHONHASHSEED=12345 python .github/scripts/run_core_tests.py tests/test_model_factory_*.py --report /tmp/contracts-seed-12345.json
+PYTHONHASHSEED=12345 python .github/scripts/run_core_tests.py tests/test_model_factory_*.py tests/test_factory_artifact_schemas.py tests/market/test_effective_config.py --report /tmp/contracts-seed-12345.json
 python .github/scripts/check_core_budget.py /tmp
 ```
 
@@ -49,7 +49,8 @@ not new skips, removed assertions or moving lightweight tests out of default.
 The scripts print per-test durations, counts and machine/Python metadata.
 The old workflow ran every Factory test three times (inside core and in both
 seed passes). Core now explicitly uses seed 0, so two executions preserve all
-tests and both hash seeds without the redundant third pass.
+tests and both hash seeds without the redundant third pass. The second pass
+also includes the new golden serializer/hash and effective-configuration modules.
 
 ## Test membership and opt-in imports
 
@@ -142,3 +143,8 @@ tests to 9.66 seconds. A separate opt-in three-tick production-default 64x64
 record/replay check passed in 8.76 seconds. No existing lightweight test was
 removed or newly skipped. CPU timings vary; the hosted aggregate gate remains
 authoritative for each submitted head.
+
+Final implementation evidence is tracked in [PR #301](https://github.com/Brain-Crumbs/CCR/pull/301).
+The two-worker local core completed 1173 passing tests and 256 pre-existing skips
+in 37.32 seconds. Both worker environments verified the inherited offline guard
+and the correct hash seed; no network attempt or model-cache file was observed.

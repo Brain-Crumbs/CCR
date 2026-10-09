@@ -108,7 +108,7 @@ jobs:
       - name: Contract tests under PYTHONHASHSEED=12345
         env:
           PYTHONHASHSEED: '12345'
-        run: sudo -E unshare --net -- "$(command -v python)" .github/scripts/run_core_tests.py tests/test_model_factory_*.py --report /tmp/contracts-seed-12345.json
+        run: sudo -E unshare --net -- "$(command -v python)" .github/scripts/run_core_tests.py tests/test_model_factory_*.py tests/test_factory_artifact_schemas.py tests/market/test_effective_config.py --report /tmp/contracts-seed-12345.json
 
       - name: Validate artifact schemas against golden fixtures
         run: python .github/scripts/validate_artifact_schemas.py

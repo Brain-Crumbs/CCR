@@ -36,7 +36,8 @@ def main(directory: Path) -> int:
             print(f"invalid core evidence {name}: {exc}", file=sys.stderr)
             return 1
     core = memberships["core-tests.json"]
-    factories = {node for node in core if node.startswith("tests/test_model_factory_")}
+    hash_contract_modules = {"tests/test_factory_artifact_schemas.py", "tests/market/test_effective_config.py"}
+    factories = {node for node in core if node.startswith("tests/test_model_factory_") or node.split("::", 1)[0] in hash_contract_modules}
     if core != memberships["core-collection.json"] or not factories or factories != memberships["contracts-seed-12345.json"]:
         print("core collection/execution or Factory dual-seed test membership differs", file=sys.stderr)
         return 1

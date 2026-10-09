@@ -1,5 +1,7 @@
 # Evidence-backed development practices
 
+Implementation and review: [PR #301](https://github.com/Brain-Crumbs/CCR/pull/301).
+
 These practices record specific, reviewed failure modes and their regression
 coverage. They do not change repository permissions or replace issue acceptance.
 
