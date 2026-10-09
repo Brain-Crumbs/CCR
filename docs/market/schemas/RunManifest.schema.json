@@ -1,0 +1,185 @@
+{
+  "$defs": {
+    "Provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_version": {
+          "type": "string"
+        },
+        "license": {
+          "type": "string"
+        },
+        "raw_sha256": {
+          "type": "string"
+        },
+        "rights": {
+          "type": "string"
+        },
+        "synthetic": {
+          "type": "boolean"
+        },
+        "untrusted_source_text": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "raw_sha256",
+        "adapter_version",
+        "rights",
+        "license",
+        "synthetic",
+        "untrusted_source_text"
+      ],
+      "type": "object"
+    },
+    "RunManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "availability_basis": {
+          "enum": [
+            "synthetic_ground_truth",
+            "evidenced_historical",
+            "collector_observation_proxy",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "availability_confidence": {
+          "type": "string"
+        },
+        "available_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "calendar_sha256": {
+          "type": "string"
+        },
+        "code_sha256": {
+          "type": "string"
+        },
+        "config_sha256": {
+          "type": "string"
+        },
+        "data_sha256": {
+          "type": "string"
+        },
+        "environment_sha256": {
+          "type": "string"
+        },
+        "event_at": {
+          "type": "string"
+        },
+        "failure": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ingested_at": {
+          "type": "string"
+        },
+        "model_sha256": {
+          "type": "string"
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "original_timezone": {
+          "type": "string"
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "provider_budget_usd": {
+          "type": "string"
+        },
+        "record_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "rights_sha256": {
+          "type": "string"
+        },
+        "runtime_seconds": {
+          "type": "string"
+        },
+        "schema_name": {
+          "const": "RunManifest"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "source_record_id": {
+          "type": "string"
+        },
+        "split_sha256": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "supersedes_record_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timestamp_precision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_name",
+        "schema_version",
+        "record_id",
+        "source_id",
+        "source_record_id",
+        "revision",
+        "supersedes_record_id",
+        "event_at",
+        "available_at",
+        "observed_at",
+        "ingested_at",
+        "availability_basis",
+        "availability_confidence",
+        "original_timezone",
+        "timestamp_precision",
+        "provenance",
+        "code_sha256",
+        "config_sha256",
+        "environment_sha256",
+        "data_sha256",
+        "model_sha256",
+        "calendar_sha256",
+        "split_sha256",
+        "rights_sha256",
+        "status",
+        "failure",
+        "provider_budget_usd",
+        "runtime_seconds"
+      ],
+      "type": "object"
+    }
+  },
+  "$ref": "#/$defs/RunManifest",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

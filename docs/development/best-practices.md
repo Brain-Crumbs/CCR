@@ -83,3 +83,28 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | 2026-10-09 | BP-002 | Added | Measured default runtime exceeded 120 seconds; preserve coverage while bounding fixtures, #297. |
 | 2026-10-09 | BP-003 | Added | Offline attempts and hardcoded Factory IDs need executable failure evidence; #297 / #212. |
 | 2026-10-09 | BP-004 | Proposed | Domain-coupled checkpoint construction and eager cortex import found during #285; integration tests added, execution/review pending. |
+
+## BP-005: Separate future outcomes and bind financial semantics explicitly
+
+- Status: proposed (submitted-head independent review pending)
+- Scope: versioned market schemas and synthetic fixtures, #286.
+- Rule: validate exact typed observation families at inference boundaries;
+  labels, terminal outcomes and training targets live in a separate module.
+  Bind target units, horizon origin, currency/feed/mark and anchor-dependent
+  distribution support in executable validation. Preserve all knowledge clocks
+  in immutable hashes. Reject unknown/stale schemas and migrate copies explicitly.
+- Exception: a schema boundary does not prove arbitrary numeric feature causality;
+  future feature/ledger implementations still require semantic leakage tests.
+- Evidence: `tests/market/test_schema_contracts.py`, explicit terminal/unknown-field,
+  currency/clock/quantile negatives, generated fixture hashes and documentation;
+  optional seeded boundary/prior-version/process checks in
+  `tests/market/extended/test_schema_properties.py` actually executed locally.
+- Added: 2026-10-09.
+
+### Additional append-only evidence history
+
+| Date | ID | Change | Reason and evidence |
+| --- | --- | --- | --- |
+| 2026-10-09 | BP-004 | Completion evidence appended | #285 merged in PR #302; exact-head core 1,189 + 600 tests (59.822s), actual six-stage Crafter smoke and neutral GRU compatibility passed per verified issue completion. Earlier proposed/runtime-blocked entry retained as historical evidence. |
+| 2026-10-09 | BP-005 | Proposed | #286 explicit financial schema boundary and decimal/clock/distribution negative cases; local default and opt-in checks passed, submitted-head review pending. |
+| 2026-10-09 | BP-005 | Review regression evidence appended | Independent review of PR #303 head 682b59e4 found cancellation after rounded division, tiny-anchor support rounding, and placeholder raw provenance. Exact bounded arithmetic and preserved hashed synthetic source inputs now have direct regressions; fresh-head review pending. |

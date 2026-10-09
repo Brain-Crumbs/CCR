@@ -1,0 +1,86 @@
+{
+  "$defs": {
+    "FixtureEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_invariants": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "intended_edge_cases": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path": {
+          "type": "string"
+        },
+        "record_hashes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sha256": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256",
+        "record_hashes",
+        "intended_edge_cases",
+        "expected_invariants"
+      ],
+      "type": "object"
+    },
+    "FixtureManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "files": {
+          "items": {
+            "$ref": "#/$defs/FixtureEntry"
+          },
+          "type": "array"
+        },
+        "generator_version": {
+          "type": "string"
+        },
+        "license": {
+          "type": "string"
+        },
+        "schema_name": {
+          "const": "FixtureManifest"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "seed": {
+          "type": "integer"
+        },
+        "source": {
+          "type": "string"
+        },
+        "synthetic": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "schema_name",
+        "schema_version",
+        "synthetic",
+        "generator_version",
+        "seed",
+        "source",
+        "license",
+        "files"
+      ],
+      "type": "object"
+    }
+  },
+  "$ref": "#/$defs/FixtureManifest",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

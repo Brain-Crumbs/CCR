@@ -1,0 +1,231 @@
+{
+  "$defs": {
+    "ContextSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "as_of_mode": {
+          "type": "string"
+        },
+        "availability_basis": {
+          "enum": [
+            "synthetic_ground_truth",
+            "evidenced_historical",
+            "collector_observation_proxy",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "availability_confidence": {
+          "type": "string"
+        },
+        "available_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "caveats": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "decision_at": {
+          "type": "string"
+        },
+        "event_at": {
+          "type": "string"
+        },
+        "feature_schema": {
+          "type": "string"
+        },
+        "ingested_at": {
+          "type": "string"
+        },
+        "manifest_sha256": {
+          "type": "string"
+        },
+        "missing_record_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "original_timezone": {
+          "type": "string"
+        },
+        "preprocessing_sha256": {
+          "type": "string"
+        },
+        "price_context": {
+          "$ref": "#/$defs/ContextWindow"
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "record_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer"
+        },
+        "schema_name": {
+          "const": "ContextSnapshot"
+        },
+        "schema_version": {
+          "const": "1.0.0"
+        },
+        "selected_record_hashes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "selected_record_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "source_id": {
+          "type": "string"
+        },
+        "source_record_id": {
+          "type": "string"
+        },
+        "stale_record_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "supersedes_record_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "text_context": {
+          "$ref": "#/$defs/ContextWindow"
+        },
+        "timestamp_precision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_name",
+        "schema_version",
+        "record_id",
+        "source_id",
+        "source_record_id",
+        "revision",
+        "supersedes_record_id",
+        "event_at",
+        "available_at",
+        "observed_at",
+        "ingested_at",
+        "availability_basis",
+        "availability_confidence",
+        "original_timezone",
+        "timestamp_precision",
+        "provenance",
+        "decision_at",
+        "as_of_mode",
+        "selected_record_ids",
+        "selected_record_hashes",
+        "price_context",
+        "text_context",
+        "missing_record_ids",
+        "stale_record_ids",
+        "feature_schema",
+        "preprocessing_sha256",
+        "manifest_sha256",
+        "caveats"
+      ],
+      "type": "object"
+    },
+    "ContextWindow": {
+      "additionalProperties": false,
+      "properties": {
+        "calendar_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "calendar_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "clock": {
+          "type": "string"
+        },
+        "count": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "clock",
+        "count",
+        "calendar_id",
+        "calendar_version"
+      ],
+      "type": "object"
+    },
+    "Provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_version": {
+          "type": "string"
+        },
+        "license": {
+          "type": "string"
+        },
+        "raw_sha256": {
+          "type": "string"
+        },
+        "rights": {
+          "type": "string"
+        },
+        "synthetic": {
+          "type": "boolean"
+        },
+        "untrusted_source_text": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "raw_sha256",
+        "adapter_version",
+        "rights",
+        "license",
+        "synthetic",
+        "untrusted_source_text"
+      ],
+      "type": "object"
+    }
+  },
+  "$ref": "#/$defs/ContextSnapshot",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}
