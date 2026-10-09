@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "fresh"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "parent": {
+            "type": "null"
+          },
+          "parent_checkpoint_sha": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "enum": [
+              "clone",
+              "resume",
+              "fine_tune"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "parent": {
+            "additionalProperties": false,
+            "properties": {
+              "checkpoint": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "run_id": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "run_id",
+              "checkpoint",
+              "sha256"
+            ],
+            "type": "object"
+          },
+          "parent_checkpoint_sha": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "configuration_parents": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "oneOf": [
+        {
+          "maxItems": 0
+        },
+        {
+          "maxItems": 2,
+          "minItems": 2
+        }
+      ],
+      "type": "array",
+      "uniqueItems": true
+    },
+    "format": {
+      "const": "model-factory-lineage-v1"
+    },
+    "mode": {
+      "enum": [
+        "fresh",
+        "clone",
+        "resume",
+        "fine_tune"
+      ]
+    },
+    "parent": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "checkpoint": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "run_id": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "run_id",
+            "checkpoint",
+            "sha256"
+          ],
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "parent_checkpoint_sha": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sibling_group": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "weight_donor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "format",
+    "mode",
+    "parent",
+    "parent_checkpoint_sha",
+    "sibling_group",
+    "configuration_parents",
+    "weight_donor"
+  ],
+  "title": "Model Factory run lineage v1",
+  "type": "object"
+}

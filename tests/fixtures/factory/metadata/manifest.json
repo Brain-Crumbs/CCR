@@ -1,0 +1,49 @@
+{
+  "artifacts": [
+    {
+      "intended_edge_case": "Nonempty disjoint split identities, canonical contract hashes, nullable budgets and absent optional policy maps.",
+      "path": "contracts.json",
+      "schema": ".github/schemas/contracts.schema.json",
+      "schema_sha256": "81b2ec83e5f8de4b582cc3e53b01990c360e4eb8db30deb516a9f855c62ae580",
+      "sha256": "fbca54ef004a7ad5803b42e77b8485e21b9cbd227a729b499732b91979670419"
+    },
+    {
+      "intended_edge_case": "Fresh run with no checkpoint parent, no configuration parents and a sibling group.",
+      "path": "lineage.fresh.json",
+      "schema": ".github/schemas/lineage.schema.json",
+      "schema_sha256": "781aba34d3af677b79dc055be777bbc690fb6d124c6bb384284e1cca7090d2fd",
+      "sha256": "445dd9a2910e67546400316b640aeab3cc2cee03c62c8f16935d4b95270c2a26"
+    },
+    {
+      "intended_edge_case": "Clone with a checkpoint parent, exact donor hash and two configuration parents.",
+      "path": "lineage.clone.json",
+      "schema": ".github/schemas/lineage.schema.json",
+      "schema_sha256": "781aba34d3af677b79dc055be777bbc690fb6d124c6bb384284e1cca7090d2fd",
+      "sha256": "34920f5930bbe2527b5abe90eef6f7d02f9be44f9a9ac0322c85526e1f7ec9a5"
+    },
+    {
+      "intended_edge_case": "Initial queued run with null reason/retry and one history entry.",
+      "path": "state.queued.json",
+      "schema": ".github/schemas/state.schema.json",
+      "schema_sha256": "bccd89e26e25fa2e6d280e8137857ee6ae1be2117676f4891c0aca69a680383c",
+      "sha256": "3154d5ac9957acacaa06850c638069778fd62efab6bab543747c8fb10884d517"
+    },
+    {
+      "intended_edge_case": "Queued -> running -> checkpointing -> completed with append-only timestamped history.",
+      "path": "state.completed.json",
+      "schema": ".github/schemas/state.schema.json",
+      "schema_sha256": "bccd89e26e25fa2e6d280e8137857ee6ae1be2117676f4891c0aca69a680383c",
+      "sha256": "d6cd06b414612eb6a8207707e99607d33668f755e22c5de71b54b02bb221549a"
+    }
+  ],
+  "config": "metadata/inputs.json",
+  "config_sha256": "a59088b5a74decdafd5bce9c45ba30f5e3463290b3a6c3b620ce3e17e0f04ca2",
+  "format": "ccr-synthetic-factory-fixtures-v1",
+  "generator": "metadata/generate.py",
+  "generator_sha256": "13301f588d52e9249e9f6982cf61771c99f5390868edd2bd4814668b2bbd0c31",
+  "license": "MIT",
+  "rights": "Original synthetic fixtures contributed under this repository's MIT license; no third-party payloads.",
+  "seed": 297,
+  "source": "Project-authored inputs serialized by the existing CCR Model Factory; no external dataset.",
+  "status": "synthetic_only"
+}

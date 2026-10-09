@@ -1,0 +1,16 @@
+{
+  "configuration_parents": [
+    "synthetic-parent-297",
+    "synthetic-config-parent-298"
+  ],
+  "format": "model-factory-lineage-v1",
+  "mode": "clone",
+  "parent": {
+    "checkpoint": "checkpoints/synthetic-parent.pt",
+    "run_id": "synthetic-parent-297",
+    "sha256": "93c49bdc61c8c87f41fde9fb2b7d59fb00f9f447f707b89ad2296832576e63b0"
+  },
+  "parent_checkpoint_sha": "93c49bdc61c8c87f41fde9fb2b7d59fb00f9f447f707b89ad2296832576e63b0",
+  "sibling_group": "synthetic-control-297",
+  "weight_donor": "synthetic-parent-297"
+}

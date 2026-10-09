@@ -19,7 +19,9 @@ from cognitive_runtime.programs.crafter.adapter import CrafterWorld
 from cognitive_runtime.programs.crafter.stream_registry import CRAFTER_STREAM_REGISTRY
 from cognitive_runtime.programs.crafter.streams import SEMANTIC_CLASS_IDS
 
-FAST_CONFIG = {"episode_ticks": 200}
+# Tiny real worlds preserve every seam/replay assertion without repeatedly
+# generating the default 64x64 terrain. Pixel resolution remains 64x64.
+FAST_CONFIG = {"area": (16, 16), "episode_ticks": 200}
 
 
 def _stream_program(seed, config=None):
@@ -263,7 +265,7 @@ def test_efference_copy_round_trip_through_the_motor_bus():
 def test_achievement_events_are_repeatable_counters():
     """Unlike Minecraft's once-only event.advancement, Crafter achievements
     are cumulative counters (e.g. wake_up increments every time)."""
-    program, sensory, motor = _stream_program(0, config={"episode_ticks": 400})
+    program, sensory, motor = _stream_program(0, config={**FAST_CONFIG, "episode_ticks": 400})
     sensory.drain()
     counts = {}
     for _ in range(400):

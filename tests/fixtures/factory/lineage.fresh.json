@@ -1,0 +1,9 @@
+{
+  "configuration_parents": [],
+  "format": "model-factory-lineage-v1",
+  "mode": "fresh",
+  "parent": null,
+  "parent_checkpoint_sha": null,
+  "sibling_group": "synthetic-control-297",
+  "weight_donor": null
+}

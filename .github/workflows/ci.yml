@@ -1,13 +1,7 @@
 name: CI
 
-# Tiered CI (issue #242). Timings below were measured on a 4-vCPU CPU-only
-# container; runner hardware will shift them, but the ratios hold.
-#
-#   core              torch-free unit tests, ~2 min, every PR
-#   factory-contracts torch-free Model Factory invariants, ~1 min, every PR
-#   neural            full suite with CPU torch, 20+ min, main/manual only
-#
-# The nightly end-to-end factory smoke trial lives in nightly-factory.yml.
+# Default PR lanes are torch-free, offline and measured together (issue #297).
+# The optional CPU-Torch sweep and Factory smoke require manual dispatch.
 
 on:
   push:
@@ -17,6 +11,11 @@ on:
     paths-ignore: ['**.md', 'docs/**', 'notebooks/**']
     
   workflow_dispatch:
+    inputs:
+      legacy_neural:
+        description: 'Run the slow legacy CPU-Torch compatibility suite'
+        type: boolean
+        default: false
 
 # A 20-minute tier must not queue behind superseded pushes.
 concurrency:
@@ -47,8 +46,10 @@ jobs:
 
       - name: Install (core + dev only, deliberately without torch)
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install -e ".[dev]"
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          .venv/bin/python -m pip install --upgrade pip setuptools wheel
+          .venv/bin/python -m pip install -e ".[dev]"
 
       # `ccr nursery list` is deliberately NOT smoke-tested here: it exits 1
       # without torch by design (cli.py:1112). The guard is graceful and
@@ -66,10 +67,20 @@ jobs:
       # the optional neural dependency, so collection is a blocking core-only
       # check rather than an advisory signal.
       - name: Test collection must succeed without torch
-        run: python -m pytest tests -q --collect-only
+        run: sudo -E unshare --net -- "$(command -v python)" .github/scripts/run_core_tests.py --collect-only --report /tmp/core-collection.json
 
-      - name: Torch-free unit tests
-        run: python -m pytest tests -q
+      - name: Torch-free unit tests (including Factory seed 0)
+        run: |
+          sudo -E unshare --net -- "$(command -v python)" .github/scripts/run_core_tests.py --report /tmp/core-tests.json
+
+      - name: Upload core runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-runtime
+          path: /tmp/core-*.json
+          if-no-files-found: error
+          retention-days: 7
 
   # --------------------------------------------------------------- tier 2
   factory-contracts:
@@ -87,63 +98,51 @@ jobs:
 
       - name: Install (core + dev only)
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install -e ".[dev]"
-          python -m pip install jsonschema
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          .venv/bin/python -m pip install --upgrade pip setuptools wheel
+          .venv/bin/python -m pip install -e ".[dev]"
 
-      - name: Detect Model Factory test modules
-        id: detect
-        run: |
-          if compgen -G "tests/test_model_factory_*.py" > /dev/null; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "No model factory tests yet — skipping (issues #213-#233)."
-          fi
-
-      # The contract hashes are the epic's foundation: a run's identity, its
-      # checkpoint compatibility and its A/B validity are all derived from
-      # them. Non-deterministic dict ordering leaking into the canonical JSON
-      # is the most likely way "reproducible identity" silently stops being
-      # reproducible, and it is invisible in any single-seed run. So run the
-      # contract suite twice under different hash seeds.
-      - name: Contract tests under PYTHONHASHSEED=0
-        if: steps.detect.outputs.present == 'true'
-        env:
-          PYTHONHASHSEED: '0'
-        run: python -m pytest tests/test_model_factory_*.py -q
-
+      # The complete core suite already runs every Factory test under seed 0.
+      # This second seed preserves hash-order coverage without a third copy.
       - name: Contract tests under PYTHONHASHSEED=12345
-        if: steps.detect.outputs.present == 'true'
         env:
           PYTHONHASHSEED: '12345'
-        run: python -m pytest tests/test_model_factory_*.py -q
+        run: sudo -E unshare --net -- "$(command -v python)" .github/scripts/run_core_tests.py tests/test_model_factory_*.py --report /tmp/contracts-seed-12345.json
 
-      # Artifact schema drift is silent data loss for a provenance system: an
-      # older run simply stops being readable and nobody notices until they
-      # need it. Golden fixtures + committed schemas make drift a red check.
-      #
-      # Run when EITHER directory exists, not both. The validator's whole job
-      # includes rejecting a schema with no fixture and a fixture with no
-      # schema -- requiring both directories would skip validation in exactly
-      # the orphan cases it exists to catch, letting the first one merge
-      # silently. It already handles a missing counterpart directory: an empty
-      # schema glob and an empty fixture glob each exit non-zero.
       - name: Validate artifact schemas against golden fixtures
-        run: |
-          if [ -d .github/schemas ] || [ -d tests/fixtures/factory ]; then
-            python .github/scripts/validate_artifact_schemas.py
-          else
-            echo "No schemas or fixtures yet — skipping (issue #242)."
-          fi
+        run: python .github/scripts/validate_artifact_schemas.py
+
+      - name: Upload contract runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contracts-runtime
+          path: /tmp/contracts-seed-*.json
+          if-no-files-found: error
+          retention-days: 7
+
+  aggregate-core-budget:
+    name: aggregate offline core budget
+    needs: [core, factory-contracts]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-runtime'
+          merge-multiple: true
+          path: /tmp/core-runtime
+      - name: Enforce aggregate 120-second execution target
+        run: python .github/scripts/check_core_budget.py /tmp/core-runtime
 
   # --------------------------------------------------------------- tier 4
   neural:
     name: full suite (CPU torch)
     # Pull requests run the fast core and Model Factory contract lanes. The
-    # expensive compatibility/CPU-Torch sweep protects main and remains
-    # available on demand through workflow_dispatch.
-    if: github.event_name != 'pull_request'
+    # expensive compatibility/CPU-Torch sweep is manual/opt-in only.
+    if: github.event_name == 'workflow_dispatch' && inputs.legacy_neural
     runs-on: ubuntu-latest
     # Non-blocking: this tier is slow (20+ min) and broad enough that a
     # failure here shouldn't hold up a merge. Treat a red run as a bug to
@@ -176,4 +175,4 @@ jobs:
       # --durations keeps runtime creep visible: this tier already measures
       # ~44 min on 4 vCPU, and it should not quietly become 90.
       - name: Full test suite
-        run: python -m pytest tests -q --durations=25
+        run: python -m pytest tests -q --durations=25 --run-market=extended

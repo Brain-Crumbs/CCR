@@ -3639,7 +3639,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_factory_clone.add_argument("run", help="parent run id to clone from")
     p_factory_clone.add_argument("--set", action="append", metavar="dotted.path=value", default=None,
                                  help="override the parent's resolved spec field, e.g. "
-                                      "--set training.loss_weights.closed_loop_pixel=0.125 (repeatable)")
+                                      "--set training.loss_weights.closed_loop_pixel_loss_weight=0.125 (repeatable)")
     p_factory_clone.add_argument("--mode", choices=["clone", "fine_tune"], default="clone",
                                  help="child trial mode (default: clone)")
     p_factory_clone.add_argument("--checkpoint", default="best-validation.pt",

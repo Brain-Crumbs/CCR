@@ -1,0 +1,42 @@
+# Project-authored synthetic recipe; provenance and SHA-256: provenance.json.
+# A one-epoch CPU integration canary, never model-quality evidence.
+format: model-factory-spec-v1
+organism: factory-smoke
+mode: fresh
+data:
+  corpus_id: micro-crafter-v1
+  world: crafter
+  expected_pixel_source: crafter
+  horizons_ticks: [1, 2]
+model:
+  backbone: transformer
+  latent_width: 8
+  hidden_dim: 16
+  action_embed_dim: 4
+  reconstruction_size: 4
+  context_length: 3
+  backbone_kwargs:
+    n_heads: 2
+    n_layers: 1
+training:
+  objective: windowed_rollout
+  optimizer:
+    name: adamw
+    lr: 0.02
+  batch_size: 4
+  seed: 0
+  rollout_frames: 2
+  warmup_frames: 2
+  scheduled_sampling_p: 0.0
+  loss_weights:
+    closed_loop_pixel_loss_weight: 0.25
+  epoch_budget: 1
+  checkpoint_cadence_epochs: 1
+  max_training_seconds: 15
+  device: cpu
+  precision: fp32
+  determinism_policy:
+    deterministic: true
+    seed: 0
+evaluation:
+  selection_metric: rollout.t+1.model_over_copy_last_mse

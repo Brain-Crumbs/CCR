@@ -1,0 +1,39 @@
+{
+  "created_at": "2026-01-01T00:00:00+00:00",
+  "devices": [
+    "cpu"
+  ],
+  "format": "model-factory-trial-state-v1",
+  "heartbeat_timeout_seconds": 30.0,
+  "history": [
+    {
+      "at": "2026-01-01T00:00:00+00:00",
+      "from": null,
+      "reason": "queued",
+      "to": "queued"
+    },
+    {
+      "at": "2026-01-01T00:00:01+00:00",
+      "from": "queued",
+      "reason": "synthetic worker started",
+      "to": "running"
+    },
+    {
+      "at": "2026-01-01T00:00:02+00:00",
+      "from": "running",
+      "reason": "synthetic checkpoint boundary",
+      "to": "checkpointing"
+    },
+    {
+      "at": "2026-01-01T00:00:03+00:00",
+      "from": "checkpointing",
+      "reason": "synthetic serialization smoke complete",
+      "to": "completed"
+    }
+  ],
+  "reason": "synthetic serialization smoke complete",
+  "retried_from": null,
+  "run_id": "synthetic-factory-seed-297",
+  "state": "completed",
+  "updated_at": "2026-01-01T00:00:03+00:00"
+}

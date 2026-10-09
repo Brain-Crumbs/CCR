@@ -20,7 +20,9 @@ from cognitive_runtime.runtime.config import RuntimeConfig  # noqa: E402
 from cognitive_runtime.runtime.loop import CognitiveRuntime  # noqa: E402
 from cognitive_runtime.tools.replay_runner import replay_session  # noqa: E402
 
-FAST_CONFIG = {"episode_ticks": 60}
+# Tiny real worlds preserve every seam/replay assertion without repeatedly
+# generating the default 64x64 terrain. Pixel resolution remains 64x64.
+FAST_CONFIG = {"area": (16, 16), "episode_ticks": 60}
 
 
 def _record_crafter_session(tmp_path, policy, session_id, seed=5):

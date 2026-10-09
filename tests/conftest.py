@@ -9,6 +9,8 @@ Factory iteration by default.
 from __future__ import annotations
 
 from pathlib import Path
+import ast
+from functools import lru_cache
 
 import pytest
 
@@ -61,7 +63,66 @@ DEFERRED_NODEIDS = frozenset(
 )
 
 
+MARKET_TIERS = ("extended", "text", "jepa", "live")
+
+
+@lru_cache(maxsize=None)
+def _market_tiers(path: Path) -> set[str]:
+    """Read marker names without importing optional test modules.
+
+    Optional modules must declare their market marker statically, or live in
+    tests/market/<tier>/. Conservatively treating any matching decorator as a
+    module boundary also keeps a misplaced eager optional import out of core.
+    """
+    tiers = set()
+    parts = path.parts
+    for index in range(len(parts) - 2):
+        if parts[index:index + 2] == ("tests", "market") and parts[index + 2] in MARKET_TIERS:
+            tiers.add(parts[index + 2])
+    if path.suffix == ".py" and path.is_file():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        # Literal getattr markers are also statically inspectable. Dynamically
+        # constructed marker names belong in a declared optional tier directory.
+        tiers.update(node.value.removeprefix("market_") for node in ast.walk(tree)
+                     if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                     and node.value in {f"market_{tier}" for tier in MARKET_TIERS})
+        tiers.update(
+            node.attr.removeprefix("market_")
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and node.attr in {f"market_{tier}" for tier in MARKET_TIERS}
+        )
+    return tiers
+
+
+def _market_enabled(config: pytest.Config) -> set[str]:
+    return set(config.getoption("--run-market"))
+
+
+def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool | None:
+    if _market_tiers(collection_path) - _market_enabled(config):
+        return True
+    return None
+
+
+class _ExcludedMarketModule(pytest.Module):
+    def collect(self):
+        return ()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_pycollect_makemodule(module_path: Path, parent):
+    # Explicit files and shell-expanded wildcards bypass ignore_collect.
+    if _market_tiers(module_path) - _market_enabled(parent.config):
+        return _ExcludedMarketModule.from_parent(parent, path=module_path)
+    return None
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--run-market", action="append", default=[], choices=MARKET_TIERS,
+        help="explicitly enable one optional market tier (repeat for more)",
+    )
     parser.addoption(
         "--run-deferred",
         action="store_true",
@@ -71,6 +132,14 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    enabled = _market_enabled(config)
+    selected, deselected = [], []
+    for item in items:
+        tiers = {tier for tier in MARKET_TIERS if item.get_closest_marker(f"market_{tier}")}
+        (deselected if tiers - enabled else selected).append(item)
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = selected
     if config.getoption("--run-deferred"):
         return
 

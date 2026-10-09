@@ -1,0 +1,38 @@
+{
+  "format": "ccr-synthetic-fixture-provenance-v1",
+  "fixtures": [
+    {
+      "path": "micro-corpus.yaml",
+      "sha256": "0a32d6e6d179875018174e0e334a2a26dce999f97540db3cb2cfcf781ea8f61c",
+      "source": "Project-authored synthetic Factory configuration for CCR issue #297; recordings generated locally by cognitive_runtime/training/nursery.py::CRAFTER_SCENARIOS.walk_forward_short.",
+      "seed": {
+        "train": [
+          0,
+          1
+        ],
+        "validation": [
+          100,
+          101
+        ],
+        "test": [
+          200,
+          201
+        ]
+      },
+      "license": "MIT (project configuration; pyproject.toml project.license)",
+      "rights": "Project-authored recipe. No third-party raw market, stock, news, Kalshi, personal or credential payloads. Generated synthetic recordings are not committed.",
+      "intended_edge_case": "Three nonempty seed-disjoint frozen splits; six bounded six-tick generated optical-flow recordings; manifest reuse must preserve exact bytes.",
+      "validation_status": "synthetic_only"
+    },
+    {
+      "path": "micro-baseline.yaml",
+      "sha256": "a3f0d71063aaad4a66f466fbed033ecb3a6149dd85e0c0ae0ac88ed3b9c85dbd",
+      "source": "Project-authored synthetic Factory configuration for CCR issue #297; recordings generated locally by cognitive_runtime/training/nursery.py::CRAFTER_SCENARIOS.walk_forward_short.",
+      "seed": 0,
+      "license": "MIT (project configuration; pyproject.toml project.license)",
+      "rights": "Project-authored recipe. No third-party raw market, stock, news, Kalshi, personal or credential payloads. Generated synthetic recordings are not committed.",
+      "intended_edge_case": "One-epoch tiny CPU baseline and two same-parent clones varying only the declared closed-loop pixel loss weight; actual generated run IDs must be captured.",
+      "validation_status": "synthetic_only"
+    }
+  ]
+}

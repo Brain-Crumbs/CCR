@@ -10,6 +10,8 @@ import json
 
 import pytest
 
+pytestmark = pytest.mark.market_extended
+
 
 @pytest.mark.parametrize("name", ["adam", "adamw"])
 def test_toy_step_json_state_resume_and_reject_wrong_class(name):
