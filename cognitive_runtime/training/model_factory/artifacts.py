@@ -226,6 +226,8 @@ def _session_artifacts(session_ids: Any, session_hashes: Any, *, split: str) -> 
 
 def _contract_session_manifest(data_contract: DataContract) -> Dict[str, Any]:
     """Exact evidence identities required even before MF-A5 adds metadata."""
+    if hasattr(data_contract, "split_artifacts"):
+        return _jsonable(data_contract.split_artifacts)
     return {
         "train": _session_artifacts(
             data_contract.train_session_ids, data_contract.train_session_hashes, split="train"
@@ -245,13 +247,15 @@ def execution_manifest(
     device: str,
     precision: str,
     determinism_policy: Mapping[str, Any],
+    import_optional: bool = True,
 ) -> Dict[str, Any]:
     """Capture source and runtime facts needed to attribute a crashed trial."""
     # ``_device_info`` intentionally avoids importing torch.  Importing it
     # here is still before model/GPU work, and ensures the manifest contains
     # the requested PyTorch/CUDA facts when the neural extra is installed.
     try:
-        __import__("torch")
+        if import_optional:
+            __import__("torch")
     except ImportError:
         pass
     git = _git_info()
@@ -342,7 +346,7 @@ def allocate_run_artifacts(
 
     spec_payload = {"format": DOCUMENT_FORMAT, **_jsonable(spec.to_dict())}
     contracts_payload = {
-        "format": CONTRACTS_FORMAT,
+        "format": CONTRACTS_FORMAT if spec.format == DOCUMENT_FORMAT else "model-factory-task-contracts-v1",
         "architecture_hash": architecture_contract.hash,
         "data_contract_hash": data_contract.hash,
         "training_contract_hash": training_contract.hash,
@@ -370,6 +374,7 @@ def allocate_run_artifacts(
         device=str(spec.training["device"]),
         precision=str(spec.training["precision"]),
         determinism_policy=spec.training["determinism_policy"],
+        import_optional=spec.format == DOCUMENT_FORMAT,
     )
 
     experiment_path = directory / "experiment.json"

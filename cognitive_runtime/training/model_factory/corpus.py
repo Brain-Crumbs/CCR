@@ -1059,3 +1059,24 @@ __all__ = [
     "resolve_corpus",
     "list_corpora",
 ]
+
+
+def prepare_task_corpus(backend, spec, *, corpus_root=None):
+    """Resolve a neutral task without nursery vocabulary or pixel fields.
+
+    Task-specific readers own the data format; Factory checks the identities
+    that bind their prepared batches, manifests and model definition together.
+    """
+    from brain.cortex.model_contracts import require_inference_input
+    prepared = backend.prepare(spec, corpus_root=Path(corpus_root) if corpus_root else None)
+    definition, data = prepared.model_definition, prepared.data_contract
+    identity = backend.identity.to_dict()
+    if definition.task_identity != identity or data.task_identity != identity:
+        raise ValueError("prepared task identity differs from selected backend")
+    if data.corpus_id != spec.data["corpus_id"] or data.feature_schema != definition.feature_schema:
+        raise ValueError("prepared corpus/feature identity differs")
+    for batch in (prepared.training, prepared.validation):
+        inputs = require_inference_input(batch.inputs)
+        if inputs.feature_schema != data.feature_schema:
+            raise ValueError("batch feature schema differs from data/model contract")
+    return prepared

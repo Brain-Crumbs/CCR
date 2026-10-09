@@ -55,6 +55,26 @@ coverage. They do not change repository permissions or replace issue acceptance.
   `tests/market/test_offline_core_runner.py` and `.github/scripts/run_factory_smoke.py`.
 - Added/revised: 2026-10-09.
 
+## BP-004: Version domain boundaries without rewriting legacy identities
+
+- Status: proposed (independent submitted-head review pending)
+- Scope: task/model registry, inference inputs and checkpoint continuation.
+- Rule: use an explicit new contract format for new domains; preserve serialized
+  legacy defaults merely on load. Check task/model identity before loading state,
+  and keep evaluation labels outside inference input containers. Exercise actual
+  Factory dispatch, artifacts and persisted failure states with tiny fake backends;
+  pair them with opt-in real compatibility runs rather than treating mocks as proof.
+- Exception: a legacy adapter may retain its existing lifecycle and serialization
+  behind the shared entry point to avoid an unnecessary trainer rewrite.
+- Evidence: [#285](https://github.com/Brain-Crumbs/CCR/issues/285),
+  `tests/test_model_factory_task_backends.py` and
+  `tests/market/extended/test_task_backend_compatibility.py` (added; runtime
+  verification blocked in the implementation environment). The audited Factory
+  constructed ActionWorldModel for every checkpoint and required pixel/action
+  contracts; `brain.cortex` also eagerly imported torch before neutral contracts.
+- Added/revised: 2026-10-09. Structural separation does not prove causal features;
+  future data/label implementations must supply semantic leakage evidence.
+
 ## Change history (append-only)
 
 | Date | ID | Change | Reason and evidence |
@@ -62,3 +82,4 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | 2026-10-09 | BP-001 | Added | Missing fixture/schema pairs produced a false-green CI path; #297. |
 | 2026-10-09 | BP-002 | Added | Measured default runtime exceeded 120 seconds; preserve coverage while bounding fixtures, #297. |
 | 2026-10-09 | BP-003 | Added | Offline attempts and hardcoded Factory IDs need executable failure evidence; #297 / #212. |
+| 2026-10-09 | BP-004 | Proposed | Domain-coupled checkpoint construction and eager cortex import found during #285; integration tests added, execution/review pending. |

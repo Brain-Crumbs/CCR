@@ -53,6 +53,11 @@ jobs:
             tests/test_model_factory_corpus.py::test_resolve_refuses_a_missing_frozen_session_and_names_it \
             tests/test_model_factory_confirmation.py::test_no_search_step_ever_opens_the_sealed_test_partition
 
+      - name: Neutral temporal backend compatibility
+        run: |
+          timeout 30s python -m pytest -q --durations=5 --run-market=extended \
+            tests/market/extended/test_task_backend_compatibility.py::test_real_temporal_backbone_through_neutral_factory
+
       - name: Upload synthetic evidence
         if: always()
         uses: actions/upload-artifact@v4

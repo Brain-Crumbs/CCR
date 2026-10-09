@@ -54,6 +54,9 @@ _BACKBONES: dict = {}
 class TemporalBackbone(nn.Module):
     """Base class for the cortex's swappable transition backbone.
 
+    Structurally implements ``model_contracts.TemporalModel``. Input vectors
+    need not contain pixels or actions; task heads own output semantics.
+
     ``context_length_max`` is ``None`` for backbones with no fixed window
     (the GRU); the training curriculum uses its presence to decide whether a
     backbone has a context length to ramp at all.

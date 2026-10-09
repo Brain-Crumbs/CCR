@@ -767,7 +767,7 @@ def _build_comparison(
     return payload
 
 
-def run_trial(
+def _run_legacy_trial(
     spec: Union[Mapping[str, Any], ExperimentSpec],
     *,
     root: Union[str, Path] = RUNS_ROOT_DEFAULT,
@@ -1246,6 +1246,38 @@ def run_trial(
         training_stats=training_stats, evaluation=best_eval, budget_report=budget_report,
         comparison=comparison_payload, experiment_report_path=report_path,
     )
+
+
+def run_trial(spec, *, root=RUNS_ROOT_DEFAULT, corpus_root=None, run_id=None,
+              naming_seed=None, trace_dir=None, heartbeat_timeout_seconds=None,
+              export_predictions=True, export_predictions_max_episodes=3) -> TrialResult:
+    """Dispatch the existing Factory entry point without rewriting old specs."""
+    from .spec import TASK_DOCUMENT_FORMAT
+    from .task_registry import LEGACY_BACKEND, load_backend, backend_registration
+    resolved = spec if isinstance(spec, ExperimentSpec) else resolve_spec(spec)
+    validate_spec(resolved)
+    name = resolved.model.get("backend", LEGACY_BACKEND)
+    entry = backend_registration(name)
+    if resolved.format == TASK_DOCUMENT_FORMAT and resolved.parent:
+        metadata = read_factory_checkpoint_metadata(str(_parent_checkpoint_path(root, resolved)))
+        if metadata.get("task_identity") != _jsonable(entry.identity.to_dict()):
+            raise ValueError("cross-domain clone/resume is forbidden")
+    backend = load_backend(name)
+    if resolved.format == TASK_DOCUMENT_FORMAT:
+        from .task_runner import run_backend_trial
+        return run_backend_trial(resolved, backend, root=root, corpus_root=corpus_root,
+                                 run_id=run_id, naming_seed=naming_seed,
+                                 heartbeat_timeout_seconds=heartbeat_timeout_seconds)
+    # Reject a neutral checkpoint before importing neural packages or building data.
+    if resolved.parent:
+        metadata = read_factory_checkpoint_metadata(str(_parent_checkpoint_path(root, resolved)))
+        if metadata.get("task_identity") is not None:
+            raise ValueError("cross-domain clone/resume is forbidden: expected legacy Crafter checkpoint")
+    return backend.run(spec, root=root, corpus_root=corpus_root, run_id=run_id,
+                       naming_seed=naming_seed, trace_dir=trace_dir,
+                       heartbeat_timeout_seconds=heartbeat_timeout_seconds,
+                       export_predictions=export_predictions,
+                       export_predictions_max_episodes=export_predictions_max_episodes)
 
 
 __all__ = ["TrialResult", "run_trial", "RUNS_ROOT_DEFAULT", "DEFAULT_EPOCH_BUDGET"]
