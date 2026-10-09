@@ -17,3 +17,8 @@ package-lock.json
 !specs/corpora/
 !specs/corpora/*.yaml
 *_worktrees/
+# Defense in depth: runtime storage must live outside the repository.
+**/market-private/
+**/index.sqlite*
+**/.ledger-owner
+**/.pending-*
