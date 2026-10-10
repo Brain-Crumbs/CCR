@@ -108,3 +108,41 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | 2026-10-09 | BP-004 | Completion evidence appended | #285 merged in PR #302; exact-head core 1,189 + 600 tests (59.822s), actual six-stage Crafter smoke and neutral GRU compatibility passed per verified issue completion. Earlier proposed/runtime-blocked entry retained as historical evidence. |
 | 2026-10-09 | BP-005 | Proposed | #286 explicit financial schema boundary and decimal/clock/distribution negative cases; local default and opt-in checks passed, submitted-head review pending. |
 | 2026-10-09 | BP-005 | Review regression evidence appended | Independent review of PR #303 head 682b59e4 found cancellation after rounded division, tiny-anchor support rounding, and placeholder raw provenance. Exact bounded arithmetic and preserved hashed synthetic source inputs now have direct regressions; fresh-head review pending. |
+
+## BP-006: Make causal replay independent of physical ingestion order
+
+- Status: proposed (independent submitted-head review pending).
+- Scope: immutable observation ledgers and snapshot manifests, #287.
+- Rule: choose among eligible revisions with an explicit stable tie rule; bind
+  knowledge clocks, exact selected hashes, identity/dedup evidence and quality
+  policy in the snapshot identity. Append corrections instead of overwriting
+  earlier observations. Test shuffled ingestion and future perturbation against
+  the same golden snapshot, including a real disk reopen.
+- Exception: rights revocation can make historical payloads unavailable; preserve
+  allowed provenance and fail reads rather than claiming an identical replay.
+- Evidence: `tests/market/test_ledger_snapshots.py` correction, tie, identity and
+  dedup tests; `tests/market/extended/test_ledger_recovery.py` large shuffled replay.
+- Added: 2026-10-09.
+
+## BP-007: Commit denial before erasure and test actual interruption
+
+- Status: proposed (independent submitted-head review pending).
+- Scope: private content-addressed storage with append-only provenance, #287.
+- Rule: persist a rights-denial intent before physical payload deletion; block
+  reads immediately, resume cleanup after interruption, and forbid older-revision
+  resurrection. Durably write content before committing its index reference;
+  recover precommit orphans. Keep sensitive content out of immutable metadata.
+- Exception: unlink cannot erase external backups or already-held memory; record
+  those operator obligations and reject policies forbidding required provenance.
+- Evidence: real subprocess exit tests between blob/index commit and denial/unlink,
+  expiry and rights-deletion tests in `tests/market/extended/test_ledger_recovery.py`.
+- Added: 2026-10-09.
+
+| Date | ID | Change | Reason and evidence |
+| --- | --- | --- | --- |
+| 2026-10-09 | BP-005 | Completion evidence appended | #286 merged as #303; exact-head 1,214 core + 600 Factory checks, 39.683s aggregate, and decimal/provenance regression review verified in issue completion. |
+| 2026-10-09 | BP-006 | Proposed | #287 corrections and shuffled physical arrival must not change past strict snapshots; disk/golden regressions added. |
+| 2026-10-09 | BP-007 | Proposed | #287 filesystem/SQLite writes cannot share a transaction; interrupted append and rights erasure need replayable intents and actual process-exit tests. |
+
+| 2026-10-10 | BP-006 | Review regression evidence appended | PR #304 independent review found price usability filtering before revision selection resurrected old values (R1); resolve knowledge revisions first and preserve unusable quality evidence. New bad-revision/gap/future-quality/reload tests cover the failure. |
+| 2026-10-10 | BP-006 | Fill-basis evidence appended | Review R2 found raw/adjusted and interval/calendar fills collapsed; complete basis keys and opposite-ingestion-order regressions now keep them independent. Fresh-head review pending. |

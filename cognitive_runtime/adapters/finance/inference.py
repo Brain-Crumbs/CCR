@@ -1,4 +1,4 @@
-"""Validate externally selected context; selection/ledger implementation is #287."""
+"""Validate selected context and bind it to neutral inference inputs."""
 from brain.cortex.model_contracts import InferenceInput
 from .schemas import (ContextSnapshot, Instrument, InstrumentAlias, PriceBar, Quote,
                       CorporateAction, NewsEvent, PredictionContractState)
@@ -19,6 +19,10 @@ def validate_context(snapshot, records):
     for record in records:
         if record.available_at is None or timestamp(record.available_at) > cutoff:
             raise ValueError('unknown or future availability')
+        if timestamp(record.event_at) > cutoff:
+            raise ValueError('future event in context')
+        if isinstance(record, CorporateAction) and timestamp(record.announced_at) > cutoff:
+            raise ValueError('future announcement in context')
         if snapshot.as_of_mode == 'strict_replay':
             if timestamp(record.observed_at) > cutoff:
                 raise ValueError('future observation in strict replay')
