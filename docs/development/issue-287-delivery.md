@@ -63,3 +63,35 @@ rejected. Unknown/unsupported migration versions fail closed.
 
 Parent must refresh source issue versions, main/base, check results and protection
 visibility before any separately authorized merge; then verify main and tracking.
+
+
+## Published-head review and fixes
+
+Initial draft [#304](https://github.com/Brain-Crumbs/CCR/pull/304) head
+`8231b09aec98929033c5bb5a1e2db26c44868c7a`, tree
+`33ab2c4eb8d7b9e3abb4f6aef4042955e3f1eaa7`. Independent review verified remote/local
+identity and ran 17 tests in 15.693s. It found R1 (P1): unusable prices filtered
+before revision selection resurrected older usable values and allowed fills over
+known missing bars; R2 (P2): fill grouping omitted adjustment/calendar/interval.
+A2/A7 failed on that head despite green tests. Other A1/A3–A6/A8–A9/A11–A12 met;
+review initially marked A10 unverified until hosted evidence was available.
+
+[Initial-head CI](https://github.com/Brain-Crumbs/CCR/actions/runs/38007035640)
+passed 1,227 core tests, 256 existing skips, 42 subtests; 600 second-seed Factory
+checks, 10 existing skips; aggregate 49.604s. Run metadata binds that head to the
+base recorded above. This is historical evidence, not repaired-head validation.
+The operator documentation example also executed successfully locally.
+The full local core command attempted zero tests because pytest was absent;
+combined schema/storage unittest ran 38 tests in 1.700s: 37 passed and the existing
+neutral bridge was blocked by missing namesgenerator, which passed on hosted CI.
+
+Fixes select latest knowledge-eligible revisions first, preserve unusable prices
+as hashed quality evidence outside inference inputs, and use that evidence to
+block obsolete values/fills. Fill bases now include adjustment, calendar version
+and interval length. Three new regressions exercise bad bar/quote corrections in
+both ingestion orders, quality reload/rights checks, future-quality exclusion,
+gap blocking and independent adjusted/calendar/duration fills. The explicit empty
+quality-input list changes the new manifest format's golden strict hash to
+`81d85010fa607719acceb272a748ac0ca8b61fe6c82c3ff8f409c02a4d749a9d`;
+no legacy hash changed. Default storage suite: 16 passed in 0.533s. Fresh published
+head review and CI follow; exact identities/results are recorded in PR #304.

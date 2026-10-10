@@ -64,7 +64,11 @@ strict mode, and is marked in the resulting caveats.
 
 Future event times and future corporate-action announcements are excluded even
 if a source has inconsistent earlier availability. Complete bars enter only at
-or after their end, and incomplete/filled bars and crossed quotes are excluded.
+or after their end. Resolve knowledge-eligible revisions before judging price
+usability: a known bad correction suppresses its older value. Incomplete/missing/
+filled bars and crossed quotes stay outside inference inputs but remain bound as
+`quality_inputs` in the manifest and `SnapshotBundle.quality_records`. Loading a
+snapshot verifies those hashes and their retention rights too.
 A known announcement about a future effective action may be stored as context;
 the ledger never retrospectively adjusts prices. Actual action-aware labels,
 exchange calendars, historical universe construction and session windows remain
@@ -102,7 +106,9 @@ record ID/hash break ties. Future reposts cannot backdate or join an old snapsho
 This is deterministic declared-cluster handling, not a fuzzy entity/news model.
 
 `expected_listings` produces absent-price masks. Selected records carry distinct
-`empty_text`, `deleted_text`, `missing_price` and `stale_price` reasons. A null
+`empty_text`, `deleted_text`, `missing_price` and `stale_price` reasons. Unusable
+price evidence adds `incomplete_price`, `filled_price` or `crossed_quote` reasons
+without putting invalid observations into ContextSnapshot selected records. A null
 NewsEvent text means empty/no usable text because #286 rejects empty strings.
 `signals=(listing, reason, evidence_record_id)` accepts `feed_outage` or
 `market_closed` only with selected, listing-related evidence. The adapter owns
@@ -113,7 +119,11 @@ Forward fill defaults off. When explicitly enabled, it emits a marked reference
 with source/target time and age, never mutates an observation or fabricates a
 complete bar. Its bound cannot exceed price freshness. Missing/stale observations,
 known outages and closed markets cannot fill. Each source/feed/venue/currency/
-mark family fills independently; an IEX trade cannot silently become a SIP mid.
+mark/adjustment/calendar/interval family fills independently; an IEX trade cannot
+silently become a SIP mid. A newer known bad observation blocks older fills in
+the same family even across interval lengths; a coarser bar is not assumed to
+escape an observed feed gap. Quality evidence first available after the cutoff
+cannot block an earlier fill.
 Feature builders consume ContextSnapshot and its bound inputs/manifest, never an
 unfiltered ledger iterator. Generic `validate_context` also rejects future event
 and announcement clocks. The legacy simulated StreamEvent time, arrival handling

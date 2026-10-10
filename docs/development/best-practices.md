@@ -143,3 +143,6 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | 2026-10-09 | BP-005 | Completion evidence appended | #286 merged as #303; exact-head 1,214 core + 600 Factory checks, 39.683s aggregate, and decimal/provenance regression review verified in issue completion. |
 | 2026-10-09 | BP-006 | Proposed | #287 corrections and shuffled physical arrival must not change past strict snapshots; disk/golden regressions added. |
 | 2026-10-09 | BP-007 | Proposed | #287 filesystem/SQLite writes cannot share a transaction; interrupted append and rights erasure need replayable intents and actual process-exit tests. |
+
+| 2026-10-10 | BP-006 | Review regression evidence appended | PR #304 independent review found price usability filtering before revision selection resurrected old values (R1); resolve knowledge revisions first and preserve unusable quality evidence. New bad-revision/gap/future-quality/reload tests cover the failure. |
+| 2026-10-10 | BP-006 | Fill-basis evidence appended | Review R2 found raw/adjusted and interval/calendar fills collapsed; complete basis keys and opposite-ingestion-order regressions now keep them independent. Fresh-head review pending. |

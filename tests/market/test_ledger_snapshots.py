@@ -89,7 +89,7 @@ class LedgerTests(unittest.TestCase):
             append(other, original)
             self.assertEqual(snapshot(other), before)
             self.assertEqual(snapshot(other, mode='historical_source_as_of'), reconstructed)
-        self.assertEqual(before.context.hash, '18817f159bf8d39942086eb80c506cce46bab0dd2d06130620178b3a46669132')
+        self.assertEqual(before.context.hash, '81d85010fa607719acceb272a748ac0ca8b61fe6c82c3ff8f409c02a4d749a9d')
 
     def test_deterministic_revision_ties(self):
         original = append(self.ledger, self.ex['NewsEvent'])
@@ -174,6 +174,65 @@ class LedgerTests(unittest.TestCase):
             snapshot(self.ledger, forward_fill_seconds=61)
         with self.assertRaises(ValueError):
             snapshot(self.ledger, signals=(('listing:demo', 'feed_outage', 'future-evidence'),))
+
+    def test_bad_price_revisions_suppress_old_values_and_preserve_quality(self):
+        for kind, changes, reason in (
+                ('PriceBar', dict(complete=False, missing=True), 'missing_price'),
+                ('PriceBar', dict(complete=False), 'incomplete_price'),
+                ('Quote', dict(crossed=True, bid='102'), 'crossed_quote')):
+            original = self.ex[kind]
+            revised = replace(original, record_id='bad-' + reason, revision=2,
+                              supersedes_record_id=original.record_id, **changes)
+            snapshots = []
+            for index, records in enumerate(((original, revised), (revised, original))):
+                with Ledger(Path(self.tmp.name) / (reason + str(index))) as ledger:
+                    for record in records:
+                        append(ledger, record)
+                    result = snapshot(ledger, decision_at='2025-01-06T14:30:30Z', forward_fill_seconds=30)
+                    self.assertEqual(result.records, ())
+                    self.assertEqual([r.record_id for r in result.quality_records], [revised.record_id])
+                    self.assertEqual(result.manifest['masks'][0]['reason'], reason)
+                    self.assertEqual(result.manifest['forward_fills'], [])
+                    self.assertEqual(load_snapshot(ledger, result.context.hash), result)
+                    snapshots.append(result)
+            self.assertEqual(*snapshots)
+
+    def test_missing_bar_blocks_fill_but_future_quality_cannot_change_past(self):
+        original = append(self.ledger, self.ex['PriceBar'])
+        before = snapshot(self.ledger, forward_fill_seconds=60)
+        missing = replace(original, record_id='gap', source_record_id='gap',
+                          end_at='2025-01-06T14:30:30Z', complete=False, missing=True,
+                          available_at='2025-01-06T14:30:30Z', observed_at='2025-01-06T14:30:30Z',
+                          ingested_at='2025-01-06T14:30:30Z')
+        append(self.ledger, missing)
+        self.assertEqual(snapshot(self.ledger, forward_fill_seconds=60), before)
+        result = snapshot(self.ledger, decision_at='2025-01-06T14:30:30Z', forward_fill_seconds=60)
+        self.assertEqual(result.manifest['forward_fills'], [])
+        self.assertEqual(result.manifest['masks'][0]['reason'], 'missing_price')
+        self.assertEqual(len(result.manifest['quality_inputs']), 1)
+        self.assertEqual(load_snapshot(self.ledger, result.context.hash), result)
+        self.ledger.revoke(missing.record_id, reason='synthetic rights deletion')
+        with self.assertRaises(PermissionError):
+            load_snapshot(self.ledger, result.context.hash)
+
+    def test_forward_fill_separates_adjustment_calendar_and_interval(self):
+        original = self.ex['PriceBar']
+        variants = [original,
+                    replace(original, record_id='adjusted', source_record_id='adjusted', adjustment='split_adjusted'),
+                    replace(original, record_id='duration', source_record_id='duration', start_at='2025-01-06T14:28:00Z'),
+                    replace(original, record_id='calendar', source_record_id='calendar', calendar_version='other-v1')]
+        results = []
+        for index, records in enumerate((variants, list(reversed(variants)))):
+            with Ledger(Path(self.tmp.name) / ('basis' + str(index))) as ledger:
+                for record in records:
+                    append(ledger, record)
+                result = snapshot(ledger, decision_at='2025-01-06T14:30:30Z', forward_fill_seconds=30)
+                fills = result.manifest['forward_fills']
+                self.assertEqual(len(fills), 4)
+                self.assertEqual(len({tuple(f['basis']) for f in fills}), 4)
+                self.assertEqual({f['source_record_id'] for f in fills}, {r.record_id for r in variants})
+                results.append(result)
+        self.assertEqual(*results)
 
     def test_rights_revocation_and_no_resurrection(self):
         original = append(self.ledger, self.ex['NewsEvent'])
