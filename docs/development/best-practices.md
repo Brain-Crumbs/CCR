@@ -191,3 +191,5 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | Date | ID | Change | Reason and evidence |
 | --- | --- | --- | --- |
 | 2026-10-12 | BP-009 | Proposed | Frozen artifacts need full identity binding; source/model text remains untrusted. Missing public metadata access must not produce fabricated pins or hidden downloads; #292. |
+
+| 2026-10-12 | BP-009 | Submitted-head review regression evidence | PR #306 head 5ec54f5 exposed mutable execution settings/pin aliases retaining stale feature identities (R1/R3), and code-point bounds exceeding serialized worker framing (R2). Read-only execution identity, defensive metadata copies and shared byte framing now have warm/cold-cache and actual fake-inference child regressions; fresh-head review pending. |

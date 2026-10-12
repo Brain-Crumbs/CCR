@@ -83,3 +83,50 @@ Local verification used the Python offline hook and empty caches, not Linux
 5-minute caps. Optional real-model smoke was not selected or run. Existing skip
 policy is unchanged. A11 default local budget is met; submitted-head CI is a
 separate pending check.
+
+## Submitted-head independent review and repairs
+
+Draft [PR #306](https://github.com/Brain-Crumbs/CCR/pull/306), first head
+`5ec54f5273963098a4c6a3bc57c9ebd990685f3f`, base
+`46330f12b71f21952268e5e922b078f2a58679ec`, test-merge
+`46da5e6d78d8030d140c9b74db2df8f395b50e99`.
+[Initial-head CI](https://github.com/Brain-Crumbs/CCR/actions/runs/38284826586)
+completed successfully: core, Factory/hash and aggregate-budget jobs passed;
+manual-only CPU-Torch skipped as configured. This evidence is not carried
+forward to a new head.
+
+A fresh independent agent read actual source, issue/master criteria and BP-009,
+ran 23 targeted tests (3.21s) and reproduced three P2 findings:
+
+- R1: mutable baseline mode/dimensions changed computations without changing the
+  fitted feature signature. Fixed with read-only configuration and warm/cold
+  cache mutation regressions.
+- R2: eight legal 4,096-character control-text inputs escaped to ~200 KiB, but
+  the worker read only 65,537 characters. Fixed with shared 256-KiB UTF-8 byte
+  framing and real child tests at maximum escape/Unicode width.
+- R3: public nested local pin/provenance aliases allowed staged tokenizer changes
+  without signature changes. Fixed with serialized private pin/provenance,
+  defensive copies, read-only identity fields and independent child validation
+  of the exact request/model/pin/batch before imports. Regressions reject altered
+  staged files despite mutation of detached metadata copies.
+
+Additional actual subprocess tests cover hard resource limits, malformed/oversized
+requests and caught synthetic audit-denial accounting. Only inference is replaced
+by a fake callable; no torch/transformers or weights are imported. The audit probe
+emits a synthetic event without a socket or physical network request. This is
+stronger boundary coverage, not real-model validation. Updated targeted suite:
+**33 passed in 4.04s**. Full new-content budget and exact new-head review/CI follow.
+
+Independent review explicitly marked A3/A4 not met. That blocker is not relabeled
+optional or complete; missing pinned model/license evidence still prevents #292
+completion. Review is an agent source review, not a GitHub approval.
+
+### Repair-content validation
+
+Same commands as above with reports under `/tmp/ccr292-r2-evidence`:
+collection **1.469s**, core **1,306 passed, 256 skipped, 42 subtests** in **28.457s**,
+Factory/hash **600 passed, 10 skipped** in **8.475s**. Aggregate **38.401s / 120s**;
+zero network attempts/model-cache files and exact collection/execution membership
+verified by `check_core_budget.py`. Targeted **33 passed in 4.04s**. Existing schema
+fixtures and CI caps are unchanged. These are local repair-content measurements;
+remote exact-head CI/review evidence is recorded in the PR after submission.

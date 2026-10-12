@@ -339,3 +339,112 @@ def test_cache_value_immutable():
     cache.put('key', value)
     value.append(2.)
     assert json.loads(cache.get('key')) == [1.]
+
+
+def test_fitted_execution_settings_are_read_only(corpus):
+    corpus, plan = corpus
+    model = TextFeatures('tfidf', 16).fit(corpus, plan)
+    artifact = model.transform(corpus.feature('6'))
+    for name, value in (('mode', 'hashing'), ('dimensions', 8)):
+        with pytest.raises(AttributeError):
+            setattr(model, name, value)
+        assert model.transform(corpus.feature('6')).hash == artifact.hash
+        model.cache.clear()
+        assert model.transform(corpus.feature('6')).hash == artifact.hash
+
+
+def test_local_identity_defensive_copies_and_readonly_fields(tmp_path, monkeypatch):
+    import cognitive_runtime.adapters.finance.text.local as local
+    pin, root, lock = fake_pin(tmp_path)
+    monkeypatch.setattr(local.importlib.util, 'find_spec', lambda name: object())
+    monkeypatch.setattr(local.importlib.metadata, 'version', lambda name: 'synthetic-test-only')
+    model = LocalModel('minilm', lock_path=lock, staged=root)
+    original = (model.signature, model.tokenizer_sha256, model.pin, model.provenance)
+    changed = b'changed tokenizer fixture'
+    (root/'tokenizer.json').write_bytes(changed)
+    for detached in (model.pin, model.provenance['pin']):
+        detached['files']['tokenizer.json'].update(size=len(changed), sha256=hashlib.sha256(changed).hexdigest())
+    for name, value in (('model','qwen'), ('staged',tmp_path), ('dimensions',2),
+                        ('signature','x'*64), ('tokenizer_sha256','y'*64), ('pin',pin), ('provenance',{})):
+        with pytest.raises(AttributeError):
+            setattr(model, name, value)
+    assert (model.signature, model.tokenizer_sha256, model.pin, model.provenance) == original
+    with pytest.raises(OptionalCapabilityError, match='artifact_mismatch'):
+        verify_staged(model.pin, model.staged)
+
+
+FAKE_WORKER = '''
+import cognitive_runtime.adapters.finance.text.worker as worker
+def fake(request, root):
+ return [[float(len(t))] * 384 for t in request['texts']]
+worker.infer = fake
+worker.main()
+'''
+
+
+def test_real_worker_framing_limits_and_parent_roundtrip(tmp_path, monkeypatch):
+    import cognitive_runtime.adapters.finance.text.local as local
+    _, root, lock = fake_pin(tmp_path)
+    monkeypatch.setattr(local.importlib.util, 'find_spec', lambda name: object())
+    monkeypatch.setattr(local.importlib.metadata, 'version', lambda name: 'synthetic-test-only')
+    model = LocalModel('minilm', lock_path=lock, staged=root)
+    run = subprocess.run
+    def actual_child(command, **kwargs):
+        assert command[-1] == 'cognitive_runtime.adapters.finance.text.worker'
+        return run([sys.executable, '-c', FAKE_WORKER], **kwargs)
+    monkeypatch.setattr(local.subprocess, 'run', actual_child)
+    # Worst JSON escape expansion, and worst UTF-8 width; both remain valid.
+    for char in ('\x01', '\U0001f642'):
+        rows = model.encode([char * MAX_CHARS] * 8)
+        assert len(rows) == 8 and len(rows[0]) == 384 and rows[0][0] == MAX_CHARS
+        assert model.last_metrics['address_space_limit_bytes'] == 4*1024**3
+        assert model.last_metrics['cpu_limit_seconds'] == 50
+        assert model.last_metrics['peak_rss_kib'] > 0
+    # Bad staged bytes are rejected by real child before fake inference.
+    (root/'tokenizer.json').write_text('tampered')
+    with pytest.raises(OptionalCapabilityError, match='local_model_failed'):
+        model.encode(['x'])
+
+
+@pytest.mark.parametrize('problem', ['extra', 'model', 'pin', 'batch', 'bytes', 'duplicate'])
+def test_worker_rejects_bad_request_before_optional_imports(tmp_path, problem):
+    from cognitive_runtime.adapters.finance.text.worker import MAX_REQUEST_BYTES
+    pin, root, _ = fake_pin(tmp_path)
+    request = {'model':'minilm','pin':pin,'staged':str(root),'texts':['x']}
+    if problem == 'extra':
+        request['tools'] = ['execute']
+    elif problem == 'model':
+        request['model'] = 'remote'
+    elif problem == 'pin':
+        request['pin']['revision'] = 'main'
+    elif problem == 'batch':
+        request['texts'] *= 9
+    raw = canonical(request)
+    if problem == 'bytes':
+        raw = ' ' * (MAX_REQUEST_BYTES + 1)
+    elif problem == 'duplicate':
+        raw = raw[:-1] + ',"model":"minilm"}'
+    result = subprocess.run([sys.executable, '-m', 'cognitive_runtime.adapters.finance.text.worker'],
+                            input=raw, text=True, capture_output=True)
+    assert result.returncode != 0
+    assert 'ValueError' in result.stderr and 'ModuleNotFoundError' not in result.stderr
+
+
+def test_worker_caught_denial_still_fails(tmp_path):
+    pin, root, _ = fake_pin(tmp_path)
+    code = '''
+import sys
+import cognitive_runtime.adapters.finance.text.worker as worker
+def fake(request, root):
+ try:
+  # Synthetic audit notification: no socket or physical network request exists.
+  sys.audit('socket.connect', None, None)
+ except RuntimeError:
+  pass
+ return []
+worker.infer = fake
+worker.main()
+'''
+    result = subprocess.run([sys.executable, '-c', code], text=True, capture_output=True,
+        input=canonical({'model':'minilm','pin':pin,'staged':str(root),'texts':['x']}))
+    assert result.returncode != 0 and 'network attempt even if caught' in result.stderr

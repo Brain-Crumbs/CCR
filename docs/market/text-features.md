@@ -27,7 +27,9 @@ record hashes, frequency-descending then lexical tie order). IDF is
 normalized. Hashing has no learned vocabulary but still requires the validated
 train partition to bind fit provenance. No test/validation text, outcome labels or
 future-target store is read by fit. Create a new transformer to refit; `state`
-returns a copy for provenance, not a mutable live estimator.
+returns a copy for provenance, not a mutable live estimator. Mode/dimensions are
+read-only; local model identity fields are read-only and pin/provenance accessors
+return defensive copies.
 
 Only news IDs and content matching the context snapshot are consumed. Knowledge
 clocks are rechecked, deleted news is omitted, and missing text is explicit as
@@ -98,8 +100,9 @@ claims = StructuredExtractor(extractor).transform(feature)
 ```
 
 Missing/unapproved pins, missing/mismatched files or missing dependencies fail
-clearly, before optional imports. Artifact verification is repeated inside the
-child. Only `local_files_only=True`, `trust_remote_code=False` and safetensors
+clearly, before optional imports. Artifact and request/pin validation is repeated inside the child. The shared
+parent/child request ceiling is 256 KiB of UTF-8 serialized JSON, including
+escape expansion; oversized payloads fail before model imports. Only `local_files_only=True`, `trust_remote_code=False` and safetensors
 loading are allowed. A Linux child enforces 4 GiB virtual address space, 50 CPU
 seconds and two threads, with a parent 60-second wall timeout per invocation.
 MiniLM batches contain at most eight 256-token sequences. Qwen uses one input,
@@ -143,6 +146,11 @@ python -m pytest tests/market/test_text_features.py -q
 python -m pytest tests/market/text/test_local_model_smoke.py --run-market=text -k minilm -s
 python -m pytest tests/market/text/test_local_model_smoke.py --run-market=text -k qwen -s
 ```
+
+Default subprocess tests exercise the real worker shell with only inference
+replaced by a synthetic function: byte framing, hard resource limits, artifact
+rechecks and caught synthetic audit-denial accounting. No socket is opened by
+the synthetic audit probe. This does not validate actual ML execution.
 
 Default collection does not import the optional tier. **Neither real-model smoke
 was run**: pins/access and staged weights are unavailable. Synthetic fake tests

@@ -40,10 +40,19 @@ class OptionalCapabilityError(RuntimeError):
 def read_pin(lock_path, model):
     if model not in MODELS:
         raise ValueError('unsupported local model')
-    lock = json.loads(Path(lock_path).read_text())
+    with Path(lock_path).open('rb') as stream:
+        data = stream.read(65537)
+    if len(data) > 65536:
+        raise ValueError('model lock exceeds 64 KiB')
+    lock = json.loads(data)
     if lock.get('version') != 1:
         raise ValueError('unsupported model lock version')
-    pin = lock['models'][model]
+    return validate_pin(lock['models'][model], model)
+
+
+def validate_pin(pin, model):
+    if model not in MODELS or type(pin) is not dict:
+        raise ValueError('unsupported model/pin')
     if pin.get('status') != 'verified':
         raise OptionalCapabilityError('unverified_model_pin', 'immutable artifact metadata must be reviewed before local use')
     if pin.get('repository') != MODELS[model] or pin.get('license') != 'Apache-2.0':
@@ -100,28 +109,61 @@ class LocalModel:
     simple isolation. A successful real-model run is not assumed from fake tests.
     """
     def __init__(self, model, *, lock_path, staged):
-        self.model = model
-        self.pin = read_pin(lock_path, model)
-        self.staged = verify_staged(self.pin, staged)
+        self._model = model
+        pin = read_pin(lock_path, model)
+        self._pin_json = canonical(pin)
+        self._staged = verify_staged(pin, staged)
         absent = [name for name in ('torch', 'transformers', 'safetensors') if importlib.util.find_spec(name) is None]
         if absent:
             raise OptionalCapabilityError('missing_optional_dependencies', 'install the market-text extra explicitly')
         runtime = {name: importlib.metadata.version(name) for name in ('torch', 'transformers', 'safetensors')}
-        self.dimensions = 384 if model == 'minilm' else 0
-        self.tokenizer_sha256 = digest({k: v for k, v in self.pin['files'].items()
+        self._dimensions = 384 if model == 'minilm' else 0
+        self._tokenizer_sha256 = digest({k: v for k, v in self.pin['files'].items()
             if k in {'tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'vocab.txt', 'vocab.json', 'merges.txt'}})
-        self.signature = digest({'implementation': 'local-cpu-v1', 'pin': self.pin, 'tokenizer': self.tokenizer_sha256, 'runtime': runtime})
-        self.provenance = {'kind': model, 'pretrained': True, 'model_sha256': self.signature,
+        self._signature = digest({'implementation': 'local-cpu-v1', 'pin': self.pin, 'tokenizer': self.tokenizer_sha256, 'runtime': runtime})
+        self._provenance_json = canonical({'kind': model, 'pretrained': True, 'model_sha256': self.signature,
                            'tokenizer_sha256': self.tokenizer_sha256, 'pin': self.pin,
                            'training_cutoff': 'unknown', 'contamination_warning': CONTAMINATION,
-                           'runtime_versions': runtime, 'capability': 'local_only_not_live_validated'}
+                           'runtime_versions': runtime, 'capability': 'local_only_not_live_validated'})
         self.last_metrics = None
+
+    @property
+    def model(self):
+        return self._model
+
+    @property
+    def staged(self):
+        return self._staged
+
+    @property
+    def dimensions(self):
+        return self._dimensions
+
+    @property
+    def pin(self):
+        return json.loads(self._pin_json)
+
+    @property
+    def provenance(self):
+        return json.loads(self._provenance_json)
+
+    @property
+    def signature(self):
+        return self._signature
+
+    @property
+    def tokenizer_sha256(self):
+        return self._tokenizer_sha256
 
     def _run(self, texts):
         limit = 8 if self.model == 'minilm' else 1
         if type(texts) is not list or not 1 <= len(texts) <= limit or any(type(t) is not str or len(t) > MAX_CHARS for t in texts):
             raise ValueError('local model text/batch bound exceeded')
         request = {'model': self.model, 'pin': self.pin, 'staged': str(self.staged), 'texts': texts}
+        from .worker import MAX_REQUEST_BYTES
+        serialized = canonical(request)
+        if len(serialized.encode('utf-8')) > MAX_REQUEST_BYTES:
+            raise ValueError('local model request exceeds 256 KiB')
         with tempfile.TemporaryDirectory(prefix='ccr-text-') as tmp:
             env = {**os.environ, 'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',
                    'HF_DATASETS_OFFLINE': '1', 'HF_HOME': tmp, 'TORCH_HOME': tmp,
@@ -129,7 +171,7 @@ class LocalModel:
                    'MKL_NUM_THREADS': '2', 'OPENBLAS_NUM_THREADS': '2', 'CUDA_VISIBLE_DEVICES': ''}
             try:
                 result = subprocess.run([sys.executable, '-m', 'cognitive_runtime.adapters.finance.text.worker'],
-                    input=canonical(request), text=True, capture_output=True, env=env, timeout=60)
+                    input=serialized, text=True, encoding='utf-8', capture_output=True, env=env, timeout=60)
             except subprocess.TimeoutExpired as exc:
                 raise OptionalCapabilityError('resource_limit', 'local model exceeded 60s wall limit') from exc
         if result.returncode:

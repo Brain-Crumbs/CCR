@@ -99,9 +99,17 @@ class TextFeatures:
     def __init__(self, mode='hashing', dimensions=256, *, cache=None):
         if mode not in ('hashing', 'tfidf') or type(dimensions) is not int or not 1 <= dimensions <= 4096:
             raise ValueError('expected hashing/tfidf and dimensions in [1,4096]')
-        self.mode, self.dimensions = mode, dimensions
+        self._mode, self._dimensions = mode, dimensions
         self.cache = cache if cache is not None else FeatureCache()
         self._state = None
+
+    @property
+    def mode(self):
+        return self._mode
+
+    @property
+    def dimensions(self):
+        return self._dimensions
 
     def fit(self, corpus, plan):
         if self._state is not None:
