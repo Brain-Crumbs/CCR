@@ -4,12 +4,12 @@ Fit/calibration views are explicit capabilities, not protection against a caller
 with arbitrary filesystem/Python access. No estimator or model is trained here.
 """
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 import json
 
 from ..schemas.base import Strict, timestamp, sha256
-from ..schemas.records import Instrument, PredictionContractState
+from ..schemas.records import Instrument, PredictionContractState, NewsEvent, PriceBar, Quote
 from cognitive_runtime.data.ledger import canonical, digest
 from cognitive_runtime.data.raw_store import RawStore, private_path
 from cognitive_runtime.data.snapshot import load_snapshot
@@ -112,6 +112,8 @@ def build_corpus(ledger, root, requests, *, spec, calendar=None, coverage='synth
         if coverage == 'synthetic_only' and not decision.context.provenance.synthetic:
             raise ValueError('real data cannot claim synthetic coverage')
         result = derive_label(decision, outcomes, listing_id=request.listing_id, spec=spec, calendar=calendar)
+        if request.listing_id not in {row[2] for row in universe.identities}:
+            result = replace(result, label=None, anchor_to_endpoint_seconds=None, censor_reason='outside_pit_universe')
         feature = {'version': 1, 'sample_id': request.sample_id, 'context': decision.context.to_dict(),
                    'universe': universe.to_dict(), 'records': [r.to_dict() for r in decision.records],
                    'quality_records': [r.to_dict() for r in decision.quality_records]}
@@ -134,6 +136,10 @@ def build_corpus(ledger, root, requests, *, spec, calendar=None, coverage='synth
         end = timestamp(result.nominal_endpoint_at) + timedelta(seconds=spec.endpoint_tolerance_seconds)
         if result.label:
             end = max(end, timestamp(result.label.actual_endpoint_at), timestamp(result.label.target_available_at))
+        else:
+            # Absence/terminal censoring is established only at the frozen
+            # outcome cutoff, never backdated to the nominal endpoint.
+            end = max(end, timestamp(outcomes.context.decision_at))
         start = timestamp(decision.context.decision_at) - timedelta(seconds=max(
             decision.context.price_context.count, decision.context.text_context.count))
         samples.append(Sample(sample_id=request.sample_id, snapshot_sha256=decision.context.hash,
@@ -151,7 +157,6 @@ def attach_training_targets(corpus, ledger, plan, targets):
     the expanded actual interval against every held-out partition before write.
     Return a new corpus and re-bound split; never mutate the old manifest.
     """
-    from dataclasses import replace
     from ..labels import FutureTarget
     from cognitive_runtime.data.snapshot import eligible
     from .splits import _sample_hash
@@ -167,11 +172,19 @@ def attach_training_targets(corpus, ledger, plan, targets):
         snapshot = load_snapshot(ledger, sample.snapshot_sha256)
         if target.context_snapshot_id != snapshot.context.record_id or target.window_start_at != sample.decision_at:
             raise ValueError('target/context window mismatch')
+        future_records = []
         for identity in target.future_record_ids:
             record = ledger.get(identity)
             if not eligible(record, target.window_end_at, 'strict_replay') or timestamp(record.event_at) <= timestamp(sample.decision_at):
                 raise ValueError('future record outside permitted training window')
-        by_id[key] = replace(sample, future_end_at=target.window_end_at)
+            future_records.append(record)
+        evidence = _future_groups(ledger, target.window_end_at, future_records,
+                                  corpus.manifest['event_family_evidence'])
+        by_id[key] = replace(sample, future_end_at=target.window_end_at,
+            issuer_ids=tuple(sorted(set(sample.issuer_ids) | evidence['issuers'])),
+            event_families=tuple(sorted(set(sample.event_families) | evidence['families'])),
+            dedup_keys=tuple(sorted(set(sample.dedup_keys) | evidence['dedup'])),
+            source_keys=tuple(sorted(set(sample.source_keys) | evidence['sources'])))
     samples = tuple(by_id[s.sample_id] for s in corpus.samples)
     new_plan = replace(plan, samples_sha256=_sample_hash(samples))
     validate_split(samples, new_plan)
@@ -199,3 +212,39 @@ def freeze_outcomes(ledger, *, decision_at, calendar_id, calendar_version, calen
     return build_snapshot(ledger, decision_at=decision_at, price_seconds=seconds, text_seconds=seconds,
         calendar_id=calendar_id, calendar_version=calendar_version, calendar_sha256=calendar_sha256,
         preprocessing_sha256=preprocessing_sha256, mode=mode)
+
+
+def _future_groups(ledger, end_at, records, family_mapping):
+    """Future price/text views participate in the same robustness boundaries.
+
+    Resolve point-in-time identities from eligible revisions at the future
+    cutoff, then check their business-valid intervals at each target event.
+    Missing/ambiguous identity is not permission to omit group metadata.
+    """
+    from cognitive_runtime.data.snapshot import select_revisions
+    from cognitive_runtime.data.identity import active
+    with ledger.locked():
+        lineage = {r['record_id']: r['supersedes'] for r in ledger.db.execute('SELECT record_id,supersedes FROM events')}
+        identities = tuple(r for r in select_revisions(ledger._records(), end_at, 'strict_replay', lineage)
+                           if type(r) is Instrument)
+    result = {'issuers': set(), 'families': set(), 'dedup': set(), 'sources': set()}
+    for record in records:
+        if type(record) is NewsEvent:
+            if not record.entities or any(e.ambiguous for e in record.entities):
+                raise ValueError('future news requires unambiguous issuer evidence')
+            result['issuers'].update(e.issuer_id for e in record.entities)
+            result['dedup'].add(record.dedup_cluster_id)
+            result['sources'].add(record.source_id + ':' + record.source_record_id)
+        elif type(record) in (PriceBar, Quote, PredictionContractState):
+            at = record.end_at if type(record) is PriceBar else record.event_at
+            matches = [i for i in identities if i.listing_id == record.listing_id and active(i, at)]
+            if len(matches) != 1:
+                raise ValueError('future price requires unambiguous PIT issuer identity')
+            result['issuers'].add(matches[0].issuer_id)
+            if type(record) is PredictionContractState:
+                if record.market_id not in family_mapping:
+                    raise ValueError('future contract requires event-family evidence')
+                result['families'].add(family_mapping[record.market_id])
+        else:
+            raise ValueError('unsupported future-target observation family')
+    return result

@@ -356,3 +356,99 @@ def test_exact_session_horizons_and_after_hours(ledger):
     assert result.label.anchor_record_id == a.record_id and result.label.endpoint_record_id == e.record_id
     assert result.label.nominal_endpoint_at == end
     assert result.anchor_to_endpoint_seconds == 71*3600
+
+
+@pytest.mark.parametrize('late_kind', ['endpoint', 'split'])
+def test_late_observation_extends_target_availability_and_purge(ledger, late_kind):
+    observed = '2025-03-10T15:00:00Z'
+    add(ledger, identity())
+    add(ledger, bar(T))
+    add(ledger, bar(END, '55' if late_kind == 'split' else '110',
+                    observed_at=observed if late_kind == 'endpoint' else END,
+                    ingested_at=observed if late_kind == 'endpoint' else END))
+    if late_kind == 'split':
+        a = examples()['CorporateAction']
+        add(ledger, replace(a, **{**envelope(type(a), 'late-split', END), 'observed_at':observed,
+            'ingested_at':observed}, announced_at=END, effective_at=END))
+    d, o = snap(ledger), snap(ledger, observed)
+    result = derive_label(d,o,listing_id='listing:demo',spec=spec(),calendar=CALENDARS[0])
+    assert result.label.value == '0.1'
+    assert result.label.target_available_at == observed
+    request = Request(sample_id='late',snapshot_sha256=d.context.hash,outcome_snapshot_sha256=o.context.hash,
+                      listing_id='listing:demo',universe_id='synthetic-universe-v1')
+    with tempfile.TemporaryDirectory(dir='/tmp') as root:
+        corpus = build_corpus(ledger,root,[request],spec=spec(),calendar=CALENDARS[0])
+        assert corpus.samples[0].label_end_at == observed
+        held = replace(corpus.samples[0], sample_id='held',decision_at='2025-03-10T14:00:00Z',
+                       context_start_at='2025-03-10T13:00:00Z',label_end_at='2025-03-10T16:00:00Z')
+        p = walk_forward((*corpus.samples,held),validation_at='2025-03-10T00:00:00Z',test_at='2025-03-11T00:00:00Z')
+        assert p.train == () and p.validation == ('held',)
+
+
+def test_outside_pit_universe_retains_explicit_censor(ledger):
+    add(ledger,identity())
+    add(ledger,bar(T))
+    add(ledger,bar(END,'110'))
+    d,o=snap(ledger),snap(ledger,END)
+    request=Request(sample_id='outside',snapshot_sha256=d.context.hash,outcome_snapshot_sha256=o.context.hash,
+                    listing_id='listing:demo',universe_id='not-the-universe')
+    with tempfile.TemporaryDirectory(dir='/tmp') as root:
+        corpus=build_corpus(ledger,root,[request],spec=spec(),calendar=CALENDARS[0])
+        assert corpus.population() == {'total':1,'reasons':{'outside_pit_universe':1}}
+        assert corpus.feature('outside')['universe']['identities'] == []
+        assert corpus._outcome('outside').label is None
+
+
+@pytest.mark.parametrize('group', ['temporal','issuer'])
+def test_future_news_contamination_revalidated_before_write(ledger,group):
+    from cognitive_runtime.data.raw_store import RawStore
+    future_at='2025-03-10T15:30:00Z'
+    news=examples()['NewsEvent']
+    future=add(ledger,replace(news,**envelope(type(news),'future-news',future_at),
+        first_seen_at=future_at,original_published_at=future_at,
+        entities=(replace(news.entities[0],issuer_id='held-issuer'),)))
+    requests=[]
+    for day in (10,11):
+        at,end=f'2025-03-{day}T14:00:00Z',f'2025-03-{day}T15:00:00Z'
+        issuer='train-issuer' if day==10 else 'held-issuer'
+        # Expire the first identity before validation so group isolation is real.
+        add(ledger,identity(at,record_id=f'i{day}',source_record_id=f'i{day}',listing_id=f'l{day}',
+            security_id=f's{day}',issuer_id=issuer,effective_to='2025-03-11T00:00:00Z' if day==10 else None))
+        add(ledger,bar(at,listing_id=f'l{day}'))
+        add(ledger,bar(end,'110',listing_id=f'l{day}'))
+        d,o=snap(ledger,at,price_seconds=3600),snap(ledger,end)
+        requests.append(Request(sample_id=str(day),snapshot_sha256=d.context.hash,outcome_snapshot_sha256=o.context.hash,
+                                listing_id=f'l{day}',universe_id='synthetic-universe-v1'))
+    with tempfile.TemporaryDirectory(dir='/tmp') as root:
+        corpus=build_corpus(ledger,root,requests,spec=spec(),calendar=CALENDARS[0])
+        p=walk_forward(corpus.samples,validation_at='2025-03-11T00:00:00Z',test_at='2025-03-12T00:00:00Z',group=group)
+        assert p.train==('10',) and p.validation==('11',)
+        target=FutureTarget(**envelope(FutureTarget,'target',future_at),split='train',
+            context_snapshot_id=corpus.feature('10')['context']['record_id'],window_start_at='2025-03-10T14:00:00Z',
+            window_end_at=future_at,future_record_ids=(future.record_id,),stop_gradient=True)
+        before=list((Path(root)/'targets').rglob('*'))
+        with pytest.raises(ValueError,match='contamination'):
+            attach_training_targets(corpus,ledger,p,{'10':target})
+        assert list((Path(root)/'targets').rglob('*'))==before
+        assert corpus.manifest['targets']=={}
+
+
+def test_future_price_identity_and_contract_family_fail_closed(ledger):
+    from cognitive_runtime.adapters.finance.datasets.corpus import _future_groups
+    at='2025-03-10T15:30:00Z'
+    future=add(ledger,bar(at))
+    with pytest.raises(ValueError,match='PIT issuer identity'):
+        _future_groups(ledger,at,[future],{})
+    add(ledger,identity('2025-03-10T14:00:00Z'))
+    assert _future_groups(ledger,at,[future],{})['issuers']=={'issuer:demo'}
+    c=add(ledger,contract(at))
+    add(ledger,identity('2025-03-10T14:00:00Z',record_id='contract-i',source_record_id='contract-i',
+        listing_id='contract:demo',security_id='contract-security',issuer_id='contract-issuer',kind='binary_contract'))
+    with pytest.raises(ValueError,match='event-family'):
+        _future_groups(ledger,at,[c],{})
+    groups=_future_groups(ledger,at,[c],{'market:demo':'family-held'})
+    assert groups['families']=={'family-held'}
+    assert groups['issuers']=={'contract-issuer'}
+    samples=(sample('train',8,9,event_families=tuple(groups['families'])),
+             sample('held',12,13,event_families=('family-held',)),sample('test',16,17))
+    assert plan(samples,group='event_family').train==()

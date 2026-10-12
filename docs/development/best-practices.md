@@ -165,3 +165,5 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | Date | ID | Change | Reason and evidence |
 | --- | --- | --- | --- |
 | 2026-10-12 | BP-008 | Proposed | #291 stale feed observations can masquerade as current prices; nominal horizons alone miss latent-target overlap. Exact delayed-feed and injected-split failures added. |
+
+| 2026-10-12 | BP-008 | Independent-review regression evidence | PR #305 first-head review reproduced late-observation availability escaping purge (R1), realized labels outside declared PIT membership (R2), and future-target story/issuer metadata bypass (R3). Include effective knowledge clocks and full future-view contamination metadata; retain an explicit non-member censor. Added direct negative regressions; fresh revised-head review required. |

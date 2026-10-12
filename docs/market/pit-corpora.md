@@ -130,3 +130,12 @@ No live source, production exchange calendar, survivorship-free universe,
 forecast accuracy, investment value, or pretrained model is validated. The
 lightweight core test runner and unchanged five-minute core CI job caps remain
 the default gates; extended tests are opt-in.
+
+Effective label knowledge includes both provider availability and first collector
+observation of endpoint/split inputs, conservatively also for reconstructed data.
+A delayed observation therefore extends purging beyond the price endpoint.
+Censored outcomes extend through their frozen outcome cutoff. Out-of-universe
+requests remain in the population with `outside_pit_universe`, never as realized
+member labels. Attached future observations contribute their own source/dedup,
+issuer and contract-family evidence to split validation before any target write;
+unknown future identities/families fail closed.

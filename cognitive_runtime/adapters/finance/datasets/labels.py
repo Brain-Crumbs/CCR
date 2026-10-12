@@ -153,7 +153,10 @@ def derive_label(decision, outcomes, *, listing_id, spec, calendar=None):
             multiplier *= Decimal(action.split_ratio)
         adjusted = Decimal(_price(endpoint)) * multiplier
     value = price_change(spec.target, _price(anchor), format(adjusted, 'f'))
-    available = max([timestamp(r.available_at) for r in (endpoint, *splits)] + [timestamp(_clock(endpoint))])
+    # A provider clock alone cannot make a late-observed strict target known.
+    # Keep this conservative for reconstructed snapshots as well.
+    available = max([timestamp(clock) for r in (endpoint, *splits)
+                     for clock in (r.available_at, r.observed_at)] + [timestamp(_clock(endpoint))])
     from .calendars import utc
     # Derived record envelope binds exact input snapshots and spec, not fabricated
     # provider raw content. Minimal provenance remains separate from raw storage.
@@ -162,8 +165,9 @@ def derive_label(decision, outcomes, *, listing_id, spec, calendar=None):
     identity = digest({**common, 'anchor': anchor.hash, 'endpoint': endpoint.hash, 'actions': [r.hash for r in splits]})
     label = RealizedLabel(schema_name='RealizedLabel', schema_version='1.0.0', record_id='label:' + identity,
         source_id='pit-label-v1', source_record_id=identity, revision=1, supersedes_record_id=None,
-        event_at=utc(available), available_at=outcomes.context.observed_at, observed_at=outcomes.context.observed_at,
-        ingested_at=outcomes.context.ingested_at, availability_basis=outcomes.context.availability_basis,
+        event_at=utc(available), available_at=utc(max(available, timestamp(outcomes.context.observed_at))),
+        observed_at=utc(max(available, timestamp(outcomes.context.observed_at))),
+        ingested_at=utc(max(available, timestamp(outcomes.context.ingested_at))), availability_basis=outcomes.context.availability_basis,
         availability_confidence='1', original_timezone='UTC', timestamp_precision='microsecond',
         provenance=Provenance(raw_sha256=identity, adapter_version='pit-label-v1', rights='derived-provenance',
             license='operator-policy', synthetic=decision.context.provenance.synthetic and outcomes.context.provenance.synthetic,

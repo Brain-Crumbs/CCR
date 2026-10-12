@@ -80,3 +80,35 @@ not an ignored runtime argument. Existing market schema wire formats are unchang
 - Independent review, exact submitted-head validation/CI and actual protection
   visibility remain final gates. No GitHub approval or merge is claimed by local
   review or passing tests. Parent tracking remains unchecked until verified merge.
+
+## Submitted-head review and repair
+
+Draft [PR #305](https://github.com/Brain-Crumbs/CCR/pull/305) first submitted at
+`c1ef01bc3f6db281fc19cad0871d26c01895eb77`, base unchanged. A fresh independent
+agent reviewed that exact head, ran all 37 targeted tests (2.89s), and reproduced:
+
+- R1/P1: late endpoint/split observation clocks were omitted from effective label
+  availability, allowing unknown training targets across a held-out boundary.
+- R2/P2: a requested listing could receive a realized label outside the declared
+  frozen universe.
+- R3/P1: attached future records expanded time intervals without expanding
+  story/source/issuer/family evidence, allowing train future text in validation.
+
+Repairs include endpoint/action observation clocks in effective availability,
+retain explicit `outside_pit_universe` censoring, and union future-target identity,
+source and story evidence before validating the expanded split and writing any
+new targets. Unknown/ambiguous future issuer or contract-family mapping fails
+closed. Censored label knowledge conservatively extends through the frozen
+outcome cutoff. Direct regressions cover delayed endpoint and split observations,
+non-member universe populations, reused future text in temporal/issuer splits,
+and absent future price/family identities.
+
+Initial-head [CI run 38280596044](https://github.com/Brain-Crumbs/CCR/actions/runs/38280596044)
+passed core, Factory/hash and aggregate-budget jobs. Manual-only CPU-Torch was
+skipped as configured; it remains optional for this framework-free dataset scope.
+The parent independently confirmed main `protected:false`, protection disabled,
+no rulesets and no GitHub reviews through authorized connector reads. This
+supersedes the child visibility gap for that observed state; parent must refresh
+protection/review gates immediately before any authorized merge. The independent
+agent review is **not** a submitted GitHub approval. New-head review/CI is required
+after these fixes; first-head success is not carried forward.
