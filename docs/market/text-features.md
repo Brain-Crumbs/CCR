@@ -1,11 +1,12 @@
 # Snapshot-bound text features (#292)
 
-**Current readiness: synthetic_only baseline; optional model pin resolution blocked.**
-The checked-in `config/market/models.lock.json` deliberately contains no invented
-commits or SHA256 values. Both optional capabilities fail as `unverified_model_pin`.
-The execution environment denied the official model metadata request with proxy
-HTTP 403 on 2026-10-12. Do not mark #292 complete until reviewed immutable pins
-replace this disabled inventory and the acceptance matrix is reconciled.
+**Current readiness: synthetic_only baseline; optional model pins verified remotely.**
+The checked-in `config/market/models.lock.json` records immutable revisions,
+artifact/tokenizer SHA256 and sizes, and selected-revision license evidence.
+Normal official metadata access succeeded on 2026-10-12 after the environment
+network update. No weights were downloaded or staged: optional capabilities now
+fail as `missing_local_artifacts` until the exact approved inventory is present.
+Real-model execution, quality and resource fit remain unverified.
 
 ## Baseline operation
 
@@ -62,30 +63,35 @@ references; process exit releases them. No disk cache or retention policy is
 silently introduced. Exported artifacts, operator copies and source revocation
 remain the operator's rights/retention responsibility.
 
-## Optional local models: blocked pending verified pins
+## Optional local models: verified pins, explicit staging
 
-Candidate official cards:
+| Model | Immutable model/tokenizer revision | Selected-revision license evidence |
+| --- | --- | --- |
+| MiniLM | `1110a243fdf4706b3f48f1d95db1a4f5529b4d41` | [README](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/blob/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/README.md) declares Apache-2.0; upstream has no separate LICENSE |
+| Qwen | `7ae557604adf67be50417f59c2c2f167def9a775` | [README](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/7ae557604adf67be50417f59c2c2f167def9a775/README.md) and [LICENSE](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/7ae557604adf67be50417f59c2c2f167def9a775/LICENSE) agree on Apache-2.0 |
 
-- [MiniLM](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) describes
-  Apache-2.0, 384-dimensional sentence embeddings and 256-wordpiece truncation.
-  Selected runtime settings are attention-mask mean pooling, L2 normalization,
-  CPU float32 and frozen parameters. We use the card's Transformers approach,
-  not a mandatory sentence-transformers import.
-- [Qwen](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) is the optional local
-  extraction candidate. License **at the selected immutable revision is still
-  unverified**; the runtime accepts only reviewed Apache-2.0 pins for this candidate.
+MiniLM uses 384 dimensions, 256-token truncation, attention-mask mean pooling,
+L2 normalization, CPU float32 and frozen parameters, matching its card's
+Transformers approach. Qwen uses CPU float32 rather than the upstream bfloat16
+configuration; it remains optional and may not fit our hard resource limits.
+Neither selected card substantiates a complete training cutoff.
 
-These current card reads do not establish immutable artifact identity. A completed
-lock needs a 40-hex model commit and matching tokenizer revision, exact SHA256 and
-byte size of **every loaded file**, immutable official evidence URLs, and reviewed
-README/license hashes. Use the exact file inventory in `local.REQUIRED` plus
-`README.md` and `LICENSE`; no alternate pickle weights, custom Python code, extra
-configs or symlinks are allowed. Resolve metadata through permitted official
-sources; never fabricate hashes, bypass denied access, or silently download.
-The repository currently ships only the disabled lock. A future verified lock
-requires code review; setting `status` alone cannot pass the validator.
+Each lock entry provides the official revision metadata URL and immutable file
+URLs. Weight SHA256/size come from that revision's official LFS metadata:
+**weight bytes have not been downloaded or locally hashed**. Every other listed
+file was downloaded, matched to metadata by byte size and Git blob SHA1, then
+SHA256-hashed locally. `status: verified` means reviewed pin evidence, not staged
+weights or successful inference. Runtime rehashes every staged file before use.
 
-Once pins are reviewed, explicitly install `.[market-text]` and stage exactly the
+Stage the exact `local.REQUIRED` inventory plus README for both models and
+LICENSE for Qwen only. The MiniLM README is its pinned license evidence; no
+fabricated LICENSE file is required. Alternate pickle weights, custom Python,
+extra configs and symlinks are rejected. All file evidence URLs must name the
+same immutable model/tokenizer revision. Changes require review; setting
+`status` alone cannot pass the validator. Do not bypass denied access or download
+weights automatically. The repository contains metadata hashes, not model files.
+
+To opt in, explicitly install `.[market-text]` and stage exactly the
 approved files in a private directory. The library has **no downloader**:
 
 ```python
@@ -153,6 +159,6 @@ rechecks and caught synthetic audit-denial accounting. No socket is opened by
 the synthetic audit probe. This does not validate actual ML execution.
 
 Default collection does not import the optional tier. **Neither real-model smoke
-was run**: pins/access and staged weights are unavailable. Synthetic fake tests
+was run**: staged weights are unavailable. Synthetic fake tests
 cover schema/cache/import boundaries; they do not validate real tokenization,
 loading, extraction usefulness or that the real model fits resource limits.

@@ -21,7 +21,7 @@ from cognitive_runtime.adapters.finance.text.features import (
 from cognitive_runtime.adapters.finance.text.cache import FeatureCache, cache_key
 from cognitive_runtime.adapters.finance.text.extractor import StructuredExtractor, validate_output, SCHEMA_HASH, PROMPT_HASH
 from cognitive_runtime.adapters.finance.text.local import (
-    LocalModel, OptionalCapabilityError, verify_staged, read_pin, REQUIRED, SETTINGS, MODELS,
+    LocalModel, OptionalCapabilityError, verify_staged, read_pin, REQUIRED, SETTINGS, MODELS, LICENSE_EVIDENCE,
 )
 
 FIXTURES = Path(__file__).parents[1] / 'fixtures/market/text'
@@ -247,13 +247,13 @@ def fake_pin(tmp_path, model='minilm'):
     root = tmp_path / model
     root.mkdir()
     files = {}
-    for name in REQUIRED[model] | {'README.md','LICENSE'}:
+    for name in REQUIRED[model] | {'README.md', LICENSE_EVIDENCE[model]}:
         content = ('synthetic fixture ' + name).encode()
         (root / name).write_bytes(content)
         files[name] = {'size':len(content),'sha256':hashlib.sha256(content).hexdigest(),
-                      'evidence_url':'https://huggingface.co/'+MODELS[model]+'/synthetic-test-only'}
+                      'evidence_url':f'https://huggingface.co/{MODELS[model]}/resolve/{"a"*40}/{name}'}
     pin = {'status':'verified','repository':MODELS[model], 'revision':'a'*40,'tokenizer_revision':'a'*40,
-           'license':'Apache-2.0','files':files,'settings':SETTINGS[model],'training_cutoff':'unknown'}
+           'license':'Apache-2.0','license_evidence':LICENSE_EVIDENCE[model],'files':files,'settings':SETTINGS[model],'training_cutoff':'unknown'}
     lock = tmp_path/'lock.json'
     lock.write_text(json.dumps({'version':1,'models':{model:pin}}))
     return pin, root, lock
@@ -277,10 +277,13 @@ def test_pin_and_local_inventory_fail_closed(tmp_path):
         read_pin(lock, 'minilm')
 
 
-def test_shipped_unresolved_pin_is_explicit_blocker(tmp_path):
+def test_shipped_verified_pins_still_require_staged_weights(tmp_path):
     lock = Path(__file__).parents[2]/'config/market/models.lock.json'
     for name in MODELS:
-        with pytest.raises(OptionalCapabilityError, match='unverified_model_pin'):
+        pin = read_pin(lock, name)
+        assert pin['training_cutoff'] == 'unknown'
+        assert pin['license_evidence'] in pin['files']
+        with pytest.raises(OptionalCapabilityError, match='missing_local_artifacts'):
             LocalModel(name, lock_path=lock, staged=tmp_path)
 
 
@@ -448,3 +451,30 @@ worker.main()
     result = subprocess.run([sys.executable, '-c', code], text=True, capture_output=True,
         input=canonical({'model':'minilm','pin':pin,'staged':str(root),'texts':['x']}))
     assert result.returncode != 0 and 'network attempt even if caught' in result.stderr
+
+
+@pytest.mark.parametrize('model', ['minilm', 'qwen'])
+def test_license_inventory_and_immutable_evidence_required(tmp_path, model):
+    pin, root, lock = fake_pin(tmp_path, model)
+    assert read_pin(lock, model) == pin
+    assert ('LICENSE' in pin['files']) == (model == 'qwen')
+    def reject(message):
+        lock.write_text(json.dumps({'version': 1, 'models': {model: pin}}))
+        with pytest.raises(ValueError, match=message):
+            read_pin(lock, model)
+    original = pin['files']['README.md']['evidence_url']
+    pin['files']['README.md']['evidence_url'] = original.replace('a'*40, 'main')
+    reject('immutable official')
+    pin['files']['README.md']['evidence_url'] = original
+    pin['license_evidence'] = 'unreviewed.txt'
+    reject('license evidence')
+    pin['license_evidence'] = LICENSE_EVIDENCE[model]
+    del pin['files'][LICENSE_EVIDENCE[model]]
+    reject('inventory')
+
+def test_disabled_pin_remains_unavailable(tmp_path):
+    pin, root, lock = fake_pin(tmp_path)
+    pin['status'] = 'access_denied'
+    lock.write_text(json.dumps({'version': 1, 'models': {'minilm': pin}}))
+    with pytest.raises(OptionalCapabilityError, match='unverified_model_pin'):
+        LocalModel('minilm', lock_path=lock, staged=root)

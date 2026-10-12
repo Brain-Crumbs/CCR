@@ -25,6 +25,8 @@ REQUIRED = {'minilm': {'config.json', 'model.safetensors', 'tokenizer.json', 'to
                        'special_tokens_map.json', 'vocab.txt'},
             'qwen': {'config.json', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json',
                      'vocab.json', 'merges.txt', 'generation_config.json'}}
+# MiniLM declares its license in README; Qwen additionally ships LICENSE.
+LICENSE_EVIDENCE = {'minilm': 'README.md', 'qwen': 'LICENSE'}
 SETTINGS = {'minilm': {'dimensions': 384, 'max_tokens': 256, 'pooling': 'attention-mask-mean',
                         'normalization': 'l2', 'dtype': 'float32', 'frozen': True},
             'qwen': {'max_tokens': 1536, 'max_new_tokens': 384, 'do_sample': False,
@@ -62,7 +64,9 @@ def validate_pin(pin, model):
     if pin.get('settings') != SETTINGS[model] or pin.get('training_cutoff') != 'unknown':
         raise ValueError('unsupported settings/cutoff; requires a reviewed implementation update')
     files = pin['files']
-    if set(files) != REQUIRED[model] | {'README.md', 'LICENSE'}:
+    if pin.get('license_evidence') != LICENSE_EVIDENCE[model]:
+        raise ValueError('reviewed license evidence required')
+    if set(files) != REQUIRED[model] | {'README.md', LICENSE_EVIDENCE[model]}:
         raise ValueError('exact reviewed artifact inventory required')
     total = 0
     for name, entry in files.items():
@@ -72,8 +76,9 @@ def validate_pin(pin, model):
             raise ValueError('artifact SHA256 required')
         if type(entry['size']) is not int or not 0 < entry['size'] <= 2*1024**3:
             raise ValueError('artifact size outside bound')
-        if not entry['evidence_url'].startswith('https://huggingface.co/' + MODELS[model] + '/'):
-            raise ValueError('official artifact evidence required')
+        expected_url = f'https://huggingface.co/{MODELS[model]}/resolve/{pin["revision"]}/{name}'
+        if entry['evidence_url'] != expected_url:
+            raise ValueError('immutable official artifact evidence required')
         total += entry['size']
     if total > 2*1024**3:
         raise ValueError('staged model exceeds 2 GiB artifact bound')

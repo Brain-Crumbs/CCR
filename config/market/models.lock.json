@@ -4,10 +4,10 @@
   "models": {
     "minilm": {
       "repository": "sentence-transformers/all-MiniLM-L6-v2",
-      "status": "access_denied",
-      "revision": null,
-      "tokenizer_revision": null,
-      "license": null,
+      "status": "verified",
+      "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+      "tokenizer_revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+      "license": "Apache-2.0",
       "training_cutoff": "unknown",
       "settings": {
         "dimensions": 384,
@@ -17,16 +17,58 @@
         "dtype": "float32",
         "frozen": true
       },
-      "files": {},
-      "card_url": "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
-      "pin_blocker": "Execution-environment proxy denied official metadata request (HTTP 403). No immutable revision/hash/license pin has been verified; model use disabled."
+      "files": {
+        "README.md": {
+          "sha256": "dcd602d2fd35c203a247304a06fec6654a12f7941b739f9221a064fe8dc3b7f0",
+          "size": 10502,
+          "evidence_url": "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/README.md"
+        },
+        "config.json": {
+          "sha256": "953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41",
+          "size": 612,
+          "evidence_url": "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/config.json"
+        },
+        "model.safetensors": {
+          "sha256": "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db",
+          "size": 90868376,
+          "evidence_url": "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/model.safetensors"
+        },
+        "special_tokens_map.json": {
+          "sha256": "303df45a03609e4ead04bc3dc1536d0ab19b5358db685b6f3da123d05ec200e3",
+          "size": 112,
+          "evidence_url": "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/special_tokens_map.json"
+        },
+        "tokenizer.json": {
+          "sha256": "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037",
+          "size": 466247,
+          "evidence_url": "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/tokenizer.json"
+        },
+        "tokenizer_config.json": {
+          "sha256": "acb92769e8195aabd29b7b2137a9e6d6e25c476a4f15aa4355c233426c61576b",
+          "size": 350,
+          "evidence_url": "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/tokenizer_config.json"
+        },
+        "vocab.txt": {
+          "sha256": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3",
+          "size": 231508,
+          "evidence_url": "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/vocab.txt"
+        }
+      },
+      "card_url": "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/blob/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/README.md",
+      "license_evidence": "README.md",
+      "metadata_url": "https://huggingface.co/api/models/sentence-transformers/all-MiniLM-L6-v2/revision/1110a243fdf4706b3f48f1d95db1a4f5529b4d41?blobs=true",
+      "verification": {
+        "model.safetensors": "official revision metadata LFS SHA256 and size only; bytes not downloaded",
+        "other_files": "downloaded from immutable resolve URLs; byte size and Git blob SHA1 matched revision metadata; SHA256 computed locally",
+        "license_review": "selected revision README declares Apache-2.0; no separate LICENSE in repository"
+      }
     },
     "qwen": {
       "repository": "Qwen/Qwen2.5-0.5B-Instruct",
-      "status": "access_denied",
-      "revision": null,
-      "tokenizer_revision": null,
-      "license": null,
+      "status": "verified",
+      "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+      "tokenizer_revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+      "license": "Apache-2.0",
       "training_cutoff": "unknown",
       "settings": {
         "max_tokens": 1536,
@@ -35,9 +77,61 @@
         "dtype": "float32",
         "frozen": true
       },
-      "files": {},
-      "card_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct",
-      "pin_blocker": "Execution-environment proxy denied official metadata request (HTTP 403). No immutable revision/hash/license pin has been verified; model use disabled."
+      "files": {
+        "LICENSE": {
+          "sha256": "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e",
+          "size": 11343,
+          "evidence_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae557604adf67be50417f59c2c2f167def9a775/LICENSE"
+        },
+        "README.md": {
+          "sha256": "b19c806a904db6dc878a0462e70b551f6b7ac78dfbb88c2eb966ca2b9109ae15",
+          "size": 4917,
+          "evidence_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae557604adf67be50417f59c2c2f167def9a775/README.md"
+        },
+        "config.json": {
+          "sha256": "18e18afcaccafade98daf13a54092927904649e1dd4eba8299ab717d5d94ff45",
+          "size": 659,
+          "evidence_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae557604adf67be50417f59c2c2f167def9a775/config.json"
+        },
+        "generation_config.json": {
+          "sha256": "e558847a8b4402616f1273797b015104dc266fe4b520056fca88823ba8f8ebe6",
+          "size": 242,
+          "evidence_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae557604adf67be50417f59c2c2f167def9a775/generation_config.json"
+        },
+        "merges.txt": {
+          "sha256": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+          "size": 1671839,
+          "evidence_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae557604adf67be50417f59c2c2f167def9a775/merges.txt"
+        },
+        "model.safetensors": {
+          "sha256": "fdf756fa7fcbe7404d5c60e26bff1a0c8b8aa1f72ced49e7dd0210fe288fb7fe",
+          "size": 988097824,
+          "evidence_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae557604adf67be50417f59c2c2f167def9a775/model.safetensors"
+        },
+        "tokenizer.json": {
+          "sha256": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+          "size": 7031645,
+          "evidence_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae557604adf67be50417f59c2c2f167def9a775/tokenizer.json"
+        },
+        "tokenizer_config.json": {
+          "sha256": "5b5d4f65d0acd3b2d56a35b56d374a36cbc1c8fa5cf3b3febbbfabf22f359583",
+          "size": 7305,
+          "evidence_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae557604adf67be50417f59c2c2f167def9a775/tokenizer_config.json"
+        },
+        "vocab.json": {
+          "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+          "size": 2776833,
+          "evidence_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/7ae557604adf67be50417f59c2c2f167def9a775/vocab.json"
+        }
+      },
+      "card_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/7ae557604adf67be50417f59c2c2f167def9a775/README.md",
+      "license_evidence": "LICENSE",
+      "metadata_url": "https://huggingface.co/api/models/Qwen/Qwen2.5-0.5B-Instruct/revision/7ae557604adf67be50417f59c2c2f167def9a775?blobs=true",
+      "verification": {
+        "model.safetensors": "official revision metadata LFS SHA256 and size only; bytes not downloaded",
+        "other_files": "downloaded from immutable resolve URLs; byte size and Git blob SHA1 matched revision metadata; SHA256 computed locally",
+        "license_review": "selected revision README and LICENSE agree on Apache-2.0"
+      }
     }
   }
 }

@@ -14,7 +14,7 @@
   resource`; main workflow and repository delivery conventions followed.
 - Authorized endpoint: reviewed **draft PR only**, no merge, issue closure or
   parent checklist edits. Actual final protection/approval gates belong to parent.
-- This is a **partial, blocked delivery**, not completion of #292. No paid/hosted
+- Current scope: pin evidence is resolved; real-model smoke remains unrun. No paid/hosted
   APIs, live data, credential changes, model downloads or substantial training.
 
 ## Acceptance matrix
@@ -23,8 +23,8 @@
 | --- | --- | --- | --- |
 | A1 | Lightweight hashing/TF-IDF, train-only fitting | `TextFeatures.fit`, real #291 corpus/split tests and exact TF-IDF counts | Implemented; synthetic_only |
 | A2 | Snapshot-selected inputs and IDs/dtype/dimensions/signature | `selected_news`, `FeatureArtifact`, tamper/knowledge-clock/missing/deletion tests | Implemented |
-| A3 | Optional local MiniLM, pinned revision/artifacts/tokenizer/license/settings | Strict lock/staged-file validation and bounded worker; candidate card only | **BLOCKED: immutable pins absent** |
-| A4 | Optional local Qwen, reviewed pin/license and schema/prompt version | Local worker and extraction validator; prompt/schema digests, fake extraction tests | **BLOCKED: immutable pins absent** |
+| A3 | Optional local MiniLM, pinned revision/artifacts/tokenizer/license/settings | Immutable revision/LFS metadata, locally hashed config/tokenizer/card, README license declaration | Pins met; real execution unverified |
+| A4 | Optional local Qwen, reviewed pin/license and schema/prompt version | Immutable revision/LFS metadata, locally hashed tokenizer/card/LICENSE; prompt/schema digests | Pins met; optional real extraction unverified |
 | A5 | Revision/model/tokenizer/preprocessor cache invalidation | Cache tests, serialized immutable LRU, frozen encoder/extractor regressions | Implemented |
 | A6 | No default torch/transformers or automatic downloads; missing weights clear | Import-denial subprocess, missing/dependency/file-status tests, explicit local-only kwargs | Implemented default boundary; real load unverified |
 | A7 | Bounded lengths/batches/memory/compute | Baseline caps, local child resource limits and timeout tests | Implemented; real-model memory/runtime unverified |
@@ -34,7 +34,7 @@
 | A11 | Synthetic provenance, offline budget <=120s, default CI <=5 min | `tests/fixtures/market/text/provenance.json`, existing core runner and unchanged default CI caps | Verification pending |
 | A12 | Operator docs, delivery ledger, living practices and exact-head review | `text-features.md`, BP-009, this ledger | Submitted-head review pending |
 
-## Pin access blocker and evidence limits
+## Prior pin access blocker (superseded below)
 
 Official candidate cards were readable through the web tool on 2026-10-12.
 The execution-environment request to the official Hugging Face metadata API
@@ -45,7 +45,7 @@ was available when this ledger was written. The checked-in lock has null
 revisions/license, empty files and `access_denied` status; runtime fails as
 `unverified_model_pin`. This is an intentionally visible acceptance blocker.
 
-A permitted official source must establish immutable model/tokenizer revisions,
+At that earlier head, a permitted official source was required to establish immutable model/tokenizer revisions,
 all loaded artifact hashes/sizes and selected-revision license/card evidence.
 Only then can reviewed pins enable local staging/use. Optional real MiniLM/Qwen
 smoke remains **unrun**, not a passing fixture or `validated_live` claim.
@@ -130,3 +130,67 @@ zero network attempts/model-cache files and exact collection/execution membershi
 verified by `check_core_budget.py`. Targeted **33 passed in 4.04s**. Existing schema
 fixtures and CI caps are unchanged. These are local repair-content measurements;
 remote exact-head CI/review evidence is recorded in the PR after submission.
+
+
+## Network refresh and verified pin revision (2026-10-12)
+
+Resumed existing PR #306 from `f17cab3a396d810f71d2d0883ae2695f45348948`,
+with main/base unchanged at `46330f12b71f21952268e5e922b078f2a58679ec`.
+No workspace/checkout AGENTS.md, skills or .agents/skills files were present.
+Full #292/#283 bodies and PR state were refreshed; issue timestamps unchanged.
+The workflow skill's linked references still returned `failed to read skill resource`.
+
+First normal-network command (no settings changes/bypass):
+
+```sh
+curl --silent --show-error --max-time 30 --dump-header /tmp/issue292-hf-headers.txt --output /tmp/issue292-hf-metadata.json --write-out 'http_code=%{http_code}\n' 'https://huggingface.co/api/models/sentence-transformers/all-MiniLM-L6-v2?blobs=true'
+```
+
+Result: exit 0, **HTTP 200**, 0.395s. Then read each model's official API,
+resolved its immutable revision and fetched `/api/models/{repository}/revision/{revision}?blobs=true`.
+Downloaded only the small non-weight files at `/resolve/{revision}/{filename}`.
+For each, checked size and Git blob SHA1 against revision metadata, then computed
+SHA256 locally. Weight SHA256/size were taken from the official LFS metadata;
+weight bytes were not downloaded, hashed locally, or executed. All exact URLs,
+SHA256s and sizes are in `config/market/models.lock.json`.
+
+- MiniLM: `1110a243fdf4706b3f48f1d95db1a4f5529b4d41`; safetensors
+  `53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db`,
+  90,868,376 bytes. Selected README declares Apache-2.0, 384 dimensions,
+  256-wordpiece truncation and mask-mean/L2 pooling. No upstream LICENSE exists;
+  exact staged inventory now requires its pinned README as license evidence.
+- Qwen: `7ae557604adf67be50417f59c2c2f167def9a775`; safetensors
+  `fdf756fa7fcbe7404d5c60e26bff1a0c8b8aa1f72ced49e7dd0210fe288fb7fe`,
+  988,097,824 bytes. Selected README and Alibaba Cloud LICENSE agree on Apache-2.0.
+  CPU float32 is our explicit override of its upstream bfloat16 configuration.
+
+Both retain **unknown** substantiated training cutoff and contamination warnings.
+No live financial data, paid services, credentials, optional dependency installs,
+weight downloads or real-model smoke were used. Local `status: verified` describes
+pin evidence only; absent staging fails explicitly as `missing_local_artifacts`.
+A3/A4 pin/license blockers are resolved. Real MiniLM loading/tokenization and Qwen
+quality/resource fit remain **unverified**, and both extended smokes **unrun**.
+This is not a `validated_live` or leakage-free claim or unconditional #292 completion.
+
+Validator now requires model-specific license evidence and exact immutable file
+URLs. Regressions exercise both real lock inventories without loading weights,
+mutable URL rejection, missing license evidence, missing staging and disabled pins.
+The existing snapshot/train/cache/extraction/worker/import tests remain in scope.
+Fresh exact-head review and CI must replace prior-head evidence before handoff.
+
+
+### Pin-update content validation
+
+Python 3.12.14, Linux, existing core/dev-only `/workspace/ccr-core-venv`.
+Targeted command `python -m pytest tests/market/test_text_features.py -q`:
+**36 passed in 5.37s**. The unchanged default commands listed above were rerun
+using `PY=/workspace/ccr-core-venv/bin/python` and report directory
+`/tmp/ccr292-pin-evidence`. Core: **1,309 passed, 256 skipped, 42 subtests**;
+Factory seed 12345: **600 passed, 10 skipped**. Aggregate **59.372s / 120s**.
+All reports show zero network attempts and zero model-cache files. Five golden
+fixtures against three schemas and `git diff --check` passed. Local offline hook
+was used; hosted CI additionally enforces OS network isolation. Optional real
+MiniLM/Qwen smoke remains unrun. Submitted-head review/CI results are recorded
+in PR #306 so their exact head can be stated without a self-referential commit.
+
+Lock SHA256: `f11dc60a8c0e0de81c9a1363b0612f10da7905c65ded3c307af36afa408c9cf7`.

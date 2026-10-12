@@ -184,8 +184,8 @@ coverage. They do not change repository permissions or replace issue acceptance.
   tests do not establish real loading, resource use or model quality.
 - Evidence: `tests/market/test_text_features.py` real corpus train-only fit,
   revision/tokenizer invalidation, import denial, staged-file mismatch and
-  malicious/duplicate-field/span regressions. Official pin resolution is blocked
-  by environment HTTP 403; production lock remains explicitly disabled.
+  malicious/duplicate-field/span regressions. Official revision metadata now resolves weight SHA256/size; downloaded
+  non-weight files are locally hashed. Real-model smoke remains unrun.
 - Added: 2026-10-12.
 
 | Date | ID | Change | Reason and evidence |
@@ -193,3 +193,5 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | 2026-10-12 | BP-009 | Proposed | Frozen artifacts need full identity binding; source/model text remains untrusted. Missing public metadata access must not produce fabricated pins or hidden downloads; #292. |
 
 | 2026-10-12 | BP-009 | Submitted-head review regression evidence | PR #306 head 5ec54f5 exposed mutable execution settings/pin aliases retaining stale feature identities (R1/R3), and code-point bounds exceeding serialized worker framing (R2). Read-only execution identity, defensive metadata copies and shared byte framing now have warm/cold-cache and actual fake-inference child regressions; fresh-head review pending. |
+
+| 2026-10-12 | BP-009 | Pin-evidence distinction | PR #306 normal official metadata access restored. Distinguish remote LFS checksums from locally hashed bytes and real execution; bind evidence URLs to the immutable revision. Use actual selected-revision license evidence (MiniLM README, Qwen LICENSE), not a fabricated upstream file. Production-lock and fail-closed inventory regressions cover both models. |
