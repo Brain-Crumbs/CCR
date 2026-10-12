@@ -146,3 +146,22 @@ coverage. They do not change repository permissions or replace issue acceptance.
 
 | 2026-10-10 | BP-006 | Review regression evidence appended | PR #304 independent review found price usability filtering before revision selection resurrected old values (R1); resolve knowledge revisions first and preserve unusable quality evidence. New bad-revision/gap/future-quality/reload tests cover the failure. |
 | 2026-10-10 | BP-006 | Fill-basis evidence appended | Review R2 found raw/adjusted and interval/calendar fills collapsed; complete basis keys and opposite-ingestion-order regressions now keep them independent. Fresh-head review pending. |
+
+## BP-008: Bind forecast origin and actual outcome intervals independently
+
+- Status: proposed (independent submitted-head review pending).
+- Scope: PIT dataset labels, temporal/group splits and fitting views, #291.
+- Rule: preserve decision, price observation, nominal endpoint and actual endpoint
+  separately. Censor unusable anchors/endpoints without removing population IDs.
+  Derive split purges and embargoes from actual label/future-target intervals;
+  retain group/source/dedup evidence and validate partition-bound fitting access.
+- Exception: explicit historical coverage limits remain limitations; a calendar
+  or synthetic fixture cannot establish unseen corporate actions or live access.
+- Evidence: `tests/market/test_pit_datasets.py` delayed-SIP, exact calendar/price,
+  terminal censor, split/dividend, injected leakage and train/validation access
+  regressions; `tests/market/extended/test_pit_boundaries.py` generated intervals.
+- Added: 2026-10-12.
+
+| Date | ID | Change | Reason and evidence |
+| --- | --- | --- | --- |
+| 2026-10-12 | BP-008 | Proposed | #291 stale feed observations can masquerade as current prices; nominal horizons alone miss latent-target overlap. Exact delayed-feed and injected-split failures added. |

@@ -1,0 +1,7 @@
+{
+  "source": "project-authored synthetic",
+  "license": "MIT",
+  "seed": 291,
+  "sha256": "03582c50f8cc448d9013d7608d69e93e46cec02a038a2d799225ff60f64ae089",
+  "intended_edge_cases": "DST, weekend, holiday, half-day, halt, after-hours"
+}
