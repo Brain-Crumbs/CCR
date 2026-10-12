@@ -1,0 +1,17 @@
+version: 1
+status: synthetic_only
+horizon_origin: decision_at
+equity:
+  trading_hours: [1, 4]
+  sessions: [1, 5]
+  session_policy: nth_close_strictly_after_decision
+  closed_decision_policy: roll_to_next_open
+  adjustment: split_neutral_ex_dividend
+contract:
+  clock: utc_elapsed_seconds
+  horizons: [3600, 14400, 86400]
+  terminal_policy: censor_without_preterminal_market_price
+anchor_policy: last_eligible_at_or_before_decision
+anchor_max_age_seconds: 60
+endpoint_policy: first_at_or_after
+endpoint_tolerance_seconds: 60

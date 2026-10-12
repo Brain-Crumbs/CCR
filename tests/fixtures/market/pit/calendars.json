@@ -1,0 +1,31 @@
+{
+  "source": "project-authored synthetic schedules; not an exchange calendar",
+  "license": "MIT",
+  "seed": 291,
+  "edge_cases": ["DST", "weekend", "holiday", "half-day", "halt", "after-hours"],
+  "calendars": [
+    {
+      "calendar_id": "synthetic-east", "version": "1", "timezone": "America/New_York",
+      "coverage_start_at": "2025-03-07T05:00:00Z", "coverage_end_at": "2025-03-15T04:00:00Z",
+      "closed_dates": ["2025-03-08", "2025-03-09"], "evidence": "MIT project-authored seed 291",
+      "sessions": [
+        {"session_id": "2025-03-07", "open_at": "2025-03-07T14:30:00Z", "close_at": "2025-03-07T21:00:00Z"},
+        {"session_id": "2025-03-10", "open_at": "2025-03-10T13:30:00Z", "close_at": "2025-03-10T20:00:00Z"},
+        {"session_id": "2025-03-11", "open_at": "2025-03-11T13:30:00Z", "close_at": "2025-03-11T20:00:00Z"},
+        {"session_id": "2025-03-12", "open_at": "2025-03-12T13:30:00Z", "close_at": "2025-03-12T20:00:00Z"},
+        {"session_id": "2025-03-13", "open_at": "2025-03-13T13:30:00Z", "close_at": "2025-03-13T20:00:00Z"},
+        {"session_id": "2025-03-14", "open_at": "2025-03-14T13:30:00Z", "close_at": "2025-03-14T20:00:00Z"}
+      ]
+    },
+    {
+      "calendar_id": "synthetic-east", "version": "2", "timezone": "America/New_York",
+      "coverage_start_at": "2025-11-27T05:00:00Z", "coverage_end_at": "2025-12-02T05:00:00Z",
+      "closed_dates": ["2025-11-27", "2025-11-29", "2025-11-30"], "evidence": "MIT project-authored seed 291",
+      "sessions": [
+        {"session_id": "2025-11-28-half", "open_at": "2025-11-28T14:30:00Z", "close_at": "2025-11-28T18:00:00Z"},
+        {"session_id": "2025-12-01", "open_at": "2025-12-01T14:30:00Z", "close_at": "2025-12-01T21:00:00Z",
+         "halts": [["2025-12-01T15:00:00Z", "2025-12-01T15:30:00Z"]]}
+      ]
+    }
+  ]
+}

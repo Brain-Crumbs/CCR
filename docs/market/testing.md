@@ -148,3 +148,14 @@ Final implementation evidence is tracked in [PR #301](https://github.com/Brain-C
 The two-worker local core completed 1173 passing tests and 256 pre-existing skips
 in 37.32 seconds. Both worker environments verified the inherited offline guard
 and the correct hash seed; no network attempt or model-cache file was observed.
+
+## PIT corpus tests (#291)
+
+The default suite includes `tests/market/test_pit_datasets.py` with exact manual
+calendar, delayed-feed, label, censoring, partition and private-store examples.
+See [PIT corpora](pit-corpora.md) for semantics and limitations. Optional generated
+interval checks require no neural dependencies:
+
+```sh
+python -m pytest tests/market/extended/test_pit_boundaries.py --run-market=extended -q
+```
