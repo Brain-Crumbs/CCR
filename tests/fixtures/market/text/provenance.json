@@ -1,0 +1,16 @@
+{
+  "synthetic": true,
+  "source": "project-authored",
+  "generator": "handwritten-text-traps-v1",
+  "seed": 292,
+  "license": "MIT",
+  "rights": "project-authored-fixture",
+  "sha256": "338888160963d663b6aa102e059a6a8e4fe5009850b875ac7a396e6e2d7de6b1",
+  "intended_edge_cases": [
+    "prompt injection remains data",
+    "duplicate fields",
+    "unknown fields/enums",
+    "malformed JSON",
+    "invalid evidence spans"
+  ]
+}

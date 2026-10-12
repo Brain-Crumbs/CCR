@@ -30,6 +30,8 @@ dev = ["pytest>=7", "jsonschema>=4.18", "pytest-xdist>=3.6"]
 # trainer and every heuristic encoder) runs without it. Only the pixel CNN,
 # its trainer and the neural policy import torch, always lazily.
 neural = ["torch>=2"]
+# Explicit local-only text workers; never installed/imported by default.
+market-text = ["torch>=2.2,<3", "transformers>=4.45,<5", "safetensors>=0.4.5"]
 # Neutral Factory contracts/registry have no extra dependencies. The lazy
 # built-in Crafter adapter uses [neural]; future backends must declare their
 # own extra in BackendRegistration and import it only at selection time.
