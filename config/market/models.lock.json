@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "reviewed_at": "2026-10-12",
+  "models": {
+    "minilm": {
+      "repository": "sentence-transformers/all-MiniLM-L6-v2",
+      "status": "access_denied",
+      "revision": null,
+      "tokenizer_revision": null,
+      "license": null,
+      "training_cutoff": "unknown",
+      "settings": {
+        "dimensions": 384,
+        "max_tokens": 256,
+        "pooling": "attention-mask-mean",
+        "normalization": "l2",
+        "dtype": "float32",
+        "frozen": true
+      },
+      "files": {},
+      "card_url": "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
+      "pin_blocker": "Execution-environment proxy denied official metadata request (HTTP 403). No immutable revision/hash/license pin has been verified; model use disabled."
+    },
+    "qwen": {
+      "repository": "Qwen/Qwen2.5-0.5B-Instruct",
+      "status": "access_denied",
+      "revision": null,
+      "tokenizer_revision": null,
+      "license": null,
+      "training_cutoff": "unknown",
+      "settings": {
+        "max_tokens": 1536,
+        "max_new_tokens": 384,
+        "do_sample": false,
+        "dtype": "float32",
+        "frozen": true
+      },
+      "files": {},
+      "card_url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct",
+      "pin_blocker": "Execution-environment proxy denied official metadata request (HTTP 403). No immutable revision/hash/license pin has been verified; model use disabled."
+    }
+  }
+}

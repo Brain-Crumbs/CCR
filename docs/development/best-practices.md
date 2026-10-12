@@ -167,3 +167,27 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | 2026-10-12 | BP-008 | Proposed | #291 stale feed observations can masquerade as current prices; nominal horizons alone miss latent-target overlap. Exact delayed-feed and injected-split failures added. |
 
 | 2026-10-12 | BP-008 | Independent-review regression evidence | PR #305 first-head review reproduced late-observation availability escaping purge (R1), realized labels outside declared PIT membership (R2), and future-target story/issuer metadata bypass (R3). Include effective knowledge clocks and full future-view contamination metadata; retain an explicit non-member censor. Added direct negative regressions; fresh revised-head review required. |
+
+## BP-009: Bind frozen text features and reject unverified local artifacts
+
+- Status: proposed (independent submitted-head review pending).
+- Scope: #292 train-fitted text transforms, optional encoders/extractors and caches.
+- Rule: derive text only from verified snapshot records; fit vocabularies/IDF on
+  validated train membership. Bind cache identities to record content/revision,
+  tokenizer, model, preprocessing and extraction prompt/schema. Check every
+  explicitly staged local artifact before optional imports; unknown pins are an
+  unavailable capability, never permission to download or invent an identity.
+  Validate model output and evidence spans before it leaves the extraction
+  boundary. Preserve unknown training cutoff and model-derived status.
+- Exception: a schema proves structure and substring identity, not entailment,
+  calibrated uncertainty or absence of pretraining contamination. Fake-model
+  tests do not establish real loading, resource use or model quality.
+- Evidence: `tests/market/test_text_features.py` real corpus train-only fit,
+  revision/tokenizer invalidation, import denial, staged-file mismatch and
+  malicious/duplicate-field/span regressions. Official pin resolution is blocked
+  by environment HTTP 403; production lock remains explicitly disabled.
+- Added: 2026-10-12.
+
+| Date | ID | Change | Reason and evidence |
+| --- | --- | --- | --- |
+| 2026-10-12 | BP-009 | Proposed | Frozen artifacts need full identity binding; source/model text remains untrusted. Missing public metadata access must not produce fabricated pins or hidden downloads; #292. |
