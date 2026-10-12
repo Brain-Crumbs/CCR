@@ -170,7 +170,7 @@ coverage. They do not change repository permissions or replace issue acceptance.
 
 ## BP-009: Bind frozen text features and reject unverified local artifacts
 
-- Status: proposed (independent submitted-head review pending).
+- Status: proposed; independent source review recorded in PR #306 (not a GitHub approval).
 - Scope: #292 train-fitted text transforms, optional encoders/extractors and caches.
 - Rule: derive text only from verified snapshot records; fit vocabularies/IDF on
   validated train membership. Bind cache identities to record content/revision,
@@ -195,3 +195,5 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | 2026-10-12 | BP-009 | Submitted-head review regression evidence | PR #306 head 5ec54f5 exposed mutable execution settings/pin aliases retaining stale feature identities (R1/R3), and code-point bounds exceeding serialized worker framing (R2). Read-only execution identity, defensive metadata copies and shared byte framing now have warm/cold-cache and actual fake-inference child regressions; fresh-head review pending. |
 
 | 2026-10-12 | BP-009 | Pin-evidence distinction | PR #306 normal official metadata access restored. Distinguish remote LFS checksums from locally hashed bytes and real execution; bind evidence URLs to the immutable revision. Use actual selected-revision license evidence (MiniLM README, Qwen LICENSE), not a fabricated upstream file. Production-lock and fail-closed inventory regressions cover both models. |
+
+| 2026-10-12 | BP-009 | Independent pin-head review | Reviewer checked full source, current issue/master and official immutable metadata at 5ee339b; no blocking source finding. Targeted 36 tests passed. Corrected one stale testing-guide sentence; final exact-head evidence recorded in PR #306. Real-model execution remains unverified. |

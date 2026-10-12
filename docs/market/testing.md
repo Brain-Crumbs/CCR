@@ -163,7 +163,7 @@ python -m pytest tests/market/extended/test_pit_boundaries.py --run-market=exten
 ## Text features (#292)
 
 Default synthetic text/cache/schema tests: `python -m pytest tests/market/test_text_features.py -q`.
-See [text features](text-features.md) for baseline use and the **blocked optional
-model pins**. Real MiniLM/Qwen smoke lives in `tests/market/text/`, requires
+See [text features](text-features.md) for baseline use and **verified immutable
+model pins** (weight checksums from official metadata; weights not staged). Real MiniLM/Qwen smoke lives in `tests/market/text/`, requires
 `--run-market=text` and exact pre-staged verified artifacts, and was not run.
 No model or live data downloads are part of any test.

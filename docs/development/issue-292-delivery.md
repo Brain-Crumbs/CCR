@@ -31,8 +31,8 @@
 | A8 | Evidence/uncertainty, schema rejection, no tools | Strict duplicate/extra-field/enum/span validation; injection remains data | Implemented with fake generator; real quality unverified |
 | A9 | Honest pretraining/contamination provenance | Unknown cutoff, runtime/model signatures and warnings, operator guide | Implemented; no leakage-free claim |
 | A10 | Frozen backbone shareable; trainable projections explicit | `FrozenTextFeatures` artifact provenance; no target-store import | Implemented boundary, JEPA deferred to #296 |
-| A11 | Synthetic provenance, offline budget <=120s, default CI <=5 min | `tests/fixtures/market/text/provenance.json`, existing core runner and unchanged default CI caps | Verification pending |
-| A12 | Operator docs, delivery ledger, living practices and exact-head review | `text-features.md`, BP-009, this ledger | Submitted-head review pending |
+| A11 | Synthetic provenance, offline budget <=120s, default CI <=5 min | `tests/fixtures/market/text/provenance.json`, existing core runner and unchanged default CI caps | Local budget met; exact-head CI recorded in PR |
+| A12 | Operator docs, delivery ledger, living practices and exact-head review | `text-features.md`, BP-009, this ledger | Independent source review complete; final head recorded in PR |
 
 ## Prior pin access blocker (superseded below)
 
@@ -194,3 +194,23 @@ MiniLM/Qwen smoke remains unrun. Submitted-head review/CI results are recorded
 in PR #306 so their exact head can be stated without a self-referential commit.
 
 Lock SHA256: `f11dc60a8c0e0de81c9a1363b0612f10da7905c65ded3c307af36afa408c9cf7`.
+
+
+### Independent pin-head review
+
+A fresh independent reviewer inspected actual full source/diff at submitted head
+`5ee339b54243a74d6673faff2fb3551570c0c993` against base
+`46330f12b71f21952268e5e922b078f2a58679ec`, current #292/#283, docs and BP-009.
+They independently fetched both immutable official metadata APIs, checked all
+7 MiniLM / 9 Qwen inventory sizes, remote weight LFS SHA256s, and the downloaded
+non-weight SHA256/Git blob identities. They reran **36 targeted tests in 5.09s**
+and independently validated the **59.372s / 120s** local aggregate.
+
+No blocking source defect was found. One P3 documentation finding: the testing
+guide still called the optional pins blocked. Corrected to verified immutable
+metadata pins with weights unstaged and real smoke unrun. A1/A2/A5/A8/A9/A10
+were met within synthetic/interface scope; A3/A4 pins/license/settings met but
+real execution unverified; A6 default boundary met but real loader unverified;
+A7 synthetic worker bounds met but real fit unverified. A11 local budget met.
+Agent source review is not a required GitHub approval. The final docs-only head
+requires re-review and fresh CI; exact evidence is recorded in PR #306.
