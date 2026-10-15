@@ -197,3 +197,23 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | 2026-10-12 | BP-009 | Pin-evidence distinction | PR #306 normal official metadata access restored. Distinguish remote LFS checksums from locally hashed bytes and real execution; bind evidence URLs to the immutable revision. Use actual selected-revision license evidence (MiniLM README, Qwen LICENSE), not a fabricated upstream file. Production-lock and fail-closed inventory regressions cover both models. |
 
 | 2026-10-12 | BP-009 | Independent pin-head review | Reviewer checked full source, current issue/master and official immutable metadata at 5ee339b; no blocking source finding. Targeted 36 tests passed. Corrected one stale testing-guide sentence; final exact-head evidence recorded in PR #306. Real-model execution remains unverified. |
+
+## BP-010: Pair baselines before comparing predictions
+
+- Status: active (independent review of initial submitted head; implementation repair re-review pending).
+- Scope: supervised market reference models, #293.
+- Rule: derive pairing identities from sample, snapshot, listing, label specification
+  and split, independently of model kind. Persist train-only preprocessing and fit
+  state together. Clip quantiles against exact decimal support after floating-point
+  prediction; test boundary anchors and reject changed resume identities.
+- Exception: missing anchors require a population result with explicit abstention,
+  not fabricated anchor fields merely to construct a forecast record.
+- Evidence: `tests/market/test_distributional_baselines.py` real corpus pairing,
+  0/1 support, train-only reads, no-anchor/stale behavior and disk resume tests.
+- Added: 2026-10-15.
+
+| Date | ID | Change | Reason and evidence |
+| --- | --- | --- | --- |
+| 2026-10-15 | BP-010 | Proposed | Model-specific population IDs and floating-point boundary drift would invalidate paired comparison; #293 adds exact pairing/support and resume regressions. |
+
+| 2026-10-15 | BP-010 | Independent review and regression | PR #307 head 03b7452 review accepted the practice; found unrelated BID/adjusted/Quote quarantine suppressing TRADE forecasts. Matching the exact target price basis now has a direct regression; repaired head review pending. |

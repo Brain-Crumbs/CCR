@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "kinds": ["zero", "unconditional", "volatility", "numeric", "text", "multimodal"],
+  "shared": {
+    "ridge": 1.0,
+    "text_mode": "hashing",
+    "text_dimensions": 16,
+    "quantiles": [0.1, 0.5, 0.9],
+    "max_train_samples": 512
+  },
+  "capability": "synthetic_only",
+  "calibrator": null,
+  "claims": "Uncalibrated supervised baselines, not JEPA. Synthetic success is generator recovery only."
+}
