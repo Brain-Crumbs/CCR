@@ -331,3 +331,7 @@ any server or GPU rendering dependencies.
   honest assessment of what's assembled vs what's separate pipelines
 
 For the offline PR budget, fixture contract and explicit optional-module commands, see [market testing](docs/market/testing.md).
+
+Offline market research: [calibration and coverage-first evaluation](docs/market/evaluation.md)
+adds paired baseline/control reports over immutable synthetic corpora. Synthetic
+results are not live validation or trading-edge evidence.

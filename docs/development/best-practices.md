@@ -217,3 +217,23 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | 2026-10-15 | BP-010 | Proposed | Model-specific population IDs and floating-point boundary drift would invalidate paired comparison; #293 adds exact pairing/support and resume regressions. |
 
 | 2026-10-15 | BP-010 | Independent review and regression | PR #307 head 03b7452 review accepted the practice; found unrelated BID/adjusted/Quote quarantine suppressing TRADE forecasts. Matching the exact target price basis now has a direct regression; repaired head review pending. |
+
+## BP-011: Preserve population and pairing before scoring
+
+- Status: proposed (fresh submitted-head review pending).
+- Scope: market evaluation/calibration and ablation reports, #294.
+- Rule: require exact held-out IDs, snapshot/spec/split/anchor identities and
+  label hashes before scoring or calibration. Keep failed, censored and abstained
+  samples in denominators and report the jointly scored baseline IDs. Fit
+  calibration only on validation; never turn a sealed test report into a search
+  objective. Sparse quantiles cannot supply CRPS or direction probabilities.
+- Exception: unknown dependence, model contamination and historical coverage
+  remain visible limitations; a structural fixture never establishes market edge.
+- Evidence: `tests/market/test_evaluation.py` identity/partition, failed-arm,
+  censor/abstention, paired counts, explicit-head scores, null/oracle and report
+  lock regressions. Source report artifacts retain negative outcomes.
+- Added: 2026-10-15.
+
+| Date | ID | Change | Reason and evidence |
+| --- | --- | --- | --- |
+| 2026-10-15 | BP-011 | Proposed | Dropping unavailable predictions or comparing different populations can manufacture apparent gains; exact population guards and retained failed/null reports added for #294. |

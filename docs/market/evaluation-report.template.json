@@ -1,0 +1,29 @@
+{
+  "template_only": true,
+  "format": "market-evaluation-v1",
+  "run_id": "<exact run identity>",
+  "status": "<completed|failed>",
+  "failure": null,
+  "population": "<synthetic|play_money|financial_market>",
+  "partition": "<validation|test>",
+  "sealed": true,
+  "edge_promotable": false,
+  "pnl": null,
+  "summary": {
+    "counts": {"samples": 0, "realized": 0, "censored": 0, "abstained": 0, "stale": 0, "missing": 0, "scored": 0},
+    "coverage": null,
+    "censor_reasons": {},
+    "abstention_reasons": {},
+    "quantile_levels": [],
+    "metrics": {},
+    "baseline": {},
+    "paired_pinball_improvement": {}
+  },
+  "caveats": ["<pretraining cutoff/unknown, source coverage, survivorship, synthetic limitations>"],
+  "identities": {},
+  "target": {},
+  "group_disjoint_policy": "<temporal|issuer|event_family>",
+  "by_source_instrument": [],
+  "slices": {},
+  "population_rows": []
+}

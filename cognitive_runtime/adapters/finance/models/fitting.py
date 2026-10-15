@@ -7,7 +7,12 @@ from ..text.features import TextFeatures
 from cognitive_runtime.data.ledger import digest
 
 
-def fit_baseline(corpus, plan, *, listing_id, config=BaselineConfig()):
+def fit_baseline(corpus, plan, *, listing_id, config=BaselineConfig(), model_factory=BaselineModel):
+    """Fit train outcomes; model_factory is a trusted offline ablation hook.
+
+    The default factory preserves ordinary baseline state and behavior. Custom
+    evaluation control models require their own lifecycle/serialization contract.
+    """
     validate_split(corpus.samples, plan)
     if not plan.train or len(plan.train) > config.max_train_samples:
         raise ValueError('empty or over-budget training partition')
@@ -16,7 +21,7 @@ def fit_baseline(corpus, plan, *, listing_id, config=BaselineConfig()):
     from ..labels import LabelSpec
     LabelSpec(**spec)
     text = TextFeatures(config.text_mode, config.text_dimensions).fit(corpus, plan)
-    model = BaselineModel(config, spec, listing_id, plan.hash, corpus.manifest_sha256, text.state)
+    model = model_factory(config, spec, listing_id, plan.hash, corpus.manifest_sha256, text.state)
     rows, targets, ids, censored = [], [], [], []
     for feature, outcome, _ in corpus.training(plan):
         if outcome.listing_id != listing_id or outcome.spec_sha256 != digest(spec):

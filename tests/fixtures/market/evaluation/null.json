@@ -1,0 +1,9 @@
+{
+  "fixture": "project-authored zero-signal negative control",
+  "seed": 294,
+  "source": "CCR authors",
+  "license": "MIT",
+  "synthetic": true,
+  "edge_case": "constant zero future price change despite varying context/text; no gain or edge is required",
+  "target_value": "0"
+}
