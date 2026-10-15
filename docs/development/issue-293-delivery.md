@@ -64,3 +64,25 @@ Core **1,328 passed, 256 skipped, 42 subtests**; Factory/hash **600 passed,
 matching collection/execution and Factory dual-seed membership. Five golden
 fixtures against three schemas passed; `git diff --check` passed. Local runner
 uses the repository offline hook; hosted CI additionally uses network namespaces.
+
+## Initial submitted-head review and repair
+
+PR #307 initial head `03b7452bbda3945041a9057dce524e598d5b2ce2`, base unchanged.
+Fresh independent reviewer read source, requirements, matrix and practices, and
+independently reran 55 tests (10.51s). One P2: quarantine filtering matched only
+listing/currency/feed, so an incomplete BID observation suppressed a valid TRADE
+anchor. Repair matches target record family, mark and raw adjustment as well;
+regressions retain same-basis quarantine while ignoring BID/adjusted/Quote rows.
+Optional test renamed to avoid implying a genuine null-signal experiment.
+Reviewer found no other blocking defects and accepted #295 Factory scope boundary.
+
+Initial-head hosted CI run 38775133885 passed all three active jobs: core 1,328,
+Factory/hash 600, aggregate 51.769s / 120s, zero network/cache activity, five
+schema fixtures. CPU-torch job skipped by explicit manual-only workflow condition.
+These initial-head results are superseded by repair-head validation/review;
+current exact evidence belongs in the PR comment to avoid a self-referential SHA.
+
+Repair targeted checks: **56 passed in 10.00s**, optional recovery **1 passed in
+1.36s**. Full offline gates rerun with `/tmp/ccr293-r2-evidence`; exact-head results,
+review, remote CI and final blockers are recorded on PR #307 after submission.
+#293 and #283 requirements refreshed unchanged before repair submission.

@@ -200,7 +200,7 @@ coverage. They do not change repository permissions or replace issue acceptance.
 
 ## BP-010: Pair baselines before comparing predictions
 
-- Status: proposed (independent submitted-head review pending).
+- Status: active (independent review of initial submitted head; implementation repair re-review pending).
 - Scope: supervised market reference models, #293.
 - Rule: derive pairing identities from sample, snapshot, listing, label specification
   and split, independently of model kind. Persist train-only preprocessing and fit
@@ -215,3 +215,5 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | Date | ID | Change | Reason and evidence |
 | --- | --- | --- | --- |
 | 2026-10-15 | BP-010 | Proposed | Model-specific population IDs and floating-point boundary drift would invalidate paired comparison; #293 adds exact pairing/support and resume regressions. |
+
+| 2026-10-15 | BP-010 | Independent review and regression | PR #307 head 03b7452 review accepted the practice; found unrelated BID/adjusted/Quote quarantine suppressing TRADE forecasts. Matching the exact target price basis now has a direct regression; repaired head review pending. |

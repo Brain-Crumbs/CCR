@@ -207,3 +207,20 @@ def test_inference_missing_text_mask_and_preprocessing_state(corpus):
     inputs, _ = model.inputs([f])
     assert inputs.features[0] == (0.,)*model.config.text_dimensions + (1.,)
     assert model.forecast([f])[0].abstention_reason is None
+
+
+def test_quarantine_only_applies_to_requested_price_basis():
+    from cognitive_runtime.adapters.finance.models.distribution import anchor
+    from cognitive_runtime.adapters.finance.schemas.semantics import Target, Unit, Mark
+    base = examples()
+    f = {'version': 1, 'sample_id': 'equity', 'context': base['ContextSnapshot'].to_dict(),
+         'records': [base['PriceBar'].to_dict(), base['NewsEvent'].to_dict()], 'quality_records': [], 'universe': {}}
+    spec = replace(base['LabelSpec'], target=Target.EQUITY_RETURN, unit=Unit.RETURN, mark=Mark.TRADE,
+        action_policy='split_neutral_ex_dividend', horizon=Horizon(clock=Clock.SESSIONS, count=1,
+        calendar_id='synthetic', calendar_version='synthetic-v1')).to_dict()
+    for bad in [replace(base['PriceBar'], complete=False, mark=Mark.BID),
+                replace(base['PriceBar'], complete=False, adjustment='split_adjusted'), base['Quote']]:
+        f['quality_records'] = [bad.to_dict()]
+        assert anchor(f, spec, 'listing:demo')[-1] is None
+    f['quality_records'] = [replace(base['PriceBar'], complete=False).to_dict()]
+    assert anchor(f, spec, 'listing:demo')[-1] == 'quarantined_anchor'

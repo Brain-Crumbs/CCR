@@ -29,8 +29,11 @@ def anchor(feature, spec, listing_id):
         and r.listing_id == listing_id and r.currency == spec['currency']]
     # A quarantined newer observation must never resurrect a convenient old one.
     quality = [r for r in feature['quality_records'] if r.get('listing_id') == listing_id
-               and r.get('currency') == spec['currency'] and
-               (r.get('feed', r.get('source_id')) == spec['feed'])]
+               and r.get('currency') == spec['currency'] and (
+                   equity and r.get('schema_name') == 'PriceBar' and r.get('feed') == spec['feed']
+                   and r.get('mark') == spec['mark'] and r.get('adjustment') == 'raw'
+                   or not equity and r.get('schema_name') == 'PredictionContractState'
+                   and r.get('source_id') == spec['feed'] and r.get('quote_basis') == spec['mark'])]
     clock = lambda r: r.end_at if type(r) is PriceBar else r.event_at
     if not candidates:
         return context, None, None, None, 'missing_anchor'
