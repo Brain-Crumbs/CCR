@@ -75,3 +75,32 @@ Full core: **1,341 passed, 256 skipped, 42 subtests** (39.77s pytest,
 120s**, zero network attempts/cache files, matching collection and dual-seed
 memberships. Five schema fixtures passed. Runtime JSON/logs reside under
 `/tmp/ccr294-evidence`; hosted CI will supply durable exact-head evidence.
+
+## Initial submitted-head review and repairs
+
+PR #308 initial head `9ec55dabf507c1f08921e0da42eceb3a25b0c0e4`, base unchanged.
+Fresh independent reviewer read full source/issues/matrix/practices and reran
+12 evaluation tests (10.17s). Three P1 blockers were reproduced: lexical UTC
+ordering let a later fractional-second sample donate to an earlier lag control;
+inner label listing/spec could disagree with its wrapper; split Sample snapshot
+identity could disagree with actual context. Review marked A1/A4/M2 incomplete.
+
+Repairs parse instants for lag ordering/strict comparison, bind loaded feature
+sample/snapshot/time to the split, bind inner label spec/listing/decision/endpoint
+to the wrapper, and enforce actual label/availability interval and provenance.
+Anchor binding also applies to abstained forecasts. New immutable-artifact and
+mixed-precision/equivalent-instant regressions cover these failures. Targeted
+repair evaluation: **14 passed in 12.21s** before final full rerun.
+
+Initial-head hosted CI [run 38807899209](https://github.com/Brain-Crumbs/CCR/actions/runs/38807899209)
+passed all three active jobs; logs verify test-merge `f5dd37f5661ef3672a1b7d7d283eefa7ad272e3d`
+combines exact initial head/base. Core 1,341 and Factory/hash 600 passed, aggregate
+66.017s / 120s, zero network/cache activity. Manual CPU-torch job skipped by
+explicit workflow condition. These results are superseded by repaired-head
+validation/review, recorded in the final PR evidence comment.
+
+Repair validation (same commands, report root `/tmp/ccr294-r2-evidence`): core
+**1,343 passed, 256 skipped, 42 subtests**, Factory/hash **600 passed, 10 skipped**;
+aggregate **49.883s / 120s**, zero network/cache activity. Five schema fixtures
+and diff check passed. Optional two-seed rerun **1 passed in 2.80s**. Issue/master
+source timestamps refreshed unchanged before repair submission.

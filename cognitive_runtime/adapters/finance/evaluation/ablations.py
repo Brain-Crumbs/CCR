@@ -9,6 +9,7 @@ from ..models.baselines import BaselineConfig, BaselineModel
 from ..models.fitting import fit_baseline
 from ..models.distribution import ForecastResult
 from ..datasets.splits import validate_split
+from ..schemas.base import timestamp
 from cognitive_runtime.data.ledger import digest
 from .report import make_report
 
@@ -43,7 +44,7 @@ class _TextControl(BaselineModel):
         samples = {s.sample_id: s for s in corpus.samples}
         rng = random.Random(seed)
         for partition in ('train', 'validation', 'test'):
-            ids = sorted(getattr(plan, partition), key=lambda k: (samples[k].decision_at, k))
+            ids = sorted(getattr(plan, partition), key=lambda k: (timestamp(samples[k].decision_at), k))
             inputs, _ = super().inputs([corpus.feature(k) for k in ids])
             text = {key: row[4:] for key, row in zip(ids, inputs.features)}
             donors = list(ids)
@@ -52,7 +53,7 @@ class _TextControl(BaselineModel):
             elif mode == 'lagged_text':
                 # Only a strictly earlier decision can donate text. Equal-time
                 # records cannot silently become each other's past.
-                donors = [next((other for other in reversed(ids[:i]) if samples[other].decision_at < samples[key].decision_at), None)
+                donors = [next((other for other in reversed(ids[:i]) if timestamp(samples[other].decision_at) < timestamp(samples[key].decision_at)), None)
                           for i, key in enumerate(ids)]
             else:
                 raise ValueError('unknown text control')

@@ -248,3 +248,60 @@ def test_template_and_fixture_inventory(corpus):
     inventory = json.loads((root / 'tests/fixtures/market/evaluation/provenance.json').read_text())
     for relative, expected in inventory['sha256'].items():
         assert hashlib.sha256((root / relative).read_bytes()).hexdigest() == expected
+
+
+def test_lag_control_uses_instant_not_timestamp_spelling(monkeypatch):
+    from types import SimpleNamespace
+    from brain.cortex.model_contracts import InferenceInput
+    from cognitive_runtime.adapters.finance.models.baselines import BaselineModel
+    from cognitive_runtime.adapters.finance.evaluation.ablations import _TextControl
+    # Valid UTC strings deliberately disagree with lexicographic time order.
+    stamps = {'early': '2025-01-01T00:00:00Z', 'same': '2025-01-01T00:00:00.0Z',
+              'late': '2025-01-01T00:00:00.1Z'}
+    c = SimpleNamespace(samples=[SimpleNamespace(sample_id=k, decision_at=v) for k, v in stamps.items()], feature=lambda k: k)
+    plan = SimpleNamespace(train=tuple(stamps), validation=(), test=())
+    def init(self, *args):
+        self.config = SimpleNamespace(text_dimensions=1)
+    def inputs(self, keys):
+        return InferenceInput('a'*64, tuple(keys), tuple((0., 0., 0., 0., float(list(stamps).index(k)), 0.) for k in keys)), ()
+    monkeypatch.setattr(BaselineModel, '__init__', init)
+    monkeypatch.setattr(BaselineModel, 'inputs', inputs)
+    model = _TextControl(corpus=c, plan=plan, mode='lagged_text', seed=294)
+    assert model.donors['early'] is None
+    assert model.donors['same'] is None
+    assert model.donors['late'] in ('early', 'same')
+
+
+def test_inner_label_and_split_sample_bindings(corpus):
+    from cognitive_runtime.adapters.finance.datasets.corpus import Corpus
+    from cognitive_runtime.adapters.finance.datasets.splits import walk_forward
+    c, plan = corpus
+    key = plan.validation[0]
+    outcome = c._outcome(key)
+    foreign_labels = (
+        replace(outcome.label, listing_id='foreign-contract'),
+        replace(outcome.label, spec=replace(outcome.label.spec, anchor_max_age_seconds=999)),
+    )
+    for label in foreign_labels:
+        manifest = {**c.manifest, 'labels': dict(c.manifest['labels'])}
+        foreign = replace(outcome, label=label)
+        manifest['labels'][key] = RawStore(c.root / 'labels').put(foreign.canonical_json().encode())
+        changed = Corpus(c.root, RawStore(c.root / 'manifests').put(canonical(manifest).encode()))
+        with pytest.raises(ValueError, match='inner label semantics'):
+            fit_calibrator(changed, plan, forecasts(changed, plan, 'validation'))
+    manifest = {**c.manifest, 'samples': [dict(s) for s in c.manifest['samples']]}
+    for s in manifest['samples']:
+        if s['sample_id'] == key:
+            s['snapshot_sha256'] = 'f'*64
+    changed = Corpus(c.root, RawStore(c.root / 'manifests').put(canonical(manifest).encode()))
+    rebound = walk_forward(changed.samples, validation_at=plan.validation_at, test_at=plan.test_at)
+    with pytest.raises(ValueError, match='sample/context'):
+        fit_calibrator(changed, rebound, forecasts(changed, rebound, 'validation'))
+    # The split validator alone cannot know that label availability was altered
+    # after the declared outcome interval. Evaluation must bind that interval.
+    future = replace(outcome, label=replace(outcome.label, target_available_at='2025-01-14T23:59:00Z'))
+    manifest = {**c.manifest, 'labels': dict(c.manifest['labels'])}
+    manifest['labels'][key] = RawStore(c.root / 'labels').put(future.canonical_json().encode())
+    changed = Corpus(c.root, RawStore(c.root / 'manifests').put(canonical(manifest).encode()))
+    with pytest.raises(ValueError, match='split outcome interval'):
+        fit_calibrator(changed, plan, forecasts(changed, plan, 'validation'))

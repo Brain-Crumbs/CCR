@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from ..datasets.splits import validate_split
 from ..models.distribution import ForecastResult, observations, anchor
+from ..schemas.base import timestamp
 from cognitive_runtime.data.ledger import digest
 
 
@@ -38,6 +39,9 @@ def bind_population(corpus, plan, predictions, *, partition='test'):
             raise TypeError('exact ForecastResult required')
         feature = corpus.feature(key)
         context, _ = observations(feature)  # rejects future/outcome fields at inference boundary
+        sample = samples[key]
+        if feature['sample_id'] != key or sample.snapshot_sha256 != context.hash or timestamp(sample.decision_at) != timestamp(context.decision_at):
+            raise ValueError('split sample/context identity mismatch')
         outcome = corpus._outcome(key)  # labels only, never future training targets
         expected = digest({'sample': key, 'snapshot': context.hash, 'listing': outcome.listing_id,
                            'label_spec': digest(spec), 'split': plan.hash})
@@ -47,8 +51,19 @@ def bind_population(corpus, plan, predictions, *, partition='test'):
             raise ValueError('label snapshot/spec identity mismatch')
         if outcome.hash != corpus.manifest['labels'][key]:
             raise ValueError('label artifact hash mismatch')
+        if outcome.label is not None:
+            label = outcome.label
+            if (label.spec.hash, label.listing_id, label.decision_at, label.nominal_endpoint_at) != (
+                    digest(spec), outcome.listing_id, outcome.decision_at, outcome.nominal_endpoint_at):
+                raise ValueError('inner label semantics mismatch')
+            if max(timestamp(label.actual_endpoint_at), timestamp(label.target_available_at)) > sample.end:
+                raise ValueError('label exceeds split outcome interval')
+            if label.provenance.synthetic != context.provenance.synthetic:
+                raise ValueError('label/context synthetic provenance differs')
         f = p.forecast
         _, record, price, at, reason = anchor(feature, spec, outcome.listing_id)
+        if outcome.label and (record is None or (outcome.label.anchor_record_id, outcome.label.anchor_price, outcome.label.anchor_at) != (record.record_id, price, at)):
+            raise ValueError('label anchor mismatch')
         if f is None:
             if not p.abstention_reason:
                 raise ValueError('missing forecast must abstain explicitly')
@@ -62,9 +77,6 @@ def bind_population(corpus, plan, predictions, *, partition='test'):
                 raise ValueError('forecast anchor mismatch')
             if reason and not p.abstention_reason:
                 raise ValueError('unusable context must abstain')
-            if outcome.label and (outcome.label.anchor_record_id, outcome.label.anchor_price, outcome.label.anchor_at) != (record.record_id, price, at):
-                raise ValueError('label anchor mismatch')
-        sample = samples[key]
         rows.append(EvaluationRow(p, outcome, outcome.hash, context.decision_at, spec['feed'], outcome.listing_id,
             context.provenance.synthetic, bool(context.stale_record_ids) or reason == 'stale_anchor',
             bool(context.missing_record_ids) or record is None, sample.issuer_ids, sample.event_families))

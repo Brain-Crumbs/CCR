@@ -237,3 +237,5 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | Date | ID | Change | Reason and evidence |
 | --- | --- | --- | --- |
 | 2026-10-15 | BP-011 | Proposed | Dropping unavailable predictions or comparing different populations can manufacture apparent gains; exact population guards and retained failed/null reports added for #294. |
+
+| 2026-10-15 | BP-011 | Independent-review regressions | PR #308 initial head 9ec55da reproduced unbound inner label/Sample identities and lexical mixed-precision UTC lag leakage. Bind wrapper, inner label and split context/interval together; compare parsed instants. Added immutable manifest and equivalent-instant regressions; repaired-head review pending. |
