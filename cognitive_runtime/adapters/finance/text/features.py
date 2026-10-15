@@ -147,6 +147,36 @@ class TextFeatures:
             raise ValueError('fit on a validated training partition before transform')
         return json.loads(json.dumps(self._state))
 
+    @classmethod
+    def from_state(cls, state):
+        """Restore exact train-only preprocessing, without consulting new data."""
+        state = json.loads(json.dumps(state, allow_nan=False))
+        expected = {'version', 'mode', 'dimensions', 'vocabulary', 'idf', 'train_records',
+                    'train_sample_ids', 'corpus_sha256', 'split_sha256', 'tokenizer_sha256',
+                    'max_chars', 'normalization', 'dtype', 'hash'}
+        if set(state) != expected or state['version'] != 1:
+            raise ValueError('unsupported text state')
+        model = cls(state['mode'], state['dimensions'])
+        if (state['tokenizer_sha256'], state['max_chars'], state['normalization'], state['dtype'], state['hash']) != (
+                TOKENIZER_HASH, MAX_CHARS, 'l2', 'float32', 'sha256-first8-big-unsigned-v1'):
+            raise ValueError('text preprocessing identity differs')
+        vocab, idf = state['vocabulary'], state['idf']
+        if len(vocab) != len(idf) or len(vocab) > model.dimensions or len(set(vocab)) != len(vocab):
+            raise ValueError('invalid text vocabulary')
+        if any(type(w) is not str or not re.fullmatch(TOKENIZER['pattern'], w) for w in vocab):
+            raise ValueError('invalid text token')
+        if any(type(x) not in (float, int) or not math.isfinite(x) or x < 1 for x in idf):
+            raise ValueError('invalid text IDF')
+        if model.mode == 'hashing' and (vocab or idf):
+            raise ValueError('hashing has no vocabulary')
+        from ..schemas.base import sha256
+        for value in [state['corpus_sha256'], state['split_sha256'], *state['train_records']]:
+            sha256(value)
+        if not state['train_sample_ids'] or len(state['train_sample_ids']) > 4096 or len(set(state['train_sample_ids'])) != len(state['train_sample_ids']):
+            raise ValueError('invalid training membership')
+        model._state = state
+        return model
+
     @property
     def signature(self):
         return digest(self.state)
