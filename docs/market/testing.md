@@ -167,3 +167,11 @@ See [text features](text-features.md) for baseline use and **verified immutable
 model pins** (weight checksums from official metadata; weights not staged). Real MiniLM/Qwen smoke lives in `tests/market/text/`, requires
 `--run-market=text` and exact pre-staged verified artifacts, and was not run.
 No model or live data downloads are part of any test.
+
+## Evaluation and calibration (#294)
+
+Default hand-score, partition/identity, oracle/null, population and equal-budget
+checks: `python -m pytest tests/market/test_evaluation.py -q`.
+Optional two-seed check: `python -m pytest tests/market/extended/test_evaluation_multiseed.py --run-market=extended -q`.
+See [evaluation operator guide](evaluation.md) for immutable report creation,
+calibration limits, time-block uncertainty and the validation-only objective.

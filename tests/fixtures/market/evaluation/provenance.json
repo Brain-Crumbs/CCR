@@ -1,0 +1,20 @@
+{
+  "source": "CCR project-authored synthetic fixtures",
+  "seed": 294,
+  "license": "MIT",
+  "rights": "project-authored-fixture",
+  "synthetic": true,
+  "edge_cases": [
+    "hand scores",
+    "oracle/outcome rejection",
+    "null signal nonpromotion",
+    "partition and identity mismatch",
+    "failed/censored/abstained coverage",
+    "equal budgets"
+  ],
+  "sha256": {
+    "tests/fixtures/market/evaluation/null.json": "8589de73fd4a18b6f92b623d8ab18f1553fc6a90fa317637265728be966308fd",
+    "tests/market/test_evaluation.py": "6e525fbd629d57d8c06621bc03557d4732bde937997c484266b19b4a100b1cda",
+    "tests/market/extended/test_evaluation_multiseed.py": "c2ddb579f50bf02be2c196485d9d66a7eb07f439297e48ede9513aa354e2c136"
+  }
+}
