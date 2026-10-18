@@ -55,3 +55,9 @@ register_backend(BackendRegistration(
     frozenset({"prepare", "fit", "predict", "evaluate", "save", "load", "resume", "clone", "fine_tune"}),
     "neural",
 ))
+
+register_backend(BackendRegistration(
+    TaskIdentity("market", "price-change", "market-baseline"),
+    "cognitive_runtime.adapters.finance.factory_backend:MarketBackend",
+    frozenset({"prepare", "fit", "predict", "evaluate", "save", "load", "resume", "clone", "manifest", "export"}),
+))

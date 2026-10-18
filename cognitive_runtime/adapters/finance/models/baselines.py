@@ -153,7 +153,14 @@ class BaselineModel:
     def load(cls, path, *, corpus_sha256, split_sha256, config):
         raw = json.loads(Path(path).read_text())
         state = raw['state']
-        if digest(state) != raw['sha256'] or state['version'] != 1:
+        if digest(state) != raw['sha256']:
+            raise ValueError('checkpoint integrity mismatch')
+        return cls.from_state(state, corpus_sha256=corpus_sha256, split_sha256=split_sha256, config=config)
+
+    @classmethod
+    def from_state(cls, state, *, corpus_sha256, split_sha256, config):
+        state = json.loads(json.dumps(state, allow_nan=False))
+        if state['version'] != 1:
             raise ValueError('checkpoint integrity/version mismatch')
         if state['corpus_sha256'] != corpus_sha256 or state['split_sha256'] != split_sha256 or BaselineConfig(**state['config']) != config:
             raise ValueError('resume corpus/split/effective configuration differs')

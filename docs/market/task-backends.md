@@ -110,3 +110,10 @@ and a one-step synthetic GRU fit/predict/save/load/clone through neutral Factory
 The GRU case checks the temporal interface without ActionWorldModel construction;
 it is a compatibility check, not a forecasting result. Both are `synthetic_only`.
 See the delivery record for checks actually executed and outstanding evidence.
+
+## Market integration
+
+The `market-baseline` backend now implements synthetic lifecycle/export and
+validation-only bounded search; see [Factory market guide](factory.md). It uses
+explicit CPU/fp64 for NumPy computation and opt-in attempt manifests. Generic
+backends retain their CPU/fp32 default; legacy Crafter identities remain stable.

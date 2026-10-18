@@ -105,9 +105,17 @@ def build_corpus(ledger, root, requests, *, spec, calendar=None, coverage='synth
         raise ValueError('nonempty unique sample IDs required')
     stores = {kind: RawStore(root / kind) for kind in ('features', 'labels', 'targets', 'manifests')}
     features, labels, samples = {}, {}, []
+    rights_inventory = {}
     for request in sorted(requests, key=lambda r: r.sample_id):
         decision = load_snapshot(ledger, request.snapshot_sha256)
         outcomes = load_snapshot(ledger, request.outcome_snapshot_sha256)
+        # Bind redistribution provenance of both feature AND label sources.
+        # Only hashes/rights metadata enter this inventory, never future prices
+        # or text; inference still receives only the separate feature store.
+        for snapshot in (decision, outcomes):
+            for record in (*snapshot.records, *snapshot.quality_records):
+                rights_inventory[record.hash] = {key: getattr(record.provenance, key)
+                    for key in ('rights', 'license', 'synthetic')}
         universe = freeze_universe(decision, request.universe_id, coverage=coverage, limitations=limitations)
         if coverage == 'synthetic_only' and not decision.context.provenance.synthetic:
             raise ValueError('real data cannot claim synthetic coverage')
@@ -147,7 +155,8 @@ def build_corpus(ledger, root, requests, *, spec, calendar=None, coverage='synth
             issuer_ids=tuple(sorted(issuer_ids | set(news_issuers))), event_families=families, dedup_keys=dedup, source_keys=source))
     manifest = {'version': 1, 'spec': spec.to_dict(), 'calendar': None if calendar is None else calendar.to_dict(),
                 'event_family_evidence': event_family_evidence or {},
-                'samples': [s.to_dict() for s in samples], 'features': features, 'labels': labels, 'targets': {}}
+                'samples': [s.to_dict() for s in samples], 'features': features, 'labels': labels, 'targets': {},
+                'source_rights': dict(sorted(rights_inventory.items()))}
     key = stores['manifests'].put(canonical(manifest).encode())
     return Corpus(root, key)
 

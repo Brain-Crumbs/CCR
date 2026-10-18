@@ -366,7 +366,14 @@ def _transition_balance_weights(
 
 def _parent_checkpoint_path(root: Union[str, Path], spec: ExperimentSpec) -> Path:
     parent = spec.parent or {}
-    return Path(root) / spec.organism / str(parent["run_id"]) / "checkpoints" / str(parent["checkpoint"])
+    directory = Path(root) / spec.organism / str(parent["run_id"])
+    checkpoint = str(parent["checkpoint"])
+    if spec.model.get("backend") == "market-baseline":
+        path = directory / checkpoint
+        if Path(checkpoint).is_absolute() or ".." in Path(checkpoint).parts or not checkpoint.startswith("attempts/"):
+            raise ValueError("market parent checkpoint must name an immutable attempt")
+        return path
+    return directory / "checkpoints" / checkpoint
 
 
 def _reference_checkpoint_path(root: Union[str, Path], spec: ExperimentSpec) -> Path:

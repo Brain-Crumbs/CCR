@@ -874,3 +874,52 @@ __all__ = [
     "record_test_use",
     "lineage_graph",
 ]
+
+
+def register_artifacts(directory, paths, *, rights_cleared, max_bytes):
+    """Validate an explicit export inventory; never recurse over private data.
+
+    Paths/hashes/sizes are references only. The caller owns the domain-specific
+    rights decision; unknown permission fails closed before inventory creation.
+    """
+    import hashlib
+    if not rights_cleared:
+        raise RegistryError('rights_blocked: explicit redistribution rights required')
+    if type(max_bytes) is not int or not 0 < max_bytes <= 100 * 1024 * 1024:
+        raise RegistryError('invalid export byte budget')
+    directory = Path(directory).resolve()
+    references, total = [], 0
+    for name in paths:
+        relative = Path(name)
+        if relative.is_absolute() or '..' in relative.parts:
+            raise RegistryError('artifact path escapes run')
+        path = directory / relative
+        if any((directory / Path(*relative.parts[:i])).is_symlink() for i in range(1, len(relative.parts) + 1)):
+            raise RegistryError('artifact symlinks are forbidden')
+        if not path.is_file() or not path.resolve().is_relative_to(directory):
+            raise RegistryError('artifact must be a regular file inside run')
+        size = path.stat().st_size
+        total += size
+        if total > max_bytes:
+            raise RegistryError('artifact byte budget exceeded')
+        references.append({'path': relative.as_posix(), 'size_bytes': size,
+                           'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+    atomic_write_json(directory / 'artifact_registry.json', {'format': 'model-factory-export-v1',
+        'rights': 'explicitly_cleared', 'total_bytes': total, 'artifacts': references})
+    return references
+
+
+def reserve_test_protocol(root, *, protocol_sha256, run_id):
+    """Consume once per data/split protocol, before opening final outcomes.
+
+    Failed reporting retains the reservation: a retry cannot inspect the test
+    again. Shares the Factory registry lock and atomic document writer.
+    """
+    path = registry_path(root)
+    with _locked(_lock_path_for(path)):
+        document = _read_document(path)
+        used = document.setdefault('sealed_protocols', {})
+        if protocol_sha256 in used:
+            raise TestBudgetExhaustedError(run_id, 1, 1)
+        used[protocol_sha256] = {'run_id': run_id, 'at': _now_iso()}
+        atomic_write_json(path, document)

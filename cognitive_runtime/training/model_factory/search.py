@@ -1712,3 +1712,97 @@ __all__ = [
     "SuccessiveHalvingReport",
     "run_successive_halving",
 ]
+
+
+def propose_market(base_spec, n, seed):
+    """Reuse Factory's seeded LHS sampler with bounded effective market genes."""
+    from .genome import MarketGenomeSchema
+    from .spec import resolve
+    from .artifacts import _jsonable
+    from .task_registry import load_backend
+    load_backend('market-baseline').validate(base_spec)
+    if base_spec.mode != 'fresh' or type(n) is not int or not 1 <= n <= 16:
+        raise SearchError('market proposal batch requires fresh mode and 1..16 candidates')
+    kind = base_spec.model['baseline']['kind']
+    if kind not in ('numeric', 'text', 'multimodal'):
+        raise SearchError('ridge/text genes require an effective regression baseline')
+    schema = MarketGenomeSchema(include_text=kind in ('text', 'multimodal'))
+    proposals = []
+    for genes in _latin_hypercube_genomes(schema, n, random.Random(seed)):
+        raw = _jsonable(base_spec.to_dict())
+        raw['model']['baseline'].update(genes)
+        proposals.append(resolve(raw))
+    return proposals
+
+
+def run_market_search(specs, *, root, corpus_root):
+    """Bounded validation-only trials using shared runner and registry locking.
+
+    Duplicate exact source/environment/specs reuse immutable evidence, including
+    failed attempts. This function cannot request or return final-test scores.
+    """
+    import hashlib
+    from .artifacts import atomic_write_json, _jsonable
+    from .registry import registry_path, _read_document
+    from .state import _locked, _lock_path_for, require_completed_for_promotion, load_state, state_path
+    from .task_registry import load_backend
+    from cognitive_runtime.adapters.finance.factory_backend import execution_identity
+    from cognitive_runtime.adapters.finance.evaluation.report import validation_objective
+    from cognitive_runtime.data.ledger import digest
+    specs = tuple(specs)
+    if not 1 <= len(specs) <= 16:
+        raise SearchError('market search supports 1..16 candidates')
+    results = []
+    fixed = (specs[0].data, specs[0].training, specs[0].evaluation)
+    if any((s.data, s.training, s.evaluation) != fixed for s in specs):
+        raise SearchError('market candidates must share fixed data, training budget and evaluation')
+    identity = execution_identity()
+    for spec in specs:
+        load_backend('market-baseline').validate(spec)
+        if spec.mode != 'fresh':
+            raise SearchError('search requires fresh market specs')
+        key = digest({'spec': _jsonable(spec.to_dict()), 'execution': identity})
+        path = registry_path(root)
+        # Hold shared registry lock across lookup/launch/publication to prevent
+        # concurrent duplicates. Individual runs use their separate state locks.
+        with _locked(_lock_path_for(path)):
+            registry = _read_document(path)
+            trials = registry.setdefault('task_trials', {})
+            if key not in trials:
+                run_id = 'market-' + key[:24]
+                try:
+                    result = run_trial(spec, root=root, corpus_root=corpus_root, run_id=run_id)
+                    entry = {'run_id': result.run_id, 'status': result.state,
+                             'directory': str(result.directory), 'score': None}
+                    if result.state == 'completed':
+                        require_completed_for_promotion(load_state(state_path(Path(root) / spec.organism / result.run_id)))
+                        entry['score'] = validation_objective(result.evaluation, metric='pinball', predeclared_metric='pinball')
+                    report = Path(result.experiment_report_path)
+                    manifest = Path(result.directory) / 'run_manifest.json'
+                    manifest_payload = json.loads(manifest.read_text())
+                    entry.update(report=str(report), report_sha256=hashlib.sha256(report.read_bytes()).hexdigest(),
+                        manifest=str(manifest), manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                        artifacts=manifest_payload['artifacts'])
+                except Exception:
+                    # The runner already wrote a redacted partial manifest.
+                    # Do not turn arbitrary exception text into public artifacts.
+                    entry = {'run_id': run_id, 'status': 'failed', 'score': None}
+                trials[key] = entry
+                atomic_write_json(path, registry)
+            entry = dict(trials[key])
+            if entry.get('report') and hashlib.sha256(Path(entry['report']).read_bytes()).hexdigest() != entry['report_sha256']:
+                raise SearchError('cached evidence changed')
+            if entry.get('manifest'):
+                manifest = Path(entry['manifest'])
+                if not manifest.is_file() or hashlib.sha256(manifest.read_bytes()).hexdigest() != entry['manifest_sha256']:
+                    raise SearchError('cached manifest missing or changed')
+                for ref in entry['artifacts']:
+                    artifact = manifest.parent / ref['path']
+                    if (not artifact.resolve().is_relative_to(manifest.parent.resolve()) or not artifact.is_file()
+                            or artifact.stat().st_size != ref['size_bytes']
+                            or hashlib.sha256(artifact.read_bytes()).hexdigest() != ref['sha256']):
+                        raise SearchError('cached artifact missing or changed')
+                if entry['status'] == 'completed':
+                    require_completed_for_promotion(load_state(state_path(Path(root) / spec.organism / entry['run_id'])))
+            results.append(entry)
+    return tuple(results)

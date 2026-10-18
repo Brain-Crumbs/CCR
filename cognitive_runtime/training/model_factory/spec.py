@@ -617,7 +617,7 @@ def _resolve_task_spec(raw: Mapping[str, Any]) -> ExperimentSpec:
     resolved = ExperimentSpec(
         format=TASK_DOCUMENT_FORMAT, organism=raw.get("organism"), mode=raw.get("mode", "fresh"),
         data=raw.get("data", {}), model=raw.get("model", {}),
-        training=_deep_merge({"device": "cpu", "precision": "fp32", "determinism_policy": {"seed": 0},
+        training=_deep_merge({"device": "cpu", "precision": "fp64" if raw.get("model", {}).get("backend") == "market-baseline" else "fp32", "determinism_policy": {"seed": 0},
                               "max_training_seconds": 60.0}, raw.get("training", {})),
         evaluation=raw.get("evaluation", {}), parent=raw.get("parent"), evolution=raw.get("evolution"),
     )
@@ -644,8 +644,9 @@ def _validate_task_spec(spec: ExperimentSpec) -> None:
         raise SpecError(f"backend does not support {spec.mode!r}")
     if spec.evolution is not None:
         raise SpecError("neutral task evolution is not implemented")
-    if spec.training.get("device") != "cpu" or spec.training.get("precision") != "fp32":
-        raise SpecError("neutral Factory currently supports cpu/fp32 only")
+    precision = "fp64" if entry.identity.backend == "market-baseline" else "fp32"
+    if spec.training.get("device") != "cpu" or spec.training.get("precision") != precision:
+        raise SpecError(f"selected neutral backend requires cpu/{precision}")
     seconds = spec.training.get("max_training_seconds")
     if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0:
         raise SpecError("max_training_seconds must be finite and positive")

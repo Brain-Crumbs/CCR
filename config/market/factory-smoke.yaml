@@ -1,0 +1,8 @@
+# Project-authored MIT generator v1; runtime corpus/split hashes are resolved
+# and written to resolved-spec.json before Factory invocation.
+seed: 295
+baseline:
+  kind: zero
+  text_mode: hashing
+  text_dimensions: 8
+max_training_seconds: 20
