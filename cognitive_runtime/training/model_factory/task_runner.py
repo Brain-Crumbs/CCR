@@ -4,6 +4,8 @@ import hashlib
 import json
 from pathlib import Path
 import time
+import uuid
+from dataclasses import replace
 from brain.cortex.model_contracts import require_inference_input
 from .artifacts import allocate_run_artifacts, atomic_write_json, _jsonable
 from .checkpoint import load_task_checkpoint, read_factory_checkpoint_metadata, save_task_checkpoint
@@ -34,16 +36,20 @@ def run_backend_trial(spec, backend, *, root, corpus_root, run_id, naming_seed,
         if header.get("checkpoint_sha256") != spec.parent["sha256"]:
             raise ValueError("parent checkpoint sha256 differs")
     from .corpus import prepare_task_corpus
-    prepared = prepare_task_corpus(backend, spec, corpus_root=corpus_root)
-    definition, data = prepared.model_definition, prepared.data_contract
+    # Backends with pinned contracts can allocate evidence before preparation.
+    prepared = None
+    if "manifest" in backend.capabilities:
+        definition, data = backend.describe(spec)
+    else:
+        prepared = prepare_task_corpus(backend, spec, corpus_root=corpus_root)
+        definition, data = prepared.model_definition, prepared.data_contract
     identity = backend.identity.to_dict()
     training = TaskTrainingContract(spec.training)
+    model = None
     if parent_path:
         model = load_task_checkpoint(str(parent_path), mode=spec.mode,
-                                    architecture_contract=definition, data_contract_hash=data,
-                                    training_contract=training).model
-    else:
-        model = backend.build(definition)
+            architecture_contract=definition, data_contract_hash=data,
+            training_contract=training).model
     if spec.mode == "resume":
         parent_id = str(spec.parent["run_id"])
         if run_id is not None and run_id != parent_id:
@@ -65,6 +71,17 @@ def run_backend_trial(spec, backend, *, root, corpus_root, run_id, naming_seed,
         create_state(state_path(artifacts.directory), artifacts.run_id,
                      heartbeat_timeout_seconds=heartbeat_timeout_seconds or max(300, 2 * spec.training["max_training_seconds"]))
         transition(state_path(artifacts.directory), "running")
+    run_directory = artifacts.directory
+    attempt_id = None
+    if "manifest" in backend.capabilities:
+        attempt_id = uuid.uuid4().hex
+        attempt = run_directory / "attempts" / attempt_id
+        attempt.mkdir(parents=True, exist_ok=False)
+        (attempt / "checkpoints").mkdir()
+        (attempt / "metrics").mkdir()
+        artifacts = replace(artifacts, directory=attempt,
+                            checkpoints_dir=attempt / "checkpoints", metrics_dir=attempt / "metrics")
+        backend.begin(spec, artifacts, run_directory=run_directory, attempt_id=attempt_id)
     started = time.monotonic()
     limit = spec.training["max_training_seconds"]
     checkpoint = artifacts.checkpoints_dir / "last.json"
@@ -73,22 +90,30 @@ def run_backend_trial(spec, backend, *, root, corpus_root, run_id, naming_seed,
     status, failure = "completed", None
 
     def cancelled():
-        write_heartbeat(heartbeat_path(artifacts.directory), run_id=artifacts.run_id)
+        write_heartbeat(heartbeat_path(run_directory), run_id=artifacts.run_id)
         if time.monotonic() - started >= limit:
             raise TaskBudgetExceeded("task cooperative wall-clock budget exceeded")
-        return cancellation_requested(artifacts.directory)
+        return cancellation_requested(run_directory)
 
     def persist_checkpoint():
         nonlocal digest
-        transition(state_path(artifacts.directory), "checkpointing")
+        transition(state_path(run_directory), "checkpointing")
         try:
             digest = save_task_checkpoint(checkpoint, backend, model, definition, data, training)
         finally:
-            transition(state_path(artifacts.directory), "running")
+            transition(state_path(run_directory), "running")
         return ArtifactReference("checkpoint", str(checkpoint.relative_to(artifacts.directory)), digest)
 
     control = TaskControl(cancelled, persist_checkpoint)
     try:
+        control.check()
+        if prepared is None:
+            prepared = prepare_task_corpus(backend, spec, corpus_root=corpus_root)
+            if prepared.model_definition != definition or prepared.data_contract != data:
+                raise ValueError("prepared contracts differ from declared pins")
+        control.check()
+        if model is None:
+            model = backend.build(definition)
         control.check()
         fitted = backend.fit(model, prepared.training, spec.training, control, resume=spec.mode == "resume")
         contract_hash(fitted)
@@ -103,17 +128,22 @@ def run_backend_trial(spec, backend, *, root, corpus_root, run_id, naming_seed,
         evaluation = evaluated
         control.check()
         atomic_write_json(artifacts.metrics_dir / "validation.json", evaluation)
+        if "export" in backend.capabilities:
+            backend.export(artifacts, model, evaluation, control)
+        control.check()
     except TaskCancelled as exc:
         status, failure = "cancelled", str(exc)
         try:
-            digest = save_task_checkpoint(checkpoint, backend, model, definition, data, training)
+            if model is not None:
+                digest = save_task_checkpoint(checkpoint, backend, model, definition, data, training)
         except BaseException as save_error:
             status, failure = "failed", f"checkpoint failure: {save_error}"
             raise
     except TaskBudgetExceeded as exc:
         status, failure = "budget_exceeded", str(exc)
         try:
-            digest = save_task_checkpoint(checkpoint, backend, model, definition, data, training)
+            if model is not None:
+                digest = save_task_checkpoint(checkpoint, backend, model, definition, data, training)
         except BaseException as save_error:
             status, failure = "failed", f"checkpoint failure: {save_error}"
             raise
@@ -122,6 +152,8 @@ def run_backend_trial(spec, backend, *, root, corpus_root, run_id, naming_seed,
         # Persist a failure result before propagating the original exception.
         raise
     finally:
+        if "manifest" in backend.capabilities and failure:
+            failure = "task_" + status
         elapsed = time.monotonic() - started
         for kind, path in (("checkpoint", checkpoint), ("evaluation", artifacts.metrics_dir / "validation.json")):
             if path.is_file():
@@ -136,7 +168,11 @@ def run_backend_trial(spec, backend, *, root, corpus_root, run_id, naming_seed,
             "architecture_hash": definition.hash, "data_contract_hash": data.hash,
             "training_contract_hash": training.hash, "artifacts": refs,
             "training_stats": stats, "evaluation": evaluation, "budget": budget})
-        transition(state_path(artifacts.directory), status, reason=failure or status)
+        if "manifest" in backend.capabilities:
+            # Exception text can contain provider payloads/credentials. The market
+            # manifest records a safe stage/type category instead of arbitrary text.
+            backend.finish(artifacts, model, status=status, budget=budget)
+        transition(state_path(run_directory), status, reason=failure or status)
     return TrialResult(run_id=artifacts.run_id, display_name=artifacts.display_name, mode=spec.mode,
                        state=status, directory=artifacts.directory, architecture_hash=definition.hash,
                        data_contract_hash=data.hash, training_contract_hash=training.hash,

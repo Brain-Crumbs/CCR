@@ -239,3 +239,24 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | 2026-10-15 | BP-011 | Proposed | Dropping unavailable predictions or comparing different populations can manufacture apparent gains; exact population guards and retained failed/null reports added for #294. |
 
 | 2026-10-15 | BP-011 | Independent-review regressions | PR #308 initial head 9ec55da reproduced unbound inner label/Sample identities and lexical mixed-precision UTC lag leakage. Bind wrapper, inner label and split context/interval together; compare parsed instants. Added immutable manifest and equivalent-instant regressions; repaired-head review pending. |
+
+## BP-012: Allocate failure evidence before preparation and isolate final outcomes
+
+- Status: proposed (submitted-head independent review pending).
+- Scope: neutral Factory lifecycle, immutable attempts and market search, #295.
+- Rule: allocate pinned run evidence before fallible data preparation; write each
+  invocation to its own attempt and retain partial failure/resource evidence.
+  Register an explicit rights-checked, bounded artifact inventory instead of
+  recursively exporting a run directory. Charge locked-test use before opening
+  outcomes; only validation metrics may drive search or duplicate reuse.
+- Exception: cooperative checks cannot interrupt blocked native code; an initial
+  partial manifest survives process death but cannot measure its final resources.
+  Filesystem writers can invalidate local locks/rights declarations.
+- Evidence: `tests/test_model_factory_market.py` prepare/fit/export failure,
+  redaction, cancellation, byte/path/rights guards, killed-worker resume,
+  validation-only search and one-use final-test regressions.
+- Added: 2026-10-18.
+
+| Date | ID | Change | Reason and evidence |
+| --- | --- | --- | --- |
+| 2026-10-18 | BP-012 | Proposed | Neutral preparation preceded run allocation, and export/final-test guards needed explicit lifecycle boundaries; #295. |

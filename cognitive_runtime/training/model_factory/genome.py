@@ -706,3 +706,20 @@ __all__ = [
     "project_cost_seconds",
     "repair",
 ]
+
+# Neutral tasks get an explicit namespace; legacy schemas/hashes stay stable.
+# Only model configuration genes are exposed. Data/splits/seeds/rights/test
+# policy cannot be expressed by this schema.
+@dataclass(frozen=True)
+class MarketGenomeSchema:
+    version: str = 'market-baseline-v1'
+    include_text: bool = True
+
+    @property
+    def genes(self):
+        result = {'ridge': Gene('ridge', 'float', 1.0,
+            MutationSpec('log_normal_perturb', .2), bounds=(.01, 100.), log_scale=True)}
+        if self.include_text:
+            result['text_dimensions'] = Gene('text_dimensions', 'int', 8,
+                MutationSpec('normal_perturb', 2.), bounds=(4, 32))
+        return MappingProxyType(result)
