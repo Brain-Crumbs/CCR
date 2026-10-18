@@ -33,7 +33,8 @@ rejected rather than pretending their states are interchangeable.
 ## Evidence and continuation
 
 Factory retains the existing run identity, spec, contracts, lineage, execution,
-state and heartbeat at the run root. Every worker invocation has a fresh immutable
+state and heartbeat at the run root. Each attempt records its actual current
+source/commit separately from the preserved original-run execution identity. Every worker invocation has a fresh immutable
 attempt ID under `attempts/<id>/`; checkpoints, metrics, budget, result and
 `run_manifest.json` live there. Running manifests are partial and finalized in
 place; terminal attempt evidence is never overwritten by resume. An abrupt kill
@@ -65,8 +66,9 @@ Budgets are cooperative wall-clock limits; RSS is process high-water measurement
 not per-attempt allocation or hard memory enforcement. #298 owns hard isolation.
 
 Export registers only checkpoint/sidecar and validation report references after
-checking every source record's synthetic MIT redistribution rights, safe regular
-paths, SHA256, size and the 1 MiB backend cap. Unknown rights fail the attempt;
+checking the corpus's content-bound inventory of both context and outcome source
+records' synthetic MIT redistribution rights, safe regular
+paths, SHA256, size and the 1 MiB backend cap. Unknown rights or older corpora without the inventory fail export;
 no recursive raw-store export occurs. Arbitrary exception text is not persisted.
 Export inventory is not an upload. A trusted writer who changes files or rewrites
 rights can invalidate these guarantees; this is not an adversarial sandbox.
@@ -84,7 +86,7 @@ successive-halving campaign.
 
 `factory.final_test` is an explicit separate reporting action. It records the
 completed candidate in the existing registry, charges its test-use ledger and
-reserves the corpus/split protocol once across that run root **before reading
+reserves the exact held-out features/labels/spec protocol once across that run root **before reading
 final outcomes**. A reporting failure consumes the reservation. Reports are
 exclusively created and never returned as search objectives. Do not move runs to
 a new root or delete reservations to repeatedly tune against the test. Guards

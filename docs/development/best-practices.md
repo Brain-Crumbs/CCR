@@ -260,3 +260,5 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | Date | ID | Change | Reason and evidence |
 | --- | --- | --- | --- |
 | 2026-10-18 | BP-012 | Proposed | Neutral preparation preceded run allocation, and export/final-test guards needed explicit lifecycle boundaries; #295. |
+
+| 2026-10-18 | BP-012 | Independent review regressions | PR #309 at 7c5f11b reproduced export despite unknown outcome-source rights (P1) and cached success after checkpoint deletion (P2); also found original-vs-resume commit mismatch (P2). Bind both feature and outcome rights, revalidate referenced evidence on reuse, and record invocation-specific provenance. Direct regressions added; fresh repaired-head review pending. |

@@ -42,3 +42,30 @@ resolve it. Keep PR open until actual protection/approval requirements are known
 - During implementation, fixed resume validation ordering, truthful NumPy fp64
   declaration, and snapshot-provenance vs source-payload redistribution handling.
   These are author checks, not independent review.
+
+## Independent submitted-head review and repairs
+
+PR: https://github.com/Brain-Crumbs/CCR/pull/309. Initial submitted head
+`7c5f11bd32af76719cf1cf24e4a067a1bfccd14b` independently reviewed against complete
+issue/master sources, code and BP-012. Reviewer independently passed 12 targeted
+tests in 4.85s and requested changes:
+
+- P1: outcome-source rights missing from export gate. Reproduced with ordinary
+  corpus construction and matching unknown retention policies. New corpora retain
+  a content-bound inventory of context AND outcome rights; missing/unknown
+  inventories fail export. Existing loaded corpus identities are not rewritten.
+- P2: cached success survived deleted checkpoint. Cache now pins/verifies manifest,
+  artifact inventory, byte counts/hashes and completed run state before reuse.
+- P2: resumed attempt advertised original run commit/dirty status. Attempt manifest
+  now records current source identity separately from original immutable execution.
+
+Regression evidence before final re-review: 59 market/Factory/PIT tests passed in
+9.27s, plus explicit resume-source identity regression. Tokenizer provenance now
+uses the actual text module TOKENIZER_HASH rather than a descriptive proxy.
+Fresh review and all final-head checks are still required.
+
+Initial-head aggregate: local 1,355 core + 612 Factory/hash tests, 62.403s; zero
+network/model-cache activity. Hosted run 39139790327 all three active jobs passed,
+68.999s aggregate (logs verified); manual CPU-torch job intentionally skipped.
+Artifact download endpoint returned 403; readable job logs supplied exact-head
+counts/runtime evidence. These initial-head checks do not validate later repairs.

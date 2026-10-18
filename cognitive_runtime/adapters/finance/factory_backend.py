@@ -22,6 +22,7 @@ from .models.fitting import fit_baseline
 from .datasets.corpus import Corpus
 from .datasets.splits import SplitPlan, validate_split
 from .evaluation.report import make_report, validation_objective
+from .text.features import TOKENIZER_HASH
 
 IDENTITY = TaskIdentity('market', 'price-change', 'market-baseline')
 
@@ -32,12 +33,14 @@ def execution_identity():
     import subprocess
     root = Path(__file__).resolve().parents[3]
     files = {}
-    for folder in ('cognitive_runtime', 'brain'):
+    for folder in ('cognitive_runtime', 'brain', 'scripts'):
         for path in sorted((root / folder).rglob('*.py')):
             files[str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
     versions = {d.metadata['Name']: d.version for d in metadata.distributions() if d.metadata['Name']}
     commit = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=root, capture_output=True, text=True, timeout=5)
+    status = subprocess.run(['git', 'status', '--porcelain'], cwd=root, capture_output=True, text=True, timeout=5)
     return {'source_sha256': digest(files), 'commit': commit.stdout.strip() if commit.returncode == 0 else None,
+            'dirty_tree': bool(status.stdout) if status.returncode == 0 else None,
             'packages': dict(sorted(versions.items())), 'python': platform.python_version(),
             'machine': platform.machine(), 'implementation': platform.python_implementation()}
 
@@ -92,7 +95,8 @@ class MarketBackend:
         validate_split(self.corpus.samples, self.plan)
         if len(self.corpus.samples) > 512:
             raise ValueError('market corpus exceeds bounded 512-sample reference budget')
-        rights = []
+        inventory = self.corpus.manifest.get('source_rights')
+        rights = [] if not inventory else list(inventory.values())
         for key in self.corpus.manifest['features']:
             feature = self.corpus.feature(key)
             if not feature['context']['provenance']['synthetic']:
@@ -101,8 +105,10 @@ class MarketBackend:
                 provenance = record['provenance']
                 if not provenance['synthetic']:
                     raise ValueError('Factory market backend is synthetic_only')
-                rights.append({k: provenance[k] for k in ('rights', 'license', 'synthetic')})
-        self.rights = sorted({json.dumps(r, sort_keys=True) for r in rights})
+                evidence = {k: provenance[k] for k in ('rights', 'license', 'synthetic')}
+                if inventory and inventory.get(digest(record)) != evidence:
+                    raise ValueError('source rights inventory differs from feature evidence')
+        self.rights = None if not inventory else sorted({json.dumps(r, sort_keys=True) for r in rights})
         definition, data = self.describe(spec)
         def inputs(ids):
             # IDs are lookup capabilities for the fixed feature store. Only
@@ -193,14 +199,15 @@ class MarketBackend:
             'label': None if self.corpus is None else digest(self.corpus.manifest['spec']),
             'feature': None if baseline is None else baseline.feature_schema,
             'model': None if baseline is None else baseline.hash,
-            'tokenizer': digest({'algorithm': 'builtin_hashing_regex_v1', 'optional_encoder': None}),
+            'tokenizer': TOKENIZER_HASH,
             'calibrator': digest({'calibration': 'none'})}
         manifest = {'format': 'market-factory-run-v1', 'task_identity': self.identity.to_dict(),
             'run_id': artifacts.run_id, 'attempt_id': self.attempt_id,
             'status': status, 'failure': None if status in ('completed', 'running') else 'task_' + status,
             'stage': self.stage, 'partial': status != 'completed', 'readiness': 'synthetic_only',
             'promotable': status == 'completed', 'edge_promotable': False,
-            'git_commit': execution['git_commit'], 'dirty_tree': execution['dirty_tree'],
+            'git_commit': self.execution['commit'], 'dirty_tree': self.execution['dirty_tree'],
+            'original_run_source': {'git_commit': execution['git_commit'], 'dirty_tree': execution['dirty_tree']},
             'resolved_config': config, 'effective_config': config,
             'environment_lock': environment, 'seed': config['training']['determinism_policy']['seed'],
             'hardware': {'machine': platform.machine(), 'processor': platform.processor(), 'device': 'cpu'},

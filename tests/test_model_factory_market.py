@@ -191,7 +191,7 @@ def test_final_test_is_explicit_once_per_protocol(pinned, tmp_path):
             final_test(candidate, root=tmp_path / 'MarketSynthetic', corpus_root=c.root.parent)
 
 
-def test_interrupted_resume_keeps_attempt_evidence(pinned, tmp_path):
+def test_interrupted_resume_keeps_attempt_evidence(pinned, tmp_path, monkeypatch):
     import subprocess
     import sys
     from cognitive_runtime.training.model_factory.state import heartbeat_path
@@ -225,8 +225,44 @@ run_trial(json.load(open(sys.argv[1])), root=sys.argv[2], corpus_root=sys.argv[3
     raw.update(mode='resume', parent={'run_id': 'interrupted',
         'checkpoint': str(checkpoint.relative_to(directory)),
         'sha256': hashlib.sha256(checkpoint.read_bytes()).hexdigest()})
+    from cognitive_runtime.adapters.finance.factory_backend import execution_identity
+    current_execution = {**execution_identity(), 'commit': 'f' * 40, 'dirty_tree': False}
+    monkeypatch.setattr('cognitive_runtime.adapters.finance.factory_backend.execution_identity', lambda: current_execution)
     resumed = run_trial(raw, root=tmp_path, corpus_root=c.root.parent)
+    doc = manifest(resumed)
+    assert doc['git_commit'] == doc['environment_lock']['commit'] == 'f' * 40
+    assert doc['dirty_tree'] is False
+    assert doc['original_run_source']['git_commit'] != doc['git_commit']
     assert resumed.state == 'completed' and resumed.run_id == 'interrupted'
     assert len(list((directory / 'attempts').iterdir())) == 2
     assert {str(x): x.read_bytes() for x in attempt.rglob('*.json')} == before
     assert resumed.checkpoint_sha256 == hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+
+
+def test_unknown_outcome_source_rights_and_legacy_inventory_block_export(tmp_path):
+    from cognitive_runtime.adapters.finance.datasets.corpus import Corpus
+    from cognitive_runtime.data.raw_store import RawStore
+    from cognitive_runtime.data.ledger import canonical
+    c, p = prepare_synthetic(tmp_path / 'unknown', endpoint_rights='unknown')
+    with pytest.raises(RegistryError, match='rights_blocked'):
+        run_trial(market_spec(c, p), root=tmp_path / 'runs', corpus_root=c.root.parent)
+    assert not list((tmp_path / 'runs').rglob('artifact_registry.json'))
+    c, p = prepare_synthetic(tmp_path / 'legacy')
+    old = dict(c.manifest)
+    del old['source_rights']
+    key = RawStore(c.root / 'manifests').put(canonical(old).encode())
+    legacy = Corpus(c.root, key)
+    with pytest.raises(RegistryError, match='rights_blocked'):
+        run_trial(market_spec(legacy, p), root=tmp_path / 'runs', corpus_root=c.root.parent)
+
+
+@pytest.mark.parametrize('artifact', ['checkpoints/last.json', 'metrics/validation.json', 'run_manifest.json'])
+def test_search_rejects_missing_cached_evidence(pinned, tmp_path, artifact):
+    from cognitive_runtime.training.model_factory.search import SearchError
+    c, p = pinned
+    spec = market_spec(c, p)
+    result = run_market_search([spec], root=tmp_path, corpus_root=c.root.parent)[0]
+    assert result['status'] == 'completed'
+    (Path(result['directory']) / artifact).unlink()
+    with pytest.raises(SearchError, match='missing or changed'):
+        run_market_search([spec], root=tmp_path, corpus_root=c.root.parent)

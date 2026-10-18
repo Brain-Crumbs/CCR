@@ -1778,7 +1778,11 @@ def run_market_search(specs, *, root, corpus_root):
                         require_completed_for_promotion(load_state(state_path(Path(root) / spec.organism / result.run_id)))
                         entry['score'] = validation_objective(result.evaluation, metric='pinball', predeclared_metric='pinball')
                     report = Path(result.experiment_report_path)
-                    entry.update(report=str(report), report_sha256=hashlib.sha256(report.read_bytes()).hexdigest())
+                    manifest = Path(result.directory) / 'run_manifest.json'
+                    manifest_payload = json.loads(manifest.read_text())
+                    entry.update(report=str(report), report_sha256=hashlib.sha256(report.read_bytes()).hexdigest(),
+                        manifest=str(manifest), manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                        artifacts=manifest_payload['artifacts'])
                 except Exception:
                     # The runner already wrote a redacted partial manifest.
                     # Do not turn arbitrary exception text into public artifacts.
@@ -1788,5 +1792,17 @@ def run_market_search(specs, *, root, corpus_root):
             entry = dict(trials[key])
             if entry.get('report') and hashlib.sha256(Path(entry['report']).read_bytes()).hexdigest() != entry['report_sha256']:
                 raise SearchError('cached evidence changed')
+            if entry.get('manifest'):
+                manifest = Path(entry['manifest'])
+                if not manifest.is_file() or hashlib.sha256(manifest.read_bytes()).hexdigest() != entry['manifest_sha256']:
+                    raise SearchError('cached manifest missing or changed')
+                for ref in entry['artifacts']:
+                    artifact = manifest.parent / ref['path']
+                    if (not artifact.resolve().is_relative_to(manifest.parent.resolve()) or not artifact.is_file()
+                            or artifact.stat().st_size != ref['size_bytes']
+                            or hashlib.sha256(artifact.read_bytes()).hexdigest() != ref['sha256']):
+                        raise SearchError('cached artifact missing or changed')
+                if entry['status'] == 'completed':
+                    require_completed_for_promotion(load_state(state_path(Path(root) / spec.organism / entry['run_id'])))
             results.append(entry)
     return tuple(results)

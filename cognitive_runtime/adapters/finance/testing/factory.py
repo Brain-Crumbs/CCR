@@ -16,15 +16,17 @@ from cognitive_runtime.data.snapshot import build_snapshot
 
 
 
-def prepare_synthetic(root, seed=295):
+def prepare_synthetic(root, seed=295, *, endpoint_rights='project-authored-fixture'):
     root = Path(root)
     base = examples()
     policy = RetentionPolicy(rights='project-authored-fixture', evidence=f'MIT generator factory-v1 seed {seed}', allow_raw=True,
                              allow_normalized=True, retain_provenance=True)
     with Ledger(root / 'ledger') as ledger:
         def append(r):
+            if r.schema_name == 'PredictionContractState' and '14:31' in r.event_at:
+                r = replace(r, provenance=replace(r.provenance, rights=endpoint_rights))
             r = seal_source(r)
-            ledger.append(r, canonical(source_payload(r)).encode(), policy)
+            ledger.append(r, canonical(source_payload(r)).encode(), replace(policy, rights=r.provenance.rights))
             return r
         append(replace(base['Instrument'], listing_id='contract:demo', kind='binary_contract'))
         requests = []
