@@ -1,0 +1,14 @@
+provider: alpaca_basic
+budget_usd: '0'
+cost_per_request_usd: '0'
+endpoint: https://data.alpaca.markets/v2/stocks/bars
+method: GET
+feeds: [iex, sip]
+adjustment: raw
+requests_per_minute: 200
+max_requests: 100
+timeout_seconds: 10
+max_response_bytes: 8388608
+allow_trial: false
+allow_upgrade: false
+allow_fallback: false
