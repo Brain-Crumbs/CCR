@@ -66,7 +66,7 @@ example, not approval to run a live smoke. Do not execute it in default CI.
 
 Pagination continues until `next_page_token` is null, including empty/short
 pages and later symbols. Repeated tokens fail explicitly. The default bound is
-100 requests per fetch (configurable downwards), 10 seconds per request and
+100 requests per fetch (explicit `max_requests` range 1–10,000), 10 seconds per request and
 8 MiB per page. There are no automatic retries or sleeps: 429, timeouts and 5xx
 return immediately with existing counts. A later authorized invocation may retry.
 The shared SQLite rolling-minute budget reserves requests atomically before

@@ -265,7 +265,7 @@ coverage. They do not change repository permissions or replace issue acceptance.
 
 ## BP-013: Bind provider policy before transport and preserve partial evidence
 
-- Status: proposed (submitted-head independent review pending).
+- Status: active; independent source review recorded in PR #310 (not a GitHub approval).
 - Scope: read-only market data adapters, #288.
 - Rule: enforce exact endpoints, explicit feeds, zero cost, rights and request
   budgets before transport; reject redirects and never fall back on entitlement
@@ -284,3 +284,5 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | 2026-11-05 | BP-013 | Proposed | #288 implicit provider defaults and truncated pagination could misstate free access or coverage; pre-transport policy and partial-count regressions added. |
 
 | 2026-11-05 | BP-013 | Author-review regression evidence | [PR #310](https://github.com/Brain-Crumbs/CCR/pull/310): identical-price replay must compare the immutable retention contract rather than silently reuse under changed rights; decoded credential reflections must fail before raw-page retention. Added direct regressions and request/rights/capability hash bindings. Independent review remains pending. |
+
+| 2026-11-05 | BP-013 | Independent review | PR #310 at f0cc0dff4c6990e70a93ebc67f8ac3b9200d6c63: all offline issue/master criteria and practice evidence accepted, no blocking code findings; 79 adapter tests independently passed. Clarified the documented request-cap range; live readiness and protection visibility remain pending. |
