@@ -77,8 +77,8 @@ distributed limiter. Do not delete or give collectors distinct quota paths to
 reset the budget. Clock rollback/corrupt quota state fails closed.
 
 `FetchResult` is a safe collection-run summary, separate from the model Factory
-RunManifest. It binds policy/capability SHA256, feed, response hashes and record
-IDs. Save only this summary and the matching `capability(...)` manifest in private
+RunManifest. It binds policy/capability/request/retention SHA256, feed, response hashes and record
+IDs, and includes the exact capability manifest. Save this summary in private
 operator run evidence. It contains no provider text, credentials or pagination
 tokens. `requests` counts attempted transport calls; `pages` counts structurally
 valid responses. `received = written + reused + rejected`; per-symbol counts
@@ -110,7 +110,10 @@ fields remain in the private raw page, not fabricated schema fields. Successful
 rows use **collector observation proxy** availability, never historical bar-end
 availability: today's download cannot enter yesterday's causal snapshot.
 Corrections append revisions; identical OHLCV replays reuse the first observation
-and original page hash. Volume/trade-count/VWAP interpretation does not imply a
+and original page hash only when the immutable retention policy also matches.
+A changed policy reports a conflict; use explicit ledger rights-revocation
+operations to remove previously retained data rather than treating replay as a
+rights migration. Volume/trade-count/VWAP interpretation does not imply a
 tradable quote. Synthetic and live identities are separate.
 
 ## Capability and readiness

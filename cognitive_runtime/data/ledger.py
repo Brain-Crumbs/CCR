@@ -198,6 +198,15 @@ class Ledger:
                 raise KeyError(record_id)
             return self._read(row)
 
+    def retention_policy(self, record_id):
+        """Return the immutable retention contract for an available record."""
+        with self.locked():
+            row = self.db.execute('SELECT * FROM events WHERE record_id=?', (record_id,)).fetchone()
+            if row is None:
+                raise KeyError(record_id)
+            self._read(row)  # expired/revoked records remain unavailable
+            return RetentionPolicy.from_json(row['policy'])
+
     def raw_payload(self, record_id):
         with self.locked():
             row = self.db.execute('SELECT * FROM events WHERE record_id=?', (record_id,)).fetchone()

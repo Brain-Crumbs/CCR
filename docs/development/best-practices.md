@@ -282,3 +282,5 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | Date | ID | Change | Reason and evidence |
 | --- | --- | --- | --- |
 | 2026-11-05 | BP-013 | Proposed | #288 implicit provider defaults and truncated pagination could misstate free access or coverage; pre-transport policy and partial-count regressions added. |
+
+| 2026-11-05 | BP-013 | Author-review regression evidence | [PR #310](https://github.com/Brain-Crumbs/CCR/pull/310): identical-price replay must compare the immutable retention contract rather than silently reuse under changed rights; decoded credential reflections must fail before raw-page retention. Added direct regressions and request/rights/capability hash bindings. Independent review remains pending. |

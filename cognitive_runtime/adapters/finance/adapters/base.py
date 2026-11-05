@@ -23,6 +23,9 @@ class FetchResult:
     feed: str
     config_sha256: str
     capability_sha256: str
+    request_sha256: str | None = None
+    retention_sha256: str | None = None
+    capability_manifest: dict = field(default_factory=dict)
     status: str = 'pending'
     readiness: str = 'docs_only'
     requests: int = 0

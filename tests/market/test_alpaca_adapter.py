@@ -339,3 +339,39 @@ def test_rate_budget_survives_subprocess(tmp_path):
         'assert not GlobalRateBudget(sys.argv[1],clock=lambda:1000).acquire(1)',str(root)],
         timeout=5,capture_output=True)
     assert result.returncode == 0, result.stderr.decode()
+
+
+def test_replay_must_not_ignore_changed_retention(setup):
+    first,_,_=fetch(setup)
+    changed=replace(RETENTION,allow_raw=False,evidence='new stricter policy')
+    result,_,_=fetch(setup,retention=changed)
+    assert result.reused == 0 and result.rejected == 3
+    assert result.reasons == {'retention_policy_conflict':3}
+    assert setup[0].retention_policy(first.record_ids[0]) == RETENTION
+    with pytest.raises(KeyError):
+        setup[0].retention_policy('missing')
+
+
+def test_no_raw_retention_replay_and_manifest_binding(setup):
+    policy=replace(RETENTION,allow_raw=False)
+    first,_,_=fetch(setup,retention=policy)
+    second,_,_=fetch(setup,retention=policy)
+    assert second.reused == 3 and second.status == 'ok'
+    assert first.retention_sha256 == policy.hash and first.request_sha256 == second.request_sha256
+    from cognitive_runtime.adapters.finance.schemas.records import ProviderCapabilityManifest
+    cap=ProviderCapabilityManifest(**first.capability_manifest)
+    assert cap.hash == first.capability_sha256 and cap.status == first.readiness
+    with pytest.raises(PermissionError):
+        setup[0].raw_payload(first.record_ids[0])
+
+
+def test_encoded_credential_reflection_rejected_before_storage(setup,monkeypatch):
+    monkeypatch.setenv('APCA_API_KEY_ID','fake-private-key')
+    monkeypatch.setenv('APCA_API_SECRET_KEY','fake-private-secret')
+    encoded=''.join('\\u%04x' % ord(c) for c in 'fake-private-secret')
+    body=pages()[1].body.replace(b'null',('"'+encoded+'"').encode())
+    adapter=AlpacaAdapter(rate_budget=setup[1],now=lambda:NOW)
+    with patch.object(HTTPTransport,'get',return_value=Response(200,body)):
+        result=adapter.fetch(setup[0],symbols=BINDINGS,feed='iex',timeframe='1Min',start='2025-01-06T14:30:00Z',
+                             end='2025-01-06T15:00:00Z',retention=RETENTION,live=True,entitlement_evidence='synthetic')
+    assert result.status == 'invalid_response' and setup[0].records() == ()

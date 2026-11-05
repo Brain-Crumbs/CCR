@@ -3,7 +3,7 @@
 No network work occurs until explicit fetch(live=True) with existing keys,
 free-entitlement evidence and a permitted retention policy. No trading SDK.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import timedelta
 from decimal import Decimal
 import hashlib
@@ -104,6 +104,16 @@ def _json(body):
     return json.loads(body, parse_float=Decimal, object_pairs_hook=unique, parse_constant=invalid)
 
 
+def _contains_secret(value, secrets):
+    if isinstance(value, str):
+        return any(secret in value for secret in secrets)
+    if isinstance(value, dict):
+        return any(_contains_secret(k, secrets) or _contains_secret(v, secrets) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_contains_secret(v, secrets) for v in value)
+    return False
+
+
 def _decimal(value):
     if type(value) not in (int, str, Decimal):
         raise ValueError('missing or invalid numeric field')
@@ -175,7 +185,8 @@ class AlpacaAdapter:
         capability = self.capability(synthetic=synthetic, credentials=credentials is not None,
                                      rights=rights, entitlement=bool(entitlement_evidence))
         result = FetchResult(feed, self.policy.hash, capability.hash, readiness=capability.status,
-                             by_symbol={s: 0 for s in symbols})
+                             by_symbol={s: 0 for s in symbols}, capability_manifest=capability.to_dict(),
+                             retention_sha256=retention.hash if type(retention) is RetentionPolicy else None)
         params = dict(symbols=','.join(sorted(symbols)), feed=feed, timeframe=timeframe,
                       start=start, end=end, adjustment='raw', limit=limit, sort='asc', asof='-', currency='USD')
         try:
@@ -185,11 +196,12 @@ class AlpacaAdapter:
         except (ValueError, TypeError, AttributeError):
             result.status = 'policy_rejected'
             return result
+        result.request_sha256 = digest({'params': params, 'bindings': {s: asdict(b) for s, b in symbols.items()}})
         if live and credentials is None:
             result.status = 'needs_user_key'
             return result
         if not rights:
-            result.status, result.readiness = 'rights_blocked', 'rights_blocked'
+            result.status = 'rights_blocked'
             return result
         if live and not entitlement_evidence:
             result.status = 'entitlement_unverified'
@@ -211,7 +223,10 @@ class AlpacaAdapter:
         tokens = set()
         while result.requests < self.policy.max_requests:
             if retention.expires_at and timestamp(retention.expires_at) <= self.now():
-                result.status, result.readiness = 'rights_blocked', 'rights_blocked'
+                expired = self.capability(synthetic=synthetic, credentials=credentials is not None,
+                                          rights=False, entitlement=bool(entitlement_evidence))
+                result.status, result.readiness = 'rights_blocked', expired.status
+                result.capability_sha256, result.capability_manifest = expired.hash, expired.to_dict()
                 return result
             try:
                 self.policy.check(BARS_URL, params, now=self.now())
@@ -240,6 +255,7 @@ class AlpacaAdapter:
                     denied = self.capability(synthetic=synthetic, credentials=credentials is not None,
                                              rights=rights, entitlement=bool(entitlement_evidence), denied=True)
                     result.readiness, result.capability_sha256 = denied.status, denied.hash
+                    result.capability_manifest = denied.to_dict()
                 return result
             try:
                 if type(response.body) is not bytes or len(response.body) > self.policy.max_response_bytes:
@@ -247,6 +263,8 @@ class AlpacaAdapter:
                 if credentials and any(secret.encode() in response.body for secret in (credentials.key, credentials.secret)):
                     raise ValueError('reflected credential')
                 data = _json(response.body)
+                if credentials and _contains_secret(data, (credentials.key, credentials.secret)):
+                    raise ValueError('reflected credential')
                 if type(data) is not dict or type(data.get('bars')) is not dict or 'next_page_token' not in data:
                     raise ValueError('malformed page')
                 token = data['next_page_token']
@@ -275,6 +293,13 @@ class AlpacaAdapter:
                     old = prior.get(record.source_record_id)
                     # First observation and original page hash survive exact replay.
                     if old is not None and record is old:
+                        try:
+                            if ledger.retention_policy(old.record_id) != retention:
+                                result.reject('retention_policy_conflict')
+                                continue
+                        except Exception:
+                            result.reject('storage_error')
+                            continue
                         result.reused += 1
                     else:
                         try:
