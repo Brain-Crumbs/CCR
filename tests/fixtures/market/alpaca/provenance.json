@@ -1,0 +1,14 @@
+{
+  "synthetic": true,
+  "generator": "hand-authored-alpaca-v1",
+  "seed": 288,
+  "source": "project-authored fictional DEMOA/DEMOB; no provider response",
+  "license": "MIT",
+  "rights": "project-authored-fixture",
+  "files": {
+    "pages.json": {
+      "sha256": "730c7692d2c6768cbeba801b5bbd568407b0e810ba09ad22cd2caef7365e7859",
+      "edge_case": "combined two-row limit, symbol-major pagination, exact decimal numeric JSON, nanosecond zero suffix"
+    }
+  }
+}

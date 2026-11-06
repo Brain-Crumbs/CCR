@@ -262,3 +262,27 @@ coverage. They do not change repository permissions or replace issue acceptance.
 | 2026-10-18 | BP-012 | Proposed | Neutral preparation preceded run allocation, and export/final-test guards needed explicit lifecycle boundaries; #295. |
 
 | 2026-10-18 | BP-012 | Independent review regressions | PR #309 at 7c5f11b reproduced export despite unknown outcome-source rights (P1) and cached success after checkpoint deletion (P2); also found original-vs-resume commit mismatch (P2). Bind both feature and outcome rights, revalidate referenced evidence on reuse, and record invocation-specific provenance. Direct regressions added; fresh repaired-head review pending. |
+
+## BP-013: Bind provider policy before transport and preserve partial evidence
+
+- Status: active; independent source review recorded in PR #310 (not a GitHub approval).
+- Scope: read-only market data adapters, #288.
+- Rule: enforce exact endpoints, explicit feeds, zero cost, rights and request
+  budgets before transport; reject redirects and never fall back on entitlement
+  failure. Drain symbol-major pagination independently of page length. Retain
+  accepted/rejected/reused counts and separate collection success from live
+  readiness and coverage. Share quota reservations across collector processes.
+- Exception: offline fixtures validate mechanics, not provider access or rights;
+  multi-machine collection needs an explicitly coordinated quota owner.
+- Evidence: `tests/market/test_alpaca_adapter.py` endpoint/query rejection,
+  multi-symbol pagination, partial 429/denial/timeout, precise decimals, separate
+  feeds/source modes, cross-process quota and mocked credential-redaction tests.
+- Added: 2026-11-05.
+
+| Date | ID | Change | Reason and evidence |
+| --- | --- | --- | --- |
+| 2026-11-05 | BP-013 | Proposed | #288 implicit provider defaults and truncated pagination could misstate free access or coverage; pre-transport policy and partial-count regressions added. |
+
+| 2026-11-05 | BP-013 | Author-review regression evidence | [PR #310](https://github.com/Brain-Crumbs/CCR/pull/310): identical-price replay must compare the immutable retention contract rather than silently reuse under changed rights; decoded credential reflections must fail before raw-page retention. Added direct regressions and request/rights/capability hash bindings. Independent review remains pending. |
+
+| 2026-11-05 | BP-013 | Independent review | PR #310 at f0cc0dff4c6990e70a93ebc67f8ac3b9200d6c63: all offline issue/master criteria and practice evidence accepted, no blocking code findings; 79 adapter tests independently passed. Clarified the documented request-cap range; live readiness and protection visibility remain pending. |
